@@ -1,0 +1,76 @@
+const express = require('express');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const session = require('express-session');
+const connectDB = require('./config/db');
+const logger = require('./config/logger');
+const limiter = require('./middlewares/rateLimiter');
+const cleanupService = require('./services/cleanupService');
+require('dotenv').config();
+
+// Routes
+const authRoutes = require('./routes/authRoutes');
+const conversationRoutes = require('./routes/conversationRoutes');
+const statisticsRoutes = require('./routes/statisticsRoutes');
+const userRoutes = require('./routes/userRoutes');
+const feedbackRoutes = require('./routes/feedbackRoutes');
+const ocrRoutes = require('./routes/ocrRoutes');
+const openaiRoutes = require('./routes/openaiRoutes');
+
+const app = express();
+const port = process.env.PORT || 3000;
+
+connectDB().then(() => console.log('Database connected successfully')).catch((err) => {
+  console.error('Database connection failed:', err);
+  process.exit(1); // Exit if DB connection fails
+});
+
+const allowedOrigins = [
+  'http://localhost:4200', // Helyi fejlesztési frontend URL-je
+  'https://lemon-moss-0ce31f803.5.azurestaticapps.net', // Az Azure Static Web Apps URL-je
+  'https://jolly-sky-004a81803.5.azurestaticapps.net'
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Ha az origin szerepel az engedélyezett listában, engedélyezd a hozzáférést
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  methods: 'GET,POST,PUT,DELETE',
+  credentials: true
+}));
+
+app.use(bodyParser.json());
+app.use(session({
+  secret: 'yourSecretKey',
+  resave: false,
+  saveUninitialized: true,
+  cookie: { secure: true }
+}));
+app.use(limiter);
+
+app.get('/', (req, res) => {
+  res.send('Welcome to the application!');
+});
+
+// Use routes
+app.use('/api', authRoutes);
+app.use('/api', conversationRoutes);
+app.use('/api', statisticsRoutes);
+app.use('/api', userRoutes);
+app.use('/api', feedbackRoutes);
+app.use('/api', ocrRoutes);
+app.use('/api', openaiRoutes);
+
+
+// Periodikus tisztítás
+setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum
+
+console.log("Starting application...");
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
