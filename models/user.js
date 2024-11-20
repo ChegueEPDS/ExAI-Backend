@@ -15,7 +15,7 @@ const UserSchema = new mongoose.Schema({
     company: { 
         type: String, 
         required: true, // Állítsd true-ra, ha minden felhasználónak tartoznia kell egy céghez
-        enum: ['PGMED', 'Viresol', 'default'], // A támogatott cégazonosítók felsorolása
+        enum: ['PGMED', 'Viresol', 'XIII', 'default'], // A támogatott cégazonosítók felsorolása
         default: 'default', // Alapértelmezett érték
     },
     password: { 
