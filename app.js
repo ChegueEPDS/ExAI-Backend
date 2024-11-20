@@ -29,7 +29,7 @@ const allowedOrigins = [
   'http://localhost:4200', // Helyi fejlesztési frontend URL-je
   'https://lemon-moss-0ce31f803.5.azurestaticapps.net', // Az Azure Static Web Apps URL-je
   'https://jolly-sky-004a81803.5.azurestaticapps.net',
-  'https://lively-mushroom-07ad34003.5.azurestaticapps.net/',
+  'https://lively-mushroom-07ad34003.5.azurestaticapps.net',
 ];
 
 app.use(cors({
