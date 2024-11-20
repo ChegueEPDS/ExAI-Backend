@@ -10,7 +10,7 @@ exports.register = async (req, res) => {
     return res.status(400).json({ errors: errors.array() });
   }
 
-  const { firstName, lastName, email, password, nickname, company } = req.body;
+  const { firstName, lastName, email, password, nickname, company, role } = req.body;
 
   try {
     const existingUser = await User.findOne({ email });
@@ -23,7 +23,7 @@ exports.register = async (req, res) => {
       lastName,
       email,
       password,
-      role: 'User',  // Alapértelmezett szerepkör
+      role: role || 'User',  // Alapértelmezett szerepkör
       nickname, // Új mező
       company: company || 'default',
     });
