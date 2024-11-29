@@ -117,8 +117,8 @@ exports.processImage = async (req, res) => {
       res.status(200).json({
         message: 'Predikció és annotálás sikeres.',
         predictions,
-        annotatedImage: `/${process.env.UPLOAD_FOLDER}/annotated-${file.filename}`,
-      });
+        annotatedImage: `${process.env.BASE_URL}/${process.env.UPLOAD_FOLDER}/annotated-${file.filename}`,
+    });
   
       // Cleanup: Delete the original uploaded file
       console.log('Deleting temporary file:', imagePath);
