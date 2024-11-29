@@ -20,6 +20,7 @@
     "express-rate-limit": "^7.4.0",
     "express-session": "^1.18.0",
     "express-validator": "^7.2.0",
+    "jimp": "^0.16.13",
     "jsonwebtoken": "^9.0.2",
     "marked": "^13.0.3",
     "mongoose": "^8.6.1",

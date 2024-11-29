@@ -7,6 +7,7 @@ const logger = require('./config/logger');
 const limiter = require('./middlewares/rateLimiter');
 const cleanupService = require('./services/cleanupService');
 require('dotenv').config();
+const path = require('path');
 
 // Routes
 const authRoutes = require('./routes/authRoutes');
@@ -16,8 +17,11 @@ const userRoutes = require('./routes/userRoutes');
 const feedbackRoutes = require('./routes/feedbackRoutes');
 const ocrRoutes = require('./routes/ocrRoutes');
 const openaiRoutes = require('./routes/openaiRoutes');
+const visionRoutes = require('./routes/visionRoutes');
+const fireRoutes = require('./routes/fireRoutes');
 
 const app = express();
+app.set('trust proxy', 1); // Csak teszt környezetben
 const port = process.env.PORT || 3000;
 
 connectDB().then(() => console.log('Database connected successfully')).catch((err) => {
@@ -30,6 +34,7 @@ const allowedOrigins = [
   'https://lemon-moss-0ce31f803.5.azurestaticapps.net', // Az Azure Static Web Apps URL-je
   'https://jolly-field-070def303.5.azurestaticapps.net',
   'https://lively-mushroom-07ad34003.5.azurestaticapps.net',
+  'https://kind-glacier-01525a703.5.azurestaticapps.net',
 ];
 
 app.use(cors({
@@ -53,9 +58,16 @@ app.use(session({
   cookie: { secure: true }
 }));
 app.use(limiter);
+app.use(express.json());
+
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 app.get('/', (req, res) => {
   res.send('Welcome to the application!');
+});
+
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
 });
 
 // Use routes
@@ -66,7 +78,8 @@ app.use('/api', userRoutes);
 app.use('/api', feedbackRoutes);
 app.use('/api', ocrRoutes);
 app.use('/api', openaiRoutes);
-
+app.use('/api/vision', visionRoutes);
+app.use('/api/fire', fireRoutes);
 
 // Periodikus tisztítás
 setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum
