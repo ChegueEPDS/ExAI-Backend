@@ -23,8 +23,8 @@ exports.register = async (req, res) => {
       lastName,
       email,
       password,
-      role: role || 'User',  // Alapértelmezett szerepkör
-      nickname, // Új mező
+      role: role || 'User',
+      nickname, 
       company: company || 'default',
     });
 
@@ -61,8 +61,8 @@ exports.login = async (req, res) => {
     // JWT létrehozása a userId és nickname alapján
     const token = jwt.sign(
       { userId: user._id, nickname: user.nickname, role: user.role, company:user.company },
-      process.env.JWT_SECRET,  // titkos kulcs környezeti változóból
-      { expiresIn: '1h' } // Token lejárati ideje (pl. 1 óra)
+      process.env.JWT_SECRET, 
+      { expiresIn: '1h' }  // #TODO: Be kell vezetni h lejárt token esetén átirányít a /login-ra és hogy lejárat előtt 1 perccel figyelmeztessen és meg lehessen hossazbbítani a tokent
     );
 
     // Token visszaküldése a kliensnek

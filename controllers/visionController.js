@@ -1,3 +1,7 @@
+/********************************************************/ 
+/*** Az OpenAI Vision API használata képfelismeréshez ***/
+/********************************************************/
+
 const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
@@ -54,7 +58,7 @@ const analyzeImages = async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'Nincsenek kép URL-ek megadva.' });
         }
 
-        const userInput = user_input || "Mit látsz a képén? Ha van olyan égésnyom ami U alakú kérlek jelezd a helyét és azt is ha olyan jelet látsz ami a tűz keletkezési helyére utal pl leesett csempe.";
+        const userInput = user_input || "Mit látsz a képén?";
         const apiUrl = 'https://api.openai.com/v1/chat/completions';
 
         const images = image_urls.map((url) => ({

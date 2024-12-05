@@ -1,4 +1,7 @@
-// Import dependencies
+/*********************************************************/ 
+/*** Azure OCR használata RB-s adattábla beolvasásához ***/
+/*********************************************************/
+
 const multer = require('multer');
 const fs = require('fs');
 const axios = require('axios');

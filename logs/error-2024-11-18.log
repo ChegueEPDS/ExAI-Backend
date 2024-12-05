@@ -1,3 +1,0 @@
-{"level":"error","message":"Hiba az asszisztens instructions lekérdezése során:","timestamp":"2024-11-18T15:27:48.999Z"}
-{"level":"error","message":"Hiba az asszisztens instructions lekérdezése során:","timestamp":"2024-11-18T15:29:16.744Z"}
-{"data":{"error":{"code":null,"message":"Invalid URL (GET /v1/assistants/asst_vpMrPMyaFjJ0s8BFzK6Bo1Us/instructions)","param":null,"type":"invalid_request_error"}},"level":"error","message":"OpenAI API válasz hiba:","status":404,"timestamp":"2024-11-18T15:33:19.710Z"}

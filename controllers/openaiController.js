@@ -1,3 +1,7 @@
+/******************************************************************************************/ 
+/*** Az OpenAI beállítások lekérdezése, és módosítása. Asszisztens választása a userhez ***/
+/******************************************************************************************/
+
 const axios = require('axios');
 const logger = require('../config/logger');
 const assistants = require('../config/assistants');

@@ -3,6 +3,7 @@ const assistants = {
     'Viresol': process.env.ASSISTANT_ID_VIRESOL,
     'XIII': process.env.ASSISTANT_ID_XIII,
     'TUZ': process.env.ASSISTANT_ID_TUZ,
+    'STAND98' : process.env.ASSISTANT_ID_STAND98,
     'default': process.env.ASSISTANT_ID_DEFAULT,
   };
   

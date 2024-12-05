@@ -8,6 +8,9 @@ const { marked } = require('marked');
 const tiktoken = require('tiktoken');
 const assistants = require('../config/assistants');
 const User = require('../models/user'); // Ha a felhasználó modell így van nevezve
+const { fetchFromAzureSearch } = require('../helpers/azureSearchHelpers');
+console.log('fetchFromAzureSearch:', typeof fetchFromAzureSearch);
+const { createEmbedding } = require('../helpers/openaiHelpers');
 
 // Új beszélgetés indítása
 exports.startNewConversation = async (req, res) => {
@@ -286,6 +289,89 @@ exports.getConversationById = async (req, res) => {
     res.status(200).json(conversation.messages);  // A beszélgetés üzeneteinek visszaküldése
   } catch (error) {
     logger.error('Hiba a beszélgetés betöltése során:', error.message);
+    res.status(500).json({ error: 'Váratlan hiba történt.' });
+  }
+};
+
+// Új keresés-válasz végpont, amely az Azure és OpenAI eredményeket használja
+exports.searchAndRespond = async (req, res) => {
+  try {
+    const { query, threadId } = req.body;
+
+    // Validáció
+    if (!query || !threadId) {
+      logger.error('Hiányzó adat: Kérdés vagy szál azonosító nincs megadva.', { query, threadId });
+      return res.status(400).json({ error: 'A kérdés és a szál azonosítója kötelező.' });
+    }
+
+    const userToken = req.headers.authorization?.split(' ')[1];
+    if (!userToken) {
+      logger.error('Hiányzó JWT token.');
+      return res.status(401).json({ error: 'Hiányzó token.' });
+    }
+
+    logger.info(`Keresési kérdés érkezett: ${query}`, { threadId });
+
+    // 1. Azure AI Search hívása
+    let azureResults;
+    try {
+      azureResults = await fetchFromAzureSearch(query);
+      logger.info('Azure keresési találatok sikeresen fogadva.', { azureResults });
+    } catch (azureError) {
+      logger.error('Hiba az Azure AI Search hívása során:', {
+        error: azureError.message,
+        stack: azureError.stack,
+        query,
+      });
+      throw new Error('Hiba történt az Azure keresés során.');
+    }
+
+    // 2. Kontextus előkészítése
+    const combinedMessage = `
+      Kérdés: ${query}
+      Azure keresési találatok:
+      ${JSON.stringify(azureResults, null, 2)}
+    `;
+    logger.info('Kontextus előkészítve a következő adatokkal.', { combinedMessage });
+
+    // 3. Továbbítás a chat végpontnak
+    const chatEndpoint = `${process.env.BASE_URL}/api/chat`;
+    let sendMessageResponse;
+    try {
+      logger.info('Kimenő chat API kérés adatai:', {
+        url: chatEndpoint,
+        headers: {
+          Authorization: `Bearer ${userToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: { message: combinedMessage, threadId },
+      });
+
+      sendMessageResponse = await axios.post(chatEndpoint, {
+        message: combinedMessage,
+        threadId,
+      }, {
+        headers: {
+          Authorization: `Bearer ${userToken}`,
+          'Content-Type': 'application/json',
+        },
+      });
+
+      logger.info('Chat végpont sikeresen válaszolt.', { responseData: sendMessageResponse.data });
+    } catch (chatError) {
+      logger.error('Hiba a chat végpont hívása során:', {
+        error: chatError.message,
+        stack: chatError.stack,
+        response: chatError.response ? chatError.response.data : 'Nincs válasz adat',
+        status: chatError.response ? chatError.response.status : 'Nincs státusz',
+      });
+      throw new Error('Hiba történt a chat végpont hívása során.');
+    }
+
+    // 4. Kliens válasz
+    res.status(200).json(sendMessageResponse.data);
+  } catch (error) {
+    logger.error('Hiba a keresés-válasz folyamat során.', { error: error.message, stack: error.stack });
     res.status(500).json({ error: 'Váratlan hiba történt.' });
   }
 };

@@ -50,7 +50,7 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10mb' }));
 app.use(session({
   secret: 'yourSecretKey',
   resave: false,
