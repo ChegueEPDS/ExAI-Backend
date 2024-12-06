@@ -26,8 +26,11 @@ jobs:
           npm install
           npm run build --if-present
 
-      - name: Zip artifact for deployment
-        run: zip release.zip ./* -r
+      - run: |
+          mkdir -p uploads # Ensure the uploads folder exists
+          find . -type d -empty -exec touch {}/.keep \; # Add .keep to empty directories
+          zip -r release.zip . -x "node_modules/*" ".git/*" # Exclude unnecessary files and folders
+          zip -r release.zip uploads # Add the uploads folder explicitly, keeping it empty
 
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4

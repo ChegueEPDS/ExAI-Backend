@@ -35,6 +35,7 @@ const allowedOrigins = [
   'https://jolly-field-070def303.5.azurestaticapps.net',
   'https://lively-mushroom-07ad34003.5.azurestaticapps.net',
   'https://kind-glacier-01525a703.5.azurestaticapps.net',
+  'https://thankful-meadow-0ab025703.4.azurestaticapps.net',
 ];
 
 app.use(cors({
