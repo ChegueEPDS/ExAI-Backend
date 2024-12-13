@@ -26,7 +26,6 @@ exports.uploadImage = [
       // Set up Azure OCR API 4.0 configuration
       const endpoint = process.env.AZURE_OCR_ENDPOINT;
       const subscriptionKey = process.env.AZURE_OCR_KEY;
-
       const imageBuffer = fs.readFileSync(filePath);
 
       // Call Azure OCR API 4.0
@@ -56,11 +55,19 @@ exports.uploadImage = [
       formattedText = formattedText.replace(/([A-Za-z])(\d{1,2}GD)/g, '$1 $2');
       formattedText = formattedText.replace(/(Tamb .*?to .*?C)/g, '$1\n');
       formattedText = formattedText.replace(/(S\/N \d+)/g, '$1\n');
-      formattedText = formattedText.replace(/(CE & II2G .*?T4)/g, '$1\n');
-
+      //formattedText = formattedText.replace(/(CE & II2G .*?T[1-6])/g, '$1\n');
+      formattedText = formattedText.replace(
+        /(?<=^|\s)(?:[1izlI]{2,3})(A|B|C)?/gm,
+        (match) => match.replace(/[1izl]/g, 'I')
+      );
+      formattedText = formattedText.replace(
+        /(?<=^|\s)(?:[MN1izlI]{2,3})(A|B|C)?/gm,
+        (match) => match.replace(/[MN]/g, 'II')
+      );
+      formattedText = formattedText.replace(/(Ex)(?!\s)/gm, '$1 ');
 
       // Send the analyzed text back to the frontend
-      res.json({ recognizedText: `<strong>Kérlek foglald össze az adattábla tartalmát egy táblázatban! </strong><br><br>${formattedText.replace(/\n/g, '<br>')}` });
+      res.json({ recognizedText: `Show the dataplate information in a table format:<br><br>${formattedText.replace(/\n/g, '<br>')}` });
 
       // Delete the file to free up space
       fs.unlinkSync(filePath);

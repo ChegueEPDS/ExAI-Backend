@@ -19,6 +19,7 @@ const ocrRoutes = require('./routes/ocrRoutes');
 const openaiRoutes = require('./routes/openaiRoutes');
 const visionRoutes = require('./routes/visionRoutes');
 const fireRoutes = require('./routes/fireRoutes');
+const exRegisterRoutes = require('./routes/exRegisterRoutes')
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -82,6 +83,7 @@ app.use('/api', ocrRoutes);
 app.use('/api', openaiRoutes);
 app.use('/api/vision', visionRoutes);
 app.use('/api/fire', fireRoutes);
+app.use('/api', exRegisterRoutes);
 
 // Periodikus tisztítás
 setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum
