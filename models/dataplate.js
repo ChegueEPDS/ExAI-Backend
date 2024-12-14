@@ -27,7 +27,7 @@ const EquipmentSchema = new mongoose.Schema({
   "Other Info": { type: String },
   "Compliance": { 
     type: String, 
-    enum: ["NA", "Igen", "Nem"], 
+    enum: ["NA", "Passed", "Failed"], 
     default: "NA" 
   },
   "CreatedBy": { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },

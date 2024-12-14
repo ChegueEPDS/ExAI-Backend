@@ -38,6 +38,7 @@ const allowedOrigins = [
   'https://kind-glacier-01525a703.5.azurestaticapps.net',
   'https://thankful-meadow-0ab025703.4.azurestaticapps.net',
   'https://delightful-rock-0f7815803.4.azurestaticapps.net',
+  'https://happy-flower-09c1d5603.4.azurestaticapps.net'
 ];
 
 app.use(cors({
