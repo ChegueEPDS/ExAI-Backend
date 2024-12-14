@@ -32,11 +32,11 @@ jobs:
           zip -r release.zip . -x "node_modules/*" ".git/*" # Exclude unnecessary files and folders
           zip -r release.zip uploads # Add the uploads folder explicitly, keeping it empty
 
-      - name: Upload artifact for deployment job
-        uses: actions/upload-artifact@v4
-        with:
-          name: node-app
-          path: release.zip
+#      - name: Upload artifact for deployment job
+#        uses: actions/upload-artifact@v4
+#        with:
+#          name: node-app
+#          path: release.zip
 
   deploy:
     runs-on: ubuntu-latest
