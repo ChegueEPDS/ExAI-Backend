@@ -12,6 +12,7 @@ const ExMarkingSchema = new mongoose.Schema({
 });
 
 const EquipmentSchema = new mongoose.Schema({
+  "EqID": { type: String },
   "Manufacturer": { type: String, required: true },
   "Model/Type": { type: String, required: true },
   "Serial Number": { type: String, required: true },

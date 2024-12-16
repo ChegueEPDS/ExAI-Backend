@@ -1,6 +1,6 @@
 const express = require('express');
 const { body } = require('express-validator');
-const { register, login, logout } = require('../controllers/authController'); // Import the logout function
+const { register, login, logout, renewToken } = require('../controllers/authController'); // Import the logout function
 const authMiddleware = require('../middlewares/authMiddleware'); // Import authMiddleware
 
 const router = express.Router();
@@ -13,6 +13,8 @@ router.post('/register', [
 ], register);
 
 router.post('/login', login);
+
+router.post('/renew-token', renewToken);
 
 router.post('/logout', authMiddleware(['Admin', 'User']), logout); // Protect logout route with authMiddleware
 

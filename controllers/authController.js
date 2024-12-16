@@ -62,7 +62,7 @@ exports.login = async (req, res) => {
     const token = jwt.sign(
       { userId: user._id, nickname: user.nickname, role: user.role, company:user.company },
       process.env.JWT_SECRET, 
-      { expiresIn: '1h' }  // #TODO: Be kell vezetni h lejárt token esetén átirányít a /login-ra és hogy lejárat előtt 1 perccel figyelmeztessen és meg lehessen hossazbbítani a tokent
+      { expiresIn: '1h' } 
     );
 
     // Token visszaküldése a kliensnek
@@ -70,6 +70,36 @@ exports.login = async (req, res) => {
   } catch (error) {
     // Általános szerverhiba kezelése
     res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// Token megújítása
+exports.renewToken = (req, res) => {
+  const oldToken = req.headers.authorization?.split(' ')[1];
+  if (!oldToken) {
+    return res.status(401).json({ error: 'Token is required' });
+  }
+
+  try {
+    const decoded = jwt.verify(oldToken, process.env.JWT_SECRET);
+
+    const newToken = jwt.sign(
+      {
+        userId: decoded.userId,
+        nickname: decoded.nickname,
+        role: decoded.role,
+        company: decoded.company,
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+
+    res.status(200).json({ token: newToken });
+  } catch (error) {
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Token has expired, please log in again' });
+    }
+    return res.status(401).json({ error: 'Invalid token' });
   }
 };
 
