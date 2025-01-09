@@ -25,12 +25,10 @@ jobs:
         run: |
           npm install
           npm run build --if-present
+          npm run test --if-present
 
-      - run: |
-          mkdir -p uploads # Ensure the uploads folder exists
-          find . -type d -empty -exec touch {}/.keep \; # Add .keep to empty directories
-          zip -r release.zip . -x "node_modules/*" ".git/*" # Exclude unnecessary files and folders
-          zip -r release.zip uploads # Add the uploads folder explicitly, keeping it empty
+      - name: Zip artifact for deployment
+        run: zip release.zip ./* -r
 
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
@@ -59,9 +57,9 @@ jobs:
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_09388A438879487F96456A69B59F8BCE }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_D034284FD3E84C47850EB66F7D354DEC }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_51D4E7F596C4425D90A867127C528DDF }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_7687FBC1B330482E9C2851D8E2A95857 }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_96F0BB1F2AD7461885DC02C30A07BBE5 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_BA60CDCFDC714CDCBB986598A7F05135 }}
 
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
