@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 
 const ProjectSchema = new mongoose.Schema({
     "Project": { type: String, required: true },
-    "Environment": { type: String, required: true, enum: ['Gas', 'Dust', 'NA'] },
+    "Environment": { type: String, required: true, enum: ['Gas', 'Dust', 'Hybrid', 'NonEx'] },
     "Zone": { 
         type: Number, 
         enum: [0, 1, 2, 20, 21, 22], 
