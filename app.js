@@ -41,7 +41,7 @@ const allowedOrigins = [
   'https://thankful-meadow-0ab025703.4.azurestaticapps.net',
   'https://delightful-rock-0f7815803.4.azurestaticapps.net',
   'https://happy-flower-09c1d5603.4.azurestaticapps.net',
-  'https://demo.epds.eu/'
+  'https://demo.epds.eu'
 ];
 
 app.use(cors({
