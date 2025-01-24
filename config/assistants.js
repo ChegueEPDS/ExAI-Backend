@@ -6,6 +6,7 @@ const assistants = {
     'TUZ': process.env.ASSISTANT_ID_TUZ,
     'STAND98': process.env.ASSISTANT_ID_STAND98,
     'BGC': process.env.ASSISTANT_ID_BGC,
+    'DRND': process.env.ASSISTANT_ID_DRND,
   };
   
   module.exports = assistants;

@@ -1,31 +1,34 @@
 const Conversation = require('../models/conversation');
-const User = require('../models/user'); // A felhasználó modell importálása
+
 
 exports.getStatistics = async (req, res) => {
   try {
+    console.log('Starting getStatistics function...');
+
     if (!req.user || !req.user.company) {
+      console.error('User company information is missing.');
       return res.status(400).json({ error: 'User company information is missing' });
     }
-    // Bejelentkezett felhasználó company adatának lekérése
+
     const loggedInUserCompany = req.user.company;
+    console.log(`Logged in user's company: ${loggedInUserCompany}`);
 
-    // Beszélgetések szűrése a kapcsolódó felhasználó company alapján
     const conversations = await Conversation.find()
-      .populate({
-        path: 'userId', // Kapcsolt felhasználó adatok betöltése
-        select: 'company', // Csak a company mezőt töltjük be
-      })
-      .then((results) =>
-        results.filter((conversation) => conversation.userId.company === loggedInUserCompany)
-      );
+  .populate({
+    path: 'userId',
+    select: 'company',
+  })
+  .then((results) =>
+    results.filter((conversation) => conversation.userId && conversation.userId.company === loggedInUserCompany)
+  );
 
-    // Statisztikai adatok előkészítése
+    console.log(`Number of conversations retrieved: ${conversations.length}`);
+
     const categoryCount = {};
     let totalRating = 0;
     let totalMessagesWithRating = 0;
     const categoryRatings = {};
 
-    // Beszélgetések feldolgozása
     conversations.forEach((conversation) => {
       let lastUserCategory = null;
 
@@ -50,10 +53,10 @@ exports.getStatistics = async (req, res) => {
       });
     });
 
-    // Globális és kategóriánkénti átlagok kiszámítása
     const globalAverageRating = totalMessagesWithRating
       ? (totalRating / totalMessagesWithRating).toFixed(2)
       : 0;
+
     const categoryAverages = {};
     for (const category in categoryRatings) {
       if (categoryRatings[category].count > 0) {
@@ -65,14 +68,19 @@ exports.getStatistics = async (req, res) => {
       }
     }
 
-    // JSON válasz visszaadása
+    // JSON naplózása a konzolra
+    console.log('Category Count:', JSON.stringify(categoryCount, null, 2));
+    console.log('Global Average Rating:', globalAverageRating);
+    console.log('Category Averages:', JSON.stringify(categoryAverages, null, 2));
+
+    // JSON válasz küldése
     res.json({
       categoryCount,
       globalAverageRating,
       categoryAverages,
     });
   } catch (error) {
-    console.error(error);
+    console.error('Error in getStatistics:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to fetch statistics.' });
   }
 };
