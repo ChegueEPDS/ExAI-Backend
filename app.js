@@ -42,7 +42,8 @@ const allowedOrigins = [
   'https://delightful-rock-0f7815803.4.azurestaticapps.net',
   'https://happy-flower-09c1d5603.4.azurestaticapps.net',
   'https://demo.epds.eu',
-  'https://stand98.demo.epds.eu'
+  'https://stand98.demo.epds.eu',
+  'https://gray-grass-070bf1a03.4.azurestaticapps.net',
 ];
 
 app.use(cors({
