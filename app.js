@@ -22,6 +22,7 @@ const fireRoutes = require('./routes/fireRoutes');
 const exRegisterRoutes = require('./routes/exRegisterRoutes');
 const certificateRoutes = require('./routes/certificateRoutes');
 const inspectionRoutes = require('./routes/inspectionRoutes');
+const projectRoutes = require('./routes/projectRoutes');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -92,6 +93,7 @@ app.use('/api/fire', fireRoutes);
 app.use('/api', exRegisterRoutes);
 app.use('/api', certificateRoutes);
 app.use('/api/inspection', inspectionRoutes);
+app.use('/api/projects', projectRoutes);
 
 // Periodikus tisztítás
 setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum

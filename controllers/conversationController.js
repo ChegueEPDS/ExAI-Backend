@@ -7,7 +7,7 @@ const { body, validationResult } = require('express-validator');
 const { marked } = require('marked');
 const tiktoken = require('tiktoken');
 const assistants = require('../config/assistants');
-const User = require('../models/user'); // Ha a felhasználó modell így van nevezve
+const User = require('../models/user'); 
 const { fetchFromAzureSearch } = require('../helpers/azureSearchHelpers');
 console.log('fetchFromAzureSearch:', typeof fetchFromAzureSearch);
 const { createEmbedding } = require('../helpers/openaiHelpers');

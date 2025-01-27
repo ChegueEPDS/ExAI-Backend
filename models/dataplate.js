@@ -32,7 +32,7 @@ const EquipmentSchema = new mongoose.Schema({
     default: "NA" 
   },
   "CreatedBy": { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  "Project": { type: mongoose.Schema.Types.ObjectId, ref: 'Project', default: null }
+  "Project": { type: String, ref: 'Project', default: null }
 });
 
 module.exports = mongoose.model('Equipment', EquipmentSchema);

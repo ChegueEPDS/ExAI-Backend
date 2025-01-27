@@ -1,6 +1,7 @@
 const Equipment = require('../models/dataplate'); // Itt használjuk a valódi model nevét
 const Project = require('../models/project')
 const logger = require('../config/logger'); // ha van loggered, vagy kiveheted
+const mongoose = require('mongoose');
 
 // Létrehozás (POST /exreg)
 exports.createEquipment = async (req, res) => {
@@ -25,15 +26,22 @@ exports.createProject = async (req, res) => {
   }
 };
 
-
-
 // Listázás (GET /exreg)
 exports.listEquipment = async (req, res) => {
   try {
-    const equipments = await Equipment.find({});
+    const filter = {};
+
+    // Szűrés Project paraméter alapján
+    if (req.query.Project) {
+      filter.Project = req.query.Project; // String szűrés
+    }
+
+    console.log("Lekérdezés szűrője:", filter); // Debug
+    const equipments = await Equipment.find(filter);
+    console.log("Lekérdezett adatok:", equipments); // Debug
     return res.json(equipments);
   } catch (error) {
-    logger.error('Hiba történt az eszközök listázásakor:', error);
+    console.error('Hiba történt az eszközök listázásakor:', error);
     return res.status(500).json({ error: 'Nem sikerült lekérni az eszközöket.' });
   }
 };
