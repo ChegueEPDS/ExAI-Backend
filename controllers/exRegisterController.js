@@ -6,12 +6,15 @@ const mongoose = require('mongoose');
 // Létrehozás (POST /exreg)
 exports.createEquipment = async (req, res) => {
   try {
-    const newEquipment = new Equipment(req.body);
-    const savedEquipment = await newEquipment.save();
-    return res.status(201).json(savedEquipment);
+    // Ellenőrizd, hogy a kérés tömböt tartalmaz-e
+    const equipmentData = Array.isArray(req.body) ? req.body : [req.body];
+
+    // Mentés a MongoDB-be egyszerre több eszközzel
+    const savedEquipments = await Equipment.insertMany(equipmentData);
+    return res.status(201).json(savedEquipments);
   } catch (error) {
-    logger.error('Hiba történt az eszköz létrehozásakor:', error);
-    return res.status(500).json({ error: 'Nem sikerült létrehozni az eszközt.' });
+    logger.error('Hiba történt az eszközök létrehozásakor:', error);
+    return res.status(500).json({ error: 'Nem sikerült létrehozni az eszközöket.' });
   }
 };
 
