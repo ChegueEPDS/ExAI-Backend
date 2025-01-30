@@ -32,6 +32,7 @@ const EquipmentSchema = new mongoose.Schema({
     default: "NA" 
   },
   "CreatedBy": { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  "Company": { type: String, required: true },
   "Project": { type: String, ref: 'Project', default: null }
 });
 

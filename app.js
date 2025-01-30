@@ -44,6 +44,7 @@ const allowedOrigins = [
   'https://happy-flower-09c1d5603.4.azurestaticapps.net',
   'https://demo.epds.eu',
   'https://stand98.demo.epds.eu',
+  'https://exai.ind-ex.ae',
   'https://gray-grass-070bf1a03.4.azurestaticapps.net',
 ];
 
