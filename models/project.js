@@ -27,6 +27,7 @@ const ProjectSchema = new mongoose.Schema({
         ref: 'User', 
         required: true 
     },
+    Company: { type: String, required: true },
 }, { timestamps: true }); // Automatikusan hozzáadja a createdAt és updatedAt mezőket
 
 module.exports = mongoose.model('Project', ProjectSchema);
