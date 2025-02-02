@@ -43,11 +43,13 @@ exports.listEquipment = async (req, res) => {
       return res.status(401).json({ error: 'Nincs bejelentkezett felhasználó vagy hiányzó cégadatok.' });
     }
 
-    const filter = { Company: req.user.company }; // 🔹 Csak az adott vállalat adatai
+    const filter = { Company: req.user.company }; // 🔹 Csak az adott vállalat eszközei
 
-    // Opcionális szűrés Zone alapján
+    // 🔹 Zone alapú szűrés
     if (req.query.Zone) {
-      filter.Zone = req.query.Zone;
+      filter.Zone = req.query.Zone; // Ha egy adott zónához tartozó adatokat kérünk
+    } else if (req.query.noZone) {
+      filter.$or = [{ Zone: null }, { Zone: { $exists: false } }]; // 🔹 Ha nincs zóna, akkor csak a NULL vagy nem létező Zone mezőket kérjük le
     }
 
     console.log("Lekérdezés szűrője:", filter); // Debug log
