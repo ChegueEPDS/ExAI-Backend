@@ -30,6 +30,7 @@ const authMiddleware = (roles = []) => {
       };
         req.userId = decoded.userId || decoded._id; // A tokenből kinyerjük a userId-t
         req.role = decoded.role; // A role-t is elérjük, ha szükséges
+        req.company = decoded.company; // A company mező beállítása
         next();
     });
   };

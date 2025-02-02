@@ -24,6 +24,7 @@ const authMiddleware = (roles = []) => {
       // Jogosultság ellenőrzése után hozzáadjuk a felhasználói adatokat a kéréshez
       req.userId = decoded.userId;
       req.role = decoded.role;
+      req.company = decoded.company;
       next();
     });
   };

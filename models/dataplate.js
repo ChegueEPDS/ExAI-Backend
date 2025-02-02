@@ -24,7 +24,7 @@ const EquipmentSchema = new mongoose.Schema({
   "X condition": {
     "X": Boolean,
     "Specific": String 
-    },
+  },
   "Other Info": { type: String },
   "Compliance": { 
     type: String, 
@@ -32,8 +32,55 @@ const EquipmentSchema = new mongoose.Schema({
     default: "NA" 
   },
   "CreatedBy": { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  "ModifiedBy": { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // 🆕 Módosító felhasználó
   "Company": { type: String, required: true },
-  "Project": { type: String, ref: 'Project', default: null }
+  "Zone": { type: mongoose.Schema.Types.ObjectId, ref: 'Zone' },
+  "Site": { type: mongoose.Schema.Types.ObjectId, ref: 'Site' }
+}, { timestamps: true }); // ⏳ Timestamps (createdAt, updatedAt)
+
+// 🔹 Pre-save middleware: beállítja a CreatedBy és Company mezőt az első mentéskor
+EquipmentSchema.pre('save', async function (next) {
+    if (!this.CreatedBy) {
+        return next(new Error('CreatedBy mező szükséges.'));
+    }
+
+    try {
+        const user = await mongoose.model('User').findById(this.CreatedBy);
+        if (!user) {
+            return next(new Error('Invalid CreatedBy user.'));
+        }
+
+        // Beállítjuk a Company mezőt a felhasználó cégéhez
+        this.Company = user.company;
+
+        next();
+    } catch (error) {
+        next(error);
+    }
+});
+
+// 🔹 Pre-update middleware: módosításkor beállítja a ModifiedBy mezőt
+EquipmentSchema.pre('findOneAndUpdate', async function (next) {
+    const update = this.getUpdate();
+    if (!update) return next();
+
+    if (update.$set && update.$set.ModifiedBy) {
+        return next(); // Ha már megadott egy ModifiedBy értéket, nem kell változtatni
+    }
+
+    if (!update.$set) {
+        update.$set = {};
+    }
+
+    if (!this.options.context || !this.options.context.userId) {
+        return next(new Error('ModifiedBy mező szükséges a módosításokhoz.'));
+    }
+
+    // Az aktuális felhasználót állítjuk be módosítóként
+    update.$set.ModifiedBy = this.options.context.userId;
+    update.$set.updatedAt = new Date(); // Frissítjük az időbélyeget is
+
+    next();
 });
 
 module.exports = mongoose.model('Equipment', EquipmentSchema);

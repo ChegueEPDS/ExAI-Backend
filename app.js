@@ -22,7 +22,8 @@ const fireRoutes = require('./routes/fireRoutes');
 const exRegisterRoutes = require('./routes/exRegisterRoutes');
 const certificateRoutes = require('./routes/certificateRoutes');
 const inspectionRoutes = require('./routes/inspectionRoutes');
-const projectRoutes = require('./routes/projectRoutes');
+const zoneRoutes = require('./routes/zoneRoutes');
+const siteRoutes = require('./routes/siteRoutes');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -46,6 +47,7 @@ const allowedOrigins = [
   'https://stand98.demo.epds.eu',
   'https://exai.ind-ex.ae',
   'https://gray-grass-070bf1a03.4.azurestaticapps.net',
+  'https://17f2-2001-4c4c-1927-e200-69ec-d233-13b7-962.ngrok-free.app'
 ];
 
 app.use(cors({
@@ -58,7 +60,8 @@ app.use(cors({
     }
   },
   methods: 'GET,POST,PUT,DELETE',
-  credentials: true
+  credentials: true,
+  allowedHeaders: ['Authorization', 'Content-Type'] 
 }));
 
 app.use(bodyParser.json({ limit: '10mb' }));
@@ -94,7 +97,8 @@ app.use('/api/fire', fireRoutes);
 app.use('/api', exRegisterRoutes);
 app.use('/api', certificateRoutes);
 app.use('/api/inspection', inspectionRoutes);
-app.use('/api/projects', projectRoutes);
+app.use('/api/zones', zoneRoutes);
+app.use('/api/sites', siteRoutes);
 
 // Periodikus tisztítás
 setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum
