@@ -4,7 +4,6 @@ const logger = require('../config/logger'); // ha van loggered, vagy kiveheted
 const mongoose = require('mongoose');
 
 // Létrehozás (POST /exreg)
-// Létrehozás (POST /exreg)
 exports.createEquipment = async (req, res) => {
   try {
     const CreatedBy = req.userId; // 🔹 Tokenből kinyerjük a user ID-t

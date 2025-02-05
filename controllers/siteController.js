@@ -41,10 +41,16 @@ exports.getAllSites = async (req, res) => {
 // 🔹 Egy site lekérése ID alapján
 exports.getSiteById = async (req, res) => {
     try {
-        const site = await Site.findById(req.params.id).populate('CreatedBy', 'nickname company');
+        const siteId = req.params.id || req.query.siteId; // ⚠️ Kereshetünk params-ban és query-ben is
+        if (!siteId) {
+            return res.status(400).json({ message: "Missing site ID" });
+        }
+
+        const site = await Site.findById(siteId).populate('CreatedBy', 'nickname company');
         if (!site) {
             return res.status(404).json({ message: "Site not found" });
         }
+
         res.status(200).json(site);
     } catch (error) {
         res.status(500).json({ message: "Server error", error: error.message });

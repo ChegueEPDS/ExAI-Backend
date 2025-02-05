@@ -35,7 +35,6 @@ connectDB().then(() => console.log('Database connected successfully')).catch((er
 });
 
 const allowedOrigins = [
-  'http://localhost:4200', // Helyi fejlesztési frontend URL-je
   'https://lemon-moss-0ce31f803.5.azurestaticapps.net', // Az Azure Static Web Apps URL-je
   'https://jolly-field-070def303.5.azurestaticapps.net',
   'https://lively-mushroom-07ad34003.5.azurestaticapps.net',
@@ -47,7 +46,6 @@ const allowedOrigins = [
   'https://stand98.demo.epds.eu',
   'https://exai.ind-ex.ae',
   'https://gray-grass-070bf1a03.4.azurestaticapps.net',
-  'https://17f2-2001-4c4c-1927-e200-69ec-d233-13b7-962.ngrok-free.app'
 ];
 
 app.use(cors({
