@@ -51,20 +51,30 @@ exports.uploadImage = [
       // Manual corrections and formatting to maintain original structure
       let formattedText = extractedText;
 
-      formattedText = formattedText.replace(/([A-Za-z])(\d{3,4})C/g, '$1 $2°C');
-      formattedText = formattedText.replace(/([A-Za-z])(\d{1,2}GD)/g, '$1 $2');
-      formattedText = formattedText.replace(/(Tamb .*?to .*?C)/g, '$1\n');
-      formattedText = formattedText.replace(/(S\/N \d+)/g, '$1\n');
-      //formattedText = formattedText.replace(/(CE & II2G .*?T[1-6])/g, '$1\n');
-      formattedText = formattedText.replace(
+      formattedText = formattedText
+      .replace(/([A-Za-z])(\d{3,4})C/g, '$1 $2°C')
+      .replace(/([A-Za-z])(\d{1,2}GD)/g, '$1 $2')
+      .replace(/(Tamb .*?to .*?C)/g, '$1\n')
+      .replace(/(S\/N \d+)/g, '$1\n')
+      .replace(
         /(?<=^|\s)(?:[1izlI]{2,3})(A|B|C)?/gm,
         (match) => match.replace(/[1izl]/g, 'I')
-      );
-      formattedText = formattedText.replace(
+      )
+      .replace(
         /(?<=^|\s)(?:[MN1izlI]{2,3})(A|B|C)?/gm,
         (match) => match.replace(/[MN]/g, 'II')
-      );
-      formattedText = formattedText.replace(/(Ex)(?!\s)/gm, '$1 ');
+      )
+      .replace(/(Ex)(?!\s)/gm, '$1 ')// Add space after 'Ex'
+      .replace(/\s{2,}/g, " ") // Többszörös szóköz eltávolítása
+      .replace(/\n(?=[a-z])/g, " ") 
+      .replace(/\|T\|(\d)\|/g, "T$1")
+      .replace(/([A-Za-z]+):\n(\d+.*)/g, "$1: $2")
+      .replace(/IP\s*(\d[X\d])/g, "IP$1")
+      .replace(/(\d+)\s*([VAKWHz])/g, "$1$2") // Mértékegységek egyesítése
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&#x2F;/g, "/")
+      .trim();
 
       // Send the analyzed text back to the frontend
       res.json({ recognizedText: `Show the dataplate information in a table format:<br><br>${formattedText.replace(/\n/g, '<br>')}` });

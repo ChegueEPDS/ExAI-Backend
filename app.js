@@ -24,6 +24,7 @@ const certificateRoutes = require('./routes/certificateRoutes');
 const inspectionRoutes = require('./routes/inspectionRoutes');
 const zoneRoutes = require('./routes/zoneRoutes');
 const siteRoutes = require('./routes/siteRoutes');
+const xlsCompareRoutes = require('./routes/xlsCompareRoutes')
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -35,6 +36,7 @@ connectDB().then(() => console.log('Database connected successfully')).catch((er
 });
 
 const allowedOrigins = [
+  'http://localhost:4200', // Helyi fejlesztési frontend URL-je
   'https://lemon-moss-0ce31f803.5.azurestaticapps.net', // Az Azure Static Web Apps URL-je
   'https://jolly-field-070def303.5.azurestaticapps.net',
   'https://lively-mushroom-07ad34003.5.azurestaticapps.net',
@@ -46,6 +48,7 @@ const allowedOrigins = [
   'https://stand98.demo.epds.eu',
   'https://exai.ind-ex.ae',
   'https://gray-grass-070bf1a03.4.azurestaticapps.net',
+  'https://80fb-2001-4c4c-1927-e200-cc0e-d6fa-8814-7cf9.ngrok-free.app'
 ];
 
 app.use(cors({
@@ -97,6 +100,7 @@ app.use('/api', certificateRoutes);
 app.use('/api/inspection', inspectionRoutes);
 app.use('/api/zones', zoneRoutes);
 app.use('/api/sites', siteRoutes);
+app.use('/api/xls', xlsCompareRoutes);
 
 // Periodikus tisztítás
 setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum

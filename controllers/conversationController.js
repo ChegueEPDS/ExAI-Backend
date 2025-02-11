@@ -11,6 +11,8 @@ const User = require('../models/user');
 const { fetchFromAzureSearch } = require('../helpers/azureSearchHelpers');
 console.log('fetchFromAzureSearch:', typeof fetchFromAzureSearch);
 const { createEmbedding } = require('../helpers/openaiHelpers');
+const sanitizeHtml = require('sanitize-html');
+
 
 // Új beszélgetés indítása
 exports.startNewConversation = async (req, res) => {
@@ -156,7 +158,21 @@ exports.sendMessage = [
         assistantContent = assistantMessage.content;
       }
 
-      assistantContent = assistantContent.replace(/【.*?】/g, '');
+      assistantContent = assistantContent.replace(/【.*?】/g, ''); // OpenAI generált zaj eltávolítása
+
+      assistantContent = sanitizeHtml(assistantContent, {
+        allowedTags: [
+          'table', 'thead', 'tbody', 'tr', 'th', 'td',  // 📌 Táblázat elemek
+          'b', 'i', 'strong', 'em', 'u', 's', 'br', 'p', 'ul', 'ol', 'li', 'blockquote', 'code', 'pre', 'span' // 📌 Szövegformázás
+        ],
+        allowedAttributes: {
+          'th': ['colspan', 'rowspan'], // Engedélyezzük a táblázatok formázását
+          'td': ['colspan', 'rowspan'],
+          'span': ['class'] // Opcionálisan engedélyezett osztályok (pl. markdown támogatáshoz)
+        },
+        disallowedTagsMode: 'discard' // Töröljük az összes más tag-et
+      });
+
       const assistantContentHtml = marked(assistantContent);
 
       // Asszisztens válasz tokenjeinek számolása
