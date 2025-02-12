@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
 const axios = require('axios');
+const sharp = require('sharp');
 
 // Betöltjük a .env változókat
 dotenv.config();
@@ -29,7 +30,6 @@ const uploadImage = async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'Kép feltöltése sikertelen.' });
         }
 
-        // Ellenőrizzük a fájl típusát
         const allowedTypes = ['image/jpeg', 'image/png', 'image/gif'];
         if (!allowedTypes.includes(image.mimetype)) {
             return res.status(400).json({ status: 'error', message: 'Csak JPEG, PNG és GIF formátumok engedélyezettek.' });
@@ -39,8 +39,28 @@ const uploadImage = async (req, res) => {
         const uniqueName = `${Date.now()}_${image.originalname}`;
         const uploadPath = path.join(UPLOADS_DIR, uniqueName);
 
-        // Fájl mentése
-        fs.writeFileSync(uploadPath, image.buffer);
+        // Ha a fájlméret meghaladja az 5MB-ot, skálázd le
+        if (image.size > 5 * 1024 * 1024) {
+            console.log('A kép nagyobb mint 5MB, átméretezés...');
+
+            let resizedImageBuffer = await sharp(image.buffer)
+                .resize({ width: 1920 })  // Ha a kép szélesebb, mint 1920px, akkor átméretezés
+                .jpeg({ quality: 100 })    // JPEG tömörítés %-os minőségre
+                .toBuffer();
+
+            // Ellenőrizzük újra a méretet, ha még mindig nagy, csökkentsük a minőséget
+            while (resizedImageBuffer.length > 5 * 1024 * 1024) {
+                resizedImageBuffer = await sharp(resizedImageBuffer)
+                    .jpeg({ quality: 70 }) // Tovább csökkentjük a minőséget, ha kell
+                    .toBuffer();
+            }
+
+            // A kisebb méretű fájl mentése
+            fs.writeFileSync(uploadPath, resizedImageBuffer);
+        } else {
+            // Ha a fájl kisebb mint 5MB, akkor mentjük az eredeti verziót
+            fs.writeFileSync(uploadPath, image.buffer);
+        }
 
         const imageUrl = `${UPLOADS_URL}/${uniqueName}`;
         res.status(200).json({ status: 'success', image_url: imageUrl });
@@ -91,7 +111,23 @@ const analyzeImages = async (req, res) => {
         });
 
         const result = response.data.choices[0]?.message?.content || 'No result from API';
+
+        // Képek törlése az uploads mappából
+        image_urls.forEach((imageUrl) => {
+            const filename = imageUrl.split('/').pop(); // Fájlnév kinyerése az URL-ből
+            const filePath = path.join(UPLOADS_DIR, filename);
+
+            fs.unlink(filePath, (err) => {
+                if (err) {
+                    console.error(`Hiba történt a fájl törlésekor: ${filename}`, err);
+                } else {
+                    console.log(`✅ Törölve: ${filename}`);
+                }
+            });
+        });
+
         res.status(200).json({ status: 'success', result });
+
     } catch (error) {
         res.status(500).json({ status: 'error', message: 'Hiba az OpenAI API hívás során.', error: error.message });
     }
