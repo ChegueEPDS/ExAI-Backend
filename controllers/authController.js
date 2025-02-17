@@ -1,9 +1,13 @@
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { validationResult } = require('express-validator');
+const axios = require('axios');
 const User = require('../models/user');
 
-// Felhasználó regisztráció
+const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret';
+const GRAPH_API_URL = 'https://graph.microsoft.com/v1.0/me';
+
+// 🔹 **Felhasználó regisztráció (normál email/jelszó)**
 exports.register = async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -18,11 +22,13 @@ exports.register = async (req, res) => {
       return res.status(400).json({ error: 'User already exists' });
     }
 
+    const hashedPassword = await bcrypt.hash(password, 10);
+
     const user = new User({
       firstName,
       lastName,
       email,
-      password,
+      password: hashedPassword,
       role: role || 'User',
       nickname, 
       company: company || 'default',
@@ -35,45 +41,125 @@ exports.register = async (req, res) => {
   }
 };
 
-// Bejelentkezés
+// 🔹 **Normál bejelentkezés (email + jelszó)**
 exports.login = async (req, res) => {
   const { email, password } = req.body;
   try {
-    // Ellenőrizzük, hogy megadtak-e emailt és jelszót
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    // Felhasználó lekérése az email alapján
     const user = await User.findOne({ email });
-    
-    // Ellenőrizzük, hogy létezik-e felhasználó az adott email-lel
     if (!user) {
       return res.status(400).json({ error: 'User not found with this email' });
     }
 
-    // Ellenőrizzük a jelszót
     const isPasswordValid = bcrypt.compareSync(password, user.password);
     if (!isPasswordValid) {
       return res.status(400).json({ error: 'Incorrect password' });
     }
 
-    // JWT létrehozása a userId és nickname alapján
     const token = jwt.sign(
-      { userId: user._id, nickname: user.nickname, role: user.role, company:user.company },
-      process.env.JWT_SECRET, 
-      { expiresIn: '1h' } 
+      { userId: user._id, nickname: user.nickname, role: user.role, company: user.company, lastName: user.lastName, nickname: user.nickname },
+      JWT_SECRET,
+      { expiresIn: '1h' }
     );
 
-    // Token visszaküldése a kliensnek
     res.status(200).json({ token });
   } catch (error) {
-    // Általános szerverhiba kezelése
     res.status(500).json({ error: 'Internal server error' });
   }
 };
 
-// Token megújítása
+// 🔹 **Microsoft bejelentkezés (MSAL token validálás és JWT generálás)**
+exports.microsoftLogin = async (req, res) => {
+  try {
+    console.log('🔹 Microsoft bejelentkezés megkezdve...');
+
+    const { accessToken } = req.body;
+
+    if (!accessToken) {
+      console.error('❌ Hiányzó access token!');
+      return res.status(400).json({ error: 'Access token is required' });
+    }
+
+    console.log('✅ Kapott Microsoft accessToken:', accessToken.slice(0, 20) + '...'); // Csak részleges megjelenítés
+
+    // 🔹 Microsoft token dekódolása
+    const decodedToken = jwt.decode(accessToken);
+
+    if (!decodedToken) {
+      console.error('❌ Érvénytelen Microsoft token.');
+      return res.status(401).json({ error: 'Invalid Microsoft token' });
+    }
+
+    console.log('🔍 Microsoft token dekódolva:', decodedToken);
+
+    // 🔹 Felhasználói adatok kinyerése a tokenből
+    const email = decodedToken.upn || decodedToken.email || null;
+    const firstName = decodedToken.family_name|| 'N/A';
+    const lastName = decodedToken.given_name || 'N/A';
+    const azureId = decodedToken.oid;
+    const tenantId = decodedToken.tid;
+    const company = email ? email.split('@')[1]?.split('.')[0] || 'default' : 'default';
+
+    console.log(`🔹 Felhasználó azonosítva:
+      Email: ${email || 'Nincs email'}
+      Név: ${firstName} ${lastName}
+      Azure ID: ${azureId}
+      Tenant ID: ${tenantId}
+      Vállalat: ${company}`);
+
+    if (!azureId) {
+      console.error('❌ Nincs Azure ID a tokenben! Nem tudunk egyedi felhasználót létrehozni.');
+      return res.status(400).json({ error: 'Azure ID is missing in the token' });
+    }
+
+    // 🔹 Ellenőrizzük, hogy a felhasználó létezik-e már
+    let user = await User.findOne({ azureId });
+
+    if (!user) {
+      console.log(`✅ Új felhasználó létrehozása: ${email || 'Nincs email'}`);
+
+      user = new User({
+        azureId,
+        firstName,
+        lastName,
+        email: email || `no-email-${azureId}@microsoft.com`, // Ha nincs email, mesterséges azonosító
+        company,
+        role: 'User',
+        password: 'microsoft-auth', // Dummy jelszó, mert nincs rá szükség
+        tenantId
+      });
+
+      try {
+        await user.save();
+        console.log(`✅ Felhasználó sikeresen létrehozva: ${user.email}, vállalat: ${user.company}`);
+      } catch (saveError) {
+        console.error('❌ Hiba a felhasználó mentésekor:', saveError);
+        return res.status(500).json({ error: 'Failed to save user' });
+      }
+    } else {
+      console.log(`🔹 Felhasználó már létezik: ${user.email}, vállalat: ${user.company}`);
+    }
+
+    // 🔹 JWT token létrehozása a user számára
+    const token = jwt.sign(
+      { userId: user._id, email: user.email, role: user.role, company: user.company, firstName: user.firstName, lastName: user.lastName },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+
+    console.log('✅ JWT token generálva:', token);
+    res.status(200).json({ token });
+
+  } catch (error) {
+    console.error('❌ Microsoft login hiba:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// 🔹 **Token megújítása**
 exports.renewToken = (req, res) => {
   const oldToken = req.headers.authorization?.split(' ')[1];
   if (!oldToken) {
@@ -81,16 +167,11 @@ exports.renewToken = (req, res) => {
   }
 
   try {
-    const decoded = jwt.verify(oldToken, process.env.JWT_SECRET);
+    const decoded = jwt.verify(oldToken, JWT_SECRET);
 
     const newToken = jwt.sign(
-      {
-        userId: decoded.userId,
-        nickname: decoded.nickname,
-        role: decoded.role,
-        company: decoded.company,
-      },
-      process.env.JWT_SECRET,
+      { userId: decoded.userId, nickname: decoded.nickname, role: decoded.role, company: decoded.company },
+      JWT_SECRET,
       { expiresIn: '1h' }
     );
 
@@ -103,9 +184,8 @@ exports.renewToken = (req, res) => {
   }
 };
 
-// Kilépés
+// 🔹 **Kilépés**
 exports.logout = (req, res) => {
-  // Session törlése, ha van
   if (req.session) {
     req.session.destroy(err => {
       if (err) {

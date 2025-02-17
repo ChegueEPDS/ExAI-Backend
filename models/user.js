@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcrypt');
 
 const UserSchema = new mongoose.Schema({
+    azureId: { type: String, unique: true, sparse: true },
     firstName: { type: String, required: true },
     lastName: { type: String, required: true },
     email: { 
@@ -11,18 +12,10 @@ const UserSchema = new mongoose.Schema({
         match: [/\S+@\S+\.\S+/, 'Please enter a valid email address'] 
     },
     nickname: { type: String, required: false },
+    company: { type: String, required: true },
+    tenantId: { type: String },
     role: { type: String, required: true, enum: ['Admin', 'User'], default: 'User' },
-    company: { 
-        type: String, 
-        required: true, // Állítsd true-ra, ha minden felhasználónak tartoznia kell egy céghez
-        enum: ['PGMED', 'Viresol', 'XIII', 'default', 'TUZ', 'STAND98', 'BGC', 'Stahl', 'Veproil', 'DRND', 'IndEx' ], // A támogatott cégazonosítók felsorolása
-        default: 'default', // Alapértelmezett érték
-    },
-    password: { 
-        type: String, 
-        required: true,
-        minlength: [6, 'Password must be at least 6 characters long'] 
-    },
+    password: { type: String, required: function() { return !this.azureId; } }, // Microsoft usernek nem kell
 });
 
 // Jelszó hash mentés előtt
@@ -33,6 +26,6 @@ UserSchema.pre('save', async function (next) {
   next();
 });
 
-const User = mongoose.model('User', UserSchema);
+const User = mongoose.models.User || mongoose.model('User', UserSchema);
 
 module.exports = User;

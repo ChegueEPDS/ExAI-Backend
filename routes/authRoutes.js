@@ -1,10 +1,12 @@
 const express = require('express');
 const { body } = require('express-validator');
-const { register, login, logout, renewToken } = require('../controllers/authController'); // Import the logout function
-const authMiddleware = require('../middlewares/authMiddleware'); // Import authMiddleware
+const { register, login, logout, renewToken, microsoftLogin } = require('../controllers/authController');
+const authMiddleware = require('../middlewares/authMiddleware');
+
 
 const router = express.Router();
 
+// Normál regisztráció
 router.post('/register', [
   body('firstName').notEmpty(),
   body('lastName').notEmpty(),
@@ -12,10 +14,19 @@ router.post('/register', [
   body('password').isLength({ min: 6 }),
 ], register);
 
+router.post('/microsoft-login', microsoftLogin);
+
+
+// **🔹 Normál bejelentkezés**
 router.post('/login', login);
 
+// **🔹 Microsoft bejelentkezés JWT generálással**
+router.post('/microsoft-login', microsoftLogin);
+
+// Token megújítása
 router.post('/renew-token', renewToken);
 
-router.post('/logout', authMiddleware(['Admin', 'User']), logout); // Protect logout route with authMiddleware
+// Kijelentkezés
+router.post('/logout', authMiddleware(['Admin', 'User']), logout);
 
 module.exports = router;

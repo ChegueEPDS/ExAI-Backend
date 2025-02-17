@@ -31,7 +31,7 @@ exports.createSite = async (req, res) => {
 // 🔹 Összes site listázása
 exports.getAllSites = async (req, res) => {
     try {
-        const sites = await Site.find().populate('CreatedBy', 'nickname company'); // Betöltjük a user adatait is
+        const sites = await Site.find().populate('CreatedBy', 'firstName lastName nickname company'); // Betöltjük a user adatait is
         res.status(200).json(sites);
     } catch (error) {
         res.status(500).json({ message: "Server error", error: error.message });
@@ -46,7 +46,7 @@ exports.getSiteById = async (req, res) => {
             return res.status(400).json({ message: "Missing site ID" });
         }
 
-        const site = await Site.findById(siteId).populate('CreatedBy', 'nickname company');
+        const site = await Site.findById(siteId).populate('CreatedBy', 'firstName lastName nickname company');
         if (!site) {
             return res.status(404).json({ message: "Site not found" });
         }

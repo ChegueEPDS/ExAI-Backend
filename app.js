@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const session = require('express-session');
 const connectDB = require('./config/db');
 const logger = require('./config/logger');
 const limiter = require('./middlewares/rateLimiter');
@@ -25,7 +24,6 @@ const inspectionRoutes = require('./routes/inspectionRoutes');
 const zoneRoutes = require('./routes/zoneRoutes');
 const siteRoutes = require('./routes/siteRoutes');
 const xlsCompareRoutes = require('./routes/xlsCompareRoutes')
-
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
 const port = process.env.PORT || 3000;
@@ -35,52 +33,30 @@ connectDB().then(() => console.log('Database connected successfully')).catch((er
   process.exit(1); // Exit if DB connection fails
 });
 
-const allowedOrigins = [
-  'http://localhost:4200', // Helyi fejlesztési frontend URL-je
-  'https://lemon-moss-0ce31f803.5.azurestaticapps.net', // Az Azure Static Web Apps URL-je
-  'https://jolly-field-070def303.5.azurestaticapps.net',
-  'https://lively-mushroom-07ad34003.5.azurestaticapps.net',
-  'https://kind-glacier-01525a703.5.azurestaticapps.net',
-  'https://thankful-meadow-0ab025703.4.azurestaticapps.net',
-  'https://delightful-rock-0f7815803.4.azurestaticapps.net',
-  'https://happy-flower-09c1d5603.4.azurestaticapps.net',
-  'https://demo.epds.eu',
-  'https://stand98.demo.epds.eu',
-  'https://exai.ind-ex.ae',
-  'https://gray-grass-070bf1a03.4.azurestaticapps.net',
-  'https://80fb-2001-4c4c-1927-e200-cc0e-d6fa-8814-7cf9.ngrok-free.app'
-];
+const allowedOrigins = process.env.CORS_ALLOWED_ORIGINS
+  ? process.env.CORS_ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
+  : [];
 
-app.use(cors({
-  origin: function (origin, callback) {
-    // Ha az origin szerepel az engedélyezett listában, engedélyezd a hozzáférést
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
-  methods: 'GET,POST,PUT,DELETE',
-  credentials: true,
-  allowedHeaders: ['Authorization', 'Content-Type'] 
-}));
 
+  app.use(cors({
+    origin: function (origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
+    methods: 'GET,POST,PUT,DELETE',
+    credentials: true,
+    allowedHeaders: ['Authorization', 'Content-Type']
+  }));
 app.use(bodyParser.json({ limit: '10mb' }));
-app.use(session({
-  secret: 'yourSecretKey',
-  resave: false,
-  saveUninitialized: true,
-  cookie: { secure: true }
-}));
 app.use(limiter);
 app.use(express.json());
-
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
 app.get('/', (req, res) => {
   res.send('Welcome to the application!');
 });
-
 app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
@@ -108,4 +84,6 @@ setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 �
 console.log("Starting application...");
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
+  console.log("Azure Tenant ID:", process.env.AZURE_TENANT_ID);
+console.log("Azure Redirect URI:", process.env.AZURE_REDIRECT_URI);
 });
