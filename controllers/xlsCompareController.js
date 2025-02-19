@@ -278,3 +278,30 @@ exports.compareExcel = async (req, res) => {
         }
     });
 };
+
+// Fájl törlése szerverről
+exports.deleteFile = async (req, res) => {
+  const fileUrl = req.query.url; // URL paraméterből kapjuk meg a fájlt
+
+  if (!fileUrl) {
+      return res.status(400).json({ error: "Nem adtál meg fájlt az URL-ben." });
+  }
+
+  // Kinyerjük a fájl nevét és elérési útját
+  const filename = path.basename(fileUrl);
+  const filePath = path.join(uploadPath, filename);
+
+  // Ellenőrizzük, hogy a fájl létezik-e
+  if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: "A fájl nem található a szerveren." });
+  }
+
+  try {
+      fs.unlinkSync(filePath); // Fájl törlése
+      console.log(`🗑️ Fájl törölve: ${filePath}`);
+      res.status(200).json({ message: "Fájl sikeresen törölve." });
+  } catch (error) {
+      console.error("❌ Hiba történt a fájl törlésekor:", error);
+      res.status(500).json({ error: "Hiba történt a fájl törlésekor." });
+  }
+};
