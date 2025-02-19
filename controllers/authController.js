@@ -17,26 +17,38 @@ exports.register = async (req, res) => {
   const { firstName, lastName, email, password, nickname, company, role } = req.body;
 
   try {
+    console.log("🔹 Regisztráció indítása...");
+    console.log(`🔹 Bejövő adatok: ${JSON.stringify(req.body)}`);
+
     const existingUser = await User.findOne({ email });
     if (existingUser) {
+      console.log("❌ A felhasználó már létezik az adatbázisban!");
       return res.status(400).json({ error: 'User already exists' });
     }
 
+    console.log("🔹 Jelszó hash-elés előtt. Eredeti jelszó:", password);
+    
+    // 🔹 HASH generálás
     const hashedPassword = await bcrypt.hash(password, 10);
+    
+    console.log("🔹 Hash-elés után. Generált hash:", hashedPassword);
 
     const user = new User({
       firstName,
       lastName,
       email,
-      password: hashedPassword,
+      password: hashedPassword,  // ⬅️ Itt mentjük el a hash-t!
       role: role || 'User',
       nickname, 
       company: company || 'default',
     });
 
     await user.save();
-    res.status(201).json({ message: 'User registered successfully' });
+    console.log("✅ Felhasználó sikeresen regisztrálva!");
+
+    res.status(201).json({ message: 'User registered successfully', hashedPassword });
   } catch (error) {
+    console.error("❌ Regisztrációs hiba:", error);
     res.status(500).json({ error: 'Internal server error' });
   }
 };
@@ -44,6 +56,8 @@ exports.register = async (req, res) => {
 // 🔹 **Normál bejelentkezés (email + jelszó)**
 exports.login = async (req, res) => {
   const { email, password } = req.body;
+  console.log("🔹 Bejelentkezési kísérlet:", email, password); // Debug
+
   try {
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
@@ -51,22 +65,29 @@ exports.login = async (req, res) => {
 
     const user = await User.findOne({ email });
     if (!user) {
+      console.log("❌ Felhasználó nem található:", email);
       return res.status(400).json({ error: 'User not found with this email' });
     }
 
-    const isPasswordValid = bcrypt.compareSync(password, user.password);
+    console.log("🔹 Tárolt jelszó hash az adatbázisban:", user.password);
+
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    console.log("🔹 Jelszó helyes?", isPasswordValid);
+
     if (!isPasswordValid) {
       return res.status(400).json({ error: 'Incorrect password' });
     }
 
     const token = jwt.sign(
-      { userId: user._id, nickname: user.nickname, role: user.role, company: user.company, lastName: user.lastName, nickname: user.nickname },
+      { userId: user._id, nickname: user.nickname, role: user.role, company: user.company, lastName: user.lastName },
       JWT_SECRET,
       { expiresIn: '1h' }
     );
 
+    console.log("✅ Sikeres bejelentkezés, JWT token generálva:", token);
     res.status(200).json({ token });
   } catch (error) {
+    console.error("❌ Login hiba:", error);
     res.status(500).json({ error: 'Internal server error' });
   }
 };

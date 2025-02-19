@@ -166,7 +166,7 @@ async function createComparisonExcel(data, outputPath) {
               cell.fill = orangeFill; // Színezés
   
               // Megjegyzés (régi érték megjelenítése)
-              cell.note = `Régi érték: ${oldValue}`;
+              cell.note = `${oldValue}`;
             }
           }
         });

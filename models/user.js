@@ -21,6 +21,12 @@ const UserSchema = new mongoose.Schema({
 // Jelszó hash mentés előtt
 UserSchema.pre('save', async function (next) {
   if (!this.isModified('password')) return next();
+
+  // Ha a jelszó már bcrypt hash (kezdet "$2b$" vagy "$2a$"), ne hash-eljük újra
+  if (this.password.startsWith('$2b$') || this.password.startsWith('$2a$')) {
+    return next();
+  }
+
   const salt = await bcrypt.genSalt(10);
   this.password = await bcrypt.hash(this.password, salt);
   next();
