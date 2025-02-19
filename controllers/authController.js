@@ -74,88 +74,91 @@ exports.login = async (req, res) => {
 // 🔹 **Microsoft bejelentkezés (MSAL token validálás és JWT generálás)**
 exports.microsoftLogin = async (req, res) => {
   try {
-    console.log('🔹 Microsoft bejelentkezés megkezdve...');
+      console.log('🔹 Microsoft bejelentkezés megkezdve...');
 
-    const { accessToken } = req.body;
+      const { accessToken } = req.body;
 
-    if (!accessToken) {
-      console.error('❌ Hiányzó access token!');
-      return res.status(400).json({ error: 'Access token is required' });
-    }
-
-    console.log('✅ Kapott Microsoft accessToken:', accessToken.slice(0, 20) + '...'); // Csak részleges megjelenítés
-
-    // 🔹 Microsoft token dekódolása
-    const decodedToken = jwt.decode(accessToken);
-
-    if (!decodedToken) {
-      console.error('❌ Érvénytelen Microsoft token.');
-      return res.status(401).json({ error: 'Invalid Microsoft token' });
-    }
-
-    console.log('🔍 Microsoft token dekódolva:', decodedToken);
-
-    // 🔹 Felhasználói adatok kinyerése a tokenből
-    const email = decodedToken.upn || decodedToken.email || null;
-    const firstName = decodedToken.family_name|| 'N/A';
-    const lastName = decodedToken.given_name || 'N/A';
-    const azureId = decodedToken.oid;
-    const tenantId = decodedToken.tid;
-    const company = email ? email.split('@')[1]?.split('.')[0] || 'default' : 'default';
-
-    console.log(`🔹 Felhasználó azonosítva:
-      Email: ${email || 'Nincs email'}
-      Név: ${firstName} ${lastName}
-      Azure ID: ${azureId}
-      Tenant ID: ${tenantId}
-      Vállalat: ${company}`);
-
-    if (!azureId) {
-      console.error('❌ Nincs Azure ID a tokenben! Nem tudunk egyedi felhasználót létrehozni.');
-      return res.status(400).json({ error: 'Azure ID is missing in the token' });
-    }
-
-    // 🔹 Ellenőrizzük, hogy a felhasználó létezik-e már
-    let user = await User.findOne({ azureId });
-
-    if (!user) {
-      console.log(`✅ Új felhasználó létrehozása: ${email || 'Nincs email'}`);
-
-      user = new User({
-        azureId,
-        firstName,
-        lastName,
-        email: email || `no-email-${azureId}@microsoft.com`, // Ha nincs email, mesterséges azonosító
-        company,
-        role: 'User',
-        password: 'microsoft-auth', // Dummy jelszó, mert nincs rá szükség
-        tenantId
-      });
-
-      try {
-        await user.save();
-        console.log(`✅ Felhasználó sikeresen létrehozva: ${user.email}, vállalat: ${user.company}`);
-      } catch (saveError) {
-        console.error('❌ Hiba a felhasználó mentésekor:', saveError);
-        return res.status(500).json({ error: 'Failed to save user' });
+      if (!accessToken) {
+          console.error('❌ Hiányzó access token!');
+          return res.status(400).json({ error: 'Access token is required' });
       }
-    } else {
-      console.log(`🔹 Felhasználó már létezik: ${user.email}, vállalat: ${user.company}`);
-    }
 
-    // 🔹 JWT token létrehozása a user számára
-    const token = jwt.sign(
-      { userId: user._id, email: user.email, role: user.role, company: user.company, firstName: user.firstName, lastName: user.lastName },
-      process.env.JWT_SECRET,
-      { expiresIn: '1h' }
-    );
+      console.log('✅ Kapott Microsoft accessToken:', accessToken.slice(0, 20) + '...');
 
-    console.log('✅ JWT token generálva:', token);
-    res.status(200).json({ token });
+      // 🔹 Microsoft token dekódolása
+      const decodedToken = jwt.decode(accessToken);
+
+      if (!decodedToken) {
+          console.error('❌ Érvénytelen Microsoft token.');
+          return res.status(401).json({ error: 'Invalid Microsoft token' });
+      }
+
+      console.log('🔍 Microsoft token dekódolva:', decodedToken);
+
+      // 🔹 Felhasználói adatok kinyerése a tokenből
+      const email = decodedToken.upn || decodedToken.email || null;
+      const firstName = decodedToken.given_name || 'N/A';
+      const lastName = decodedToken.family_name || 'N/A';
+      const azureId = decodedToken.oid; // **Azure AD egyedi felhasználói azonosító**
+      const tenantId = decodedToken.tid;
+      const company = email ? email.split('@')[1]?.split('.')[0] || 'default' : 'default';
+
+      console.log(`🔹 Felhasználó azonosítva:
+        Email: ${email || 'Nincs email'}
+        Név: ${firstName} ${lastName}
+        Azure ID: ${azureId}
+        Tenant ID: ${tenantId}
+        Vállalat: ${company}`);
+
+      if (!azureId) {
+          console.error('❌ Nincs Azure ID a tokenben! Nem tudunk egyedi felhasználót létrehozni.');
+          return res.status(400).json({ error: 'Azure ID is missing in the token' });
+      }
+
+      // 🔹 Ellenőrizzük, hogy a felhasználó létezik-e már
+      let user = await User.findOne({ azureId });
+
+      if (!user) {
+          console.log(`✅ Új felhasználó létrehozása: ${email || 'Nincs email'}`);
+
+          user = new User({
+              azureId,
+              firstName,
+              lastName,
+              email: email || `no-email-${azureId}@microsoft.com`,
+              company,
+              role: 'User',
+              password: 'microsoft-auth',
+              tenantId
+          });
+
+          await user.save();
+          console.log(`✅ Felhasználó sikeresen létrehozva: ${user.email}, vállalat: ${user.company}`);
+      } else {
+          console.log(`🔹 Felhasználó már létezik: ${user.email}, vállalat: ${user.company}`);
+      }
+
+      // 🔹 **JWT token létrehozása az azureId mezővel**
+      const token = jwt.sign(
+          {
+              userId: user._id,
+              email: user.email,
+              role: user.role,
+              company: user.company,
+              firstName: user.firstName,
+              lastName: user.lastName,
+              azureId: user.azureId // **Azure ID beillesztése a tokenbe**
+          },
+          process.env.JWT_SECRET,
+          { expiresIn: '1h' }
+      );
+
+      console.log('✅ JWT token generálva:', token);
+      res.status(200).json({ token });
 
   } catch (error) {
-    console.error('❌ Microsoft login hiba:', error);
-    res.status(500).json({ error: 'Internal server error' });
+      console.error('❌ Microsoft login hiba:', error);
+      res.status(500).json({ error: 'Internal server error' });
   }
 };
 

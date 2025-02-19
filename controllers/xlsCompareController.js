@@ -239,3 +239,42 @@ exports.compareExcel = async (req, res) => {
       }
     });
   };
+
+  exports.compareExcelNoAI = async (req, res) => {
+    upload(req, res, async (err) => {
+        if (err) {
+            return res.status(500).json({ error: `Fájlfeltöltési hiba: ${err.message}` });
+        }
+
+        if (!req.files || req.files.length !== 2 || !req.body.columnLetter) {
+            return res.status(400).json({ error: "Kérlek tölts fel két fájlt és adj meg egy oszlop betűjelét!" });
+        }
+
+        const file1 = req.files[0].path;
+        const file2 = req.files[1].path;
+        const columnLetter = req.body.columnLetter.toUpperCase();
+
+        try {
+            // 📌 1️⃣ Excel összehasonlítás végrehajtása
+            const { resultForExcel, changesForFrontend } = compareExcelFiles(file1, file2, columnLetter);
+
+            // 📌 2️⃣ Az összehasonlítás eredményének Excel fájlba mentése
+            const outputPath = path.join(uploadPath, "comparison_result.xlsx");
+            await createComparisonExcel(resultForExcel, outputPath);
+
+            // 📌 3️⃣ Régi fájlok törlése
+            fs.unlinkSync(file1);
+            fs.unlinkSync(file2);
+
+            // 📌 4️⃣ Eredmények visszaküldése a frontendnek
+            res.json({
+                changes: changesForFrontend.map(change => JSON.stringify(change)),  // 📌 Minden objektumot JSON stringgé alakítunk
+                fileUrl: `${BASE_URL}/uploads/comparison_result.xlsx`
+            });
+
+        } catch (error) {
+            console.error("Hiba az összehasonlítás során:", error);
+            res.status(500).json({ error: "Hiba történt az összehasonlítás során." });
+        }
+    });
+};
