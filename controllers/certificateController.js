@@ -20,7 +20,7 @@ exports.uploadCertificate = async (req, res) => {
       }
 
       try {
-          const { certNo, xcondition, specCondition } = req.body;
+        const { certNo, equipment, manufacturer, exmarking, xcondition, specCondition } = req.body;
 
           if (!certNo) {
               return res.status(400).json({ message: "❌ A certNo kötelező mező!" });
@@ -51,9 +51,12 @@ exports.uploadCertificate = async (req, res) => {
           // 📂 Új tanúsítvány (Certificate) mentése MongoDB-be
           const certificate = new Certificate({
               certNo: certNo,
-              fileName: fileName,
-              fileUrl: fileUrl, // ✅ Most már az OneDrive fájl URL-je kerül mentésre
-              xcondition: xcondition === 'true',
+              equipment: equipment || 'N/A', // Ha üres, adjon meg egy alapértelmezett értéket
+              manufacturer: manufacturer || 'N/A',
+              exmarking: exmarking || 'N/A',
+              fileName,
+              fileUrl,
+              xcondition: xcondition === 'true' || xcondition === true, // 🔹 Biztosítja a Boolean típust
               specCondition: specCondition || null
           });
           await certificate.save();
