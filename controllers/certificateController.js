@@ -1,57 +1,73 @@
 const Certificate = require('../models/certificate');
-const { BlobServiceClient } = require('@azure/storage-blob');
+const axios = require('axios');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
-require('dotenv').config();
+const { getOrCreateFolder } = require('../controllers/graphController'); // OneDrive mappakezelés
+
 
 // Multer konfiguráció a fájl feltöltéshez
 const upload = multer({ dest: 'uploads/' });
 
-// Azure Blob Storage inicializálása
-const blobServiceClient = BlobServiceClient.fromConnectionString(process.env.AZURE_STORAGE_CONNECTION_STRING);
-const containerName = process.env.CONTAINER_NAME || 'certificates';
-const containerClient = blobServiceClient.getContainerClient(containerName);
-
 // Fájl feltöltési endpoint
 exports.uploadCertificate = async (req, res) => {
   upload.single('file')(req, res, async (err) => {
-    if (err) return res.status(500).send('Fájl feltöltési hiba.');
+      if (err) return res.status(500).send('❌ Fájl feltöltési hiba.');
 
-    try {
-      const { certNo, xcondition, specCondition } = req.body;
-
-      if (!certNo) {
-        return res.status(400).json({ message: "A certNo kötelező mező!" });
+      const accessToken = req.headers.authorization?.split(" ")[1];
+      if (!accessToken) {
+          return res.status(401).json({ message: "❌ Access token szükséges!" });
       }
 
-      const filePath = path.resolve(req.file.path);
-      const blobName = `${Date.now()}-${req.file.originalname}`;
-      const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+      try {
+          const { certNo, xcondition, specCondition } = req.body;
 
-      console.log(`Feltöltés az Azure Blob Storage-ra: ${blobName}`);
-      await blockBlobClient.uploadFile(filePath);
+          if (!certNo) {
+              return res.status(400).json({ message: "❌ A certNo kötelező mező!" });
+          }
 
-      // Új Certificate mentése MongoDB-be
-      const certificate = new Certificate({
-        certNo: certNo,
-        fileName: req.file.originalname,
-        fileUrl: blockBlobClient.url,
-        xcondition: xcondition === 'true', // Boolean konvertálása
-        specCondition: specCondition || null
-      });
-      await certificate.save();
+          const filePath = path.resolve(req.file.path);
+          const fileName = req.file.originalname;
+          const folderName = "Certificates"; // 📂 A fájlokat mindig az ExAI/Certificates mappába mentjük
 
-      fs.unlinkSync(filePath); // Helyi fájl törlése
-      res.json({
-        message: 'Feltöltés sikeres!',
-        fileUrl: blockBlobClient.url,
-        data: certificate
-      });
-    } catch (error) {
-      console.error('Hiba a feltöltés során:', error);
-      res.status(500).send('Hiba a feltöltés során');
-    }
+          // 📂 Megnézzük, hogy létezik-e a "Certificates" mappa, ha nem, létrehozzuk
+          const targetFolderId = await getOrCreateFolder(accessToken, folderName);
+
+          // 📄 Fájl beolvasása és feltöltése a OneDrive "Certificates" mappába
+          const fileData = fs.readFileSync(filePath);
+          const uploadResponse = await axios.put(
+              `https://graph.microsoft.com/v1.0/me/drive/items/${targetFolderId}:/${fileName}:/content`,
+              fileData,
+              {
+                  headers: { 
+                      Authorization: `Bearer ${accessToken}`, 
+                      "Content-Type": "application/octet-stream" 
+                  },
+              }
+          );
+
+          const fileUrl = uploadResponse.data.webUrl; // 📎 OneDrive fájl URL-je
+
+          // 📂 Új tanúsítvány (Certificate) mentése MongoDB-be
+          const certificate = new Certificate({
+              certNo: certNo,
+              fileName: fileName,
+              fileUrl: fileUrl, // ✅ Most már az OneDrive fájl URL-je kerül mentésre
+              xcondition: xcondition === 'true',
+              specCondition: specCondition || null
+          });
+          await certificate.save();
+
+          fs.unlinkSync(filePath); // 📄 Helyi fájl törlése
+          res.json({
+              message: "✅ Feltöltés sikeres!",
+              fileUrl: fileUrl,
+              data: certificate
+          });
+      } catch (error) {
+          console.error("❌ Hiba a feltöltés során:", error.response?.data || error.message);
+          res.status(500).send("❌ Hiba a feltöltés során");
+      }
   });
 };
 

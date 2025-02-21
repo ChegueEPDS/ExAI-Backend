@@ -24,6 +24,7 @@ const inspectionRoutes = require('./routes/inspectionRoutes');
 const zoneRoutes = require('./routes/zoneRoutes');
 const siteRoutes = require('./routes/siteRoutes');
 const xlsCompareRoutes = require('./routes/xlsCompareRoutes')
+const graphRoutes = require('./routes/graphRoutes');
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
 const port = process.env.PORT || 3000;
@@ -77,6 +78,8 @@ app.use('/api/inspection', inspectionRoutes);
 app.use('/api/zones', zoneRoutes);
 app.use('/api/sites', siteRoutes);
 app.use('/api/xls', xlsCompareRoutes);
+app.use('/api/graph', graphRoutes);
+
 
 // Periodikus tisztítás
 setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum

@@ -7,6 +7,7 @@ const assistants = {
     'STAND98': process.env.ASSISTANT_ID_STAND98,
     'BGC': process.env.ASSISTANT_ID_BGC,
     'DRND': process.env.ASSISTANT_ID_DRND,
+    'archicon': process.env.ASSISTANT_ID_ARCHICON,
   };
   
   module.exports = assistants;
