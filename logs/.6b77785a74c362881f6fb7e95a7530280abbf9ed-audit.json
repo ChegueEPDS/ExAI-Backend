@@ -6,31 +6,6 @@
     "auditLog": "logs/.6b77785a74c362881f6fb7e95a7530280abbf9ed-audit.json",
     "files": [
         {
-            "date": 1738926973374,
-            "name": "logs/error-2025-02-07.log",
-            "hash": "6f5a4f9c8e44448535f77d22ea0a3cfd26374c076e8eef02122796d530848d97"
-        },
-        {
-            "date": 1738989034513,
-            "name": "logs/error-2025-02-08.log",
-            "hash": "dd0fe7b5109465a346e724ba7898555595f811bccecb47ac6f5a28bb8ee0692c"
-        },
-        {
-            "date": 1739065507935,
-            "name": "logs/error-2025-02-09.log",
-            "hash": "113fa820267758547e06fb6d32caa60d1a9fca8bcdffe27b8caed6717b7625a8"
-        },
-        {
-            "date": 1739142846441,
-            "name": "logs/error-2025-02-10.log",
-            "hash": "3297c6d87aec840384b8c95c55f63b28ff906764ce95b2e51c8dbd0692736d76"
-        },
-        {
-            "date": 1739243756376,
-            "name": "logs/error-2025-02-11.log",
-            "hash": "0fcc4153647fef8753cbf8e38f7e8cec72de0c75b699847ebe385799a10ef2d3"
-        },
-        {
             "date": 1739325125845,
             "name": "logs/error-2025-02-12.log",
             "hash": "047682dc4b12580027f81dca3a6e6e2a3cf53780181b06ac13e423a5c23d1ad2"
@@ -79,6 +54,26 @@
             "date": 1740111411531,
             "name": "logs/error-2025-02-21.log",
             "hash": "60b03f886a5ebb7d1a22115f228c177c255e2b0bd077ca0b11d4868c0a87f4c6"
+        },
+        {
+            "date": 1740179042511,
+            "name": "logs/error-2025-02-22.log",
+            "hash": "ff65a96d00539f4568ed00b4dd1944040e7dd4626e55f127b40d85e36510f146"
+        },
+        {
+            "date": 1740267436388,
+            "name": "logs/error-2025-02-23.log",
+            "hash": "cea254769cf92c3d3701ce61525109dbd8f8c0820f7db8b43a414df6199fb0ff"
+        },
+        {
+            "date": 1740359886289,
+            "name": "logs/error-2025-02-24.log",
+            "hash": "e502ff1e12ca656824b2931dda9aa8d86fa68562282e63b23013d44bea6a03f1"
+        },
+        {
+            "date": 1740462567992,
+            "name": "logs/error-2025-02-25.log",
+            "hash": "1408bc38a5fbf23a3aaf332c15a145c75002bd607499c18a46bcea0376878c6d"
         }
     ],
     "hashType": "sha256"

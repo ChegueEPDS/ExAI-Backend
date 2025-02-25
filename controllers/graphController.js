@@ -7,95 +7,80 @@ const upload = multer({ dest: 'uploads/' }); // Ideiglenes fájlok mentése
 /**
  * 📂 Általános mappa létrehozása vagy keresése az ExAI mappán belül
  */
-exports.getOrCreateFolder = async function (accessToken, folderName) {
+exports.getOrCreateFolder = async function (accessToken, folderPath) {
     try {
-        // 📂 ExAI mappa azonosítójának lekérése vagy létrehozása
-        const exAIFolderId = await getOrCreateExAIFolder(accessToken);
+        console.log(`🔍 Checking or creating OneDrive folder: ${folderPath}`);
 
-        // 📂 Összes almappa lekérdezése az ExAI mappán belül
-        const response = await axios.get(
-            `https://graph.microsoft.com/v1.0/me/drive/items/${exAIFolderId}/children`,
-            { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
+        // 📂 Mappa elérési útvonalának darabolása (pl. "ExAI/Certificates" → ["ExAI", "Certificates"])
+        const folders = folderPath.split("/");
+        let parentFolderId = "root"; // A gyökérmappából indulunk
 
-        // 📂 Keresés a létező mappák között
-        const existingFolder = response.data.value.find(folder => folder.name.toLowerCase() === folderName.toLowerCase());
-        if (existingFolder) {
-            console.log(`✅ ${folderName} mappa már létezik, ID: ${existingFolder.id}`);
-            return existingFolder.id; // 📂 Ha létezik, visszaadjuk az ID-ját
+        for (const folder of folders) {
+            let folderExists = null;
+
+            // 📂 Ellenőrizzük, hogy a mappa létezik-e a szülőmappán belül
+            try {
+                const checkResponse = await axios.get(
+                    `https://graph.microsoft.com/v1.0/me/drive/${parentFolderId === "root" ? "root" : `items/${parentFolderId}`}/children`,
+                    { headers: { Authorization: `Bearer ${accessToken}` } }
+                );
+
+                folderExists = checkResponse.data.value.find(f => f.name === folder);
+                if (folderExists) {
+                    parentFolderId = folderExists.id; // Ha létezik, frissítjük az ID-t
+                    console.log(`✅ Folder exists: ${folder} (ID: ${parentFolderId})`);
+                    continue;
+                }
+            } catch (error) {
+                console.error(`❌ Error checking folder: ${error.response?.data || error.message}`);
+                return null;
+            }
+
+            // 📂 Ha a mappa nem létezik, létrehozzuk
+            console.log(`📁 Creating folder: ${folder} under parent ID: ${parentFolderId}`);
+            try {
+                const createResponse = await axios.post(
+                    `https://graph.microsoft.com/v1.0/me/drive/${parentFolderId === "root" ? "root" : `items/${parentFolderId}`}/children`,
+                    { name: folder, folder: {}, "@microsoft.graph.conflictBehavior": "rename" },
+                    { headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" } }
+                );
+
+                parentFolderId = createResponse.data.id; // Az újonnan létrehozott mappa ID-ját frissítjük
+                console.log(`✅ Folder created: ${folder} (ID: ${parentFolderId})`);
+            } catch (error) {
+                console.error(`❌ Error creating folder: ${error.response?.data || error.message}`);
+                return null;
+            }
         }
 
-        // 📂 Ha nem létezik, akkor létrehozzuk
-        const createResponse = await axios.post(
-            `https://graph.microsoft.com/v1.0/me/drive/items/${exAIFolderId}/children`,
-            { name: folderName, folder: {}, "@microsoft.graph.conflictBehavior": "fail" },
-            { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
-
-        console.log(`✅ ${folderName} mappa létrehozva, ID: ${createResponse.data.id}`);
-        return createResponse.data.id;
+        return parentFolderId;
     } catch (error) {
-        console.error(`❌ ${folderName} mappa ellenőrzési/létrehozási hiba:`, error.response?.data || error.message);
-        throw error;
+        console.error(`❌ Unexpected error in folder creation: ${error.response?.data || error.message}`);
+        return null;
     }
 };
 
-async function getOrCreateExAIFolder(accessToken) {
-    try {
-        // 📂 Megkeressük, hogy létezik-e az ExAI mappa
-        const response = await axios.get(
-            "https://graph.microsoft.com/v1.0/me/drive/root/children?$filter=name eq 'ExAI'",
-            { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
-
-        if (response.data.value.length > 0) {
-            console.log("✅ ExAI mappa már létezik:", response.data.value[0].id);
-            return response.data.value[0].id; // Ha létezik, visszaadjuk az ID-ját
-        }
-
-        // 📂 Ha nem létezik, létrehozzuk
-        const createResponse = await axios.post(
-            "https://graph.microsoft.com/v1.0/me/drive/root/children",
-            { name: "ExAI", folder: {}, "@microsoft.graph.conflictBehavior": "rename" },
-            { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
-
-        console.log("✅ ExAI mappa létrehozva:", createResponse.data.id);
-        return createResponse.data.id;
-    } catch (error) {
-        console.error("❌ ExAI mappa ellenőrzési/létrehozási hiba:", error.response?.data || error.message);
-        throw error;
-    }
-}
-
 exports.createOneDriveFolder = async (req, res) => {
     const accessToken = req.headers.authorization?.split(" ")[1];
-    const { folderName } = req.body;
+    const { folderPath } = req.body;  // 📂 Már teljes útvonalat várunk pl. "ExAI/Certificates"
 
-    if (!accessToken || !folderName) {
-        return res.status(400).json({ error: "❌ Access token and folderName are required" });
+    if (!accessToken || !folderPath) {
+        return res.status(400).json({ error: "❌ Access token and folderPath are required" });
     }
 
     try {
-        // 📂 ExAI mappa azonosítójának lekérése vagy létrehozása
-        const exAIFolderId = await getOrCreateExAIFolder(accessToken);
+        // 📂 Mappa ellenőrzése/létrehozása
+        const folderId = await getOrCreateFolder(accessToken, folderPath);
 
-        // 📂 Új mappa létrehozása az ExAI mappán belül
-        const response = await axios.post(
-            `https://graph.microsoft.com/v1.0/me/drive/items/${exAIFolderId}/children`,
-            { 
-                name: folderName, 
-                folder: {}, 
-                "@microsoft.graph.conflictBehavior": "rename" 
-            },
-            { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
+        if (!folderId) {
+            return res.status(500).json({ error: "❌ Failed to create folder" });
+        }
 
-        console.log("✅ Almappa létrehozva az ExAI mappán belül:", response.data);
-        res.json(response.data);
+        console.log(`✅ Mappa létrehozva vagy már létezik: ${folderPath} (ID: ${folderId})`);
+        res.json({ message: "✅ Folder created or already exists", folderId });
     } catch (error) {
-        console.error("❌ Almappa létrehozási hiba:", error.response?.data || error.message);
-        res.status(500).json({ error: "Failed to create subfolder" });
+        console.error("❌ Mappa létrehozási hiba:", error.response?.data || error.message);
+        res.status(500).json({ error: "Failed to create folder" });
     }
 };
 
@@ -134,18 +119,19 @@ exports.uploadOneDriveFile = async (req, res) => {
         const accessToken = req.headers.authorization?.split(" ")[1];
         const filePath = req.file.path;
         const fileName = req.file.originalname;
-        const folderName = req.body.folderName; // 📂 A frontendről kapott célmappa neve
+        const folderPath = req.body.folderPath; // 📂 Teljes elérési útvonal pl. "ExAI/Certificates"
 
-        if (!accessToken || !folderName) {
+        if (!accessToken || !folderPath) {
             return res.status(400).json({ error: "❌ Access token és mappa név megadása kötelező." });
         }
 
         try {
-            // 📂 Biztosítjuk, hogy az ExAI főmappa létezik
-            const exAIFolderId = await getOrCreateExAIFolder(accessToken);
+            // 📂 Mappa ellenőrzése/létrehozása
+            const targetFolderId = await getOrCreateFolder(accessToken, folderPath);
 
-            // 📂 Biztosítjuk, hogy a frontend által küldött mappa létezik az ExAI mappán belül
-            const targetFolderId = await getOrCreateFolder(accessToken, folderName);
+            if (!targetFolderId) {
+                return res.status(500).json({ error: "❌ Failed to create folder" });
+            }
 
             // 📄 Fájl beolvasása és feltöltése a célmappába
             const fileData = fs.readFileSync(filePath);
@@ -158,7 +144,7 @@ exports.uploadOneDriveFile = async (req, res) => {
             );
 
             fs.unlinkSync(filePath); // 📄 Helyi fájl törlése
-            console.log(`✅ Fájl feltöltve a ${folderName} mappába:`, uploadResponse.data);
+            console.log(`✅ Fájl feltöltve a ${folderPath} mappába:`, uploadResponse.data);
             res.json(uploadResponse.data);
         } catch (error) {
             console.error("❌ Fájl feltöltési hiba:", error.response?.data || error.message);
