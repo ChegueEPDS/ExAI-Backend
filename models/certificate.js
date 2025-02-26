@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 
 const CertificateSchema = new mongoose.Schema({
-    certNo: { type: String, required: true, unique: true },
+    certNo: { type: String, required: true },
     scheme: { type: String },
     status: { type: String },
     issueDate: { type: String },
@@ -11,14 +11,43 @@ const CertificateSchema = new mongoose.Schema({
     manufacturer: { type: String },
     exmarking: { type: String },
     fileName: { type: String },
-    fileUrl: { type: String }, // PDF file URL
-    fileId: { type: String },  // PDF file ID
-    docxUrl: { type: String }, // DOCX file URL
-    docxId: { type: String },  // DOCX file ID
-    folderId: { type: String },  // OneDrive folder ID
-    folderUrl: { type: String }, // 🔹 OneDrive folder URL (NEW)
+    fileUrl: { type: String },
+    fileId: { type: String },
+    docxUrl: { type: String },
+    docxId: { type: String },
+    folderId: { type: String },
+    folderUrl: { type: String },
     xcondition: { type: Boolean, default: false },
-    specCondition: { type: String }
+    specCondition: { type: String },
+    createdBy: { 
+        type: mongoose.Schema.Types.ObjectId, 
+        ref: 'User', 
+        required: true 
+    },
+    company: { 
+        type: String, 
+        required: true 
+    }
 }, { timestamps: true });
+
+// 🔹 **Automatikus Company beállítás a CreatedBy alapján**
+CertificateSchema.pre('save', async function (next) {
+    if (!this.isModified('createdBy')) return next();
+
+    try {
+        // 🔎 Lekérdezzük a felhasználót, aki létrehozta a tanúsítványt
+        const user = await mongoose.model('User').findById(this.createdBy);
+        if (!user) {
+            return next(new Error('Invalid CreatedBy user'));
+        }
+
+        // ✅ Beállítjuk a Company mezőt a User modellből
+        this.company = user.company; // Feltételezzük, hogy a user objektumnak van `company` mezője
+
+        next();
+    } catch (error) {
+        next(error);
+    }
+});
 
 module.exports = mongoose.model('Certificate', CertificateSchema);

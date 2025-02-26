@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { getOrCreateFolder } = require('../controllers/graphController'); // OneDrive mappakezelés
 const { generateDocxFile } = require('../helpers/docx'); // 🔹 DOCX generálás importálása
+const User = require('../models/user'); // 🔹 Importáljuk a User modellt
 
 
 // Multer konfiguráció a fájl feltöltéshez
@@ -14,47 +15,48 @@ const upload = multer({ dest: 'uploads/' });
 exports.uploadCertificate = async (req, res) => {
     upload.single('file')(req, res, async (err) => {
         if (err) return res.status(500).send('❌ Fájl feltöltési hiba.');
-  
+
         const accessToken = req.headers.authorization?.split(" ")[1];
         if (!accessToken) {
             return res.status(401).json({ message: "❌ Access token szükséges!" });
         }
-  
+
         try {
-            // 🔹 Fogadd el az OCR eredményt a frontendtől!
-            const { certNo, scheme, status, issueDate, applicant, protection, equipment, manufacturer, exmarking, xcondition, specCondition, recognizedText } = req.body;
-  
+            // 🔹 User ID átvétele
+            const { userId, certNo, scheme, status, issueDate, applicant, protection, equipment, manufacturer, exmarking, xcondition, specCondition, recognizedText } = req.body;
+
+            if (!userId) {
+                return res.status(400).json({ message: "❌ User ID szükséges!" });
+            }
+
             if (!certNo) {
                 return res.status(400).json({ message: "❌ A certNo kötelező mező!" });
             }
-  
+
+            // 🔹 Felhasználó lekérése a MongoDB-ből
+            const user = await User.findById(userId);
+            if (!user || !user.company) {
+                return res.status(400).json({ message: "❌ Érvénytelen felhasználó vagy hiányzó company adat!" });
+            }
+
             const pdfPath = path.resolve(req.file.path);
             const pdfFileName = req.file.originalname;
-            
-            // 📂 **Dynamically create a folder for each certificate**
-            const rootFolderPath = "ExAI/Certificates"; // Root folder
-            const certFolderPath = `${rootFolderPath}/${certNo}`; // 🔹 Folder named by certNo
-  
-            // ✅ Ensure the folder exists on OneDrive
+
+            // 📂 **OneDrive mappa létrehozása**
+            const rootFolderPath = "ExAI/Certificates";
+            const certFolderPath = `${rootFolderPath}/${certNo}`;
+
             const { folderId, folderUrl } = await getOrCreateFolder(accessToken, certFolderPath);
-            console.log(`📂 OneDrive Folder Created: ${certFolderPath} (ID: ${folderId})`);
-            console.log(`🔗 OneDrive Folder URL: ${folderUrl}`);
-  
-            // 📄 **Generate DOCX using recognized text**
+
+            // 📄 **DOCX generálás**
             const extractedText = recognizedText || "Nincs OCR szöveg";
-            console.log("✅ OCR szöveg fogadva a frontendtől!");
-  
             const docxFilePath = await generateDocxFile(extractedText, certNo);
-  
-            // 📄 **Upload PDF to OneDrive**
+
+            // 📄 **PDF és DOCX feltöltése OneDrive-ra**
             const pdfUploadResponse = await uploadToOneDrive(accessToken, folderId, pdfPath, pdfFileName);
-            console.log(`✅ PDF feltöltve OneDrive-ra: ${pdfUploadResponse.webUrl}`);
-  
-            // 📄 **Upload DOCX to OneDrive**
             const docxUploadResponse = await uploadToOneDrive(accessToken, folderId, docxFilePath, `${certNo}_extracted.docx`);
-            console.log(`✅ DOCX feltöltve OneDrive-ra: ${docxUploadResponse.webUrl}`);
-  
-            // 📂 **Save Certificate in MongoDB**
+
+            // 📂 **Tanúsítvány mentése MongoDB-be**
             const certificate = new Certificate({
                 certNo,
                 scheme,
@@ -67,38 +69,40 @@ exports.uploadCertificate = async (req, res) => {
                 exmarking,
                 fileName: pdfFileName,
                 fileUrl: pdfUploadResponse.webUrl,
-                fileId: pdfUploadResponse.id, // PDF File ID
-                docxUrl: docxUploadResponse.webUrl, // DOCX URL
-                docxId: docxUploadResponse.id, // DOCX File ID
-                folderId: folderId, // OneDrive Folder ID
-                folderUrl: folderUrl, // 🔹 OneDrive Folder URL (NEW)
+                fileId: pdfUploadResponse.id,
+                docxUrl: docxUploadResponse.webUrl,
+                docxId: docxUploadResponse.id,
+                folderId: folderId,
+                folderUrl: folderUrl,
                 xcondition: xcondition === 'true' || xcondition === true,
-                specCondition: specCondition || null
+                specCondition: specCondition || null,
+                createdBy: userId, // 🔹 Beállítjuk a CreatedBy-t
+                company: user.company // ✅ Itt kézzel beállítjuk a Company-t
             });
-            
+
             await certificate.save();
-  
-            // 🗑️ **Delete Local Files**
+
+            // 🗑️ **Helyi fájlok törlése**
             fs.unlinkSync(pdfPath);
             fs.unlinkSync(docxFilePath);
-  
-            // ✅ **Response**
+
+            // ✅ **Válasz küldése**
             res.json({
                 message: "✅ Feltöltés sikeres!",
                 fileUrl: pdfUploadResponse.webUrl,
-                docxUrl: docxUploadResponse.webUrl, // 📂 DOCX URL visszaküldése
+                docxUrl: docxUploadResponse.webUrl,
                 fileId: pdfUploadResponse.id,
                 docxId: docxUploadResponse.id,
                 folderId: folderId,
                 data: certificate
             });
-  
+
         } catch (error) {
             console.error("❌ Hiba a feltöltés során:", error.response?.data || error.message);
             res.status(500).send("❌ Hiba a feltöltés során");
         }
     });
-  };
+};
 
 async function uploadToOneDrive(accessToken, folderId, filePath, fileName) {
   try {
@@ -123,14 +127,23 @@ async function uploadToOneDrive(accessToken, folderId, filePath, fileName) {
 
 // Tanúsítványok lekérdezési endpoint
 exports.getCertificates = async (req, res) => {
-  try {
-    const certificates = await Certificate.find();
-    res.json(certificates);
-  } catch (error) {
-    console.error('Hiba a lekérdezés során:', error);
-    res.status(500).send('Hiba a lekérdezés során');
-  }
-};
+    try {
+      // 🔹 Csak a bejelentkezett felhasználó cégéhez tartozó tanúsítványokat listázzuk
+      const company = req.user.company;
+      if (!company) {
+        return res.status(400).json({ message: "❌ Hiányzó company adat a felhasználó tokenjében!" });
+      }
+  
+      console.log(`🔍 Keresés a következő cégre: ${company}`);
+  
+      const certificates = await Certificate.find({ company });
+  
+      res.json(certificates);
+    } catch (error) {
+      console.error('❌ Hiba a lekérdezés során:', error);
+      res.status(500).send('❌ Hiba a lekérdezés során');
+    }
+  };
 
 exports.getCertificateByCertNo = async (req, res) => {
     try {
