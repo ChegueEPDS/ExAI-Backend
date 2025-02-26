@@ -11,15 +11,15 @@ exports.getOrCreateFolder = async function (accessToken, folderPath) {
     try {
         console.log(`🔍 Checking or creating OneDrive folder: ${folderPath}`);
 
-        // 📂 Mappa elérési útvonalának darabolása (pl. "ExAI/Certificates" → ["ExAI", "Certificates"])
         const folders = folderPath.split("/");
-        let parentFolderId = "root"; // A gyökérmappából indulunk
+        let parentFolderId = "root"; 
+        let folderUrl = null;
 
         for (const folder of folders) {
             let folderExists = null;
 
-            // 📂 Ellenőrizzük, hogy a mappa létezik-e a szülőmappán belül
             try {
+                // 📂 Check if the folder exists in the parent folder
                 const checkResponse = await axios.get(
                     `https://graph.microsoft.com/v1.0/me/drive/${parentFolderId === "root" ? "root" : `items/${parentFolderId}`}/children`,
                     { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -27,8 +27,9 @@ exports.getOrCreateFolder = async function (accessToken, folderPath) {
 
                 folderExists = checkResponse.data.value.find(f => f.name === folder);
                 if (folderExists) {
-                    parentFolderId = folderExists.id; // Ha létezik, frissítjük az ID-t
-                    console.log(`✅ Folder exists: ${folder} (ID: ${parentFolderId})`);
+                    parentFolderId = folderExists.id;
+                    folderUrl = folderExists.webUrl; // 🔹 Get the OneDrive folder URL
+                    console.log(`✅ Folder exists: ${folder} (ID: ${parentFolderId}, URL: ${folderUrl})`);
                     continue;
                 }
             } catch (error) {
@@ -36,7 +37,7 @@ exports.getOrCreateFolder = async function (accessToken, folderPath) {
                 return null;
             }
 
-            // 📂 Ha a mappa nem létezik, létrehozzuk
+            // 📂 If the folder does not exist, create it
             console.log(`📁 Creating folder: ${folder} under parent ID: ${parentFolderId}`);
             try {
                 const createResponse = await axios.post(
@@ -45,15 +46,16 @@ exports.getOrCreateFolder = async function (accessToken, folderPath) {
                     { headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" } }
                 );
 
-                parentFolderId = createResponse.data.id; // Az újonnan létrehozott mappa ID-ját frissítjük
-                console.log(`✅ Folder created: ${folder} (ID: ${parentFolderId})`);
+                parentFolderId = createResponse.data.id;
+                folderUrl = createResponse.data.webUrl; // 🔹 Get OneDrive folder URL
+                console.log(`✅ Folder created: ${folder} (ID: ${parentFolderId}, URL: ${folderUrl})`);
             } catch (error) {
                 console.error(`❌ Error creating folder: ${error.response?.data || error.message}`);
                 return null;
             }
         }
 
-        return parentFolderId;
+        return { folderId: parentFolderId, folderUrl }; // 🔹 Return both folderId and folderUrl
     } catch (error) {
         console.error(`❌ Unexpected error in folder creation: ${error.response?.data || error.message}`);
         return null;
