@@ -158,7 +158,7 @@ exports.uploadPdfWithFormRecognizer = [
 
         if (certType === "IECEx") {
           regexes = {
-            certificateNumber: extractValue(ocrText, /\b(IECEx\s+[A-Z]{2,4}\s+\d{2}\.\d{4,5}X?)\b/i),
+            certificateNumber: extractValue(ocrText, /\b(IECEx\s+[A-Z]{2,4}\s+\d{2}\.\d{4,5}[UX]?)\b/i),
             status: extractValue(ocrText, 
               /(?:Status:)\s*([\s\S]+?)(?=\n(?:Date of issue:|Issue No:|\n[A-Z]+\s[A-Z]+))/i
             )?.replace(/\n/g, " ").trim(),
@@ -166,10 +166,11 @@ exports.uploadPdfWithFormRecognizer = [
               /(?:Date of Issue:)\s*([\s\S]+?)(?=\n(?:Applicant:|\n[A-Z]+\s[A-Z]+))/i
             )?.replace(/\n/g, " ").trim(),
             applicant: extractValue(ocrText, 
-              /(?:Applicant:)\s*([\s\S]+?)(?=\n(?:Equipment:|\n[A-Z]+\s[A-Z]+))/i
+              /(?:Applicant:)\s*([\s\S]+?)(?=\n(?:Equipment:|Ex Component:|\n[A-Z]+\s[A-Z]+))/i
             )?.replace(/\n/g, " ").trim(),
             manufacturer: extractValue(ocrText, /(?:Manufacturer:|Manufactured by)\s*([^\n\r]+)/),
-            equipment: extractValue(ocrText, /(?:Equipment:|Product:|Device:)\s*([^\n\r]+)/),
+            equipment: extractValue(ocrText,
+              /(?:Equipment:|Product:|Device:|Ex Component:)\s*([\s\S]+?)(?=\nThis component|Type of Protection:|Marking:|\n[A-Z]+\s[A-Z]+)/i),
             exMarking: extractValue(ocrText, 
               /(?:Ex marking:|Marking:)[\s]*([\s\S]+?)(?=\n(?:Approved for issue|Certificate issued by|TÜV|On behalf of|\n[A-Z]+\s[A-Z]+))/i
             )?.replace(/\n/g, " ").trim(),
@@ -177,7 +178,9 @@ exports.uploadPdfWithFormRecognizer = [
               /Type of Protection:\s*([^\n]*?)(?=\s*Marking:|\n)/i
              )?.trim(),
             specialConditions: extractValue(ocrText, 
-              /(?:SPECIFIC CONDITIONS OF USE: YES as shown below:?|SPECIFIC CONDITIONS OF USE:?|Special Conditions of Use:?|Special conditions for safe use:?)[\s:]*([\s\S]+?)(?=\n(?:Annex:|Attachment to Certificate|TEST & ASSESSMENT REPORTS|This certificate|DETAILS OF CERTIFICATE CHANGES|IECEx|On behalf of|\n[A-Z]+\s[A-Z]+))/i)
+              /(?:SPECIFIC CONDITIONS OF USE: YES as shown below:?|SPECIFIC CONDITIONS OF USE:?|Special Conditions of Use:?|Special conditions for safe use:?)[\s:]*([\s\S]+?)(?=\n(?:Annex:|Attachment to Certificate|TEST & ASSESSMENT REPORTS|This certificate|DETAILS OF CERTIFICATE CHANGES|IECEx|On behalf of|\n[A-Z]+\s[A-Z]+))/i),
+            description: extractValue(ocrText, 
+              /(?:EQUIPMENT:|Ex Component\(s\) covered by this certificate is described below:|Equipment and systems covered by this Certificate are as follows:|Description:|Equipment description:)[\s:]*([\s\S]+?)(?=\n(?:Schedule of Limitations|SPECIFIC CONDITIONS OF USE:|Conditions of Certification:|ROUTINE TESTS:|PARAMETERS RELATING TO THE SAFETY:|Annex:|Attachment to Certificate|TEST & ASSESSMENT REPORTS|This certificate|DETAILS OF CERTIFICATE CHANGES|IECEx|On behalf of|\n[A-Z]{3,}|\n[A-Z]+\s[A-Z]+))/i),    
           };
         } else {
           regexes = {

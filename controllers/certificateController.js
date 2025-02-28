@@ -23,7 +23,7 @@ exports.uploadCertificate = async (req, res) => {
 
         try {
             // 🔹 User ID átvétele
-            const { userId, certNo, scheme, status, issueDate, applicant, protection, equipment, manufacturer, exmarking, xcondition, specCondition, recognizedText } = req.body;
+            const { userId, certNo, scheme, status, issueDate, applicant, protection, equipment, manufacturer, exmarking, xcondition, specCondition, description, ucondition, recognizedText } = req.body;
 
             if (!userId) {
                 return res.status(400).json({ message: "❌ User ID szükséges!" });
@@ -76,6 +76,8 @@ exports.uploadCertificate = async (req, res) => {
                 folderUrl: folderUrl,
                 xcondition: xcondition === 'true' || xcondition === true,
                 specCondition: specCondition || null,
+                description: description,
+                ucondition: ucondition === 'true' || ucondition === true,
                 createdBy: userId, // 🔹 Beállítjuk a CreatedBy-t
                 company: user.company // ✅ Itt kézzel beállítjuk a Company-t
             });
@@ -290,7 +292,7 @@ exports.updateCertificate = async (req, res) => {
       }
 
       const { id } = req.params;
-      const { certNo, scheme, status, issueDate, applicant, protection, equipment, manufacturer, exmarking, xcondition, specCondition } = req.body;
+      const { certNo, scheme, status, issueDate, applicant, protection, equipment, manufacturer, exmarking, xcondition, ucondition, specCondition, description } = req.body;
 
       // 🔎 2. Ellenőrizzük, hogy létezik-e a tanúsítvány
       const certificate = await Certificate.findById(id);
@@ -309,7 +311,9 @@ exports.updateCertificate = async (req, res) => {
       certificate.manufacturer = manufacturer || certificate.manufacturer;
       certificate.exmarking = exmarking || certificate.exmarking;
       certificate.xcondition = xcondition === 'true' || xcondition === true; // Boolean conversion
+      certificate.ucondition = ucondition === 'true' || ucondition === true; // Boolean conversion
       certificate.specCondition = specCondition || certificate.specCondition;
+      certificate.description = description || certificate.description;
 
       await certificate.save();
 

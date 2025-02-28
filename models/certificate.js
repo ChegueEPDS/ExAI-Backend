@@ -18,7 +18,9 @@ const CertificateSchema = new mongoose.Schema({
     folderId: { type: String },
     folderUrl: { type: String },
     xcondition: { type: Boolean, default: false },
+    ucondition: { type: Boolean, default: false },
     specCondition: { type: String },
+    description: { type: String },
     createdBy: { 
         type: mongoose.Schema.Types.ObjectId, 
         ref: 'User', 
