@@ -7,9 +7,8 @@ const { getOrCreateFolder } = require('../controllers/graphController'); // OneD
 const { generateDocxFile } = require('../helpers/docx'); // 🔹 DOCX generálás importálása
 const User = require('../models/user'); // 🔹 Importáljuk a User modellt
 
-
-// Multer konfiguráció a fájl feltöltéshez
 const upload = multer({ dest: 'uploads/' });
+const today = new Date();
 
 // Fájl feltöltési endpoint
 exports.uploadCertificate = async (req, res) => {
@@ -41,10 +40,12 @@ exports.uploadCertificate = async (req, res) => {
 
             const pdfPath = path.resolve(req.file.path);
             const pdfFileName = req.file.originalname;
+            const formattedDateTime = today.toISOString().slice(2, 10).replace(/-/g, '') + '-' + 
+                          today.toISOString().slice(11, 16).replace(/:/g, '');
 
             // 📂 **OneDrive mappa létrehozása**
             const rootFolderPath = "ExAI/Certificates";
-            const certFolderPath = `${rootFolderPath}/${certNo}`;
+            const certFolderPath = `${rootFolderPath}/${certNo}_${formattedDateTime}`;
 
             const { folderId, folderUrl } = await getOrCreateFolder(accessToken, certFolderPath);
 
