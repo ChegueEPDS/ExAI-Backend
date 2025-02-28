@@ -180,7 +180,7 @@ exports.uploadPdfWithFormRecognizer = [
             specialConditions: extractValue(ocrText, 
               /(?:SPECIFIC CONDITIONS OF USE: YES as shown below:?|SPECIFIC CONDITIONS OF USE:?|Special Conditions of Use:?|Special conditions for safe use:?)[\s:]*([\s\S]+?)(?=\n(?:Annex:|Attachment to Certificate|TEST & ASSESSMENT REPORTS|This certificate|DETAILS OF CERTIFICATE CHANGES|IECEx|On behalf of|\n[A-Z]+\s[A-Z]+))/i),
             description: extractValue(ocrText, 
-              /(?:EQUIPMENT:\s*Equipment and systems covered by this Certificate are as follows:\s*)([\s\S]+?)(?=\nSPECIFIC CONDITION OF USE:|SCHEDULE OF LIMITATIONS|Annex:|Attachment to Certificate|TEST & ASSESSMENT REPORTS|DETAILS OF CERTIFICATE CHANGES|IECEx|On behalf of|\n[A-Z]{3,}|\n[A-Z]+\s[A-Z]+)/i),    
+              /(?:EQUIPMENT:\s*Equipment and systems covered by this Certificate are as follows:|Ex Component\(s\) covered by this certificate is described below:)\s*([\s\S]+?)(?=\n(?:SPECIFIC CONDITION OF USE:|SCHEDULE OF LIMITATIONS|Annex:|Attachment to Certificate|TEST & ASSESSMENT REPORTS|DETAILS OF CERTIFICATE CHANGES|IECEx|On behalf of|\n[A-Z]{3,}|\n[A-Z]+\s[A-Z]+))/i),    
           };
         } else {
           regexes = {
