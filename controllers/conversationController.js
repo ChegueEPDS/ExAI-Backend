@@ -206,7 +206,7 @@ exports.sendMessage = [
 
       // 🟢 Üzenetek mentése a beszélgetésbe
       conversation.messages.push({ role: 'user', content: message });
-      conversation.messages.push({ role: 'assistant', content: assistantContentHtml });
+      conversation.messages.push({ role: 'assistant', content: assistantContentHtml, images: imageUrls });
 
       await conversation.save();
 

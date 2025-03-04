@@ -9,6 +9,7 @@ const MessageSchema = new mongoose.Schema({
   inputToken: { type: Number, default: null },
   outputToken: { type: Number, default: null },
   rating: { type: Number, default: null },
+  images: { type: [String], default: [] }, 
   feedback: {
     comment: { type: String, default: '' },
     references: { type: String, default: '' },
