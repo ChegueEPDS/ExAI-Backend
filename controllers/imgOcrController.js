@@ -53,18 +53,33 @@ exports.uploadImage = [
       let formattedText = extractedText;
 
       formattedText = formattedText
+      
       .replace(/([A-Za-z])(\d{3,4})C/g, '$1 $2°C')
       .replace(/([A-Za-z])(\d{1,2}GD)/g, '$1 $2')
       .replace(/(Tamb .*?to .*?C)/g, '$1\n')
       .replace(/(S\/N \d+)/g, '$1\n')
-      .replace(
+      /*.replace(
         /(?<=^|\s)(?:[1izlI]{2,3})(A|B|C)?/gm,
         (match) => match.replace(/[1izl]/g, 'I')
       )
       .replace(
         /(?<=^|\s)(?:[MN1izlI]{2,3})(A|B|C)?/gm,
         (match) => match.replace(/[MN]/g, 'II')
+      )*/
+      .replace(
+        /(?<=^|\s)([a-z]*)([1izl]{2,3})([A-Z]?)/gm,
+        (_, prefix, match, suffix) => prefix + match.replace(/[1izl]/g, 'I') + suffix
       )
+      .replace(
+          /(?<=^|\s)([a-z]*)([MN1izlI]{2,3})([A-Z]?)/gm,
+          (_, prefix, match, suffix) => prefix + match.replace(/[MN]/g, 'II') + suffix
+      )
+      .replace(/(Ex)\s*([a-z]+)([A-Z]{3})/g, '$1 $2 $3') // Ex után betűk és római számok közé szóköz
+      .replace(/(Ex)\s*([a-z]+)/g, '$1 $2') // Ex után kisbetűk közé szóköz
+      .replace(/(Ex)(?!\s)(IIA|IIB|IIC|IIIA|IIIB|IIIC)/g, '$1 $2') // Ex után római számok közé szóköz
+      .replace(/\b11\b/g, 'II') // 11 -> II
+      .replace(/\b111\b/g, 'III') // 111 -> III
+      .replace(/\b1\b/g, 'I') // 1 -> I
       .replace(/(Ex)(?!\s)/gm, '$1 ')// Add space after 'Ex'
       .replace(/\s{2,}/g, " ") // Többszörös szóköz eltávolítása
       .replace(/\n(?=[a-z])/g, " ") 
