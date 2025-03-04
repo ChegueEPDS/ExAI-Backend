@@ -50,7 +50,7 @@ const encoder = tiktoken.get_encoding('o200k_base');  // Vagy egyéb modellekhez
 
 // Üzenet küldése egy meglévő szálban
 const imageMapping = {
-  "építési hely": ["KESZ_7_MELL-1.png"],
+  "építési hely": ["KESZ_7_MELL-1.png", "KESZ_7_MELL-7.png"],
   "zártsorú beépítési mód": ["KESZ_7_MELL-2.png", "KESZ_7_MELL-3.png", "KESZ_7_MELL-4.png", "KESZ_7_MELL-5.png"],
   "épületköz": ["KESZ_7_MELL-8.png"],
   "közterület felé eső építési vonal": ["KESZ_7_MELL-9.png", "KESZ_7_MELL-10.png"],
@@ -59,7 +59,13 @@ const imageMapping = {
   "szintterületi mutató": ["KESZ_7_MELL-13.png"],
   "parkolás": ["KESZ_7_MELL-13.png"],
   "parkoló": ["KESZ_7_MELL-13.png"],
-  "garázs": ["KESZ_7_MELL-13.png"]
+  "garázs": ["KESZ_7_MELL-13.png"],
+  "építési hely meghatározás":["KESZ_7_MELL-7.png"],
+  "utcai párkánymagasság":["KESZ_7_MELL-15.png"],
+  "magassági idom":["KESZ_7_MELL-18.png"],
+  "Az építési övezetek magassági szabályozása":["KESZ_4_MELL_MAGASSAG.png"],
+  "XIII kerület magassági szabályozás":["KESZ_4_MELL_MAGASSAG.png"],
+  "épületmagasság":["KESZ_4_MELL_MAGASSAG.png"],
 };
 
 exports.sendMessage = [
