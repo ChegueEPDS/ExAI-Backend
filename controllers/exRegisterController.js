@@ -156,3 +156,14 @@ exports.deleteEquipment = async (req, res) => {
     return res.status(500).json({ error: 'Nem sikerült törölni az eszközt.' });
   }
 };
+
+// Gyártók lekérdezése (GET /api/manufacturers)
+exports.getManufacturers = async (req, res) => {
+  try {
+      const manufacturers = await Equipment.distinct("Manufacturer"); // Egyedi gyártók lekérése
+      res.json(manufacturers);
+  } catch (error) {
+      console.error("Error fetching manufacturers:", error);
+      res.status(500).json({ error: "Server error while fetching manufacturers." });
+  }
+};

@@ -53,43 +53,47 @@ exports.uploadImage = [
       let formattedText = extractedText;
 
       formattedText = formattedText
-      
-      .replace(/([A-Za-z])(\d{3,4})C/g, '$1 $2°C')
-      .replace(/([A-Za-z])(\d{1,2}GD)/g, '$1 $2')
-      .replace(/(Tamb .*?to .*?C)/g, '$1\n')
-      .replace(/(S\/N \d+)/g, '$1\n')
-      /*.replace(
-        /(?<=^|\s)(?:[1izlI]{2,3})(A|B|C)?/gm,
-        (match) => match.replace(/[1izl]/g, 'I')
-      )
-      .replace(
-        /(?<=^|\s)(?:[MN1izlI]{2,3})(A|B|C)?/gm,
-        (match) => match.replace(/[MN]/g, 'II')
-      )*/
-      .replace(
-        /(?<=^|\s)([a-z]*)([1izl]{2,3})([A-Z]?)/gm,
-        (_, prefix, match, suffix) => prefix + match.replace(/[1izl]/g, 'I') + suffix
-      )
-      .replace(
-          /(?<=^|\s)([a-z]*)([MN1izlI]{2,3})([A-Z]?)/gm,
-          (_, prefix, match, suffix) => prefix + match.replace(/[MN]/g, 'II') + suffix
-      )
-      .replace(/(Ex)\s*([a-z]+)([A-Z]{3})/g, '$1 $2 $3') // Ex után betűk és római számok közé szóköz
-      .replace(/(Ex)\s*([a-z]+)/g, '$1 $2') // Ex után kisbetűk közé szóköz
-      .replace(/(Ex)(?!\s)(IIA|IIB|IIC|IIIA|IIIB|IIIC)/g, '$1 $2') // Ex után római számok közé szóköz
-      .replace(/\b11\b/g, 'II') // 11 -> II
-      .replace(/\b111\b/g, 'III') // 111 -> III
-      .replace(/\b1\b/g, 'I') // 1 -> I
-      .replace(/(Ex)(?!\s)/gm, '$1 ')// Add space after 'Ex'
-      .replace(/\s{2,}/g, " ") // Többszörös szóköz eltávolítása
-      .replace(/\n(?=[a-z])/g, " ") 
-      .replace(/\|T\|(\d)\|/g, "T$1")
-      .replace(/([A-Za-z]+):\n(\d+.*)/g, "$1: $2")
-      .replace(/IP\s*(\d[X\d])/g, "IP$1")
-      .replace(/(\d+)\s*([VAKWHz])/g, "$1$2") // Mértékegységek egyesítése
+      // Speciális karakterek és HTML entitások javítása
       .replace(/&lt;/g, "<")
       .replace(/&gt;/g, ">")
       .replace(/&#x2F;/g, "/")
+      .replace(/℃/gi, "°C")
+
+      // Ex és római számok korrigálása
+      .replace(/(Ex)\s*([MN1il|]{2,3})(A|B|C)/gi, (match, ex, roman, letter) => {
+          let correctedRoman = roman.replace(/[MN1il|]/g, "I");
+          return `${ex} ${correctedRoman}${letter}`;
+      })
+      .replace(/(Ex)\s*([a-z]+)([A-Z]{3})/g, '$1 $2 $3')
+      .replace(/(Ex)\s*([a-z]+)/g, '$1 $2')
+      .replace(/(Ex)(?!\s)(IIA|IIB|IIC|IIIA|IIIB|IIIC)/g, '$1 $2')
+      .replace(/(Ex)(?!\s)/gm, '$1 ')
+
+      // Hibás római számok korrigálása
+      .replace(/\b(d|de|e|nA|p|q|ia|ib|ic|ma|mb|mc|o|s|tb|t)?([l1|I]{2,3})(A|B|C)\b/gi, (match, prefix, roman, letter) => {
+          let correctedRoman = roman.replace(/[l1|I]/g, "I");
+          return `${prefix ? prefix + " " : ""}${correctedRoman}${letter}`;
+      })
+      .replace(/\b11\b/g, 'II')
+      .replace(/\b111\b/g, 'III')
+      .replace(/\b1\b/g, 'I')
+
+      // Számok és mértékegységek egyesítése
+      .replace(/([A-Za-z])(\d{3,4})C/g, '$1 $2°C')
+      .replace(/(\d+)\s*([VAKWHz])/g, "$1$2")
+      .replace(/IP\s*(\d[X\d])/g, "IP$1")
+
+      // "|T|4|" típusú hibák javítása (T1, T2, stb.)
+      .replace(/\|T\|(\d)\|/g, "T$1")
+
+      // Új sorok és egyéb formázások
+      .replace(/(Tamb .*?to .*?C)/g, '$1\n')
+      .replace(/(S\/N \d+)/g, '$1\n')
+      .replace(/([A-Za-z]+):\n(\d+.*)/g, "$1: $2")
+      .replace(/\n(?=[a-z])/g, " ") 
+
+      // Többszörös szóközök eltávolítása
+      .replace(/\s{2,}/g, " ")
       .trim();
 
       // Send the analyzed text back to the frontend
@@ -161,6 +165,8 @@ exports.uploadPdfWithFormRecognizer = [
 
       const extractedText = analyzeResult.content;
       logger.info(`📄 Extracted text: ${extractedText.substring(0, 500)}...`);
+      logger.info("🔍 Extracted Text Before Processing:");
+      logger.info(extractedText);
 
       // 🔹 Szöveg kinyerésére szolgáló függvények (csak itt)
       function extractValue(text, regex) {
@@ -206,23 +212,34 @@ exports.uploadPdfWithFormRecognizer = [
               || extractValue(ocrText, 
               /\b([A-Za-z0-9\-\/]+)\s+ATEX\s+([A-Za-z0-9\-\/]+(?:\s*[XU])?)\b/i)
               || extractValue(ocrText, 
-              /\b([A-Za-z0-9\-\/]+)\s+IECEX\s+([A-Za-z0-9\-\/]+(?:\s*[XU])?)\b/i),
-            manufacturer: extractValue(ocrText, /(?:Manufacturer:|Manufactured by)\s*([^\n\r]+)/),
-            equipment: extractValue(ocrText, /(?:Equipment or Protective System:|Equipment:|Product:)\s*([^\n\r]+)/),
-            exMarking: extractValue(ocrText, 
-              /(?:\[12\]|\(12\)|The marking of the product shall include the following:)[^\n]*\n+([\s\S]+?)(?=\n\[\d+\]|\n[A-Z]{3,}|This certificate|TÜV|On behalf of)/i
-            )
-            ?.replace(/\nSUL\nEx\n/, 'Ex\n')
-            ?.replace(/@/, 'Ex')
-            ?.split("\n")
-            ?.map(line => line.trim())
-            ?.filter(line => /(?:Ex|EEx|II|I|IP|T\d|D\sT\d+°C)/.test(line))
-            ?.join(" ")
-            ?.trim(),
+              /\b([A-Za-z0-9\-\/]+)\s+IECEX\s+([A-Za-z0-9\-\/]+(?:\s*[XU])?)\b/i)
+              || extractValue(ocrText, 
+              /\b(TÜV\s*[A-Za-z]{2,4}\s*\d{2}\s*ATEX\s*\d{3,5}\s*[XU]?)\b/i) // NEW ATEX pattern
+              || "-",
+          
+            manufacturer: extractValue(ocrText, /(?:Manufacturer:|Manufactured by)\s*([^\n\r]+)/) || "-",
+          
+            equipment: extractValue(ocrText, 
+              /(?:Equipment or Protective System:|Equipment:|Product:)\s*([^\n\r]+)/) || "-",
+          
+            exMarking: (extractValue(ocrText, 
+                /(?:\[12\]|\(12\)|The marking of (?:the )?(?:equipment|product|protective system) shall include the following)[:\-\s]*([\s\S]+?)(?=\n\[\d+\]|\n[A-Z]{3,}|This certificate|TÜV|On behalf of)/i
+              ) || "")
+              .replace(/\nSUL\nEx\n/, 'Ex\n')
+              .replace(/@/, 'Ex')
+              .replace(/℃/gi, "°C")
+              .split(/[\n\s]+/)  // Fontos! Így a szóközzel vagy sortöréssel elválasztott Ex értékek is maradnak
+              .map(line => line.trim())
+              .filter(line => /(?:Ex|EEx|II|I|IP|T\d|D\sT\d+°C)/.test(line))
+              .join(" ")
+              .trim()
+              || "-",
+          
             specialConditions: extractValue(ocrText, 
-              /(?:Special conditions for safe use|Specific condition of use|Special Conditions of Use|Special Conditions)[\s:]*([\s\S]+?)(?=\n\[\d+\]|\n[A-Z]{4,}|\nThis certificate|\nTÜV|\nOn behalf of|\n[A-Z]+\s[A-Z]+)/),
-            issueDate: extractValue(ocrText,
-              /(?:Issue\s*date\s*[:.\s]*|Issued\s*on\s*)\s*(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{2}[-/]\d{2}[-/]\d{4})/i)
+              /(?:Special conditions for safe use|Specific condition of use|Special Conditions of Use|Special Conditions)[\s:]*([\s\S]+?)(?=\n\[\d+\]|\n[A-Z]{4,}|\nThis certificate|\nTÜV|\nOn behalf of|\n[A-Z]+\s[A-Z]+)/) || "-",
+          
+            issueDate: extractValue(ocrText, 
+              /(?:Issue\s*date\s*[:.\s]*|Issued\s*on\s*)\s*(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{2}[-/]\d{2}[-/]\d{4})/i) || "-"
           };
         }
 
@@ -232,6 +249,7 @@ exports.uploadPdfWithFormRecognizer = [
       // 🔹 Kivont adatok feldolgozása
       const extractedData = processOcrText(extractedText, certType);
       logger.info("📊 Extracted Data:", extractedData);
+      logger.info("📊 Extracted Data:", JSON.stringify(extractedData, null, 2));
 
       res.json({ recognizedText: extractedText, extractedData });
 

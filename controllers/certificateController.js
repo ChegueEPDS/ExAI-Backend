@@ -16,9 +16,6 @@ exports.uploadCertificate = async (req, res) => {
         if (err) return res.status(500).send('❌ Fájl feltöltési hiba.');
 
         const accessToken = req.headers.authorization?.split(" ")[1];
-        if (!accessToken) {
-            return res.status(401).json({ message: "❌ Access token szükséges!" });
-        }
 
         try {
             // 🔹 User ID átvétele
@@ -38,24 +35,49 @@ exports.uploadCertificate = async (req, res) => {
                 return res.status(400).json({ message: "❌ Érvénytelen felhasználó vagy hiányzó company adat!" });
             }
 
+            // 🔹 Ellenőrizzük, hogy a felhasználónak van-e Entra ID-ja (ha van `tenantId`, akkor igen)
+            const hasEntraID = !!user.tenantId;  // Ha `tenantId` van, akkor a user Microsoft fiókos
+
             const pdfPath = path.resolve(req.file.path);
             const pdfFileName = req.file.originalname;
-            const formattedDateTime = today.toISOString().slice(2, 10).replace(/-/g, '') + '-' + 
-                          today.toISOString().slice(11, 16).replace(/:/g, '');
+            const formattedDateTime = new Date().toISOString().slice(2, 10).replace(/-/g, '') + '-' + 
+                          new Date().toISOString().slice(11, 16).replace(/:/g, '');
 
-            // 📂 **OneDrive mappa létrehozása**
-            const rootFolderPath = "ExAI/Certificates";
-            const certFolderPath = `${rootFolderPath}/${certNo}_${formattedDateTime}`;
+            let folderId = null;
+            let folderUrl = null;
+            let fileUrl = null;
+            let fileId = null;
+            let docxUrl = null;
+            let docxId = null;
 
-            const { folderId, folderUrl } = await getOrCreateFolder(accessToken, certFolderPath);
+            // 📂 **OneDrive műveletek CSAK ha van Entra ID!**
+            if (hasEntraID && accessToken) {
+                const rootFolderPath = "ExAI/Certificates";
+                const certFolderPath = `${rootFolderPath}/${certNo}_${formattedDateTime}`;
+                
+                const folderData = await getOrCreateFolder(accessToken, certFolderPath);
+                folderId = folderData.folderId;
+                folderUrl = folderData.folderUrl;
 
-            // 📄 **DOCX generálás**
-            const extractedText = recognizedText || "Nincs OCR szöveg";
-            const docxFilePath = await generateDocxFile(extractedText, certNo);
+                // 📄 **DOCX generálás**
+                const extractedText = recognizedText || "Nincs OCR szöveg";
+                const docxFilePath = await generateDocxFile(extractedText, certNo);
 
-            // 📄 **PDF és DOCX feltöltése OneDrive-ra**
-            const pdfUploadResponse = await uploadToOneDrive(accessToken, folderId, pdfPath, pdfFileName);
-            const docxUploadResponse = await uploadToOneDrive(accessToken, folderId, docxFilePath, `${certNo}_extracted.docx`);
+                // 📄 **PDF és DOCX feltöltése OneDrive-ra**
+                const pdfUploadResponse = await uploadToOneDrive(accessToken, folderId, pdfPath, pdfFileName);
+                const docxUploadResponse = await uploadToOneDrive(accessToken, folderId, docxFilePath, `${certNo}_extracted.docx`);
+
+                fileUrl = pdfUploadResponse.webUrl;
+                fileId = pdfUploadResponse.id;
+                docxUrl = docxUploadResponse.webUrl;
+                docxId = docxUploadResponse.id;
+
+                // 🗑️ **Helyi fájlok törlése**
+                fs.unlinkSync(pdfPath);
+                fs.unlinkSync(docxFilePath);
+            } else {
+                console.log(`🔹 OneDrive feltöltés kihagyva, mert a felhasználó nem rendelkezik Entra ID-val (tenantId: ${user.tenantId})`);
+            }
 
             // 📂 **Tanúsítvány mentése MongoDB-be**
             const certificate = new Certificate({
@@ -69,34 +91,30 @@ exports.uploadCertificate = async (req, res) => {
                 manufacturer,
                 exmarking,
                 fileName: pdfFileName,
-                fileUrl: pdfUploadResponse.webUrl,
-                fileId: pdfUploadResponse.id,
-                docxUrl: docxUploadResponse.webUrl,
-                docxId: docxUploadResponse.id,
-                folderId: folderId,
-                folderUrl: folderUrl,
+                fileUrl,
+                fileId,
+                docxUrl,
+                docxId,
+                folderId,
+                folderUrl,
                 xcondition: xcondition === 'true' || xcondition === true,
                 specCondition: specCondition || null,
                 description: description,
                 ucondition: ucondition === 'true' || ucondition === true,
-                createdBy: userId, // 🔹 Beállítjuk a CreatedBy-t
-                company: user.company // ✅ Itt kézzel beállítjuk a Company-t
+                createdBy: userId,
+                company: user.company 
             });
 
             await certificate.save();
 
-            // 🗑️ **Helyi fájlok törlése**
-            fs.unlinkSync(pdfPath);
-            fs.unlinkSync(docxFilePath);
-
             // ✅ **Válasz küldése**
             res.json({
                 message: "✅ Feltöltés sikeres!",
-                fileUrl: pdfUploadResponse.webUrl,
-                docxUrl: docxUploadResponse.webUrl,
-                fileId: pdfUploadResponse.id,
-                docxId: docxUploadResponse.id,
-                folderId: folderId,
+                fileUrl,
+                docxUrl,
+                fileId,
+                docxId,
+                folderId,
                 data: certificate
             });
 
@@ -238,44 +256,62 @@ async function deleteFolderFromOneDrive(folderId, accessToken, retryCount = 3) {
 // 📂 **Tanúsítvány törlése (PDF, DOCX és a mappa)** 
 exports.deleteCertificate = async (req, res) => {
     try {
-        const accessToken = req.headers.authorization?.split(" ")[1];
-        if (!accessToken) {
-            return res.status(401).json({ message: "❌ Access token is required!" });
-        }
-
         const { id } = req.params;
+
+        // 🔎 1. Tanúsítvány keresése
         const certificate = await Certificate.findById(id);
         if (!certificate) {
             return res.status(404).json({ message: "❌ Certificate not found" });
         }
 
+        // 🔎 2. Tanúsítványhoz tartozó felhasználó keresése
+        const user = await User.findById(certificate.createdBy);
+        if (!user) {
+            return res.status(404).json({ message: "❌ Certificate owner not found" });
+        }
+
+        // 🔎 3. Ellenőrizzük, hogy a felhasználónak van-e Entra ID-ja
+        const hasEntraID = !!user.tenantId; // Ha `tenantId` van, akkor a user Microsoft fiókos
+
         let fileDeleteSuccess = true;
         let docxDeleteSuccess = true;
         let folderDeleteSuccess = true;
 
-        // 🔹 **PDF törlése**
-        if (certificate.fileId) {
-            fileDeleteSuccess = await deleteFileFromOneDrive(certificate.fileId, accessToken);
+        // 🛡️ 4. Ha van Entra ID, akkor szükség van az access tokenre is
+        let accessToken = null;
+        if (hasEntraID) {
+            accessToken = req.headers.authorization?.split(" ")[1];
+            if (!accessToken) {
+                return res.status(401).json({ message: "❌ Entra ID token szükséges a törléshez!" });
+            }
+            console.log(`🔹 Entra ID-val rendelkező felhasználó törli a tanúsítványt (tenantId: ${user.tenantId})`);
+        } else {
+            console.log(`🔹 Entra ID nélküli felhasználó törli a tanúsítványt (tenantId: null) - OneDrive műveletek kihagyva.`);
         }
 
-        // 🔹 **DOCX törlése**
-        if (certificate.docxId) {
-            docxDeleteSuccess = await deleteFileFromOneDrive(certificate.docxId, accessToken);
+        // 🗑️ 5. **OneDrive fájlok és mappa törlése CSAK, ha van Entra ID és token**
+        if (hasEntraID && accessToken) {
+            if (certificate.fileId) {
+                fileDeleteSuccess = await deleteFileFromOneDrive(certificate.fileId, accessToken);
+            }
+
+            if (certificate.docxId) {
+                docxDeleteSuccess = await deleteFileFromOneDrive(certificate.docxId, accessToken);
+            }
+
+            if (certificate.folderId) {
+                folderDeleteSuccess = await deleteFolderFromOneDrive(certificate.folderId, accessToken);
+            }
         }
 
-        // 🔹 **Mappa törlése**
-        if (certificate.folderId) {
-            folderDeleteSuccess = await deleteFolderFromOneDrive(certificate.folderId, accessToken);
-        }
-
-        // 🔥 **Ha bármelyik törlés sikertelen, ne folytassuk a törlést!**
-        if (!fileDeleteSuccess || !docxDeleteSuccess || !folderDeleteSuccess) {
+        // 🛑 6. Ha az Entra ID-s fájlok törlése sikertelen, akkor a MongoDB-t ne töröljük
+        if (hasEntraID && (!fileDeleteSuccess || !docxDeleteSuccess || !folderDeleteSuccess)) {
             return res.status(500).json({ message: "❌ Nem sikerült törölni az összes fájlt/mappát a OneDrive-ról!" });
         }
 
-        // 🔹 **Tanúsítvány törlése MongoDB-ből**
+        // 🗑️ 7. **Tanúsítvány törlése MongoDB-ből**
         await Certificate.findByIdAndDelete(id);
-        res.json({ message: "✅ Certificate deleted successfully, including files and folder!" });
+        res.json({ message: "✅ Certificate deleted successfully, including OneDrive files if applicable!" });
 
     } catch (error) {
         console.error("❌ Error deleting certificate:", error);

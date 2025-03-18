@@ -79,7 +79,14 @@ exports.login = async (req, res) => {
     }
 
     const token = jwt.sign(
-      { userId: user._id, nickname: user.nickname, role: user.role, company: user.company, lastName: user.lastName },
+      { 
+        userId: user._id,
+        nickname: user.nickname,
+        role: user.role,
+        company: user.company,
+        lastName: user.lastName,
+        tenantId: user.tenantId || null // 🔹 Tenant ID hozzáadása
+      },
       JWT_SECRET,
       { expiresIn: '1h' }
     );
@@ -161,17 +168,18 @@ exports.microsoftLogin = async (req, res) => {
 
       // 🔹 **JWT token létrehozása az azureId mezővel**
       const token = jwt.sign(
-          {
-              userId: user._id,
-              email: user.email,
-              role: user.role,
-              company: user.company,
-              firstName: user.firstName,
-              lastName: user.lastName,
-              azureId: user.azureId // **Azure ID beillesztése a tokenbe**
-          },
-          process.env.JWT_SECRET,
-          { expiresIn: '1h' }
+        {
+          userId: user._id,
+          email: user.email,
+          role: user.role,
+          company: user.company,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          azureId: user.azureId, // **Azure ID beillesztése**
+          tenantId: user.tenantId || null // 🔹 Tenant ID beillesztése
+        },
+        process.env.JWT_SECRET,
+        { expiresIn: '1h' }
       );
 
       console.log('✅ JWT token generálva:', token);
@@ -194,7 +202,13 @@ exports.renewToken = (req, res) => {
     const decoded = jwt.verify(oldToken, JWT_SECRET);
 
     const newToken = jwt.sign(
-      { userId: decoded.userId, nickname: decoded.nickname, role: decoded.role, company: decoded.company },
+      { 
+        userId: decoded.userId, 
+        nickname: decoded.nickname, 
+        role: decoded.role, 
+        company: decoded.company,
+        tenantId: decoded.tenantId || null // 🔹 Tenant ID beillesztése az új tokenbe
+      },
       JWT_SECRET,
       { expiresIn: '1h' }
     );

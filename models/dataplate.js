@@ -13,9 +13,9 @@ const ExMarkingSchema = new mongoose.Schema({
 
 const EquipmentSchema = new mongoose.Schema({
   "EqID": { type: String },
-  "Manufacturer": { type: String, required: true },
-  "Model/Type": { type: String, required: true },
-  "Serial Number": { type: String, required: true },
+  "Manufacturer": { type: String },
+  "Model/Type": { type: String },
+  "Serial Number": { type: String },
   "Equipment Type": { type: String, default: "-" },
   "Ex Marking": { type: [ExMarkingSchema], default: [] },
   "IP rating": String,

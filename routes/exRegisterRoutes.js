@@ -17,4 +17,8 @@ router.put('/exreg/:id', authMiddleware(), exRegisterController.updateEquipment)
 // Törlés
 router.delete('/exreg/:id', authMiddleware(), exRegisterController.deleteEquipment);
 
+// Gyártók lekérdezése
+router.get('/manufacturers', authMiddleware(), exRegisterController.getManufacturers);
+
+
 module.exports = router;
