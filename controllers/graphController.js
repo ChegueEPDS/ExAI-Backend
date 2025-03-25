@@ -33,7 +33,7 @@ exports.getOrCreateFolder = async function (accessToken, folderPath) {
                     continue;
                 }
             } catch (error) {
-                console.error(`❌ Error checking folder: ${error.response?.data || error.message}`);
+                console.error('❌ Error checking folder:', error.response?.data || error.message || error);
                 return null;
             }
 
@@ -50,7 +50,7 @@ exports.getOrCreateFolder = async function (accessToken, folderPath) {
                 folderUrl = createResponse.data.webUrl; // 🔹 Get OneDrive folder URL
                 console.log(`✅ Folder created: ${folder} (ID: ${parentFolderId}, URL: ${folderUrl})`);
             } catch (error) {
-                console.error(`❌ Error creating folder: ${error.response?.data || error.message}`);
+                console.error('❌ Error checking folder:', error.response?.data || error.message || error);;
                 return null;
             }
         }

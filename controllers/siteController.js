@@ -1,27 +1,56 @@
 const Site = require('../models/site'); // Importáljuk a Site modellt
 const User = require('../models/user'); // Importáljuk a User modellt
+const Zone = require('../models/zone'); // Ez kell a file tetejére is
+const Equipment = require('../models/dataplate'); // 👈 importáljuk a modell tetején
+const { getOrCreateFolder } = require('../controllers/graphController');
 const mongoose = require('mongoose');
 
 // 🔹 Új site létrehozása
 exports.createSite = async (req, res) => {
     try {
-        const CreatedBy = req.userId; // A tokenből kivesszük a user ID-t
-        const Company = req.user.company; // A tokenből kivesszük a company mezőt
+        const CreatedBy = req.userId;
+        const Company = req.user.company;
 
-        // Ellenőrizzük, hogy a usernek van-e company értéke
         if (!Company) {
             return res.status(400).json({ message: "Company is missing in token" });
         }
 
-        // Új Site létrehozása
+        // 🔎 Felhasználó lekérése tenantId ellenőrzéshez
+        const user = await User.findById(CreatedBy);
+        const hasEntraID = !!user?.tenantId;
+
+        // 1️⃣ Site létrehozása és mentése
         const newSite = new Site({
             Name: req.body.Name,
             Client: req.body.Client,
-            CreatedBy: CreatedBy, 
-            Company: Company, // Company a JWT-ből jön
+            CreatedBy: CreatedBy,
+            Company: Company,
         });
 
         await newSite.save();
+
+        // 2️⃣ OneDrive mappa létrehozása CSAK Entra ID-s usernél
+        const accessToken = req.headers['x-ms-graph-token'];
+        if (hasEntraID && accessToken) {
+            console.log('🔐 Entra ID-s user. Access token megvan, próbáljuk létrehozni a mappát...');
+        
+            const folderPath = `ExAI/Projects/${newSite.Name}`;
+            const folderResult = await getOrCreateFolder(accessToken, folderPath);
+        
+            console.log('📁 OneDrive folder result:', folderResult);
+        
+            if (folderResult && folderResult.folderId) {
+                newSite.oneDriveFolderUrl = folderResult.folderUrl;
+                await newSite.save();
+                console.log(`✅ OneDrive mappa létrejött: ${folderPath}`);
+            } else {
+                console.warn(`⚠️ Nem sikerült létrehozni a mappát: ${folderPath}`);
+            }
+        } else {
+            console.log(`🔹 OneDrive mappa kihagyva. hasEntraID: ${hasEntraID}, token: ${!!accessToken}`);
+        }
+
+        // 4️⃣ Válasz kiküldése
         res.status(201).json(newSite);
     } catch (error) {
         res.status(500).json({ message: "Server error", error: error.message });
@@ -92,11 +121,21 @@ exports.updateSite = async (req, res) => {
 // 🔹 Site törlése
 exports.deleteSite = async (req, res) => {
     try {
-        const site = await Site.findByIdAndDelete(req.params.id);
+        const siteId = req.params.id;
+
+        // 1️⃣ Töröljük az összes eszközt, ami ehhez a site-hoz tartozik
+        await Equipment.deleteMany({ Site: siteId });
+
+        // 2️⃣ Töröljük az összes zónát, ami ehhez a site-hoz tartozik
+        await Zone.deleteMany({ Site: siteId });
+
+        // 3️⃣ Végül töröljük a site-ot
+        const site = await Site.findByIdAndDelete(siteId);
         if (!site) {
             return res.status(404).json({ message: "Site not found" });
         }
-        res.status(200).json({ message: "Site deleted successfully" });
+
+        res.status(200).json({ message: "Site, related zones and equipment deleted successfully" });
     } catch (error) {
         res.status(500).json({ message: "Server error", error: error.message });
     }

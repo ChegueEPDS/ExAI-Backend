@@ -49,7 +49,7 @@ const allowedOrigins = process.env.CORS_ALLOWED_ORIGINS
     },
     methods: 'GET,POST,PUT,DELETE',
     credentials: true,
-    allowedHeaders: ['Authorization', 'Content-Type']
+    allowedHeaders: ['Authorization', 'Content-Type', 'x-ms-graph-token']
   }));
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(limiter);

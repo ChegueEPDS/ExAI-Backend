@@ -38,7 +38,8 @@ const ZoneSchema = new mongoose.Schema(
         Site: {
             type: mongoose.Schema.Types.ObjectId,
             ref: 'Site',
-        }
+        },
+        oneDriveFolderUrl: { type: String },
     }, 
     { timestamps: true }
 );
