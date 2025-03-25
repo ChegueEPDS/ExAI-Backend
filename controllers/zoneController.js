@@ -2,7 +2,7 @@ const Zone = require('../models/zone'); // A Zone modell importálása
 const User = require('../models/user'); 
 const Equipment = require('../models/dataplate'); // 👈 hozzáadandó a fájl tetejére
 const mongoose = require('mongoose');
-const { getOrCreateFolder } = require('../controllers/graphController');
+const { getOrCreateFolder, deleteOneDriveItemById, renameOneDriveItemById } = require('../controllers/graphController');
 
 
 
@@ -36,6 +36,8 @@ exports.createZone = async (req, res) => {
 
                 if (folderResult && folderResult.folderId) {
                     zone.oneDriveFolderUrl = folderResult.folderUrl;
+                    zone.oneDriveFolderId = folderResult.folderId;
+
                     await zone.save(); // 💾 újra mentjük a frissített mezőkkel
 
                     console.log(`✅ Zóna mappa létrejött: ${folderPath}`);
@@ -100,19 +102,45 @@ exports.getZoneById = async (req, res) => {
 exports.updateZone = async (req, res) => {
     try {
         if (req.body.CreatedBy) {
-            delete req.body.CreatedBy; // Ne engedjük módosítani a CreatedBy mezőt
+            delete req.body.CreatedBy;
         }
 
-        const zone = await Zone.findByIdAndUpdate(req.params.id, req.body, { 
-            new: true, 
-            runValidators: true 
-        });
-
+        const zone = await Zone.findById(req.params.id);
         if (!zone) {
             return res.status(404).json({ error: 'Zone not found' });
         }
+
+        const oldName = zone.Name;
+        const newName = req.body.Name;
+
+        // 🔁 Ha a zóna neve változott és van OneDrive mappa, próbáljuk átnevezni
+        const user = await User.findById(req.userId);
+        const hasEntraID = !!user?.tenantId;
+        const accessToken = req.headers['x-ms-graph-token'];
+
+        if (hasEntraID && accessToken && zone.oneDriveFolderId && newName && newName !== oldName) {
+            console.log(`✏️ Próbáljuk átnevezni a OneDrive mappát: ${oldName} → ${newName}`);
+            try {
+                const renameResult = await renameOneDriveItemById(zone.oneDriveFolderId, newName, accessToken);
+                if (renameResult?.webUrl) {
+                    zone.oneDriveFolderUrl = renameResult.webUrl;
+                }
+                if (renameResult?.id) {
+                    zone.oneDriveFolderId = renameResult.id; // ✅ fontos!
+                }
+            } catch (err) {
+                console.warn(`⚠️ OneDrive mappa átnevezés sikertelen:`, err.response?.data || err.message);
+            }
+        }
+
+        // ✅ Frissítés alkalmazása
+        Object.assign(zone, req.body);
+        zone.ModifiedBy = req.userId;
+        await zone.save();
+
         res.status(200).json({ message: 'Zone updated successfully', zone });
     } catch (error) {
+        console.error("❌ Zóna módosítási hiba:", error);
         res.status(400).json({ error: error.message });
     }
 };
@@ -125,14 +153,32 @@ exports.deleteZone = async (req, res) => {
         // 1️⃣ Töröljük az eszközöket, amik ehhez a zónához tartoznak
         await Equipment.deleteMany({ Zone: zoneId });
 
-        // 2️⃣ Töröljük magát a zónát
-        const zone = await Zone.findByIdAndDelete(zoneId);
+        // 2️⃣ Zóna adatainak lekérése
+        const zone = await Zone.findById(zoneId);
         if (!zone) {
             return res.status(404).json({ error: 'Zone not found' });
         }
 
+        const user = await User.findById(req.userId);
+        const hasEntraID = !!user?.tenantId;
+        const accessToken = req.headers['x-ms-graph-token'];
+
+        if (hasEntraID && accessToken) {
+            // 🗑️ Zóna mappa törlése OneDrive-ról
+            if (zone.oneDriveFolderId) {
+                await deleteOneDriveItemById(zone.oneDriveFolderId, accessToken);
+                console.log(`🗑️ Zóna mappa törölve OneDrive-ról (ID: ${zone.oneDriveFolderId})`);
+            }
+        } else {
+            console.log(`🔹 OneDrive törlés kihagyva. hasEntraID: ${hasEntraID}, token: ${!!accessToken}`);
+        }
+
+        // 3️⃣ Zóna törlése
+        await Zone.findByIdAndDelete(zoneId);
+
         res.status(200).json({ message: 'Zone and related equipment deleted successfully' });
     } catch (error) {
+        console.error("❌ Zóna törlés hiba:", error);
         res.status(500).json({ error: error.message });
     }
 };

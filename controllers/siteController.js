@@ -2,7 +2,7 @@ const Site = require('../models/site'); // Importáljuk a Site modellt
 const User = require('../models/user'); // Importáljuk a User modellt
 const Zone = require('../models/zone'); // Ez kell a file tetejére is
 const Equipment = require('../models/dataplate'); // 👈 importáljuk a modell tetején
-const { getOrCreateFolder } = require('../controllers/graphController');
+const { getOrCreateFolder, deleteOneDriveItemById } = require('../controllers/graphController');
 const mongoose = require('mongoose');
 
 // 🔹 Új site létrehozása
@@ -41,6 +41,7 @@ exports.createSite = async (req, res) => {
         
             if (folderResult && folderResult.folderId) {
                 newSite.oneDriveFolderUrl = folderResult.folderUrl;
+                newSite.oneDriveFolderId = folderResult.folderId;
                 await newSite.save();
                 console.log(`✅ OneDrive mappa létrejött: ${folderPath}`);
             } else {
@@ -91,10 +92,28 @@ exports.updateSite = async (req, res) => {
     try {
         const { Name, Client, CreatedBy } = req.body;
 
-        // Ellenőrizzük, hogy létezik-e a módosítani kívánt site
+        // 🔍 Site lekérése
         let site = await Site.findById(req.params.id);
         if (!site) {
             return res.status(404).json({ message: "Site not found" });
+        }
+
+        const oldName = site.Name;
+        const newName = Name;
+
+        // 🔍 Felhasználó ellenőrzés a OneDrive-hoz
+        const user = await User.findById(req.userId);
+        const hasEntraID = !!user?.tenantId;
+        const accessToken = req.headers['x-ms-graph-token'];
+
+        // ✏️ OneDrive mappa átnevezés, ha változott a név
+        if (hasEntraID && accessToken && site.oneDriveFolderId && newName && newName !== oldName) {
+            console.log(`✏️ Site mappa átnevezése: ${oldName} → ${newName}`);
+            const { renameOneDriveItemById } = require('../controllers/graphController');
+            const renameResult = await renameOneDriveItemById(site.oneDriveFolderId, newName, accessToken);
+            if (renameResult?.webUrl) {
+                site.oneDriveFolderUrl = renameResult.webUrl;
+            }
         }
 
         // Ha változik a CreatedBy, akkor frissítjük a Company mezőt is
@@ -106,14 +125,15 @@ exports.updateSite = async (req, res) => {
             site.Company = user.company;
         }
 
-        // Módosítások alkalmazása
-        site.Name = Name || site.Name;
+        // ✅ Módosítások alkalmazása
+        site.Name = newName || site.Name;
         site.Client = Client || site.Client;
         site.CreatedBy = CreatedBy || site.CreatedBy;
 
         await site.save();
         res.status(200).json(site);
     } catch (error) {
+        console.error("❌ Site módosítás hiba:", error);
         res.status(500).json({ message: "Server error", error: error.message });
     }
 };
@@ -123,20 +143,55 @@ exports.deleteSite = async (req, res) => {
     try {
         const siteId = req.params.id;
 
-        // 1️⃣ Töröljük az összes eszközt, ami ehhez a site-hoz tartozik
-        await Equipment.deleteMany({ Site: siteId });
+        const site = await Site.findById(siteId);
+        if (!site) return res.status(404).json({ message: "Site not found" });
 
-        // 2️⃣ Töröljük az összes zónát, ami ehhez a site-hoz tartozik
-        await Zone.deleteMany({ Site: siteId });
+        const user = await User.findById(req.userId);
+        const hasEntraID = !!user?.tenantId;
+        const accessToken = req.headers['x-ms-graph-token'];
 
-        // 3️⃣ Végül töröljük a site-ot
-        const site = await Site.findByIdAndDelete(siteId);
-        if (!site) {
-            return res.status(404).json({ message: "Site not found" });
+        const zones = await Zone.find({ Site: siteId });
+
+        if (hasEntraID && accessToken) {
+            // 🗑️ Site mappa törlése
+            if (site.oneDriveFolderUrl) {
+                const folderId = site.oneDriveFolderId;
+                if (folderId) {
+                    await deleteOneDriveItemById(folderId, accessToken);
+                    console.log(`🗑️ Site mappa törölve OneDrive-ról (ID: ${folderId})`);
+                }
+            }
+
+            // 🗑️ Zóna mappák törlése
+            for (const zone of zones) {
+                if (zone.oneDriveFolderUrl) {
+                    const folderId = zone.oneDriveFolderId;
+                    if (folderId) {
+                        await deleteOneDriveItemById(folderId, accessToken);
+                        console.log(`🗑️ Zóna mappa törölve: ${zone.Name} (ID: ${folderId})`);
+                    }
+                }
+            }
+        } else {
+            console.log(`🔹 OneDrive törlés kihagyva. hasEntraID: ${hasEntraID}, token: ${!!accessToken}`);
         }
 
-        res.status(200).json({ message: "Site, related zones and equipment deleted successfully" });
+        await Equipment.deleteMany({ Site: siteId });
+        await Zone.deleteMany({ Site: siteId });
+        await site.deleteOne();
+
+        res.status(200).json({ message: "Site, related zones, equipment, and OneDrive folders deleted successfully" });
     } catch (error) {
+        console.error("❌ Site törlés hiba:", error);
         res.status(500).json({ message: "Server error", error: error.message });
     }
 };
+
+function extractFolderIdFromUrl(url) {
+    try {
+        const match = url.match(/resid=([A-Za-z0-9!]+)/);
+        return match ? match[1] : null;
+    } catch {
+        return null;
+    }
+}

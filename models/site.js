@@ -13,6 +13,7 @@ const SiteSchema = new mongoose.Schema({
         required: true 
     },
     oneDriveFolderUrl: { type: String }, 
+    oneDriveFolderId: { type: String },
 }, { timestamps: true });
 
 // Mielőtt mentenénk a Site modellt, beállítjuk a Company értékét a CreatedBy felhasználó alapján
