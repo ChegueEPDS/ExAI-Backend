@@ -41,6 +41,15 @@ const ZoneSchema = new mongoose.Schema(
         },
         oneDriveFolderUrl: { type: String },
         oneDriveFolderId: { type: String },
+        documents: [
+            {
+              name: { type: String },
+              oneDriveId: { type: String },
+              oneDriveUrl: { type: String },
+              type: { type: String, enum: ['document', 'image'], default: 'document' },
+              uploadedAt: { type: Date, default: Date.now }
+            }
+          ]
     }, 
     { timestamps: true }
 );

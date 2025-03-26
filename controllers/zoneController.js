@@ -2,9 +2,16 @@ const Zone = require('../models/zone'); // A Zone modell importálása
 const User = require('../models/user'); 
 const Equipment = require('../models/dataplate'); // 👈 hozzáadandó a fájl tetejére
 const mongoose = require('mongoose');
+const fs = require('fs');
+const axios = require('axios');
 const { getOrCreateFolder, deleteOneDriveItemById, renameOneDriveItemById } = require('../controllers/graphController');
 
-
+function cleanFileName(filename) {
+    return filename
+      .normalize("NFKD")                         // Szétbontott ékezetek eltávolítása
+      .replace(/[\u0300-\u036f]/g, "")           // Diakritikus jelek eltávolítása
+      .replace(/[^a-zA-Z0-9.\-_ ]/g, "_");       // Biztonságos karakterek megtartása
+  }
 
 // Új zóna létrehozása
 exports.createZone = async (req, res) => {
@@ -182,3 +189,91 @@ exports.deleteZone = async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 };
+
+exports.uploadFileToZone = async (req, res) => {
+    try {
+      const zone = await Zone.findById(req.params.id);
+      if (!zone) return res.status(404).json({ message: "Zone not found" });
+  
+      const accessToken = req.headers['x-ms-graph-token'];
+      const files = req.files;
+      const folderId = zone.oneDriveFolderId;
+  
+      if (!folderId || !accessToken) {
+        return res.status(400).json({ message: "Missing OneDrive access or folder" });
+      }
+  
+      const uploadedFiles = [];
+  
+      for (const file of files) {
+        const fileBuffer = fs.readFileSync(file.path);
+        const safeFileName = encodeURIComponent(cleanFileName(file.originalname));
+          
+        const uploadResponse = await axios.put(
+          `https://graph.microsoft.com/v1.0/me/drive/items/${folderId}:/${safeFileName}:/content`,
+          fileBuffer,
+          {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              'Content-Type': 'application/octet-stream'
+            }
+          }
+        );
+  
+        uploadedFiles.push({
+          name: file.originalname,
+          oneDriveId: uploadResponse.data.id,
+          oneDriveUrl: uploadResponse.data.webUrl,
+          type: file.mimetype.startsWith('image') ? 'image' : 'document'
+        });
+  
+        fs.unlinkSync(file.path); // 🧹 ideiglenes fájl törlése
+      }
+  
+      zone.documents = zone.documents || [];
+      zone.documents.push(...uploadedFiles);
+      await zone.save();
+  
+      res.status(200).json({ message: "Files uploaded and saved", files: uploadedFiles });
+    } catch (error) {
+      console.error("❌ Zone file upload error:", error);
+      res.status(500).json({ message: "Failed to upload files to zone", error: error.message });
+    }
+  };
+
+  exports.getFilesOfZone = async (req, res) => {
+    try {
+      const zone = await Zone.findById(req.params.id);
+      if (!zone) return res.status(404).json({ message: "Zone not found" });
+  
+      res.status(200).json(zone.documents || []);
+    } catch (error) {
+      res.status(500).json({ message: "Fetch failed", error: error.message });
+    }
+  };
+
+  exports.deleteFileFromZone = async (req, res) => {
+    try {
+      const { zoneId, fileId } = req.params;
+      const accessToken = req.headers['x-ms-graph-token'];
+  
+      const zone = await Zone.findById(zoneId);
+      if (!zone) return res.status(404).json({ message: "Zone not found" });
+  
+      const fileToDelete = zone.documents.find(doc => doc.oneDriveId === fileId);
+      if (!fileToDelete) return res.status(404).json({ message: "File not found" });
+  
+      await axios.delete(`https://graph.microsoft.com/v1.0/me/drive/items/${fileId}`, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+  
+      zone.documents = zone.documents.filter(doc => doc.oneDriveId !== fileId);
+      await zone.save();
+  
+      res.status(200).json({ message: "File deleted" });
+    } catch (error) {
+      console.error("❌ File delete error:", error.message);
+      res.status(500).json({ message: "Failed to delete", error: error.message });
+    }
+  };
+

@@ -7,6 +7,13 @@ const mongoose = require('mongoose');
 const fs = require('fs');
 const axios = require('axios');
 
+function cleanFileName(filename) {
+    return filename
+      .normalize("NFKD")                         // Szétbontott ékezetek eltávolítása
+      .replace(/[\u0300-\u036f]/g, "")           // Diakritikus jelek eltávolítása
+      .replace(/[^a-zA-Z0-9.\-_ ]/g, "_");       // Biztonságos karakterek megtartása
+  }
+
 // 🔹 Új site létrehozása
 exports.createSite = async (req, res) => {
     try {
@@ -208,7 +215,7 @@ exports.uploadFileToSite = async (req, res) => {
         const fileBuffer = fs.readFileSync(file.path);
   
         const uploadResponse = await axios.put(
-          `https://graph.microsoft.com/v1.0/me/drive/items/${folderId}:/${file.originalname}:/content`,
+          `https://graph.microsoft.com/v1.0/me/drive/items/${folderId}:/${encodeURIComponent(cleanFileName(file.originalname))}:/content`,
           fileBuffer,
           {
             headers: {
