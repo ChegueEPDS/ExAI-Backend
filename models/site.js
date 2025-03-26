@@ -14,6 +14,15 @@ const SiteSchema = new mongoose.Schema({
     },
     oneDriveFolderUrl: { type: String }, 
     oneDriveFolderId: { type: String },
+    documents: [
+        {
+          name: { type: String },
+          oneDriveId: { type: String },
+          oneDriveUrl: { type: String },
+          type: { type: String, enum: ['document', 'image'], default: 'document' }, // vagy más logika szerint
+          uploadedAt: { type: Date, default: Date.now }
+        }
+      ]
 }, { timestamps: true });
 
 // Mielőtt mentenénk a Site modellt, beállítjuk a Company értékét a CreatedBy felhasználó alapján

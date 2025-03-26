@@ -4,6 +4,8 @@ const Zone = require('../models/zone'); // Ez kell a file tetejére is
 const Equipment = require('../models/dataplate'); // 👈 importáljuk a modell tetején
 const { getOrCreateFolder, deleteOneDriveItemById } = require('../controllers/graphController');
 const mongoose = require('mongoose');
+const fs = require('fs');
+const axios = require('axios');
 
 // 🔹 Új site létrehozása
 exports.createSite = async (req, res) => {
@@ -187,11 +189,100 @@ exports.deleteSite = async (req, res) => {
     }
 };
 
-function extractFolderIdFromUrl(url) {
+exports.uploadFileToSite = async (req, res) => {
     try {
-        const match = url.match(/resid=([A-Za-z0-9!]+)/);
-        return match ? match[1] : null;
-    } catch {
-        return null;
+      const site = await Site.findById(req.params.id);
+      if (!site) return res.status(404).json({ message: "Site not found" });
+  
+      const accessToken = req.headers['x-ms-graph-token'];
+      const files = req.files; // most már tömb
+      const folderId = site.oneDriveFolderId;
+  
+      if (!folderId || !accessToken) {
+        return res.status(400).json({ message: "Missing OneDrive access or folder" });
+      }
+  
+      const uploadedFiles = [];
+  
+      for (const file of files) {
+        const fileBuffer = fs.readFileSync(file.path);
+  
+        const uploadResponse = await axios.put(
+          `https://graph.microsoft.com/v1.0/me/drive/items/${folderId}:/${file.originalname}:/content`,
+          fileBuffer,
+          {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              'Content-Type': 'application/octet-stream'
+            }
+          }
+        );
+  
+        uploadedFiles.push({
+          name: file.originalname,
+          oneDriveId: uploadResponse.data.id,
+          oneDriveUrl: uploadResponse.data.webUrl,
+          type: file.mimetype.startsWith('image') ? 'image' : 'document'
+        });
+  
+        fs.unlinkSync(file.path); // töröljük a temp fájlt
+      }
+  
+      site.documents.push(...uploadedFiles); // hozzáadjuk az összeset
+      await site.save();
+  
+      res.status(200).json({ message: "Files uploaded and saved", files: uploadedFiles });
+    } catch (error) {
+      console.error("❌ Multiple file upload error:", error.message || error);
+      res.status(500).json({ message: "Failed to upload files", error: error.message });
     }
-}
+  };
+
+  exports.getFilesOfSite = async (req, res) => {
+    try {
+      const site = await Site.findById(req.params.id);
+      if (!site) return res.status(404).json({ message: "Site not found" });
+  
+      res.status(200).json(site.documents || []);
+    } catch (error) {
+      console.error("❌ File list fetch error:", error.message || error);
+      res.status(500).json({ message: "Failed to fetch files", error: error.message });
+    }
+  };
+
+  exports.deleteFileFromSite = async (req, res) => {
+    try {
+      const { siteId, fileId } = req.params;
+      const accessToken = req.headers['x-ms-graph-token'];
+  
+      const site = await Site.findById(siteId);
+      if (!site) return res.status(404).json({ message: "Site not found" });
+  
+      const fileToDelete = site.documents.find(doc => doc.oneDriveId === fileId);
+      if (!fileToDelete) return res.status(404).json({ message: "File not found in site" });
+  
+      if (!accessToken) {
+        return res.status(400).json({ message: "Missing OneDrive access token" });
+      }
+  
+      // 1️⃣ Próbáljuk meg törölni a OneDrive-ból
+      try {
+        await axios.delete(
+          `https://graph.microsoft.com/v1.0/me/drive/items/${fileId}`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        console.log(`🗑️ Fájl törölve OneDrive-ból (ID: ${fileId})`);
+      } catch (deleteErr) {
+        console.warn(`⚠️ OneDrive törlés sikertelen vagy nem szükséges (ID: ${fileId})`, deleteErr.response?.status);
+      }
+  
+      // 2️⃣ Töröljük a dokumentumot a Site modellből
+      site.documents = site.documents.filter(doc => doc.oneDriveId !== fileId);
+      await site.save();
+  
+      res.status(200).json({ message: "File deleted from site and OneDrive (if applicable)" });
+    } catch (error) {
+      console.error("❌ File delete error:", error.message || error);
+      res.status(500).json({ message: "Failed to delete file", error: error.message });
+    }
+  };
