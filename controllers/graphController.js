@@ -156,51 +156,6 @@ exports.uploadOneDriveFile = async (req, res) => {
 };
 
 /**
- * 🗑️ Fájl vagy mappa törlése az ExAI mappából
- */
-exports.deleteOneDriveItem = async (req, res) => {
-    const accessToken = req.headers.authorization?.split(" ")[1];
-    const itemId = req.params.itemId;
-
-    if (!accessToken || !itemId) {
-        return res.status(400).json({ error: "❌ Access token and itemId are required" });
-    }
-
-    try {
-        await axios.delete(`https://graph.microsoft.com/v1.0/me/drive/items/${itemId}`, {
-            headers: { Authorization: `Bearer ${accessToken}` },
-        });
-
-        console.log("✅ Fájl/Mappa törölve:", itemId);
-        res.json({ message: "Deleted successfully" });
-    } catch (error) {
-        console.error("❌ Törlési hiba:", error.response?.data || error.message);
-        res.status(500).json({ error: "Failed to delete item" });
-    }
-};
-
-/**
- * 🛠️ Használható backend belső logikában (pl. site/zóna törlésekor)
- */
-exports.deleteOneDriveItemById = async (itemId, accessToken) => {
-    if (!accessToken || !itemId) {
-        throw new Error("❌ Missing accessToken or itemId in deleteOneDriveItemById");
-    }
-
-    try {
-        await axios.delete(`https://graph.microsoft.com/v1.0/me/drive/items/${itemId}`, {
-            headers: { Authorization: `Bearer ${accessToken}` },
-        });
-
-        console.log("✅ OneDrive fájl vagy mappa törölve:", itemId);
-        return true;
-    } catch (error) {
-        console.error("❌ Törlési hiba (deleteOneDriveItemById):", error.response?.data || error.message);
-        throw error;
-    }
-};
-
-/**
  * 🗑️ Fájl vagy mappa törlése - HTTP API endpointként
  */
 exports.deleteOneDriveItem = async (req, res) => {
@@ -216,6 +171,32 @@ exports.deleteOneDriveItem = async (req, res) => {
         res.json({ message: "Deleted successfully" });
     } catch (error) {
         res.status(500).json({ error: "Failed to delete item" });
+    }
+};
+
+exports.deleteOneDriveItemById = async (itemId, accessToken) => {
+    try {
+        const response = await axios.delete(
+            `https://graph.microsoft.com/v1.0/me/drive/items/${itemId}`,
+            {
+                headers: {
+                    Authorization: `Bearer ${accessToken}`
+                }
+            }
+        );
+
+        console.log(`✅ OneDrive item deleted: ${itemId}`);
+        return true;
+    } catch (error) {
+        const status = error?.response?.status;
+        
+        if (status === 404) {
+            console.warn(`⚠️ OneDrive item already deleted or not found: ${itemId}`);
+            return true; // 🔁 Továbbmehetünk
+        }
+
+        console.error(`❌ OneDrive item delete error (${itemId}):`, error.response?.data || error.message);
+        throw error; // Más hibát továbbra is dobjunk
     }
 };
 
@@ -246,28 +227,24 @@ exports.renameOneDriveItem = async (req, res) => {
     }
 };
 
-exports.deleteOneDriveItemById = async (itemId, accessToken) => {
+
+exports.renameOneDriveItemById = async (itemId, accessToken, newName) => {
     try {
-        const response = await axios.delete(
-            `https://graph.microsoft.com/v1.0/me/drive/items/${itemId}`,
-            {
-                headers: {
-                    Authorization: `Bearer ${accessToken}`
-                }
-            }
-        );
-
-        console.log(`✅ OneDrive item deleted: ${itemId}`);
-        return true;
-    } catch (error) {
-        const status = error?.response?.status;
-        
-        if (status === 404) {
-            console.warn(`⚠️ OneDrive item already deleted or not found: ${itemId}`);
-            return true; // 🔁 Továbbmehetünk
+      const response = await axios.patch(
+        `https://graph.microsoft.com/v1.0/me/drive/items/${itemId}`,
+        { name: newName },
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
         }
-
-        console.error(`❌ OneDrive item delete error (${itemId}):`, error.response?.data || error.message);
-        throw error; // Más hibát továbbra is dobjunk
+      );
+  
+      console.log(`✅ OneDrive item renamed to "${newName}" (ID: ${itemId})`);
+      return response.data;
+    } catch (error) {
+      console.error(`❌ Rename error for ID ${itemId}:`, error.response?.data || error.message);
+      throw error;
     }
-};
+  };

@@ -1,37 +1,115 @@
 const Equipment = require('../models/dataplate'); // Itt használjuk a valódi model nevét
 const Zone = require('../models/zone')
+const Site = require('../models/site');
 const logger = require('../config/logger'); // ha van loggered, vagy kiveheted
 const mongoose = require('mongoose');
+const fs = require('fs');
+const axios = require('axios'); // ezt is, ha OneDrive-hoz képek feltöltése van
+const { getOrCreateFolder, deleteOneDriveItemById, renameOneDriveItemById } = require('../controllers/graphController');
 
 // Létrehozás (POST /exreg)
+// 🔧 Segédfüggvény a fájlnév tisztítására
+function cleanFileName(filename) {
+  return filename
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9.\-_ ]/g, "_");
+}
+
+// 📥 Létrehozás (POST /exreg)
 exports.createEquipment = async (req, res) => {
+  console.log('📥 equipmentData:', req.body.equipmentData);
+console.log('📸 Feltöltött fájlok:', req.files.map(f => f.originalname));
   try {
-    const CreatedBy = req.userId; // 🔹 Tokenből kinyerjük a user ID-t
-    const Company = req.user.company; // 🔹 Tokenből kinyerjük a company-t
+    const CreatedBy = req.userId;
+    const Company = req.user.company;
 
     if (!Company) {
       return res.status(400).json({ message: "Company is missing in token" });
     }
 
-    console.log("Bejelentkezett felhasználó:", { CreatedBy, Company });
+    const azureToken = req.headers['x-ms-graph-token'];
+    const equipmentData = JSON.parse(req.body.equipmentData || "[]");
+    const files = req.files || [];
 
-    // Ellenőrizzük, hogy a kérés tömböt tartalmaz-e
-    const equipmentData = Array.isArray(req.body) ? req.body : [req.body];
+    const processedEquipments = [];
 
-    // Minden berendezéshez hozzáadjuk a CreatedBy és Company mezőt
-    const equipmentWithUser = equipmentData.map(eq => ({
-      ...eq,
-      CreatedBy: CreatedBy,
-      Company: Company
-    }));
+    for (const equipment of equipmentData) {
+      const eqId = equipment.EqID || new mongoose.Types.ObjectId().toString();
 
-    // Tömeges mentés az adatbázisba
-    const savedEquipments = await Equipment.insertMany(equipmentWithUser);
-    
+      let folderPath;
+      if (equipment.Zone && equipment.Site) {
+        const zoneDoc = await Zone.findById(equipment.Zone).lean();
+        const siteDoc = await Site.findById(equipment.Site).lean();
+        const zoneName = zoneDoc?.Name || `Zone_${equipment.Zone}`;
+        const siteName = siteDoc?.Name || `Site_${equipment.Site}`;
+        folderPath = `ExAI/Projects/${siteName}/${zoneName}/${eqId}`;
+      } else {
+        folderPath = `ExAI/Equipment/${eqId}`;
+      }
+
+      const equipmentFiles = files.filter((file) => {
+        const eqIdInName = file.originalname.split('__')[0];
+        return eqIdInName === eqId;
+      });
+
+      let pictures = [];
+      let oneDriveFolderId = null;
+      let oneDriveFolderUrl = null;
+
+      if (azureToken && equipmentFiles.length > 0) {
+        const folderResult = await getOrCreateFolder(azureToken, folderPath);
+
+        if (folderResult?.folderId) {
+          oneDriveFolderId = folderResult.folderId;
+          oneDriveFolderUrl = folderResult.folderUrl;
+
+          for (const file of equipmentFiles) {
+            try {
+              const fileBuffer = fs.readFileSync(file.path);
+              const cleanName = file.originalname.split('__')[1] || file.originalname;
+              const uploadUrl = `https://graph.microsoft.com/v1.0/me/drive/items/${folderResult.folderId}:/${cleanFileName(cleanName)}:/content`;
+
+              const uploadResponse = await axios.put(uploadUrl, fileBuffer, {
+                headers: {
+                  Authorization: `Bearer ${azureToken}`,
+                  "Content-Type": file.mimetype
+                }
+              });
+
+              fs.unlinkSync(file.path);
+
+              pictures.push({
+                name: cleanFileName(cleanName),
+                oneDriveId: uploadResponse.data.id,
+                oneDriveUrl: uploadResponse.data.webUrl,
+                uploadedAt: new Date()
+              });
+            } catch (err) {
+              console.error("❌ Feltöltési hiba:", err);
+            }
+          }
+        }
+      }
+
+      const finalEquipment = {
+        ...equipment,
+        EqID: eqId,
+        CreatedBy,
+        Company,
+        Pictures: pictures,
+        OneDriveFolderId: oneDriveFolderId,
+        OneDriveFolderUrl: oneDriveFolderUrl
+      };
+
+      processedEquipments.push(finalEquipment);
+    }
+
+    const savedEquipments = await Equipment.insertMany(processedEquipments);
     return res.status(201).json(savedEquipments);
   } catch (error) {
-    console.error('Hiba történt az eszközök létrehozásakor:', error);
-    return res.status(500).json({ error: 'Nem sikerült létrehozni az eszközöket.' });
+    console.error('❌ Hiba createEquipment-ben:', error);
+    return res.status(500).json({ error: 'Nem sikerült létrehozni az eszközt.' });
   }
 };
 
@@ -52,10 +130,20 @@ exports.listEquipment = async (req, res) => {
     }
 
     console.log("Lekérdezés szűrője:", filter); // Debug log
-    const equipments = await Equipment.find(filter);
+    const equipments = await Equipment.find(filter).lean();
     console.log("Lekérdezett adatok:", equipments); // Debug log
 
-    return res.json(equipments);
+    // Kiegészítés OneDrivePath mezővel
+    const withPaths = equipments.map(eq => {
+      const oneDrivePath = eq.OneDriveFolderUrl || (eq?.Pictures?.[0]?.oneDriveUrl ?? null);
+
+      return {
+        ...eq,
+        OneDrivePath: oneDrivePath
+      };
+    });
+
+    return res.json(withPaths);
   } catch (error) {
     console.error('Hiba történt az eszközök listázásakor:', error);
     return res.status(500).json({ error: 'Nem sikerült lekérni az eszközöket.' });
@@ -68,70 +156,41 @@ exports.updateEquipment = async (req, res) => {
     const { id } = req.params;
     const ModifiedBy = req.userId;
     const Company = req.user.company;
+    const azureToken = req.headers['x-ms-graph-token'];
 
     if (!ModifiedBy || !Company) {
-      console.log("❌ HIBA: Bejelentkezett felhasználó vagy cégadat hiányzik.");
-      return res.status(401).json({ error: 'Nincs bejelentkezett felhasználó vagy hiányzó cégadatok.' });
+      return res.status(401).json({ error: 'Hiányzó jogosultság.' });
     }
 
-    console.log("🔹 Módosítási kísérlet Equipment ID:", id);
-    console.log("🔹 Módosító felhasználó (ModifiedBy):", ModifiedBy);
-    console.log("🔹 Felhasználó cége:", Company);
-
-    // **Ellenőrizzük, hogy az adott eszköz valóban az adott céghez tartozik**
-    const equipment = await Equipment.findOne({ _id: id, Company: Company });
-
+    const equipment = await Equipment.findOne({ _id: id, Company });
     if (!equipment) {
-      console.log("❌ Az eszköz nem található vagy nem tartozik a felhasználó cégéhez.");
-      return res.status(404).json({ error: 'Az eszköz nem található vagy nem tartozik a vállalatához.' });
+      return res.status(404).json({ error: 'Eszköz nem található.' });
     }
 
-    // **Frissítéshez szükséges adatok előkészítése**
-    let updatedFields = { ...req.body };
-
-    // **🔹 Töröljük a CreatedBy mezőt, hogy ne módosuljon**
+    const oldEqID = req.body.OriginalEqID || equipment.EqID;
+    const updatedFields = { ...req.body };
     delete updatedFields.CreatedBy;
-
-    // **🔹 Zone és Site ObjectId konverzió**
-    if (req.body.Zone) {
-      if (mongoose.Types.ObjectId.isValid(req.body.Zone)) {
-        updatedFields.Zone = new mongoose.Types.ObjectId(req.body.Zone);
-      } else {
-        console.log("❌ HIBA: A megadott Zone nem érvényes ObjectId.");
-        return res.status(400).json({ error: 'Érvénytelen Zone azonosító formátum.' });
-      }
-    }
-
-    if (req.body.Site) {
-      if (mongoose.Types.ObjectId.isValid(req.body.Site)) {
-        updatedFields.Site = new mongoose.Types.ObjectId(req.body.Site);
-      } else {
-        console.log("❌ HIBA: A megadott Site nem érvényes ObjectId.");
-        return res.status(400).json({ error: 'Érvénytelen Site azonosító formátum.' });
-      }
-    }
-
-    // **🔹 ModifiedBy biztosítása**
     updatedFields.ModifiedBy = new mongoose.Types.ObjectId(ModifiedBy);
 
-    console.log("✅ Módosított adatok (mentés előtt):", updatedFields);
-
-    // **Frissítés az adatbázisban**
     const updatedEquipment = await Equipment.findByIdAndUpdate(
       id,
       { $set: updatedFields },
-      { new: true, runValidators: true, context: { userId: ModifiedBy } }
+      { new: true, runValidators: true }
     );
 
-    if (!updatedEquipment) {
-      console.log("❌ Sikertelen frissítés, nincs találat.");
-      return res.status(404).json({ error: 'Nem sikerült módosítani az eszközt.' });
+    // 🟡 OneDrive átnevezés csak akkor, ha változott az EqID és van folderId
+    if (azureToken && updatedEquipment && updatedEquipment.EqID !== oldEqID && equipment.OneDriveFolderId) {
+      try {
+        await renameOneDriveItemById(equipment.OneDriveFolderId, azureToken, updatedEquipment.EqID);
+        console.log(`✅ OneDrive mappa átnevezve: ${oldEqID} → ${updatedEquipment.EqID}`);
+      } catch (err) {
+        console.warn("⚠️ OneDrive átnevezési hiba:", err.message);
+      }
     }
 
-    console.log("✅ Equipment sikeresen frissítve:", updatedEquipment);
     return res.json(updatedEquipment);
   } catch (error) {
-    console.error("❌ Hiba történt az eszköz módosításakor:", error);
+    console.error('❌ Hiba módosítás közben:', error);
     return res.status(500).json({ error: 'Nem sikerült módosítani az eszközt.' });
   }
 };
@@ -140,19 +199,32 @@ exports.updateEquipment = async (req, res) => {
 exports.deleteEquipment = async (req, res) => {
   const { id } = req.params;
   try {
-    if (!req.user || !req.user.company) {
+    const user = req.user;
+    const azureToken = req.headers['x-ms-graph-token'];
+
+    if (!user || !user.company) {
       return res.status(401).json({ error: 'Nincs bejelentkezett felhasználó vagy hiányzó cégadatok.' });
     }
 
-    const deletedEquipment = await Equipment.findOneAndDelete({ _id: id, Company: req.user.company });
-
-    if (!deletedEquipment) {
+    const equipment = await Equipment.findOne({ _id: id, Company: user.company });
+    if (!equipment) {
       return res.status(404).json({ error: 'Az eszköz nem található vagy nem tartozik a vállalatához.' });
     }
 
+    // 🗑️ OneDrive törlés folderId alapján
+    if (azureToken && equipment.OneDriveFolderId) {
+      try {
+        await deleteOneDriveItemById(equipment.OneDriveFolderId, azureToken);
+        console.log(`✅ OneDrive mappa törölve (ID alapján): ${equipment.OneDriveFolderId}`);
+      } catch (err) {
+        console.warn("⚠️ OneDrive törlési hiba:", err.message);
+      }
+    }
+
+    await Equipment.deleteOne({ _id: id });
     return res.json({ message: 'Az eszköz sikeresen törölve.' });
   } catch (error) {
-    console.error('Hiba történt az eszköz törlésekor:', error);
+    console.error('❌ Hiba az eszköz törlésekor:', error);
     return res.status(500).json({ error: 'Nem sikerült törölni az eszközt.' });
   }
 };

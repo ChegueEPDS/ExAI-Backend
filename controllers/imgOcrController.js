@@ -69,6 +69,20 @@ exports.uploadImage = [
       .replace(/(Ex)(?!\s)(IIA|IIB|IIC|IIIA|IIIB|IIIC)/g, '$1 $2')
       .replace(/(Ex)(?!\s)/gm, '$1 ')
 
+      .replace(/\b[l1]\b/gi, "I")       
+        .replace(/\b(1I|iI|Il|lI|ll)\b/gi, "II")  
+        .replace(/\b(1II|IlI|lll|lIl)\b/gi, "III")
+          
+        // MA, MB, MC és változataik cseréje II és III-ra
+        .replace(/\b(MA|NA)\b/gi, "IIA")
+        .replace(/\b(MB|NB)\b/gi, "IIB")
+        .replace(/\b(MC|NC)\b/gi, "IIC")
+        
+        // IIIA, IIIB, IIIC változatainak javítása
+        .replace(/\b(NIIIA|MIIIA|MIIA)\b/gi, "IIIA")
+        .replace(/\b(NIIIB|MIIIB|MIIB)\b/gi, "IIIB")
+        .replace(/\b(NIC|MIC)\b/gi, "IIIC")
+
       // Hibás római számok korrigálása
       .replace(/\b(d|de|e|nA|p|q|ia|ib|ic|ma|mb|mc|o|s|tb|t)?([l1|I]{2,3})(A|B|C)\b/gi, (match, prefix, roman, letter) => {
           let correctedRoman = roman.replace(/[l1|I]/g, "I");

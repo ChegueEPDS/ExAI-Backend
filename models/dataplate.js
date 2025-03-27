@@ -35,7 +35,17 @@ const EquipmentSchema = new mongoose.Schema({
   "ModifiedBy": { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // 🆕 Módosító felhasználó
   "Company": { type: String, required: true },
   "Zone": { type: mongoose.Schema.Types.ObjectId, ref: 'Zone' },
-  "Site": { type: mongoose.Schema.Types.ObjectId, ref: 'Site' }
+  "Site": { type: mongoose.Schema.Types.ObjectId, ref: 'Site' },
+  "Pictures": [
+    {
+      name: { type: String },
+      oneDriveId: { type: String },
+      oneDriveUrl: { type: String },
+      uploadedAt: { type: Date, default: Date.now }
+    }
+  ],
+  "OneDriveFolderId": { type: String },
+  "OneDriveFolderUrl": { type: String }
 }, { timestamps: true }); // ⏳ Timestamps (createdAt, updatedAt)
 
 // 🔹 Pre-save middleware: beállítja a CreatedBy és Company mezőt az első mentéskor

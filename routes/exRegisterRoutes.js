@@ -1,12 +1,14 @@
 const express = require('express');
 const router = express.Router();
 const exRegisterController = require('../controllers/exRegisterController');
-const authMiddleware = require('../middlewares/authMiddleware'); // Importáljuk az autentikációs middleware-t
+const authMiddleware = require('../middlewares/authMiddleware');
+const multer = require('multer'); 
+const upload = multer({ dest: 'uploads/' });
 
 
 
 // Létrehozás
-router.post('/exreg', authMiddleware(), exRegisterController.createEquipment);
+router.post('/exreg', authMiddleware(), upload.array('pictures'), exRegisterController.createEquipment);
 
 // Listázás
 router.get('/exreg', authMiddleware(), exRegisterController.listEquipment);
