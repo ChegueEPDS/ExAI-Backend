@@ -276,7 +276,8 @@ exports.uploadFileToSite = async (req, res) => {
       const site = await Site.findById(siteId);
       if (!site) return res.status(404).json({ message: "Site not found" });
   
-      const fileToDelete = site.documents.find(doc => doc.oneDriveId === fileId);
+      const fileToDelete = site.documents.find(doc => doc.oneDriveId === fileId || doc._id.toString() === fileId);
+      console.log('🧹 DB törlés fájl:', fileToDelete?.alias || fileToDelete?.name);
       if (!fileToDelete) return res.status(404).json({ message: "File not found in site" });
   
       if (!accessToken) {
