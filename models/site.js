@@ -17,6 +17,7 @@ const SiteSchema = new mongoose.Schema({
     documents: [
         {
           name: { type: String },
+          alias: { type: String },
           oneDriveId: { type: String },
           oneDriveUrl: { type: String },
           type: { type: String, enum: ['document', 'image'], default: 'document' }, // vagy más logika szerint

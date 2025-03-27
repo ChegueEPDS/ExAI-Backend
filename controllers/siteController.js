@@ -219,6 +219,9 @@ exports.uploadFileToSite = async (req, res) => {
   
       const uploadedFiles = [];
   
+      // 👉 alias lekérése
+      const aliasFromForm = req.body.alias; // lehet undefined is
+  
       for (const file of files) {
         const fileBuffer = fs.readFileSync(file.path);
   
@@ -235,15 +238,16 @@ exports.uploadFileToSite = async (req, res) => {
   
         uploadedFiles.push({
           name: file.originalname,
+          alias: aliasFromForm || cleanFileName(file.originalname), // itt már tudod használni
           oneDriveId: uploadResponse.data.id,
           oneDriveUrl: uploadResponse.data.webUrl,
           type: file.mimetype.startsWith('image') ? 'image' : 'document'
         });
   
-        fs.unlinkSync(file.path); // töröljük a temp fájlt
+        fs.unlinkSync(file.path);
       }
   
-      site.documents.push(...uploadedFiles); // hozzáadjuk az összeset
+      site.documents.push(...uploadedFiles);
       await site.save();
   
       res.status(200).json({ message: "Files uploaded and saved", files: uploadedFiles });
@@ -252,7 +256,6 @@ exports.uploadFileToSite = async (req, res) => {
       res.status(500).json({ message: "Failed to upload files", error: error.message });
     }
   };
-
   exports.getFilesOfSite = async (req, res) => {
     try {
       const site = await Site.findById(req.params.id);

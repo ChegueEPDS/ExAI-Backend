@@ -10,6 +10,8 @@ const upload = multer({ dest: 'uploads/' });
 // Létrehozás
 router.post('/exreg', authMiddleware(), upload.array('pictures'), exRegisterController.createEquipment);
 
+router.post('/exreg/import', authMiddleware(), express.json(), exRegisterController.createEquipment);
+
 // Listázás
 router.get('/exreg', authMiddleware(), exRegisterController.listEquipment);
 

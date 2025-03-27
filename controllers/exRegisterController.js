@@ -5,7 +5,7 @@ const logger = require('../config/logger'); // ha van loggered, vagy kiveheted
 const mongoose = require('mongoose');
 const fs = require('fs');
 const axios = require('axios'); // ezt is, ha OneDrive-hoz képek feltöltése van
-const { getOrCreateFolder, deleteOneDriveItemById, renameOneDriveItemById } = require('../controllers/graphController');
+const { getOrCreateFolder, deleteOneDriveItemById, renameOneDriveItemById, moveOneDriveItemToFolder} = require('../controllers/graphController');
 
 // Létrehozás (POST /exreg)
 // 🔧 Segédfüggvény a fájlnév tisztítására
@@ -18,8 +18,6 @@ function cleanFileName(filename) {
 
 // 📥 Létrehozás (POST /exreg)
 exports.createEquipment = async (req, res) => {
-  console.log('📥 equipmentData:', req.body.equipmentData);
-console.log('📸 Feltöltött fájlok:', req.files.map(f => f.originalname));
   try {
     const CreatedBy = req.userId;
     const Company = req.user.company;
@@ -28,11 +26,37 @@ console.log('📸 Feltöltött fájlok:', req.files.map(f => f.originalname));
       return res.status(400).json({ message: "Company is missing in token" });
     }
 
-    const azureToken = req.headers['x-ms-graph-token'];
-    const equipmentData = JSON.parse(req.body.equipmentData || "[]");
-    const files = req.files || [];
+    console.log('📥 equipmentData:', req.body.equipmentData);
 
+    const azureToken = req.headers['x-ms-graph-token'];
+    const files = Array.isArray(req.files) ? req.files : [];
+
+    if (files.length > 0) {
+      console.log('📸 Feltöltött fájlok:', files.map(f => f.originalname));
+    } else {
+      console.log('📸 Nincs feltöltött fájl.');
+    }
+
+    let equipmentData = [];
+
+      if (typeof req.body.equipmentData === 'string') {
+        // multipart/form-data formában jött, parse-olni kell
+        equipmentData = JSON.parse(req.body.equipmentData);
+      } else if (Array.isArray(req.body.equipmentData)) {
+        // application/json formában jött
+        equipmentData = req.body.equipmentData;
+      } else if (Array.isArray(req.body)) {
+        // fallback: body maga a tömb
+        equipmentData = req.body;
+      }
+
+    // 🛡️ Itt a lényeg: inicializáljuk a tömböt!
     const processedEquipments = [];
+
+    // 🚀 Ha nincs equipmentData, akkor rögtön vissza is térhetünk
+    if (!equipmentData.length) {
+      return res.status(400).json({ message: "No equipment data received." });
+    }
 
     for (const equipment of equipmentData) {
       const eqId = equipment.EqID || new mongoose.Types.ObjectId().toString();
@@ -178,13 +202,52 @@ exports.updateEquipment = async (req, res) => {
       { new: true, runValidators: true }
     );
 
-    // 🟡 OneDrive átnevezés csak akkor, ha változott az EqID és van folderId
+    // 🟡 OneDrive mappa átnevezése, ha az EqID változott
     if (azureToken && updatedEquipment && updatedEquipment.EqID !== oldEqID && equipment.OneDriveFolderId) {
       try {
         await renameOneDriveItemById(equipment.OneDriveFolderId, azureToken, updatedEquipment.EqID);
         console.log(`✅ OneDrive mappa átnevezve: ${oldEqID} → ${updatedEquipment.EqID}`);
       } catch (err) {
         console.warn("⚠️ OneDrive átnevezési hiba:", err.message);
+      }
+    }
+
+    // 🔁 OneDrive mappa áthelyezése, ha Site vagy Zone változott
+    const oldSiteId = equipment.Site?.toString();
+    const oldZoneId = equipment.Zone?.toString();
+    const newSiteId = updatedEquipment.Site?.toString();
+    const newZoneId = updatedEquipment.Zone?.toString();
+
+    const siteChanged = oldSiteId !== newSiteId;
+    const zoneChanged = oldZoneId !== newZoneId;
+
+    if ((siteChanged || zoneChanged) && azureToken && equipment.OneDriveFolderId) {
+      try {
+        let newPath;
+        if (newSiteId && newZoneId) {
+          const site = await Site.findById(newSiteId).lean();
+          const zone = await Zone.findById(newZoneId).lean();
+          const siteName = site?.Name || `Site_${newSiteId}`;
+          const zoneName = zone?.Name || `Zone_${newZoneId}`;
+          newPath = `ExAI/Projects/${siteName}/${zoneName}/${updatedEquipment.EqID}`;
+        } else {
+          newPath = `ExAI/Equipment/${updatedEquipment.EqID}`;
+        }
+
+        const newFolder = await getOrCreateFolder(azureToken, newPath);
+        if (newFolder?.folderId) {
+          await moveOneDriveItemToFolder(equipment.OneDriveFolderId, newFolder.folderId, azureToken);
+
+          updatedEquipment.OneDriveFolderId = newFolder.folderId;
+          updatedEquipment.OneDriveFolderUrl = newFolder.folderUrl;
+          await updatedEquipment.save();
+
+          console.log(`📂 OneDrive mappa áthelyezve → ${newPath}`);
+        } else {
+          console.warn('⚠️ Nem sikerült a célmappa létrehozása vagy elérése.');
+        }
+      } catch (err) {
+        console.error('❌ Hiba a OneDrive mappa áthelyezésekor:', err.message || err);
       }
     }
 

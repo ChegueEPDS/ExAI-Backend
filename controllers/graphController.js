@@ -248,3 +248,28 @@ exports.renameOneDriveItemById = async (itemId, accessToken, newName) => {
       throw error;
     }
   };
+
+  exports.moveOneDriveItemToFolder = async (itemId, destinationFolderId, accessToken) => {
+    try {
+      const response = await axios.patch(
+        `https://graph.microsoft.com/v1.0/me/drive/items/${itemId}`,
+        {
+          parentReference: {
+            id: destinationFolderId
+          }
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+  
+      console.log('📦 Fájl/mappa áthelyezve:', response.data?.name);
+      return response.data;
+    } catch (error) {
+      console.error('❌ Hiba a mappa mozgatása közben:', error.response?.data || error.message);
+      throw error;
+    }
+  };
