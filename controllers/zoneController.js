@@ -260,7 +260,9 @@ exports.uploadFileToZone = async (req, res) => {
       const zone = await Zone.findById(zoneId);
       if (!zone) return res.status(404).json({ message: "Zone not found" });
   
-      const fileToDelete = zone.documents.find(doc => doc.oneDriveId === fileId);
+      const fileToDelete = zone.documents.find(doc =>
+        doc.oneDriveId === fileId || (doc._id && doc._id.toString() === fileId)
+      );
       if (!fileToDelete) return res.status(404).json({ message: "File not found" });
   
       await axios.delete(`https://graph.microsoft.com/v1.0/me/drive/items/${fileId}`, {
