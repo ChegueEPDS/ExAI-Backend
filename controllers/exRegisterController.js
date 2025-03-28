@@ -137,6 +137,76 @@ exports.createEquipment = async (req, res) => {
   }
 };
 
+exports.uploadImagesToEquipment = async (req, res) => {
+  try {
+    const equipmentId = req.params.id;
+    const azureToken = req.headers['x-ms-graph-token'];
+    const files = Array.isArray(req.files) ? req.files : [];
+
+    const equipment = await Equipment.findById(equipmentId);
+    if (!equipment) return res.status(404).json({ message: "Equipment not found" });
+
+    if (!azureToken || !files.length) {
+      return res.status(400).json({ message: "Missing files or Graph token" });
+    }
+
+    // 🔍 Mappaútvonal új képekhez
+    let folderPath = `ExAI/Equipment/${equipment.EqID}`;
+    if (equipment.Zone && equipment.Site) {
+      const zone = await Zone.findById(equipment.Zone);
+      const site = await Site.findById(equipment.Site);
+      const zoneName = zone?.Name || `Zone_${equipment.Zone}`;
+      const siteName = site?.Name || `Site_${equipment.Site}`;
+      folderPath = `ExAI/Projects/${siteName}/${zoneName}/${equipment.EqID}`;
+    }
+
+    const folderResult = await getOrCreateFolder(azureToken, folderPath);
+    if (!folderResult?.folderId) {
+      return res.status(500).json({ message: "Could not create or find OneDrive folder" });
+    }
+
+    const uploadedPictures = [];
+
+    for (const file of files) {
+      const fileBuffer = fs.readFileSync(file.path);
+      const safeName = cleanFileName(file.originalname);
+
+      const uploadRes = await axios.put(
+        `https://graph.microsoft.com/v1.0/me/drive/items/${folderResult.folderId}:/${safeName}:/content`,
+        fileBuffer,
+        {
+          headers: {
+            Authorization: `Bearer ${azureToken}`,
+            "Content-Type": file.mimetype
+          }
+        }
+      );
+
+      fs.unlinkSync(file.path); // ideiglenes fájl törlés
+
+      uploadedPictures.push({
+        name: safeName,
+        oneDriveId: uploadRes.data.id,
+        oneDriveUrl: uploadRes.data.webUrl,
+        uploadedAt: new Date()
+      });
+    }
+
+    // 🔄 Mentés a meglévő dokumentumhoz
+    equipment.Pictures = [...(equipment.Pictures || []), ...uploadedPictures];
+
+    equipment.OneDriveFolderId = folderResult.folderId;
+    equipment.OneDriveFolderUrl = folderResult.folderUrl;
+
+    await equipment.save();
+
+    return res.status(200).json({ message: "Images uploaded", pictures: uploadedPictures });
+  } catch (error) {
+    console.error('❌ uploadImagesToEquipment error:', error);
+    return res.status(500).json({ error: error.message });
+  }
+};
+
 // Listázás (GET /exreg)
 exports.listEquipment = async (req, res) => {
   try {

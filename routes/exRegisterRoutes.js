@@ -12,6 +12,8 @@ router.post('/exreg', authMiddleware(), upload.array('pictures'), exRegisterCont
 
 router.post('/exreg/import', authMiddleware(), express.json(), exRegisterController.createEquipment);
 
+router.post('/exreg/:id/upload-images', authMiddleware(), upload.array('pictures'), exRegisterController.uploadImagesToEquipment);
+
 // Listázás
 router.get('/exreg', authMiddleware(), exRegisterController.listEquipment);
 
