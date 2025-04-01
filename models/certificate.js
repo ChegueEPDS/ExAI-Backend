@@ -17,39 +17,39 @@ const CertificateSchema = new mongoose.Schema({
     docxId: { type: String },
     folderId: { type: String },
     folderUrl: { type: String },
+    sharePointFileUrl: { type: String },
+    sharePointDocxUrl: { type: String },
+    sharePointFileId: { type: String },
+    sharePointDocxId: { type: String },
+    sharePointFolderId: { type: String },
+    sharePointFolderUrl: { type: String },
     xcondition: { type: Boolean, default: false },
     ucondition: { type: Boolean, default: false },
     specCondition: { type: String },
     description: { type: String },
-    createdBy: { 
-        type: mongoose.Schema.Types.ObjectId, 
-        ref: 'User', 
-        required: true 
+    createdBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true
     },
-    company: { 
-        type: String, 
-        required: true 
+    company: {
+      type: String,
+      required: true
     }
-}, { timestamps: true });
-
-// 🔹 **Automatikus Company beállítás a CreatedBy alapján**
-CertificateSchema.pre('save', async function (next) {
+  }, { timestamps: true });
+  
+  // 🔹 Automatikus Company kitöltés CreatedBy alapján
+  CertificateSchema.pre('save', async function (next) {
     if (!this.isModified('createdBy')) return next();
-
+  
     try {
-        // 🔎 Lekérdezzük a felhasználót, aki létrehozta a tanúsítványt
-        const user = await mongoose.model('User').findById(this.createdBy);
-        if (!user) {
-            return next(new Error('Invalid CreatedBy user'));
-        }
-
-        // ✅ Beállítjuk a Company mezőt a User modellből
-        this.company = user.company; // Feltételezzük, hogy a user objektumnak van `company` mezője
-
-        next();
+      const user = await mongoose.model('User').findById(this.createdBy);
+      if (!user) return next(new Error('Invalid CreatedBy user'));
+      this.company = user.company;
+      next();
     } catch (error) {
-        next(error);
+      next(error);
     }
-});
-
-module.exports = mongoose.model('Certificate', CertificateSchema);
+  });
+  
+  module.exports = mongoose.model('Certificate', CertificateSchema);

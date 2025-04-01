@@ -41,11 +41,18 @@ const ZoneSchema = new mongoose.Schema(
         },
         oneDriveFolderUrl: { type: String },
         oneDriveFolderId: { type: String },
+        sharePointFolderUrl: { type: String },
+        sharePointFolderId: { type: String },
+        sharePointSiteId: { type: String },
+        sharePointDriveId: { type: String },
         documents: [
             {
               name: { type: String },
+              alias: { type: String },
               oneDriveId: { type: String },
               oneDriveUrl: { type: String },
+              sharePointId: { type: String },
+              sharePointUrl: { type: String },
               type: { type: String, enum: ['document', 'image'], default: 'document' },
               uploadedAt: { type: Date, default: Date.now }
             }

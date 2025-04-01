@@ -1,6 +1,16 @@
+/* graphController.js */
 const axios = require('axios');
 const multer = require('multer');
 const fs = require('fs');
+const {
+    getOrCreateSharePointFolder,
+    uploadSharePointFile,
+    getSharePointFiles,
+    deleteSharePointItemById,
+    renameSharePointItemById,
+    moveSharePointItemToFolder,
+    moveSharePointItem
+  } = require('../helpers/sharePointHelpers');
 
 const upload = multer({ dest: 'uploads/' }); // Ideiglenes fájlok mentése
 
@@ -63,28 +73,27 @@ exports.getOrCreateFolder = async function (accessToken, folderPath) {
 };
 
 exports.createOneDriveFolder = async (req, res) => {
-    const accessToken = req.headers.authorization?.split(" ")[1];
-    const { folderPath } = req.body;  // 📂 Már teljes útvonalat várunk pl. "ExAI/Certificates"
-
+    const accessToken = req.headers['x-ms-graph-token'];
+    const { folderPath } = req.body;
+  
     if (!accessToken || !folderPath) {
-        return res.status(400).json({ error: "❌ Access token and folderPath are required" });
+      return res.status(400).json({ error: "❌ Access token and folderPath are required" });
     }
-
+  
     try {
-        // 📂 Mappa ellenőrzése/létrehozása
-        const folderId = await getOrCreateFolder(accessToken, folderPath);
-
-        if (!folderId) {
-            return res.status(500).json({ error: "❌ Failed to create folder" });
-        }
-
-        console.log(`✅ Mappa létrehozva vagy már létezik: ${folderPath} (ID: ${folderId})`);
-        res.json({ message: "✅ Folder created or already exists", folderId });
+      const folder = await exports.getOrCreateFolder(accessToken, folderPath);
+  
+      if (!folder) {
+        return res.status(500).json({ error: "❌ Failed to create OneDrive folder" });
+      }
+  
+      console.log(`✅ OneDrive mappa létrejött: ${folderPath}`);
+      res.json({ message: "✅ Folder created or already exists", folder });
     } catch (error) {
-        console.error("❌ Mappa létrehozási hiba:", error.response?.data || error.message);
-        res.status(500).json({ error: "Failed to create folder" });
+      console.error("❌ OneDrive folder creation error:", error.response?.data || error.message);
+      res.status(500).json({ error: "Failed to create OneDrive folder" });
     }
-};
+  };
 
 /**
  * 📂 OneDrive fájlok listázása az ExAI mappában
@@ -273,3 +282,112 @@ exports.renameOneDriveItemById = async (itemId, accessToken, newName) => {
       throw error;
     }
   };
+
+  exports.uploadSharePointFileHandler = async (req, res) => {
+    upload.single("file")(req, res, async (err) => {
+        if (err) return res.status(500).send("❌ File upload error");x
+
+        const accessToken = req.headers['x-ms-graph-token'];
+        const filePath = req.file.path;
+        const fileName = req.file.originalname;
+        const folderPath = req.body.folderPath;
+
+        if (!accessToken || !folderPath) {
+            return res.status(400).json({ error: "❌ Access token and folderPath are required" });
+        }
+
+        try {
+            const result = await uploadSharePointFile(accessToken, folderPath, filePath, fileName);
+            res.json(result);
+        } catch (error) {
+            console.error("❌ SharePoint upload error:", error.response?.data || error.message);
+            res.status(500).json({ error: "Failed to upload file to SharePoint" });
+        }
+    });
+};
+
+exports.getSharePointFiles = async (req, res) => {
+    const accessToken = req.headers['x-ms-graph-token'];
+    const folderPath = req.query.folderPath || 'ExAI';
+
+    if (!accessToken) {
+        return res.status(401).json({ error: "❌ Access token is required" });
+    }
+
+    try {
+        const result = await getSharePointFiles(accessToken, folderPath);
+        res.json(result);
+    } catch (error) {
+        console.error("❌ Get SharePoint files error:", error.response?.data || error.message);
+        res.status(500).json({ error: "Failed to fetch SharePoint files" });
+    }
+};
+
+exports.createSharePointFolderHandler = async (req, res) => {
+    const accessToken = req.headers['x-ms-graph-token'];
+    const { folderPath } = req.body;
+
+    if (!accessToken || !folderPath) {
+        return res.status(400).json({ error: "❌ Access token and folderPath are required" });
+    }
+
+    try {
+        const folder = await getOrCreateSharePointFolder(accessToken, folderPath);
+        res.json({ message: "✅ Folder created or already exists", folder });
+    } catch (error) {
+        console.error("❌ SharePoint folder creation error:", error.response?.data || error.message);
+        res.status(500).json({ error: "Failed to create folder in SharePoint" });
+    }
+};
+
+exports.deleteSharePointItem = async (req, res) => {
+    const accessToken = req.headers['x-ms-graph-token'];
+    const itemId = req.params.itemId;
+
+    if (!accessToken || !itemId) {
+        return res.status(400).json({ error: "❌ Access token and itemId are required" });
+    }
+
+    try {
+        await deleteSharePointItemById(accessToken, itemId);
+        res.json({ message: "✅ Deleted successfully" });
+    } catch (error) {
+        res.status(500).json({ error: "❌ Failed to delete item from SharePoint" });
+    }
+};
+
+exports.renameSharePointItem = async (req, res) => {
+    const accessToken = req.headers['x-ms-graph-token'];
+    const itemId = req.params.itemId;
+    const { newName } = req.body;
+
+    if (!accessToken || !itemId || !newName) {
+        return res.status(400).json({ error: "❌ Access token, itemId, and newName are required" });
+    }
+
+    try {
+        const result = await renameSharePointItemById(accessToken, itemId, newName);
+        res.json(result);
+    } catch (error) {
+        console.error("❌ Rename SharePoint item error:", error.response?.data || error.message);
+        res.status(500).json({ error: "Failed to rename item in SharePoint" });
+    }
+};
+
+exports.moveSharePointItem = async (req, res) => {
+    const accessToken = req.headers['x-ms-graph-token'];
+    const { itemId, destinationFolderId } = req.body;
+  
+    if (!accessToken || !itemId || !destinationFolderId) {
+      return res.status(400).json({ error: "Missing parameters" });
+    }
+  
+    try {
+      const result = await moveSharePointItemToFolder(accessToken, itemId, destinationFolderId);
+      res.json(result);
+    } catch (error) {
+      console.error("❌ Error moving SharePoint item:", error.response?.data || error.message);
+      res.status(500).json({ error: "Failed to move item" });
+    }
+  };
+
