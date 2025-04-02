@@ -9,7 +9,6 @@ const {
     deleteSharePointItemById,
     renameSharePointItemById,
     moveSharePointItemToFolder,
-    moveSharePointItem
   } = require('../helpers/sharePointHelpers');
 
 const upload = multer({ dest: 'uploads/' }); // Ideiglenes fájlok mentése

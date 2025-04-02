@@ -71,7 +71,7 @@ exports.uploadCertificate = async (req, res) => {
                 }
 
                 // === SharePoint ===
-                const sharePointPath = `${userCompany}/Certificates/${certNo}_${formattedDateTime}`;
+                const sharePointPath = `Certificates/${certNo}_${formattedDateTime}`;
                 const sharePointFolder = await getOrCreateSharePointFolder(accessToken, sharePointPath);
 
                 if (sharePointFolder?.folderId) {
