@@ -44,10 +44,25 @@ exports.createEquipment = async (req, res) => {
       return res.status(400).json({ message: "No equipment data received." });
     }
 
-    const processedEquipments = [];
+    const results = [];
 
     for (const equipment of equipmentData) {
+      const _id = equipment._id || null;
       const eqId = equipment.EqID || new mongoose.Types.ObjectId().toString();
+
+      // 🔎 Létező eszköz keresése _id vagy kombináció alapján
+      let existingEquipment = null;
+      if (_id) {
+        existingEquipment = await Equipment.findById(_id);
+      }
+      if (!existingEquipment && eqId) {
+        existingEquipment = await Equipment.findOne({
+          EqID: eqId,
+          Company,
+          Site: equipment.Site || null,
+          Zone: equipment.Zone || null
+        });
+      }
 
       let zoneDoc = null;
       let siteDoc = null;
@@ -56,7 +71,6 @@ exports.createEquipment = async (req, res) => {
       if (equipment.Zone && equipment.Site) {
         zoneDoc = await Zone.findById(equipment.Zone).lean();
         siteDoc = await Site.findById(equipment.Site).lean();
-
         const zoneName = zoneDoc?.Name || `Zone_${equipment.Zone}`;
         const siteName = siteDoc?.Name || `Site_${equipment.Site}`;
         folderPath = `ExAI/Projects/${siteName}/${zoneName}/${eqId}`;
@@ -66,7 +80,7 @@ exports.createEquipment = async (req, res) => {
         sharePointPath = `${Company.toUpperCase()}/General Equipment/${eqId}`;
       }
 
-      const equipmentFiles = files.filter((file) => {
+      const equipmentFiles = files.filter(file => {
         const eqIdInName = file.originalname.split('__')[0];
         return eqIdInName === eqId;
       });
@@ -106,8 +120,7 @@ exports.createEquipment = async (req, res) => {
             }
 
             if (sharePointFolderId) {
-              const shareUpload = await uploadSharePointFile(azureToken, sharePointPath, file.path, cleanName);
-              sharePointUpload = shareUpload;
+              sharePointUpload = await uploadSharePointFile(azureToken, sharePointPath, file.path, cleanName);
             }
 
             pictures.push({
@@ -122,28 +135,41 @@ exports.createEquipment = async (req, res) => {
             console.error("❌ Feltöltési hiba:", err.message);
           }
 
-          fs.unlinkSync(file.path); // Temp fájl törlés
+          fs.unlinkSync(file.path);
         }
       }
 
-      processedEquipments.push({
+      const updateFields = {
         ...equipment,
         EqID: eqId,
-        CreatedBy,
         Company,
-        Pictures: pictures,
-        OneDriveFolderId: oneDriveFolderId,
-        OneDriveFolderUrl: oneDriveFolderUrl,
-        SharePointId: sharePointFolderId,
-        SharePointUrl: sharePointFolderUrl
-      });
+        Pictures: [...(existingEquipment?.Pictures || []), ...pictures],
+        OneDriveFolderId: oneDriveFolderId || existingEquipment?.OneDriveFolderId || null,
+        OneDriveFolderUrl: oneDriveFolderUrl || existingEquipment?.OneDriveFolderUrl || null,
+        SharePointId: sharePointFolderId || existingEquipment?.SharePointId || null,
+        SharePointUrl: sharePointFolderUrl || existingEquipment?.SharePointUrl || null
+      };
+
+      if (existingEquipment) {
+        updateFields.ModifiedBy = CreatedBy;
+        const saved = await Equipment.findByIdAndUpdate(
+          existingEquipment._id,
+          { $set: updateFields },
+          { new: true }
+        );
+        results.push(saved);
+      } else {
+        updateFields.CreatedBy = CreatedBy;
+        const newEquipment = new Equipment(updateFields);
+        const saved = await newEquipment.save();
+        results.push(saved);
+      }
     }
 
-    const savedEquipments = await Equipment.insertMany(processedEquipments);
-    return res.status(201).json(savedEquipments);
+    return res.status(201).json(results);
   } catch (error) {
     console.error('❌ Hiba createEquipment-ben:', error);
-    return res.status(500).json({ error: 'Nem sikerült létrehozni az eszközt.' });
+    return res.status(500).json({ error: 'Nem sikerült létrehozni vagy frissíteni az eszközt.' });
   }
 };
 
