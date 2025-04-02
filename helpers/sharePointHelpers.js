@@ -183,20 +183,26 @@ async function renameSharePointItemById(accessToken, itemId, newName, driveId) {
 /**
  * 📦 SharePoint fájl áthelyezése egy másik mappába
  */
-async function moveSharePointItemToFolder(accessToken, itemId, destinationFolderId) {
-  const res = await axios.patch(
-    `https://graph.microsoft.com/v1.0/sites/${siteHostname}:${sitePath}:/drive/items/${itemId}`,
-    {
-      parentReference: { id: destinationFolderId }
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json'
+async function moveSharePointItemToFolder(accessToken, itemId, destinationFolderId, driveId) {
+  try {
+    const res = await axios.patch(
+      `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}`,
+      {
+        parentReference: { id: destinationFolderId }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
+        }
       }
-    }
-  );
-  return res.data;
+    );
+    console.log(`✅ SharePoint elem áthelyezve új mappába (ID: ${itemId})`);
+    return res.data;
+  } catch (err) {
+    console.error('❌ Hiba a SharePoint item áthelyezése közben:', err?.response?.data || err.message);
+    throw err;
+  }
 }
 
 module.exports = {

@@ -6,6 +6,8 @@ const mongoose = require('mongoose');
 const fs = require('fs');
 const axios = require('axios'); // ezt is, ha OneDrive-hoz képek feltöltése van
 const { getOrCreateFolder, deleteOneDriveItemById, renameOneDriveItemById, moveOneDriveItemToFolder} = require('../controllers/graphController');
+const { getOrCreateSharePointFolder, renameSharePointItemById, deleteSharePointItemById, uploadSharePointFile, moveSharePointItemToFolder } = require('../helpers/sharePointHelpers');
+
 
 // Létrehozás (POST /exreg)
 // 🔧 Segédfüggvény a fájlnév tisztítására
@@ -26,50 +28,42 @@ exports.createEquipment = async (req, res) => {
       return res.status(400).json({ message: "Company is missing in token" });
     }
 
-    console.log('📥 equipmentData:', req.body.equipmentData);
-
     const azureToken = req.headers['x-ms-graph-token'];
     const files = Array.isArray(req.files) ? req.files : [];
 
-    if (files.length > 0) {
-      console.log('📸 Feltöltött fájlok:', files.map(f => f.originalname));
-    } else {
-      console.log('📸 Nincs feltöltött fájl.');
+    let equipmentData = [];
+    if (typeof req.body.equipmentData === 'string') {
+      equipmentData = JSON.parse(req.body.equipmentData);
+    } else if (Array.isArray(req.body.equipmentData)) {
+      equipmentData = req.body.equipmentData;
+    } else if (Array.isArray(req.body)) {
+      equipmentData = req.body;
     }
 
-    let equipmentData = [];
-
-      if (typeof req.body.equipmentData === 'string') {
-        // multipart/form-data formában jött, parse-olni kell
-        equipmentData = JSON.parse(req.body.equipmentData);
-      } else if (Array.isArray(req.body.equipmentData)) {
-        // application/json formában jött
-        equipmentData = req.body.equipmentData;
-      } else if (Array.isArray(req.body)) {
-        // fallback: body maga a tömb
-        equipmentData = req.body;
-      }
-
-    // 🛡️ Itt a lényeg: inicializáljuk a tömböt!
-    const processedEquipments = [];
-
-    // 🚀 Ha nincs equipmentData, akkor rögtön vissza is térhetünk
     if (!equipmentData.length) {
       return res.status(400).json({ message: "No equipment data received." });
     }
 
+    const processedEquipments = [];
+
     for (const equipment of equipmentData) {
       const eqId = equipment.EqID || new mongoose.Types.ObjectId().toString();
 
-      let folderPath;
+      let zoneDoc = null;
+      let siteDoc = null;
+      let folderPath, sharePointPath;
+
       if (equipment.Zone && equipment.Site) {
-        const zoneDoc = await Zone.findById(equipment.Zone).lean();
-        const siteDoc = await Site.findById(equipment.Site).lean();
+        zoneDoc = await Zone.findById(equipment.Zone).lean();
+        siteDoc = await Site.findById(equipment.Site).lean();
+
         const zoneName = zoneDoc?.Name || `Zone_${equipment.Zone}`;
         const siteName = siteDoc?.Name || `Site_${equipment.Site}`;
         folderPath = `ExAI/Projects/${siteName}/${zoneName}/${eqId}`;
+        sharePointPath = `${Company.toUpperCase()}/Projects/${siteName}/${zoneName}/${eqId}`;
       } else {
         folderPath = `ExAI/Equipment/${eqId}`;
+        sharePointPath = `${Company.toUpperCase()}/General Equipment/${eqId}`;
       }
 
       const equipmentFiles = files.filter((file) => {
@@ -80,53 +74,69 @@ exports.createEquipment = async (req, res) => {
       let pictures = [];
       let oneDriveFolderId = null;
       let oneDriveFolderUrl = null;
+      let sharePointFolderId = null;
+      let sharePointFolderUrl = null;
 
       if (azureToken && equipmentFiles.length > 0) {
-        const folderResult = await getOrCreateFolder(azureToken, folderPath);
+        const { folderId: oneDriveId, folderUrl: oneDriveUrl } = await getOrCreateFolder(azureToken, folderPath) || {};
+        const { folderId: shareId, folderUrl: shareUrl } = await getOrCreateSharePointFolder(azureToken, sharePointPath) || {};
 
-        if (folderResult?.folderId) {
-          oneDriveFolderId = folderResult.folderId;
-          oneDriveFolderUrl = folderResult.folderUrl;
+        oneDriveFolderId = oneDriveId;
+        oneDriveFolderUrl = oneDriveUrl;
+        sharePointFolderId = shareId;
+        sharePointFolderUrl = shareUrl;
 
-          for (const file of equipmentFiles) {
-            try {
-              const fileBuffer = fs.readFileSync(file.path);
-              const cleanName = file.originalname.split('__')[1] || file.originalname;
-              const uploadUrl = `https://graph.microsoft.com/v1.0/me/drive/items/${folderResult.folderId}:/${cleanFileName(cleanName)}:/content`;
+        for (const file of equipmentFiles) {
+          const cleanName = cleanFileName(file.originalname.split('__')[1] || file.originalname);
+          const fileBuffer = fs.readFileSync(file.path);
 
-              const uploadResponse = await axios.put(uploadUrl, fileBuffer, {
+          let oneDriveUpload = null;
+          let sharePointUpload = null;
+
+          try {
+            if (oneDriveFolderId) {
+              const oneDriveUploadUrl = `https://graph.microsoft.com/v1.0/me/drive/items/${oneDriveFolderId}:/${cleanName}:/content`;
+              const uploadRes = await axios.put(oneDriveUploadUrl, fileBuffer, {
                 headers: {
                   Authorization: `Bearer ${azureToken}`,
                   "Content-Type": file.mimetype
                 }
               });
-
-              fs.unlinkSync(file.path);
-
-              pictures.push({
-                name: cleanFileName(cleanName),
-                oneDriveId: uploadResponse.data.id,
-                oneDriveUrl: uploadResponse.data.webUrl,
-                uploadedAt: new Date()
-              });
-            } catch (err) {
-              console.error("❌ Feltöltési hiba:", err);
+              oneDriveUpload = uploadRes.data;
             }
+
+            if (sharePointFolderId) {
+              const shareUpload = await uploadSharePointFile(azureToken, sharePointPath, file.path, cleanName);
+              sharePointUpload = shareUpload;
+            }
+
+            pictures.push({
+              name: cleanName,
+              oneDriveId: oneDriveUpload?.id || null,
+              oneDriveUrl: oneDriveUpload?.webUrl || null,
+              sharePointId: sharePointUpload?.id || null,
+              sharePointUrl: sharePointUpload?.webUrl || null,
+              uploadedAt: new Date()
+            });
+          } catch (err) {
+            console.error("❌ Feltöltési hiba:", err.message);
           }
+
+          fs.unlinkSync(file.path); // Temp fájl törlés
         }
       }
 
-      const finalEquipment = {
+      processedEquipments.push({
         ...equipment,
         EqID: eqId,
         CreatedBy,
         Company,
         Pictures: pictures,
         OneDriveFolderId: oneDriveFolderId,
-        OneDriveFolderUrl: oneDriveFolderUrl
-      };
-
-      processedEquipments.push(finalEquipment);
+        OneDriveFolderUrl: oneDriveFolderUrl,
+        SharePointId: sharePointFolderId,
+        SharePointUrl: sharePointFolderUrl
+      });
     }
 
     const savedEquipments = await Equipment.insertMany(processedEquipments);
@@ -150,20 +160,24 @@ exports.uploadImagesToEquipment = async (req, res) => {
       return res.status(400).json({ message: "Missing files or Graph token" });
     }
 
-    // 🔍 Mappaútvonal új képekhez
-    let folderPath = `ExAI/Equipment/${equipment.EqID}`;
+    let folderPath, sharePointPath;
+    const company = req.user.company.toUpperCase();
+
     if (equipment.Zone && equipment.Site) {
       const zone = await Zone.findById(equipment.Zone);
       const site = await Site.findById(equipment.Site);
       const zoneName = zone?.Name || `Zone_${equipment.Zone}`;
       const siteName = site?.Name || `Site_${equipment.Site}`;
+
       folderPath = `ExAI/Projects/${siteName}/${zoneName}/${equipment.EqID}`;
+      sharePointPath = `${company}/Projects/${siteName}/${zoneName}/${equipment.EqID}`;
+    } else {
+      folderPath = `ExAI/Equipment/${equipment.EqID}`;
+      sharePointPath = `${company}/General Equipment/${equipment.EqID}`;
     }
 
     const folderResult = await getOrCreateFolder(azureToken, folderPath);
-    if (!folderResult?.folderId) {
-      return res.status(500).json({ message: "Could not create or find OneDrive folder" });
-    }
+    const shareResult = await getOrCreateSharePointFolder(azureToken, sharePointPath);
 
     const uploadedPictures = [];
 
@@ -171,32 +185,44 @@ exports.uploadImagesToEquipment = async (req, res) => {
       const fileBuffer = fs.readFileSync(file.path);
       const safeName = cleanFileName(file.originalname);
 
-      const uploadRes = await axios.put(
-        `https://graph.microsoft.com/v1.0/me/drive/items/${folderResult.folderId}:/${safeName}:/content`,
-        fileBuffer,
-        {
-          headers: {
-            Authorization: `Bearer ${azureToken}`,
-            "Content-Type": file.mimetype
-          }
-        }
-      );
+      let oneDriveRes = null;
+      let sharePointRes = null;
 
-      fs.unlinkSync(file.path); // ideiglenes fájl törlés
+      if (folderResult?.folderId) {
+        oneDriveRes = await axios.put(
+          `https://graph.microsoft.com/v1.0/me/drive/items/${folderResult.folderId}:/${safeName}:/content`,
+          fileBuffer,
+          {
+            headers: {
+              Authorization: `Bearer ${azureToken}`,
+              "Content-Type": file.mimetype
+            }
+          }
+        );
+      }
+
+      if (shareResult?.folderId) {
+        sharePointRes = await uploadSharePointFile(azureToken, sharePointPath, file.path, safeName);
+      }
+
+      fs.unlinkSync(file.path);
 
       uploadedPictures.push({
         name: safeName,
-        oneDriveId: uploadRes.data.id,
-        oneDriveUrl: uploadRes.data.webUrl,
+        oneDriveId: oneDriveRes?.data?.id || null,
+        oneDriveUrl: oneDriveRes?.data?.webUrl || null,
+        sharePointId: sharePointRes?.id || null,
+        sharePointUrl: sharePointRes?.webUrl || null,
         uploadedAt: new Date()
       });
     }
 
-    // 🔄 Mentés a meglévő dokumentumhoz
     equipment.Pictures = [...(equipment.Pictures || []), ...uploadedPictures];
 
-    equipment.OneDriveFolderId = folderResult.folderId;
-    equipment.OneDriveFolderUrl = folderResult.folderUrl;
+    equipment.OneDriveFolderId = folderResult?.folderId;
+    equipment.OneDriveFolderUrl = folderResult?.folderUrl;
+    equipment.SharePointId = shareResult?.folderId;
+    equipment.SharePointUrl = shareResult?.folderUrl;
 
     await equipment.save();
 
@@ -214,26 +240,24 @@ exports.listEquipment = async (req, res) => {
       return res.status(401).json({ error: 'Nincs bejelentkezett felhasználó vagy hiányzó cégadatok.' });
     }
 
-    const filter = { Company: req.user.company }; // 🔹 Csak az adott vállalat eszközei
+    const filter = { Company: req.user.company };
 
-    // 🔹 Zone alapú szűrés
     if (req.query.Zone) {
-      filter.Zone = req.query.Zone; // Ha egy adott zónához tartozó adatokat kérünk
+      filter.Zone = req.query.Zone;
     } else if (req.query.noZone) {
-      filter.$or = [{ Zone: null }, { Zone: { $exists: false } }]; // 🔹 Ha nincs zóna, akkor csak a NULL vagy nem létező Zone mezőket kérjük le
+      filter.$or = [{ Zone: null }, { Zone: { $exists: false } }];
     }
 
-    console.log("Lekérdezés szűrője:", filter); // Debug log
     const equipments = await Equipment.find(filter).lean();
-    console.log("Lekérdezett adatok:", equipments); // Debug log
 
-    // Kiegészítés OneDrivePath mezővel
     const withPaths = equipments.map(eq => {
-      const oneDrivePath = eq.OneDriveFolderUrl || (eq?.Pictures?.[0]?.oneDriveUrl ?? null);
+      const oneDrivePath = eq.OneDriveFolderUrl || eq.Pictures?.[0]?.oneDriveUrl || null;
+      const sharePointPath = eq.SharePointUrl || eq.Pictures?.[0]?.sharePointUrl || null;
 
       return {
         ...eq,
-        OneDrivePath: oneDrivePath
+        OneDrivePath: oneDrivePath,
+        SharePointPath: sharePointPath
       };
     });
 
@@ -272,53 +296,83 @@ exports.updateEquipment = async (req, res) => {
       { new: true, runValidators: true }
     );
 
-    // 🟡 OneDrive mappa átnevezése, ha az EqID változott
-    if (azureToken && updatedEquipment && updatedEquipment.EqID !== oldEqID && equipment.OneDriveFolderId) {
-      try {
-        await renameOneDriveItemById(equipment.OneDriveFolderId, azureToken, updatedEquipment.EqID);
-        console.log(`✅ OneDrive mappa átnevezve: ${oldEqID} → ${updatedEquipment.EqID}`);
-      } catch (err) {
-        console.warn("⚠️ OneDrive átnevezési hiba:", err.message);
+    // 1️⃣ EqID átnevezés OneDrive és SharePoint
+    if (azureToken && updatedEquipment && updatedEquipment.EqID !== oldEqID) {
+      if (equipment.OneDriveFolderId) {
+        try {
+          await renameOneDriveItemById(equipment.OneDriveFolderId, azureToken, updatedEquipment.EqID);
+          console.log(`✅ OneDrive mappa átnevezve: ${oldEqID} → ${updatedEquipment.EqID}`);
+        } catch (err) {
+          console.warn("⚠️ OneDrive átnevezési hiba:", err.message);
+        }
+      }
+
+      if (equipment.SharePointId && equipment.SharePointUrl && equipment.SharePointUrl.includes('/')) {
+        try {
+          const driveId = equipment.SharePointUrl.split('/').find(s => s.includes('drive')) || updatedEquipment.sharePointDriveId;
+          await renameSharePointItemById(azureToken, equipment.SharePointId, updatedEquipment.EqID, driveId);
+          console.log(`✅ SharePoint mappa átnevezve: ${oldEqID} → ${updatedEquipment.EqID}`);
+        } catch (err) {
+          console.warn("⚠️ SharePoint átnevezési hiba:", err.message);
+        }
       }
     }
 
-    // 🔁 OneDrive mappa áthelyezése, ha Site vagy Zone változott
+    // 2️⃣ Áthelyezés, ha Site vagy Zone változott
     const oldSiteId = equipment.Site?.toString();
     const oldZoneId = equipment.Zone?.toString();
     const newSiteId = updatedEquipment.Site?.toString();
     const newZoneId = updatedEquipment.Zone?.toString();
-
     const siteChanged = oldSiteId !== newSiteId;
     const zoneChanged = oldZoneId !== newZoneId;
 
-    if ((siteChanged || zoneChanged) && azureToken && equipment.OneDriveFolderId) {
-      try {
-        let newPath;
-        if (newSiteId && newZoneId) {
-          const site = await Site.findById(newSiteId).lean();
-          const zone = await Zone.findById(newZoneId).lean();
-          const siteName = site?.Name || `Site_${newSiteId}`;
-          const zoneName = zone?.Name || `Zone_${newZoneId}`;
-          newPath = `ExAI/Projects/${siteName}/${zoneName}/${updatedEquipment.EqID}`;
-        } else {
-          newPath = `ExAI/Equipment/${updatedEquipment.EqID}`;
-        }
+    if ((siteChanged || zoneChanged) && azureToken) {
+      let newPath, sharePointPath;
+      const company = Company.toUpperCase();
 
-        const newFolder = await getOrCreateFolder(azureToken, newPath);
-        if (newFolder?.folderId) {
-          await moveOneDriveItemToFolder(equipment.OneDriveFolderId, newFolder.folderId, azureToken);
+      if (newSiteId && newZoneId) {
+        const site = await Site.findById(newSiteId).lean();
+        const zone = await Zone.findById(newZoneId).lean();
+        const siteName = site?.Name || `Site_${newSiteId}`;
+        const zoneName = zone?.Name || `Zone_${newZoneId}`;
 
-          updatedEquipment.OneDriveFolderId = newFolder.folderId;
-          updatedEquipment.OneDriveFolderUrl = newFolder.folderUrl;
-          await updatedEquipment.save();
-
-          console.log(`📂 OneDrive mappa áthelyezve → ${newPath}`);
-        } else {
-          console.warn('⚠️ Nem sikerült a célmappa létrehozása vagy elérése.');
-        }
-      } catch (err) {
-        console.error('❌ Hiba a OneDrive mappa áthelyezésekor:', err.message || err);
+        newPath = `ExAI/Projects/${siteName}/${zoneName}/${updatedEquipment.EqID}`;
+        sharePointPath = `${company}/Projects/${siteName}/${zoneName}/${updatedEquipment.EqID}`;
+      } else {
+        newPath = `ExAI/Equipment/${updatedEquipment.EqID}`;
+        sharePointPath = `${company}/General Equipment/${updatedEquipment.EqID}`;
       }
+
+      // 🔁 OneDrive
+      if (equipment.OneDriveFolderId) {
+        try {
+          const newOneDrive = await getOrCreateFolder(azureToken, newPath);
+          await moveOneDriveItemToFolder(equipment.OneDriveFolderId, newOneDrive.folderId, azureToken);
+          updatedEquipment.OneDriveFolderId = newOneDrive.folderId;
+          updatedEquipment.OneDriveFolderUrl = newOneDrive.folderUrl;
+        } catch (err) {
+          console.warn("⚠️ OneDrive mozgatási hiba:", err.message);
+        }
+      }
+
+      // 🔁 SharePoint
+      if (equipment.SharePointId) {
+        try {
+          const newShare = await getOrCreateSharePointFolder(azureToken, sharePointPath);
+          await moveSharePointItemToFolder(
+            azureToken,
+            equipment.SharePointId,
+            newShare.folderId,
+            newShare.driveId // 💡 Ezt most már visszaadja a helper
+          );
+          updatedEquipment.SharePointId = newShare.folderId;
+          updatedEquipment.SharePointUrl = newShare.folderUrl;
+        } catch (err) {
+          console.warn("⚠️ SharePoint mozgatási hiba:", err.message);
+        }
+      }
+
+      await updatedEquipment.save();
     }
 
     return res.json(updatedEquipment);
@@ -344,13 +398,21 @@ exports.deleteEquipment = async (req, res) => {
       return res.status(404).json({ error: 'Az eszköz nem található vagy nem tartozik a vállalatához.' });
     }
 
-    // 🗑️ OneDrive törlés folderId alapján
-    if (azureToken && equipment.OneDriveFolderId) {
-      try {
-        await deleteOneDriveItemById(equipment.OneDriveFolderId, azureToken);
-        console.log(`✅ OneDrive mappa törölve (ID alapján): ${equipment.OneDriveFolderId}`);
-      } catch (err) {
-        console.warn("⚠️ OneDrive törlési hiba:", err.message);
+    if (azureToken) {
+      if (equipment.OneDriveFolderId) {
+        try {
+          await deleteOneDriveItemById(equipment.OneDriveFolderId, azureToken);
+        } catch (err) {
+          console.warn("⚠️ OneDrive törlési hiba:", err.message);
+        }
+      }
+
+      if (equipment.SharePointId) {
+        try {
+          await deleteSharePointItemById(azureToken, equipment.SharePointId);
+        } catch (err) {
+          console.warn("⚠️ SharePoint törlési hiba:", err.message);
+        }
       }
     }
 

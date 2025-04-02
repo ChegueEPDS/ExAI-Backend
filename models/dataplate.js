@@ -41,11 +41,15 @@ const EquipmentSchema = new mongoose.Schema({
       name: { type: String },
       oneDriveId: { type: String },
       oneDriveUrl: { type: String },
+      SharePointId: { type: String },
+      SharePointUrl: { type: String },
       uploadedAt: { type: Date, default: Date.now }
     }
   ],
   "OneDriveFolderId": { type: String },
-  "OneDriveFolderUrl": { type: String }
+  "OneDriveFolderUrl": { type: String },
+  "SharePointId": { type: String },
+  "SharePointUrl": { type: String },
 }, { timestamps: true }); // ⏳ Timestamps (createdAt, updatedAt)
 
 // 🔹 Pre-save middleware: beállítja a CreatedBy és Company mezőt az első mentéskor
