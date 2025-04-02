@@ -128,22 +128,30 @@ async function getSharePointFiles(accessToken, folderPath = 'ExAI') {
 async function deleteSharePointItemById(accessToken, itemId) {
   console.log("➡️ SharePoint törlés hívás: ID =", itemId);
   try {
-    // 🔍 Előbb le kell kérni a siteId-t
+    // 🔍 Site ID lekérés
     const siteRes = await axios.get(
       `https://graph.microsoft.com/v1.0/sites/${siteHostname}:${sitePath}`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
     const siteId = siteRes.data.id;
 
-    // ✅ Törlés a helyes API végponttal
+    // ❌ Törlés kísérlet
     await axios.delete(
       `https://graph.microsoft.com/v1.0/sites/${siteId}/drive/items/${itemId}`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
+
     console.log(`✅ SharePoint item deleted: ${itemId}`);
   } catch (error) {
+    const status = error?.response?.status;
+
+    if (status === 404) {
+      console.warn(`⚠️ SharePoint item already deleted or not found: ${itemId}`);
+      return true; // ✅ folytatjuk a törlést
+    }
+
     console.error(`❌ Delete error: ${itemId}`, error.response?.data || error.message);
-    throw error;
+    throw error; // ⛔ Más hibát továbbdobunk
   }
 }
 
