@@ -20,7 +20,7 @@ const visionRoutes = require('./routes/visionRoutes');
 const fireRoutes = require('./routes/fireRoutes');
 const exRegisterRoutes = require('./routes/exRegisterRoutes');
 const certificateRoutes = require('./routes/certificateRoutes');
-const inspectionRoutes = require('./routes/inspectionRoutes');
+const questionsRoutes = require('./routes/questionsRoutes');
 const zoneRoutes = require('./routes/zoneRoutes');
 const siteRoutes = require('./routes/siteRoutes');
 const xlsCompareRoutes = require('./routes/xlsCompareRoutes')
@@ -74,7 +74,7 @@ app.use('/api/vision', visionRoutes);
 app.use('/api/fire', fireRoutes);
 app.use('/api', exRegisterRoutes);
 app.use('/api', certificateRoutes);
-app.use('/api/inspection', inspectionRoutes);
+app.use('/api/questions', questionsRoutes);
 app.use('/api/zones', zoneRoutes);
 app.use('/api/sites', siteRoutes);
 app.use('/api/xls', xlsCompareRoutes);

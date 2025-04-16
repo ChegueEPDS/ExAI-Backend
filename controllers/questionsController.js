@@ -1,16 +1,13 @@
-const Question = require('../models/question'); // Mongoose model
+const Question = require('../models/questions'); // Mongoose model
 
-// Új kérdés hozzáadása
+// Új kérdés(ek) hozzáadása
 const addQuestion = async (req, res) => {
     try {
-        // Ellenőrizzük, hogy a kérésben tömb vagy egy objektum érkezett
         const data = Array.isArray(req.body) ? req.body : [req.body];
-
-        // Adatok mentése az adatbázisba
         const savedQuestions = await Question.insertMany(data);
 
         res.status(201).json({
-            message: `${savedQuestions.length} question(s) have been successfully added.`,
+            message: `${savedQuestions.length} question(s) added successfully.`,
             data: savedQuestions
         });
     } catch (err) {
@@ -18,45 +15,57 @@ const addQuestion = async (req, res) => {
     }
 };
 
-// Összes kérdés lekérdezése (opcionális szűrőfeltételekkel)
+// Kérdések lekérdezése opcionális szűrőkkel
 const getQuestions = async (req, res) => {
-    const { protection, grade, type } = req.query;
-
+    const { protectionType, inspectionType, equipmentCategory } = req.query;
+  
     const filter = {};
-    if (protection) filter.protections = protection;
-    if (grade) filter.grades = grade;
-    if (type) filter.type = type;
-
-    try {
-        const questions = await Question.find(filter);
-        res.status(200).json(questions);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+  
+    if (protectionType) {
+      const types = Array.isArray(protectionType) ? protectionType : [protectionType];
+      filter.protectionTypes = { $in: types };
     }
-};
+  
+    if (inspectionType) {
+      filter.inspectionTypes = inspectionType;
+    }
+  
+    if (equipmentCategory) {
+      filter.equipmentCategories = { $in: [equipmentCategory, "All"] };
+    }
+  
+    try {
+      const questions = await Question.find(filter);
+      res.status(200).json(questions);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  };
 
-// Egy adott kérdés módosítása
+// Egy kérdés frissítése
 const updateQuestion = async (req, res) => {
     try {
-        const updatedQuestion = await Question.findByIdAndUpdate(
+        const updated = await Question.findByIdAndUpdate(
             req.params.id,
             req.body,
             { new: true, runValidators: true }
         );
-        if (!updatedQuestion) {
+
+        if (!updated) {
             return res.status(404).json({ error: "Question not found" });
         }
-        res.status(200).json(updatedQuestion);
+
+        res.status(200).json(updated);
     } catch (err) {
         res.status(400).json({ error: err.message });
     }
 };
 
-// Egy adott kérdés törlése
+// Egy kérdés törlése
 const deleteQuestion = async (req, res) => {
     try {
-        const deletedQuestion = await Question.findByIdAndDelete(req.params.id);
-        if (!deletedQuestion) {
+        const deleted = await Question.findByIdAndDelete(req.params.id);
+        if (!deleted) {
             return res.status(404).json({ error: "Question not found" });
         }
         res.status(200).json({ message: "Question deleted successfully" });
@@ -65,7 +74,6 @@ const deleteQuestion = async (req, res) => {
     }
 };
 
-// Függvények exportálása
 module.exports = {
     addQuestion,
     getQuestions,

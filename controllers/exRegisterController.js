@@ -274,6 +274,10 @@ exports.listEquipment = async (req, res) => {
       filter.$or = [{ Zone: null }, { Zone: { $exists: false } }];
     }
 
+    if (req.query.EqID) {
+      filter.EqID = req.query.EqID;
+    }
+
     const equipments = await Equipment.find(filter).lean();
 
     const withPaths = equipments.map(eq => {
