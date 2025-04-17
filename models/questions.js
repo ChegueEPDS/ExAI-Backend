@@ -19,7 +19,7 @@ const QuestionsSchema = new mongoose.Schema({
   },
 
   number: {
-    type: Number
+    type: String
   },
 
   protectionTypes: [{
