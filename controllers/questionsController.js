@@ -23,7 +23,11 @@ const getQuestions = async (req, res) => {
   
     if (protectionType) {
       const types = Array.isArray(protectionType) ? protectionType : [protectionType];
-      filter.protectionTypes = { $in: types };
+  
+      // 👇 Regex minden protectionType-ra (kisbetű-független)
+      filter.protectionTypes = {
+        $in: types.map(type => new RegExp(`^${type}$`, 'i'))
+      };
     }
   
     if (inspectionType) {
@@ -31,7 +35,7 @@ const getQuestions = async (req, res) => {
     }
   
     if (equipmentCategory) {
-      filter.equipmentCategories = { $in: [equipmentCategory, "All"] };
+      filter.equipmentCategories = { $in: [equipmentCategory, 'All'] };
     }
   
     try {

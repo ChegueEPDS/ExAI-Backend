@@ -41,7 +41,8 @@ const QuestionsSchema = new mongoose.Schema({
   },
 
   equipmentType: {
-    type: String
+    type: String,
+    enum: ["General", "Motors", "Lighting", "Installation", "Installation Heating System", "Installation Motors", "Environment"],
   },
 });
 

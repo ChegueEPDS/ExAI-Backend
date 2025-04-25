@@ -1,0 +1,8 @@
+{"error":{"code":"Gone","message":"Computer Vision 2023-02-01-preview has been deprecated. Please upgrade to the latest Computer Vision GA service - https://azure.microsoft.com/en-us/updates?id=475779 "},"level":"error","message":"Error during image upload:","timestamp":"2025-04-24T07:15:52.579Z"}
+{"error":{"code":"404","message":"Resource not found"},"level":"error","message":"Error during image upload:","timestamp":"2025-04-24T07:56:52.210Z"}
+{"level":"error","message":"❌ Error during image upload:","timestamp":"2025-04-24T07:59:11.500Z"}
+{"level":"error","message":"❌ Error during image upload:","timestamp":"2025-04-24T07:59:33.132Z"}
+{"level":"error","message":"❌ Error during image upload:","timestamp":"2025-04-24T08:46:05.256Z"}
+{"level":"error","message":"❌ Error during image upload: formattedText is not defined","stack":"ReferenceError: formattedText is not defined\n    at exports.uploadImage (/Users/chegue/AI demok/Backend/controllers/imgOcrController.js:57:7)\n    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)","timestamp":"2025-04-24T08:47:37.749Z"}
+{"level":"error","message":"Hiba az üres beszélgetések törlése során:","timestamp":"2025-04-24T11:56:46.793Z"}
+{"level":"error","message":"Hiba az üres beszélgetések törlése során:","timestamp":"2025-04-24T19:49:15.874Z"}

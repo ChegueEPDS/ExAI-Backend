@@ -7,6 +7,7 @@ const imgOcrController = require('../controllers/imgOcrController');
 
 // Route for uploading images
 router.post('/plate', imgOcrController.uploadImage);
+router.post('/plate/multiple', imgOcrController.uploadMultipleImages);
 router.post('/pdfcert', imgOcrController.uploadPdfWithFormRecognizer);  // Új PDF OCR végpont
 
 

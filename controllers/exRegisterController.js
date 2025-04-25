@@ -50,7 +50,6 @@ exports.createEquipment = async (req, res) => {
       const _id = equipment._id || null;
       const eqId = equipment.EqID || new mongoose.Types.ObjectId().toString();
 
-      // 🔎 Létező eszköz keresése _id vagy kombináció alapján
       let existingEquipment = null;
       if (_id) {
         existingEquipment = await Equipment.findById(_id);
@@ -101,13 +100,13 @@ exports.createEquipment = async (req, res) => {
         sharePointFolderUrl = shareUrl;
 
         for (const file of equipmentFiles) {
-          const cleanName = cleanFileName(file.originalname.split('__')[1] || file.originalname);
-          const fileBuffer = fs.readFileSync(file.path);
-
-          let oneDriveUpload = null;
-          let sharePointUpload = null;
-
           try {
+            const cleanName = cleanFileName(file.originalname.split('__')[1] || file.originalname);
+            const fileBuffer = fs.readFileSync(file.path);
+
+            let oneDriveUpload = null;
+            let sharePointUpload = null;
+
             if (oneDriveFolderId) {
               const oneDriveUploadUrl = `https://graph.microsoft.com/v1.0/me/drive/items/${oneDriveFolderId}:/${cleanName}:/content`;
               const uploadRes = await axios.put(oneDriveUploadUrl, fileBuffer, {
@@ -131,11 +130,12 @@ exports.createEquipment = async (req, res) => {
               sharePointUrl: sharePointUpload?.webUrl || null,
               uploadedAt: new Date()
             });
-          } catch (err) {
-            console.error("❌ Feltöltési hiba:", err.message);
-          }
 
-          fs.unlinkSync(file.path);
+            fs.unlinkSync(file.path);
+          } catch (err) {
+            console.error(`❌ File feldolgozás hiba (${file?.originalname}):`, err.message);
+            continue; // továbblép a többi fájlra
+          }
         }
       }
 
