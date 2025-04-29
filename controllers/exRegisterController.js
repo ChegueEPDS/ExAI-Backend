@@ -47,6 +47,13 @@ exports.createEquipment = async (req, res) => {
     const results = [];
 
     for (const equipment of equipmentData) {
+      if (!equipment["X condition"]) {
+        equipment["X condition"] = { X: false, Specific: '' };
+      }
+      if (equipment["X condition"].Specific && equipment["X condition"].Specific.trim() !== '') {
+        equipment["X condition"].X = true;
+      }
+
       const _id = equipment._id || null;
       const eqId = equipment.EqID || new mongoose.Types.ObjectId().toString();
 
@@ -329,6 +336,15 @@ exports.updateEquipment = async (req, res) => {
 
     const oldEqID = req.body.OriginalEqID || equipment.EqID;
     const updatedFields = { ...req.body };
+
+    // X condition auto-set
+    if (!updatedFields["X condition"]) {
+      updatedFields["X condition"] = { X: false, Specific: '' };
+    }
+    if (updatedFields["X condition"].Specific && updatedFields["X condition"].Specific.trim() !== '') {
+      updatedFields["X condition"].X = true;
+    }
+
     delete updatedFields.CreatedBy;
     updatedFields.ModifiedBy = new mongoose.Types.ObjectId(ModifiedBy);
 
