@@ -278,6 +278,18 @@ exports.listEquipment = async (req, res) => {
       filter.EqID = req.query.EqID;
     }
 
+    if (req.query.Manufacturer) {
+      filter["Manufacturer"] = req.query.Manufacturer;
+    }
+
+    if (req.query.SerialNumber) {
+      filter["Serial Number"] = req.query.SerialNumber;
+    }
+
+    if (req.query.Qualitycheck) {
+      filter["Qualitycheck"] = req.query.Qualitycheck === 'true';
+    }
+
     const equipments = await Equipment.find(filter).lean();
 
     const withPaths = equipments.map(eq => {
