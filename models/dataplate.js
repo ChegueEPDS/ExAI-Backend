@@ -31,6 +31,7 @@ const EquipmentSchema = new mongoose.Schema({
     enum: ["NA", "Passed", "Failed"], 
     default: "NA" 
   },
+  "Qualitycheck": { type: Boolean, default: false },
   "CreatedBy": { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   "ModifiedBy": { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // 🆕 Módosító felhasználó
   "Company": { type: String, required: true },
