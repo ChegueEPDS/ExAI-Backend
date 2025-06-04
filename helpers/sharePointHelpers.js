@@ -28,7 +28,12 @@ async function getOrCreateSharePointFolder(accessToken, folderPath) {
     const driveId = driveRes.data.value[0].id; // vagy szűrés, ha több drive van
 
     // 🔹 3. Mappa létrehozása/megkeresése
-    let parentFolderId = 'root';
+    // 🔹 Lekérjük a gyökérmappát (valódi ID-vel)
+const rootRes = await axios.get(
+  `https://graph.microsoft.com/v1.0/sites/${siteId}/drives/${driveId}/root`,
+  { headers: { Authorization: `Bearer ${accessToken}` } }
+);
+let parentFolderId = rootRes.data.id;
     const folders = folderPath.split('/');
     let folderUrl = null;
 
