@@ -266,6 +266,29 @@ exports.uploadImagesToEquipment = async (req, res) => {
   }
 };
 
+// GET /exreg/:id
+exports.getEquipmentById = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const company = req.user?.company;
+
+    if (!company) {
+      return res.status(401).json({ error: 'Hiányzó céginformáció a tokenből.' });
+    }
+
+    const equipment = await Equipment.findOne({ _id: id, Company: company }).lean();
+
+    if (!equipment) {
+      return res.status(404).json({ error: 'Eszköz nem található.' });
+    }
+
+    res.json(equipment);
+  } catch (error) {
+    console.error('❌ Hiba az eszköz lekérdezésekor:', error);
+    res.status(500).json({ error: 'Nem sikerült lekérni az eszközt.' });
+  }
+};
+
 // Listázás (GET /exreg)
 exports.listEquipment = async (req, res) => {
   try {
@@ -334,8 +357,15 @@ exports.updateEquipment = async (req, res) => {
       return res.status(404).json({ error: 'Eszköz nem található.' });
     }
 
+    // 🔧 Ez a kulcspont: FormData-ból bontsuk ki a JSON-t
+    let updatedFields = {};
+    if (typeof req.body.equipmentData === 'string') {
+      updatedFields = JSON.parse(req.body.equipmentData)[0];
+    } else {
+      updatedFields = { ...req.body };
+    }
+
     const oldEqID = req.body.OriginalEqID || equipment.EqID;
-    const updatedFields = { ...req.body };
 
     // X condition auto-set
     if (!updatedFields["X condition"]) {
@@ -421,7 +451,7 @@ exports.updateEquipment = async (req, res) => {
             azureToken,
             equipment.SharePointId,
             newShare.folderId,
-            newShare.driveId // 💡 Ezt most már visszaadja a helper
+            newShare.driveId
           );
           updatedEquipment.SharePointId = newShare.folderId;
           updatedEquipment.SharePointUrl = newShare.folderUrl;
@@ -429,6 +459,74 @@ exports.updateEquipment = async (req, res) => {
           console.warn("⚠️ SharePoint mozgatási hiba:", err.message);
         }
       }
+
+      await updatedEquipment.save();
+    }
+
+    // 3️⃣ Új képek feltöltése, ha vannak fájlok
+    const files = Array.isArray(req.files) ? req.files : [];
+    let pictures = [];
+
+    if (azureToken && files.length > 0) {
+      let folderPath, sharePointPath;
+      const company = Company.toUpperCase();
+
+      if (updatedEquipment.Zone && updatedEquipment.Site) {
+        const site = await Site.findById(updatedEquipment.Site).lean();
+        const zone = await Zone.findById(updatedEquipment.Zone).lean();
+        const siteName = site?.Name || `Site_${updatedEquipment.Site}`;
+        const zoneName = zone?.Name || `Zone_${updatedEquipment.Zone}`;
+        folderPath = `ExAI/Projects/${siteName}/${zoneName}/${updatedEquipment.EqID}`;
+        sharePointPath = `${company}/Projects/${siteName}/${zoneName}/${updatedEquipment.EqID}`;
+      } else {
+        folderPath = `ExAI/Equipment/${updatedEquipment.EqID}`;
+        sharePointPath = `${company}/General Equipment/${updatedEquipment.EqID}`;
+      }
+
+      const folderResult = await getOrCreateFolder(azureToken, folderPath);
+      const shareResult = await getOrCreateSharePointFolder(azureToken, sharePointPath);
+
+      for (const file of files) {
+        const fileBuffer = fs.readFileSync(file.path);
+        const safeName = cleanFileName(file.originalname);
+
+        let oneDriveRes = null;
+        let sharePointRes = null;
+
+        if (folderResult?.folderId) {
+          oneDriveRes = await axios.put(
+            `https://graph.microsoft.com/v1.0/me/drive/items/${folderResult.folderId}:/${safeName}:/content`,
+            fileBuffer,
+            {
+              headers: {
+                Authorization: `Bearer ${azureToken}`,
+                "Content-Type": file.mimetype
+              }
+            }
+          );
+        }
+
+        if (shareResult?.folderId) {
+          sharePointRes = await uploadSharePointFile(azureToken, sharePointPath, file.path, safeName);
+        }
+
+        fs.unlinkSync(file.path);
+
+        pictures.push({
+          name: safeName,
+          oneDriveId: oneDriveRes?.data?.id || null,
+          oneDriveUrl: oneDriveRes?.data?.webUrl || null,
+          sharePointId: sharePointRes?.id || null,
+          sharePointUrl: sharePointRes?.webUrl || null,
+          uploadedAt: new Date()
+        });
+      }
+
+      updatedEquipment.Pictures = [...(updatedEquipment.Pictures || []), ...pictures];
+      updatedEquipment.OneDriveFolderId = folderResult?.folderId;
+      updatedEquipment.OneDriveFolderUrl = folderResult?.folderUrl;
+      updatedEquipment.SharePointId = shareResult?.folderId;
+      updatedEquipment.SharePointUrl = shareResult?.folderUrl;
 
       await updatedEquipment.save();
     }

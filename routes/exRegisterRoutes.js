@@ -17,8 +17,11 @@ router.post('/exreg/:id/upload-images', authMiddleware(), upload.array('pictures
 // Listázás
 router.get('/exreg', authMiddleware(), exRegisterController.listEquipment);
 
+// Lekérés ID alapján (GET /exreg/:id)
+router.get('/exreg/:id', authMiddleware(), exRegisterController.getEquipmentById);
+
 // Módosítás
-router.put('/exreg/:id', authMiddleware(), exRegisterController.updateEquipment);
+router.put('/exreg/:id', authMiddleware(), upload.array('pictures'), exRegisterController.updateEquipment);
 
 // Törlés
 router.delete('/exreg/:id', authMiddleware(), exRegisterController.deleteEquipment);
