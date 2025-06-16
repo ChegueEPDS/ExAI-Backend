@@ -98,7 +98,7 @@ exports.sendMessage = [
       const companyId = user.company;
       const assistantId = assistants[companyId] || assistants['default'];
 
-      logger.info(`Assistant ID kiválasztva: ${assistantId} (Company: ${companyId})`);
+     // logger.info(`Assistant ID kiválasztva: ${assistantId} (Company: ${companyId})`);
 
       // 🟢 Beszélgetés ellenőrzése
       const conversation = await Conversation.findOne({ threadId });
