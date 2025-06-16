@@ -31,6 +31,16 @@ exports.createEquipment = async (req, res) => {
     const azureToken = req.headers['x-ms-graph-token'];
     const files = Array.isArray(req.files) ? req.files : [];
 
+    console.log('📥 Új equipment létrehozási kérés érkezett.');
+    console.log('🧾 Felhasználó:', CreatedBy);
+    console.log('🏢 Cég:', Company);
+    console.log('📦 Fájlok száma:', files.length);
+    console.log('📨 Kérelmi body (equipmentData):', req.body.equipmentData);
+    console.log('📦 Beérkezett fájlok (req.files):');
+      files.forEach((f, i) => {
+        console.log(`  ${i + 1}. ${f.originalname} (${f.mimetype}, ${f.size} bytes)`);
+      });
+
     let equipmentData = [];
     if (typeof req.body.equipmentData === 'string') {
       equipmentData = JSON.parse(req.body.equipmentData);
@@ -91,6 +101,12 @@ exports.createEquipment = async (req, res) => {
         return eqIdInName === eqId;
       });
 
+      console.log('🔍 EqID a feldolgozáshoz:', eqId);
+        console.log('🔍 Fájlok, amelyek eqId alapján illeszkedtek:');
+        equipmentFiles.forEach((f, i) => {
+          console.log(`  ✅ ${i + 1}. ${f.originalname}`);
+        });
+
       let pictures = [];
       let oneDriveFolderId = null;
       let oneDriveFolderUrl = null;
@@ -107,10 +123,11 @@ exports.createEquipment = async (req, res) => {
         sharePointFolderUrl = shareUrl;
 
         for (const file of equipmentFiles) {
+          console.log(`📂 Fájl feldolgozása: ${file.originalname}`);
           try {
             const cleanName = cleanFileName(file.originalname.split('__')[1] || file.originalname);
             const fileBuffer = fs.readFileSync(file.path);
-
+            console.log(`📄 Fájl betöltve (${file.path}, ${file.mimetype})`);
             let oneDriveUpload = null;
             let sharePointUpload = null;
 
@@ -141,10 +158,19 @@ exports.createEquipment = async (req, res) => {
             fs.unlinkSync(file.path);
           } catch (err) {
             console.error(`❌ File feldolgozás hiba (${file?.originalname}):`, err.message);
+            console.log('❌ Hiba stack trace:', err.stack);
             continue; // továbblép a többi fájlra
           }
         }
       }
+
+      console.log('💾 Equipment mentésre készül:', {
+        EqID: eqId,
+        Site: equipment.Site,
+        Zone: equipment.Zone,
+        PictureCount: pictures.length,
+        Pictures: pictures.map(p => p.name)
+      });
 
       const updateFields = {
         ...equipment,
@@ -196,6 +222,12 @@ exports.uploadImagesToEquipment = async (req, res) => {
     let folderPath, sharePointPath;
     const company = req.user.company.toUpperCase();
 
+    console.log('📥 Képfeltöltési kérés érkezett:', {
+      equipmentId: req.params.id,
+      user: req.user?.email || req.userId,
+      filesCount: Array.isArray(req.files) ? req.files.length : 0
+    });
+
     if (equipment.Zone && equipment.Site) {
       const zone = await Zone.findById(equipment.Zone);
       const site = await Site.findById(equipment.Site);
@@ -208,6 +240,12 @@ exports.uploadImagesToEquipment = async (req, res) => {
       folderPath = `ExAI/Equipment/${equipment.EqID}`;
       sharePointPath = `${company}/General Equipment/${equipment.EqID}`;
     }
+
+    console.log('🔍 Equipment megtalálva:', {
+      EqID: equipment.EqID,
+      Site: equipment.Site,
+      Zone: equipment.Zone
+    });
 
     const folderResult = await getOrCreateFolder(azureToken, folderPath);
     const shareResult = await getOrCreateSharePointFolder(azureToken, sharePointPath);
