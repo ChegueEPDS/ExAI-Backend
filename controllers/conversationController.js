@@ -213,7 +213,12 @@ exports.sendMessage = [
       // 🟢 Válasz küldése a frontendnek
       res.json({ html: assistantContentHtml, images: imageUrls.length > 0 ? imageUrls : [] });
     } catch (error) {
-      logger.error('Hiba az üzenetküldés során:', error.message);
+      logger.error('Hiba az üzenetküldés során:', {
+        message: error.message,
+        stack: error.stack,
+        response: error.response?.data,
+        status: error.response?.status,
+      });
       res.status(500).json({ error: 'Váratlan hiba történt.' });
     }
   }
