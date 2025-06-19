@@ -79,7 +79,7 @@ exports.sendMessage = [
     }
 
     try {
-      const { message, threadId } = req.body;
+      const { message, threadId, category } = req.body;
       const userId = req.userId;
 
       if (!userId) {
@@ -97,6 +97,18 @@ exports.sendMessage = [
 
       const companyId = user.company;
       const assistantId = assistants[companyId] || assistants['default'];
+
+      let finalCategory = category;
+
+        if (!finalCategory) {
+          try {
+            finalCategory = await categorizeMessageUsingAI(message);  // automatikus kategorizálás
+            logger.info('Automatikusan kategorizált:', finalCategory);
+          } catch (err) {
+            logger.warn('Nem sikerült automatikusan kategorizálni:', err.message);
+            finalCategory = null;
+          }
+}
 
      // logger.info(`Assistant ID kiválasztva: ${assistantId} (Company: ${companyId})`);
 
@@ -205,7 +217,7 @@ exports.sendMessage = [
       const imageUrls = matchedImages.map(filename => `${process.env.BASE_URL}/uploads/${filename}`);
 
       // 🟢 Üzenetek mentése a beszélgetésbe
-      conversation.messages.push({ role: 'user', content: message });
+      conversation.messages.push({ role: 'user', content: message, ...(finalCategory && { category: finalCategory })});
       conversation.messages.push({ role: 'assistant', content: assistantContentHtml, images: imageUrls });
 
       await conversation.save();

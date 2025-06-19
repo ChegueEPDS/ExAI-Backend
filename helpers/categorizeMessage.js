@@ -10,7 +10,7 @@ const categorizeMessageUsingAI = async (message, assistantMessage) => {
         messages: [
           {
             role: 'system',
-            content: 'Categorize the conversation into one of the following categories: ATEX, Ex markings, Hazardous Area Classification, Explosion protection, Legal, Fire Proterction, Work safety, Viresol, PGMED, Uncategorized. Only return the category name!',
+            content: 'Categorize the conversation into one of the following categories: ATEX, Ex markings, Hazardous Area Classification, Explosion protection, ATEX137, ATEX114, 60079-0, 60079-10-1, 60079-10-2, Legal, Fire Proterction, Work safety, Viresol, PGMED, Uncategorized. Only return the category name!',
           },
           { 
             role: 'user', 
