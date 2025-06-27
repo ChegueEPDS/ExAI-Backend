@@ -1,4 +1,5 @@
 const Conversation = require('../models/conversation');
+const InjectionRule = require('../models/injectionRule');
 const axios = require('axios');
 const logger = require('../config/logger');
 const categorizeMessageUsingAI = require('../helpers/categorizeMessage');
@@ -68,6 +69,8 @@ const imageMapping = {
   "épületmagasság":["KESZ_4_MELL_MAGASSAG.png"],
 };
 
+/* 
+
 exports.sendMessage = [
   body('message').isString().notEmpty().trim().escape(),
   body('threadId').isString().notEmpty().trim().escape(),
@@ -89,7 +92,6 @@ exports.sendMessage = [
 
       logger.info(`Üzenet fogadva a szálhoz: ${threadId}, Üzenet: ${message}`);
 
-      // 🟢 Felhasználó és céges asszisztens ID meghatározása
       const user = await User.findById(userId).select('company');
       if (!user) {
         return res.status(404).json({ error: 'Felhasználó nem található.' });
@@ -98,30 +100,47 @@ exports.sendMessage = [
       const companyId = user.company;
       const assistantId = assistants[companyId] || assistants['default'];
 
-      let finalCategory = category;
-
-        if (!finalCategory) {
+      let applicableInjection = null;
+      if (companyId === 'wolff' || assistantId === process.env.ASSISTANT_ID_WOLFF) {
+        const allRules = await InjectionRule.find();
+        const matchingRule = allRules.find(rule => {
           try {
-            finalCategory = await categorizeMessageUsingAI(message);  // automatikus kategorizálás
-            logger.info('Automatikusan kategorizált:', finalCategory);
-          } catch (err) {
-            logger.warn('Nem sikerült automatikusan kategorizálni:', err.message);
-            finalCategory = null;
+            const regex = new RegExp(rule.pattern, 'i');
+            return regex.test(message);
+          } catch (e) {
+            return false;
           }
-}
+        });
+        if (matchingRule) {
+          logger.info('💡 Injection rule alkalmazva:', matchingRule);
+          applicableInjection = matchingRule.injectedKnowledge;
+        }
+      }
 
-     // logger.info(`Assistant ID kiválasztva: ${assistantId} (Company: ${companyId})`);
+      let finalCategory = category;
+      if (!finalCategory) {
+        try {
+          finalCategory = await categorizeMessageUsingAI(message);
+          logger.info('Automatikusan kategorizált:', finalCategory);
+        } catch (err) {
+          logger.warn('Nem sikerült automatikusan kategorizálni:', err.message);
+          finalCategory = null;
+        }
+      }
 
-      // 🟢 Beszélgetés ellenőrzése
       const conversation = await Conversation.findOne({ threadId });
       if (!conversation) {
         logger.error('Beszélgetés nem található a megadott szálhoz:', threadId);
         return res.status(404).json({ error: 'A megadott szál nem található.' });
       }
 
-      // 🟢 Üzenet OpenAI API-hoz küldése
-      await axios.post(`https://api.openai.com/v1/threads/${threadId}/messages`, 
-        { role: 'user', content: message }, 
+      let combinedMessage = message;
+      if (applicableInjection) {
+        combinedMessage += `\n\n[System Note for Assistant]\n${applicableInjection}`;
+      }
+
+      await axios.post(`https://api.openai.com/v1/threads/${threadId}/messages`,
+        { role: 'user', content: combinedMessage },
         {
           headers: {
             'Content-Type': 'application/json',
@@ -130,9 +149,8 @@ exports.sendMessage = [
           }
         });
 
-      // 🟢 OpenAI válasz generálás elindítása
-      const runResponse = await axios.post(`https://api.openai.com/v1/threads/${threadId}/runs`, 
-        { assistant_id: assistantId }, 
+      const runResponse = await axios.post(`https://api.openai.com/v1/threads/${threadId}/runs`,
+        { assistant_id: assistantId },
         {
           headers: {
             'Content-Type': 'application/json',
@@ -141,7 +159,6 @@ exports.sendMessage = [
           }
         });
 
-      // 🟢 OpenAI válaszának lekérése (polling, max 30 másodperc)
       let completed = false;
       let retries = 0;
       const maxRetries = 30;
@@ -169,7 +186,6 @@ exports.sendMessage = [
         throw new Error('A futás nem fejeződött be a megadott idő alatt.');
       }
 
-      // 🟢 Az AI válaszának lekérése
       const messagesResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/messages`, {
         headers: {
           'Content-Type': 'application/json',
@@ -183,7 +199,6 @@ exports.sendMessage = [
         throw new Error('Nem található asszisztens üzenet');
       }
 
-      // 🟢 Szöveges válasz kivonása az AI válaszból
       let assistantContent = '';
       if (Array.isArray(assistantMessage.content)) {
         assistantMessage.content.forEach(item => {
@@ -195,7 +210,7 @@ exports.sendMessage = [
         assistantContent = assistantMessage.content;
       }
 
-      assistantContent = assistantContent.replace(/【.*?】/g, ''); // OpenAI generált zaj eltávolítása
+      assistantContent = assistantContent.replace(/【.*?】/g, '');
 
       assistantContent = sanitizeHtml(assistantContent, {
         allowedTags: ['b', 'i', 'strong', 'em', 'u', 's', 'br', 'p', 'ul', 'ol', 'li', 'blockquote', 'code', 'pre', 'span'],
@@ -205,7 +220,6 @@ exports.sendMessage = [
 
       const assistantContentHtml = marked(assistantContent);
 
-      // 🟢 Kulcsszavak alapján képek kiválasztása
       let matchedImages = [];
       Object.keys(imageMapping).forEach(keyword => {
         if (message.toLowerCase().includes(keyword) || assistantContent.toLowerCase().includes(keyword)) {
@@ -213,16 +227,14 @@ exports.sendMessage = [
         }
       });
 
-      matchedImages = [...new Set(matchedImages)]; // Duplikációk kiszűrése
+      matchedImages = [...new Set(matchedImages)];
       const imageUrls = matchedImages.map(filename => `${process.env.BASE_URL}/uploads/${filename}`);
 
-      // 🟢 Üzenetek mentése a beszélgetésbe
-      conversation.messages.push({ role: 'user', content: message, ...(finalCategory && { category: finalCategory })});
+      conversation.messages.push({ role: 'user', content: message, ...(finalCategory && { category: finalCategory }) });
       conversation.messages.push({ role: 'assistant', content: assistantContentHtml, images: imageUrls });
 
       await conversation.save();
 
-      // 🟢 Válasz küldése a frontendnek
       res.json({ html: assistantContentHtml, images: imageUrls.length > 0 ? imageUrls : [] });
     } catch (error) {
       logger.error('Hiba az üzenetküldés során:', {
@@ -235,6 +247,248 @@ exports.sendMessage = [
     }
   }
 ];
+
+*/
+
+exports.sendMessage = [
+  body('message').isString().notEmpty().trim().escape(),
+  body('threadId').isString().notEmpty().trim().escape(),
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      logger.error('Validációs hiba:', errors.array());
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    try {
+      const { message, threadId, category } = req.body;
+      const userId = req.userId;
+
+      if (!userId) {
+        logger.error('Hiányzó userId a kérésből.');
+        return res.status(400).json({ error: 'Bejelentkezett felhasználó azonosítója hiányzik.' });
+      }
+
+      logger.info(`Üzenet fogadva a szálhoz: ${threadId}, Üzenet: ${message}`);
+
+      const user = await User.findById(userId).select('company');
+      if (!user) {
+        return res.status(404).json({ error: 'Felhasználó nem található.' });
+      }
+
+      const companyId = user.company;
+      const assistantId = assistants[companyId] || assistants['default'];
+
+      let applicableInjection = null;
+      if (companyId === 'wolff' || assistantId === process.env.ASSISTANT_ID_WOLFF) {
+        const allRules = await InjectionRule.find();
+        const matchingRule = allRules.find(rule => {
+          try {
+            const regex = new RegExp(rule.pattern, 'i');
+            return regex.test(message);
+          } catch (e) {
+            return false;
+          }
+        });
+        if (matchingRule) {
+          logger.info('💡 Injection rule alkalmazva:', matchingRule);
+          applicableInjection = matchingRule.injectedKnowledge;
+        }
+      }
+
+      let finalCategory = category;
+      if (!finalCategory) {
+        try {
+          finalCategory = await categorizeMessageUsingAI(message);
+          logger.info('Automatikusan kategorizált:', finalCategory);
+        } catch (err) {
+          logger.warn('Nem sikerült automatikusan kategorizálni:', err.message);
+          finalCategory = null;
+        }
+      }
+
+      const conversation = await Conversation.findOne({ threadId });
+      if (!conversation) {
+        logger.error('Beszélgetés nem található a megadott szálhoz:', threadId);
+        return res.status(404).json({ error: 'A megadott szál nem található.' });
+      }
+
+      // Ellenőrzés: van-e aktív run a szálhoz
+      const runsResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/runs`, {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          'OpenAI-Beta': 'assistants=v2',
+        },
+      });
+
+      const activeRun = runsResponse.data.data.find(
+        r => ['queued', 'in_progress', 'requires_action', 'cancelling'].includes(r.status)
+      );
+
+      if (activeRun) {
+        logger.warn('⚠️ Aktív run már létezik ehhez a threadhez:', {
+          threadId,
+          activeRunId: activeRun.id,
+          status: activeRun.status
+        });
+        return res.status(429).json({
+          error: `Már fut egy aktív feldolgozás (${activeRun.status}). Kérlek, várj amíg véget ér.`,
+          activeRunId: activeRun.id,
+          status: activeRun.status
+        });
+      }
+
+      await axios.post(`https://api.openai.com/v1/threads/${threadId}/messages`, {
+        role: 'user',
+        content: message,
+      }, {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          'OpenAI-Beta': 'assistants=v2',
+        }
+      });
+
+      let runPayload = { assistant_id: assistantId };
+
+      if (applicableInjection) {
+        const assistantData = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {
+          headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            'OpenAI-Beta': 'assistants=v2'
+          }
+        });
+
+        const assistantPrompt = assistantData.data.instructions || '';
+
+        const finalInstructions = `${assistantPrompt}\n\nAlways put the following sentence at the end of the explanation part as a <strong>Note:</strong>, exactly as written, in a separate paragraph between <em> tags: :\n\n"${applicableInjection}"`;
+
+        logger.info('📋 Final instructions before sending:', finalInstructions);
+        console.log('📋 Final instructions before sending:', finalInstructions);
+
+        runPayload.instructions = finalInstructions;
+      }
+
+      const runResponse = await axios.post(`https://api.openai.com/v1/threads/${threadId}/runs`, runPayload, {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          'OpenAI-Beta': 'assistants=v2',
+        }
+      });
+
+      let completed = false;
+      let retries = 0;
+      const maxRetries = 60;
+
+      while (!completed && retries < maxRetries) {
+        await delay(1000);
+        retries++;
+
+        const statusResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/runs/${runResponse.data.id}`, {
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            'OpenAI-Beta': 'assistants=v2',
+          },
+        });
+
+        const status = statusResponse.data.status;
+
+        if (status === 'completed') {
+          completed = true;
+        } else if (['failed', 'cancelled', 'expired'].includes(status)) {
+          throw new Error(`A futás sikertelen vagy megszakadt. Állapot: ${status}`);
+        }
+
+        // opcionális: logolás minden lépésben
+        logger.debug(`⏳ Run státusz (${retries}/${maxRetries}): ${status}`);
+      }
+
+      const messagesResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/messages`, {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          'OpenAI-Beta': 'assistants=v2',
+        },
+      });
+
+      const assistantMessage = messagesResponse.data.data.find(m => m.role === 'assistant');
+      if (!assistantMessage) {
+        throw new Error('Nem található asszisztens üzenet');
+      }
+
+      let assistantContent = '';
+      if (Array.isArray(assistantMessage.content)) {
+        assistantMessage.content.forEach(item => {
+          if (item.type === 'text' && item.text && item.text.value) {
+            assistantContent += item.text.value;
+          }
+        });
+      } else {
+        assistantContent = assistantMessage.content;
+      }
+
+      assistantContent = assistantContent.replace(/【.*?】/g, '');
+
+      assistantContent = sanitizeHtml(assistantContent, {
+        allowedTags: ['b', 'i', 'strong', 'em', 'u', 's', 'br', 'p', 'ul', 'ol', 'li', 'blockquote', 'code', 'pre', 'span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'],
+        allowedAttributes: { 'span': ['class'] },
+        disallowedTagsMode: 'discard'
+      });
+
+      let assistantContentHtml = marked(assistantContent);
+
+      if (finalCategory) {
+        assistantContentHtml = assistantContentHtml.replace(
+          /<h3>According to the document:<\/h3>/,
+          `<h3>According to ${finalCategory}:</h3>`
+        );
+      }
+
+      let matchedImages = [];
+      Object.keys(imageMapping).forEach(keyword => {
+        if (message.toLowerCase().includes(keyword) || assistantContent.toLowerCase().includes(keyword)) {
+          matchedImages = [...matchedImages, ...imageMapping[keyword]];
+        }
+      });
+
+      matchedImages = [...new Set(matchedImages)];
+      const imageUrls = matchedImages.map(filename => `${process.env.BASE_URL}/uploads/${filename}`);
+
+      const assistantEntry = {
+        role: 'assistant',
+        content: assistantContentHtml,
+        images: imageUrls
+      };
+
+      conversation.messages.push({ role: 'user', content: message, ...(finalCategory && { category: finalCategory }) });
+      conversation.messages.push(assistantEntry);
+
+      await conversation.save();
+
+      const lastAssistantMessage = conversation.messages.slice().reverse().find(m => m.role === 'assistant');
+
+      
+      res.json({
+        html: assistantContentHtml,
+        images: imageUrls.length > 0 ? imageUrls : [],
+        messageId: lastAssistantMessage?._id  // ✅ új elem _id-ját visszaküldjük
+      });
+
+    } catch (error) {
+      logger.error('Hiba az üzenetküldés során:', {
+        message: error.message,
+        stack: error.stack,
+        response: error.response?.data,
+        status: error.response?.status,
+      });
+      res.status(500).json({ error: 'Váratlan hiba történt.' });
+    }
+  }
+];
+
+
 
 
 // Üzenet értékelése
