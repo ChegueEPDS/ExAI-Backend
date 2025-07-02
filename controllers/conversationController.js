@@ -282,14 +282,22 @@ exports.sendMessage = [
       let applicableInjection = null;
       if (companyId === 'wolff' || assistantId === process.env.ASSISTANT_ID_WOLFF) {
         const allRules = await InjectionRule.find();
-        const matchingRule = allRules.find(rule => {
-          try {
-            const regex = new RegExp(rule.pattern, 'i');
-            return regex.test(message);
-          } catch (e) {
-            return false;
-          }
-        });
+        // Kiválasztjuk azt a szabályt, ami a legtöbb kulcsszót találja meg
+        const scoredMatches = allRules
+          .map(rule => {
+            try {
+              const regex = new RegExp(rule.pattern, 'gi');
+              const matches = message.match(regex);
+              const score = matches ? matches.length : 0;
+              return score > 0 ? { rule, score } : null;
+            } catch {
+              return null;
+            }
+          })
+          .filter(Boolean)
+          .sort((a, b) => b.score - a.score);
+
+        const matchingRule = scoredMatches.length > 0 ? scoredMatches[0].rule : null;
         if (matchingRule) {
           logger.info('💡 Injection rule alkalmazva:', matchingRule);
           applicableInjection = matchingRule.injectedKnowledge;
