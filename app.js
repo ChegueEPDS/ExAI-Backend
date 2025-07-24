@@ -26,6 +26,7 @@ const siteRoutes = require('./routes/siteRoutes');
 const xlsCompareRoutes = require('./routes/xlsCompareRoutes')
 const graphRoutes = require('./routes/graphRoutes');
 const injectionRoutes = require('./routes/injectionRoutes');
+const dxfRoute = require('./routes/dxf');
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
 const port = process.env.PORT || 3000;
@@ -56,6 +57,7 @@ app.use(bodyParser.json({ limit: '10mb' }));
 app.use(limiter);
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/results', express.static(path.join(__dirname, 'results')));
 app.get('/', (req, res) => {
   res.send('Welcome to the application!');
 });
@@ -81,6 +83,7 @@ app.use('/api/sites', siteRoutes);
 app.use('/api/xls', xlsCompareRoutes);
 app.use('/api/graph', graphRoutes);
 app.use('/api', injectionRoutes);
+app.use('/api/dxf', dxfRoute);
 
 // Periodikus tisztítás
 setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum
