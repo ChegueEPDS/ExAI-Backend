@@ -1,9 +1,13 @@
 #!/bin/bash
+set -e
 
-# Python requirements telepítése
-echo "Installing Python dependencies..."
-pip3 install -r python/requirements.txt
+echo "📦 Installing Python 3 and pip3 manually..."
 
-# Node.js app indítása
-echo "Starting Node.js app..."
+apt update && apt install -y python3 python3-pip
+
+echo "📦 Installing Python dependencies..."
+pip3 install --upgrade pip
+pip3 install -r /home/site/wwwroot/python/requirements.txt
+
+echo "🚀 Starting Node.js server..."
 npm start
