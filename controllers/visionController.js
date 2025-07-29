@@ -78,7 +78,7 @@ const analyzeImages = async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'Nincsenek kép URL-ek megadva.' });
         }
 
-        const userInput = user_input || "Mit látsz a képén?";
+        const userInput = user_input || "What is opn the image? Please explain!";
         const apiUrl = 'https://api.openai.com/v1/chat/completions';
 
         const images = image_urls.map((url) => ({
