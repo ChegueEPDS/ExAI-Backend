@@ -1,5 +1,13 @@
-/.env
+.env
 /node_modules
 /uploads/*
 /logs/*
-!.gitkeep
+*.zip
+*.log
+# IDE-k és build fájlok
+*.DS_Store
+*.vscode
+*.idea
+
+# ✅ Biztosítsd, hogy startup.sh bekerül a zipbe
+!startup.sh
