@@ -27,6 +27,7 @@ const xlsCompareRoutes = require('./routes/xlsCompareRoutes')
 const graphRoutes = require('./routes/graphRoutes');
 const injectionRoutes = require('./routes/injectionRoutes');
 const dxfRoute = require('./routes/dxf');
+
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
 const port = process.env.PORT || 3000;
@@ -87,6 +88,7 @@ app.use('/api/dxf', dxfRoute);
 
 // Periodikus tisztítás
 setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum
+setInterval(cleanupService.cleanupDxfResults, 3 * 60 * 60 * 1000);
 
 console.log("Starting application...");
 app.listen(port, () => {
