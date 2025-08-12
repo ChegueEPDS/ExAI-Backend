@@ -27,6 +27,8 @@ const xlsCompareRoutes = require('./routes/xlsCompareRoutes')
 const graphRoutes = require('./routes/graphRoutes');
 const injectionRoutes = require('./routes/injectionRoutes');
 const dxfRoute = require('./routes/dxf');
+const certificateDraftRoutes = require('./routes/certificateDraftRoutes');
+const notificationsRoutes = require('./routes/notificationsRoutes');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -50,7 +52,7 @@ const allowedOrigins = process.env.CORS_ALLOWED_ORIGINS
         callback(new Error('Not allowed by CORS'));
       }
     },
-    methods: 'GET,POST,PUT,DELETE',
+    methods: 'GET,POST,PUT,PATCH,DELETE',
     credentials: true,
     allowedHeaders: ['Authorization', 'Content-Type', 'x-ms-graph-token']
   }));
@@ -85,6 +87,8 @@ app.use('/api/xls', xlsCompareRoutes);
 app.use('/api/graph', graphRoutes);
 app.use('/api', injectionRoutes);
 app.use('/api/dxf', dxfRoute);
+app.use('/api', certificateDraftRoutes);
+app.use('/api', notificationsRoutes);
 
 // Periodikus tisztítás
 setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum

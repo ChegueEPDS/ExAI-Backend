@@ -35,7 +35,7 @@ const CertificateSchema = new mongoose.Schema({
     company: {
       type: String,
       required: true
-    }
+    },
   }, { timestamps: true });
   
   // 🔹 Automatikus Company kitöltés CreatedBy alapján

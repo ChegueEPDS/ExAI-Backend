@@ -8,9 +8,10 @@ const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthT
  * @param {string} ocrText - Az OCR által felismert nyers szöveg
  * @param {string} certNo - A tanúsítvány száma (fájlnévhez)
  * @param {string} certType - A tanúsítvány típusa ("ATEX" vagy "IECEx")
+ * @param {string|null} outputPath - Opcionális: a generált fájl elérési útja
  * @returns {string} - A generált DOCX fájl elérési útja
  */
-async function generateDocxFile(ocrText, certNo, certType) {
+async function generateDocxFile(ocrText, certNo, certType, outputPath = null) {
     try {
         console.log(`📄 OCR szöveg formázása... Típus: ${certType}`);
 
@@ -135,7 +136,7 @@ async function generateDocxFile(ocrText, certNo, certType) {
         });
 
         // 📄 Fájl mentése
-        const docxFilePath = path.join(__dirname, `../uploads/${certNo}_${certType}_extracted.docx`);
+        const docxFilePath = outputPath || path.join(__dirname, `../uploads/${certNo}_${certType}_extracted.docx`);
         const buffer = await Packer.toBuffer(doc);
         fs.writeFileSync(docxFilePath, buffer);
 
