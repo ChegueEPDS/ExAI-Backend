@@ -12,5 +12,6 @@ router.post('/certificates/drafts/finalize/by-id/:id', authMiddleware(), certifi
 router.post('/certificates/drafts/finalize/:uploadId', authMiddleware(), certificateDraftController.finalizeDrafts);
 router.get('/certificates/uploads/pending', authMiddleware(), certificateDraftController.getPendingUploads);
 router.delete('/certificates/uploads/:uploadId', authMiddleware(), certificateDraftController.deletePendingUpload);
+router.get('/certificates/drafts/by-id/:id/pdf', authMiddleware(), certificateDraftController.getDraftPdfById);
 
 module.exports = router;

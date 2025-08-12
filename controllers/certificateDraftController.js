@@ -703,3 +703,22 @@ exports.deletePendingUpload = async (req, res) => {
     return res.status(500).json({ error: 'Failed to delete pending upload' });
   }
 };
+
+exports.getDraftPdfById = async (req, res) => {
+  const { id } = req.params;
+  try {
+    const draft = await DraftCertificate.findById(id).lean();
+    if (!draft) return res.status(404).json({ error: 'Draft not found' });
+
+    if (!draft.originalPdfPath || !fs.existsSync(draft.originalPdfPath)) {
+      return res.status(404).json({ error: 'PDF file not found' });
+    }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    const abs = path.resolve(draft.originalPdfPath);
+    return res.sendFile(abs);
+  } catch (e) {
+    console.error('[getDraftPdfById] error:', e.message);
+    return res.status(500).json({ error: 'Failed to stream PDF' });
+  }
+};
