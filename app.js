@@ -1,11 +1,10 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const bodyParser = require('body-parser');
 const connectDB = require('./config/db');
 const logger = require('./config/logger');
 const limiter = require('./middlewares/rateLimiter');
 const cleanupService = require('./services/cleanupService');
-require('dotenv').config();
 const path = require('path');
 
 // Routes
@@ -33,6 +32,15 @@ const notificationsRoutes = require('./routes/notificationsRoutes');
 const app = express();
 app.set('trust proxy', 1); // Csak teszt kÃ¶rnyezetben
 const port = process.env.PORT || 3000;
+console.log = (...args) => {
+  logger.info(args.join(' '));
+};
+console.warn = (...args) => {
+  logger.warn(args.join(' '));
+};
+console.error = (...args) => {
+  logger.error(args.join(' '));
+};
 
 connectDB().then(() => console.log('Database connected successfully')).catch((err) => {
   console.error('Database connection failed:', err);
@@ -56,9 +64,9 @@ const allowedOrigins = process.env.CORS_ALLOWED_ORIGINS
     credentials: true,
     allowedHeaders: ['Authorization', 'Content-Type', 'x-ms-graph-token']
   }));
-app.use(bodyParser.json({ limit: '10mb' }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(limiter);
-app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/results', express.static(path.join(__dirname, 'results')));
 app.get('/', (req, res) => {
@@ -95,8 +103,15 @@ setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 Ã
 setInterval(cleanupService.cleanupDxfResults, 3 * 60 * 60 * 1000);
 
 console.log("Starting application...");
+process.on('unhandledRejection', (reason) => {
+  logger.error(`Unhandled Rejection: ${reason instanceof Error ? reason.stack : reason}`);
+});
+process.on('uncaughtException', (err) => {
+  logger.error(`Uncaught Exception: ${err.stack || err.message}`);
+  // Consider graceful shutdown in production
+});
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
   console.log("Azure Tenant ID:", process.env.AZURE_TENANT_ID);
-console.log("Azure Redirect URI:", process.env.AZURE_REDIRECT_URI);
+  console.log("Azure Redirect URI:", process.env.AZURE_REDIRECT_URI);
 });

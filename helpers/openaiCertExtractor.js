@@ -174,6 +174,7 @@ async function extractCertFieldsFromOCR(ocrText) {
     "Output exactly one JSON object that matches the requested fields.",
     "If a field is missing, return empty string for strings and false for booleans.",
     "Detect scheme: 'ATEX' or 'IECEx' if possible.",
+    "Return 'issueDate' strictly in ISO 8601 format (YYYY-MM-DD), if a date is present; otherwise empty string.",
     "For 'specCondition', extract the exact text under headings like:",
     "'Special conditions for safe use', 'Specific conditions of use', 'Schedule of Limitations',",
     "'Special Conditions', 'Specific Conditions', 'Conditions for safe use', or similar.",

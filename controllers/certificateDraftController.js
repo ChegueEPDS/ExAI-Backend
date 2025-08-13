@@ -47,7 +47,6 @@ function runNextProcess() {
 }
 
 function enqueueProcess(uploadId) {
-  console.log(`[enqueueProcess] request uploadId=${uploadId} inFlight=${Array.from(inFlight).join(',')} queued=${processQueue.map(x => x.uploadId).join(',')}`);
   // avoid duplicate queueing for the same uploadId
   if (inFlight.has(uploadId) || queuedIds.has(uploadId)) {
     return { alreadyQueuedOrRunning: true, position: null };
@@ -88,7 +87,6 @@ exports.bulkUpload = [
       const uploadId = `${Date.now()}-${uuidv4().slice(0, 6)}`;
       // the authenticated user who owns this upload
       const createdBy = req.userId || null;
-      console.log(`[bulkUpload] uploadId=${uploadId} createdBy=${createdBy}`);
       const targetDir = path.join('storage', 'certificates', 'draft', uploadId);
 
       fs.mkdirSync(targetDir, { recursive: true });
@@ -175,9 +173,6 @@ async function _processDraftsInternal(uploadId) {
     const { total = 0, ready = 0, draft = 0, error = 0 } = agg[0] || {};
     const finished = total > 0 && (ready + error === total);
 
-    console.log('[notify-check] uploadId=%s userId=%s totals=%o finished=%s',
-      uploadId, userId || 'n/a', { total, ready, draft, error }, finished);
-
     if (finished && userId) {
       const title = 'Bulk processing finished';
       const message = `Upload ${uploadId}: ${ready} ready, ${error} error.`;
@@ -202,8 +197,7 @@ async function _processDraftsInternal(uploadId) {
         error,
         createdAt: notif.createdAt
       });
-
-      console.log('[notify] persisted + emitted task-complete for uploadId=%s to user=%s', uploadId, userId.toString());
+      console.log(`Bulk processing finished for uploadId=${uploadId}: ${ready} ready, ${error} error, total ${total}`);
     }
 
     return { message: 'Feldolgozás kész', uploadId };
@@ -346,13 +340,10 @@ exports.finalizeDrafts = async (req, res) => {
   const userId = req.userId;
 
   try {
-    console.log('🔍 Finalizing drafts for uploadId:', uploadId, 'userId:', userId);
     const user = await User.findById(userId);
     if (!user || !user.company) {
       return res.status(400).json({ message: '❌ Invalid user or missing company' });
     }
-
-    console.log('ℹ️ Skipping access token / Entra ID checks (no OneDrive/SharePoint).');
 
     const drafts = await DraftCertificate.find({ uploadId, status: 'ready' });
     if (drafts.length === 0) {
@@ -468,7 +459,6 @@ exports.finalizeSingleDraftById = async (req, res) => {
   const userId = req.userId;
 
   try {
-    console.log('🔍 Finalizing single draft by ID:', { id, userId });
     const user = await User.findById(userId);
     if (!user || !user.company) {
       return res.status(400).json({ message: '❌ Invalid user or missing company' });
@@ -605,9 +595,6 @@ exports.getPendingUploads = async (req, res) => {
     }
 
     const items = await DraftCertificate.aggregate(pipeline);
-    console.log('[getPendingUploads] aggregated uploadIds=', (items || []).map(it => it.uploadId));
-    console.log('[getPendingUploads] inFlight=', Array.from(inFlight));
-    console.log('[getPendingUploads] queue=', processQueue.map(x => x.uploadId));
     // 🔹 Enrich with queue state (queued / processing) based on in-memory queue
     // NOTE: this reflects *current* process state; not persisted in DB.
     const enriched = (items || []).map(it => {
@@ -643,12 +630,6 @@ exports.getPendingUploads = async (req, res) => {
         queuePosition
       };
     });
-    console.log('[getPendingUploads] enriched states=', enriched.map(e => ({
-      uploadId: e.uploadId,
-      state: e.queueState,
-      pos: e.queuePosition,
-      finished: ((e.counts?.ready||0)+(e.counts?.error||0)) === (e.counts?.total||0)
-    })));
 
 
     // Optionally expose overall concurrency snapshot for UI (useful for diagnostics)
@@ -657,7 +638,6 @@ exports.getPendingUploads = async (req, res) => {
       limit: PROCESS_CONCURRENCY,
       queueLength: processQueue.length
     };
-    console.log('[getPendingUploads] concurrency snapshot=', { active: activeProcesses, limit: PROCESS_CONCURRENCY, queueLength: processQueue.length });
     return res.json({ items: enriched, concurrency });
   } catch (err) {
     console.error('❌ getPendingUploads error:', err.message);
@@ -720,5 +700,39 @@ exports.getDraftPdfById = async (req, res) => {
   } catch (e) {
     console.error('[getDraftPdfById] error:', e.message);
     return res.status(500).json({ error: 'Failed to stream PDF' });
+  }
+};
+
+// Delete a single draft by its ID (and cleanup files/folder)
+exports.deleteDraftById = async (req, res) => {
+  const { id } = req.params;
+  try {
+    const draft = await DraftCertificate.findById(id);
+    if (!draft) {
+      return res.status(404).json({ message: '❌ Draft not found' });
+    }
+
+    // ideiglenes fájlok törlése
+    safeUnlink(draft.originalPdfPath);
+    safeUnlink(draft.docxPath);
+
+    // draft rekord törlés
+    await DraftCertificate.deleteOne({ _id: id });
+
+    // ha az upload alatt nincs több draft, mappa takarítás
+    const remaining = await DraftCertificate.countDocuments({ uploadId: draft.uploadId });
+    if (remaining === 0) {
+      removeDraftFolderIfEmpty(draft.uploadId);
+    }
+
+    return res.json({
+      message: '✅ Draft deleted',
+      id,
+      uploadId: draft.uploadId,
+      remainingInUpload: remaining
+    });
+  } catch (err) {
+    console.error('❌ deleteDraftById error:', err.message);
+    return res.status(500).json({ error: 'Failed to delete draft' });
   }
 };

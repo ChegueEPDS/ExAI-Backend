@@ -8,7 +8,14 @@ const logger = createLogger({
     format.json(),
   ),
   transports: [
-    new transports.Console(),
+    new transports.Console({
+      format: format.combine(
+        format.colorize(),
+        format.printf(({ level, message, timestamp }) => {
+          return `${timestamp} [${level}]: ${message}`;
+        })
+      )
+    }),
     new DailyRotateFile({
       filename: 'logs/application-%DATE%.log',
       datePattern: 'YYYY-MM-DD',
