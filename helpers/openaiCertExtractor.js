@@ -1,6 +1,39 @@
 // helpers/openaiCertExtractor.js
 const axios = require('axios');
 
+// Global axios request timeout (per HTTP call)
+axios.defaults.timeout = 60000; // 60s
+
+// --- transient error helpers + retry wrapper ---
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function isTransientError(err) {
+  const status = err?.response?.status;
+  const code = err?.code;
+  // Treat 429, 5xx and common network hiccups as transient
+  return status === 429 ||
+         (status >= 500 && status < 600) ||
+         code === 'ECONNRESET' ||
+         code === 'ETIMEDOUT' ||
+         code === 'ECONNABORTED';
+}
+
+async function withRetry(fn, { retries = 5, baseDelay = 500, maxDelay = 5000 } = {}) {
+  let attempt = 0;
+  let delay = baseDelay;
+  const jitter = () => Math.floor(Math.random() * Math.min(250, Math.floor(delay / 2)));
+  while (true) {
+    try {
+      return await fn();
+    } catch (err) {
+      attempt++;
+      if (!isTransientError(err) || attempt > retries) throw err;
+      await sleep(delay + jitter());
+      delay = Math.min(maxDelay, Math.floor(delay * 1.8));
+    }
+  }
+}
+
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const ASSISTANT_ID = process.env.ASSISTANT_ID_CERT || process.env.ASSISTANT_ID || process.env.ASSISTANT_ID_DEFAULT; // dedikált asszisztens ajánlott
 
@@ -101,42 +134,66 @@ async function addMessage(threadId, content) {
   }
 }
 
-async function runAndWait(threadId, payload) {
+async function runAndWait(threadId, payload, {
+  timeoutMs = 10 * 60 * 1000,    // 10 minutes total wait
+  pollBaseDelay = 1000,          // start polling at 1s
+  pollMaxDelay = 10000           // cap polling at 10s
+} = {}) {
   let runId;
   try {
-    const run = await axios.post(`https://api.openai.com/v1/threads/${threadId}/runs`,
+    const run = await withRetry(() => axios.post(
+      `https://api.openai.com/v1/threads/${threadId}/runs`,
       payload,
       {
         headers: {
           'Authorization': `Bearer ${OPENAI_KEY}`,
           'OpenAI-Beta': 'assistants=v2',
           'Content-Type': 'application/json',
-        }
+        },
+        timeout: 60000
       }
-    );
+    ));
     runId = run.data.id;
   } catch (err) {
     throw enhanceAxiosError('createRun', err);
   }
 
-  for (let i = 0; i < 60; i++) {
-    await new Promise(r => setTimeout(r, 1000));
+  const start = Date.now();
+  let delay = pollBaseDelay;
+
+  while ((Date.now() - start) < timeoutMs) {
+    await sleep(delay);
     try {
-      const st = await axios.get(`https://api.openai.com/v1/threads/${threadId}/runs/${runId}`, {
-        headers: {
-          'Authorization': `Bearer ${OPENAI_KEY}`,
-          'OpenAI-Beta': 'assistants=v2',
+      const st = await withRetry(() => axios.get(
+        `https://api.openai.com/v1/threads/${threadId}/runs/${runId}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${OPENAI_KEY}`,
+            'OpenAI-Beta': 'assistants=v2',
+          },
+          timeout: 30000
         }
-      });
-      if (st.data.status === 'completed') return;
-      if (['failed','cancelled','expired'].includes(st.data.status)) {
-        throw new Error(`Run failed: ${st.data.status}`);
+      ));
+
+      const status = st.data.status;
+      if (status === 'completed') return;
+      if (['failed', 'cancelled', 'expired'].includes(status)) {
+        throw new Error(`Run failed: ${status}`);
       }
+
+      // Exponential backoff for the next poll, capped at pollMaxDelay
+      delay = Math.min(pollMaxDelay, Math.floor(delay * 1.6));
     } catch (err) {
+      if (isTransientError(err)) {
+        // transient issue while polling, increase delay and continue
+        delay = Math.min(pollMaxDelay, Math.floor(delay * 1.8));
+        continue;
+      }
       throw enhanceAxiosError('pollRun', err);
     }
   }
-  throw new Error('Run timeout');
+
+  throw new Error(`Run timeout after ${Math.floor(timeoutMs/1000)}s`);
 }
 
 async function getLastAssistantText(threadId) {

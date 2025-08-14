@@ -5,8 +5,7 @@ const { v4: uuidv4 } = require('uuid');
 const { uploadPdfWithFormRecognizerInternal } = require('../helpers/ocrHelper');
 const { generateDocxFile } = require('../helpers/docx');
 const azureBlobService = require('../services/azureBlobService');
-const Notification = require('../models/notification');
-const bus = require('../lib/notifications/bus');
+const { notifyAndStore } = require('../lib/notifications/notifier');
 
 const { extractCertFieldsFromOCR } = require('../helpers/openaiCertExtractor');
 
@@ -58,6 +57,22 @@ function enqueueProcess(uploadId) {
   });
 }
 /* ===== End of queue block ===== */
+
+// ---- simple concurrency-limited promise pool (no external deps) ----
+async function promisePool(items, limit, worker) {
+  let i = 0;
+  const results = new Array(items.length);
+  const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= items.length) break;
+      results[idx] = await worker(items[idx], idx);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+// -------------------------------------------------------------------
 
 // ---- local FS cleanup helpers ----
 function safeUnlink(p) {
@@ -121,15 +136,17 @@ async function _processDraftsInternal(uploadId) {
     if (drafts.length === 0) {
       throw new Error('No drafts found for this uploadId');
     }
+    // max párhuzamos feldolgozás (környezeti változóval felülírható)
+    const FILE_CONCURRENCY = parseInt(process.env.CERT_FILE_CONCURRENCY || '4', 10);
 
-    for (const draft of drafts) {
+    await promisePool(drafts, FILE_CONCURRENCY, async (draft) => {
       try {
         const pdfBuffer = fs.readFileSync(draft.originalPdfPath);
 
         // 1) OCR
         const { recognizedText } = await uploadPdfWithFormRecognizerInternal(pdfBuffer);
 
-        // 2) OpenAI kivonat
+        // 2) OpenAI kivonat (backoff + hosszabb timeout a helperben)
         const extractedData = await extractCertFieldsFromOCR(recognizedText);
 
         // 3) DOCX
@@ -151,7 +168,7 @@ async function _processDraftsInternal(uploadId) {
         draft.status = 'error';
         await draft.save();
       }
-    }
+    });
 
     // ==== ÉRTESÍTÉS: ha minden fájl (ready+error) lefutott az uploadban ====
     const oneDraft = await DraftCertificate.findOne({ uploadId });
@@ -177,26 +194,17 @@ async function _processDraftsInternal(uploadId) {
       const title = 'Bulk processing finished';
       const message = `Upload ${uploadId}: ${ready} ready, ${error} error.`;
 
-      const notif = await Notification.create({
-        userId: userId.toString(),
-        type: 'task-complete',
+      await notifyAndStore(userId.toString(), {
+        type: 'bulk-finished',
         title,
         message,
-        data: { uploadId, total, ready, error }
-        // status alapból 'unread', readAt null – a sémában
+        data: { uploadId, total, ready, error },
+        meta: {
+          route: '/bulkcert',
+          query: { uploadId }
+        }
       });
 
-      bus.emitTo(userId.toString(), 'task-complete', {
-        id: notif._id.toString(),
-        type: 'task-complete',
-        title,
-        message,
-        uploadId,
-        total,
-        ready,
-        error,
-        createdAt: notif.createdAt
-      });
       console.log(`Bulk processing finished for uploadId=${uploadId}: ${ready} ready, ${error} error, total ${total}`);
     }
 

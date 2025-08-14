@@ -51,19 +51,35 @@ const allowedOrigins = process.env.CORS_ALLOWED_ORIGINS
   ? process.env.CORS_ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
   : [];
 
+// Reusable CORS options (applies to REST + SSE)
+const corsOptions = {
+  origin: function (origin, callback) {
+    // allow same-origin or server-to-server (no origin), and allow-listed origins
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  credentials: true,
+  allowedHeaders: ['Authorization', 'Content-Type', 'x-ms-graph-token'],
+  // make sure caches/proxies vary on Origin
+  preflightContinue: false,
+  optionsSuccessStatus: 204
+};
 
-  app.use(cors({
-    origin: function (origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error('Not allowed by CORS'));
-      }
-    },
-    methods: 'GET,POST,PUT,PATCH,DELETE',
-    credentials: true,
-    allowedHeaders: ['Authorization', 'Content-Type', 'x-ms-graph-token']
-  }));
+app.use(cors(corsOptions));
+// Ensure CORS is applied to preflight requests across all routes
+app.options('*', cors(corsOptions));
+
+// Hint proxies not to buffer (useful for SSE)
+app.use((req, res, next) => {
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('X-Accel-Buffering', 'no'); // nginx
+  next();
+});
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(limiter);

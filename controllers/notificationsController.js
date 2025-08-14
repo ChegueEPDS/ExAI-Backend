@@ -8,15 +8,26 @@ exports.notificationsStream = (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // nginx: disable proxy buffering
+  res.setHeader('Content-Encoding', '');    // ensure no compression is applied on this route
   res.flushHeaders?.();
 
   // első “connected” event
   res.write(`event: connected\ndata: ${JSON.stringify({ userId, ts: new Date().toISOString() })}\n\n`);
+  // Tell EventSource the default reconnection delay (ms)
+  res.write('retry: 2000\n\n');
 
   const channel = `notify:${userId}`;
   const handler = (msg) => {
+    const topLevel = {
+      userId: msg.userId,
+      ...msg.payload,
+      // expose meta at top-level if present in payload.data
+      meta: msg?.payload?.data?.meta || undefined,
+      ts: msg.ts
+    };
     res.write(`event: ${msg.event || 'notification'}\n`);
-    res.write(`data: ${JSON.stringify({ userId: msg.userId, ...msg.payload, ts: msg.ts })}\n\n`);
+    res.write(`data: ${JSON.stringify(topLevel)}\n\n`);
   };
 
   bus.on(channel, handler);
@@ -38,7 +49,11 @@ exports.listNotifications = async (req, res) => {
   if (unreadOnly) q.status = 'unread';
 
   const items = await Notification.find(q).sort({ createdAt: -1 }).limit(limit).lean();
-  res.json({ items });
+  const enriched = (items || []).map(it => ({
+    ...it,
+    meta: it?.data?.meta || undefined
+  }));
+  res.json({ items: enriched });
 };
 
 exports.markRead = async (req, res) => {

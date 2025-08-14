@@ -11,4 +11,9 @@ const limiter = rateLimit({
   }
 });
 
-module.exports = limiter;
+module.exports = (req, res, next) => {
+  if (req.path === '/api/notifications/stream') {
+    return next();
+  }
+  return limiter(req, res, next);
+};
