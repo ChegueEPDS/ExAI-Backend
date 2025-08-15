@@ -142,7 +142,12 @@ exports.getCertificates = async (req, res) => {
   
       console.log(`🔍 Keresés a következő cégre: ${company}`);
   
-      const certificates = await Certificate.find({ company });
+      const certificates = await Certificate.find({
+          $or: [
+            { company },             // saját cég
+            { company: 'global' }    // globális
+          ]
+        });
   
       res.json(certificates);
     } catch (error) {
