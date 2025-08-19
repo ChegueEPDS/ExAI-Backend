@@ -200,8 +200,8 @@ async function _processDraftsInternal(uploadId) {
         message,
         data: { uploadId, total, ready, error },
         meta: {
-          route: '/bulkcert',
-          query: { uploadId }
+          route: '/cert',
+          query: { tab: 'upload', uploadId }
         }
       });
 
@@ -308,6 +308,46 @@ function sanitizeOverrides(src = {}) {
   return out;
 }
 
+// ---- Duplicate handling helpers (company + certNo + issueDate) ----
+function isDuplicateKeyError(err) {
+  // MongoServerError duplicate
+  return err && (err.code === 11000 || err.name === 'MongoServerError' && err.message && err.message.includes('E11000'));
+}
+
+/**
+ * Build a conflicts array by checking which (company, certNo, issueDate) combos already exist.
+ * @param {Array<{company:string, certNo:string, issueDate:string}>} items
+ * @returns {Promise<Array<{company:string, certNo:string, issueDate:string}>>}
+ */
+async function findCertificateConflicts(items = []) {
+  const unique = new Map();
+  for (const it of items) {
+    const key = `${(it.company||'').toLowerCase()}|${(it.certNo||'').trim()}|${(it.issueDate||'').trim()}`;
+    if (!unique.has(key)) unique.set(key, it);
+  }
+  const checks = Array.from(unique.values()).map(async it => {
+    const exists = await Certificate.exists({
+      company: it.company,
+      certNo: it.certNo,
+      issueDate: it.issueDate
+    });
+    return exists ? { company: it.company, certNo: it.certNo, issueDate: it.issueDate } : null;
+  });
+  const results = await Promise.all(checks);
+  return results.filter(Boolean);
+}
+
+/**
+ * Send a standardized 409 response for duplicate certificate constraint.
+ */
+function sendDuplicateResponse(res, conflicts) {
+  return res.status(409).json({
+    error: 'DUPLICATE_CERTIFICATE',
+    message: 'One or more certificates already exist with the same (company, certNo, issueDate).',
+    conflicts
+  });
+}
+
 
 // 🔹 Update a single draft's extracted fields BY ID (inline edit save)
 exports.updateDraftExtractedById = async (req, res) => {
@@ -358,102 +398,148 @@ exports.finalizeDrafts = async (req, res) => {
       return res.status(404).json({ message: '❌ No ready drafts found for this uploadId' });
     }
 
-    const certificates = [];
-    const draftIds = [];
     const overridesMap = (req.body && req.body.overrides) || {};
-    const cleanupItems = []; // { pdfPath, docxPath, uploadId }
+    const resultsSaved = [];            // IDs of drafts successfully finalized
+    const conflicts = [];               // [{ company, certNo, issueDate }]
+    const otherErrors = [];             // [{ id, error }]
+    const cleanupItems = [];            // FS cleanup for saved docs only
 
-    // 1) Fájlok feltöltése és dokumentumok előkészítése
+    // Process each draft independently to allow partial success on duplicates
     for (const draft of drafts) {
-      draftIds.push(draft._id);
-      const data = draft.extractedData || {};
-      const idKey = draft._id.toString();
-      const bodyOverrides = overridesMap[idKey] || overridesMap[draft.fileName] || null;
-      const merged = { ...data, ...sanitizeOverrides(bodyOverrides || {}) };
+      try {
+        const data = draft.extractedData || {};
+        const idKey = draft._id.toString();
+        const bodyOverrides = overridesMap[idKey] || overridesMap[draft.fileName] || null;
+        const merged = { ...data, ...sanitizeOverrides(bodyOverrides || {}) };
 
-      const pdfFileName = draft.fileName;
-      const docxFileName = path.basename(draft.docxPath || `${draft.fileName}.docx`);
-      const blobFolder = `certificates/${merged.certNo || draft.fileName}`;
+        const pdfFileName = draft.fileName;
+        const docxFileName = path.basename(draft.docxPath || `${draft.fileName}.docx`);
+        const blobFolder = `certificates/${merged.certNo || draft.fileName}`;
 
-      let uploadedPdf = null;
-      if (fs.existsSync(draft.originalPdfPath)) {
-        try {
-          await azureBlobService.uploadFile(draft.originalPdfPath, `${blobFolder}/${pdfFileName}`);
-          uploadedPdf = `${blobFolder}/${pdfFileName}`;
-        } catch (err) {
-          console.warn(`⚠️ Blob PDF upload failed for ${pdfFileName}:`, err.message);
+        let uploadedPdf = null;
+        if (fs.existsSync(draft.originalPdfPath)) {
+          try {
+            await azureBlobService.uploadFile(draft.originalPdfPath, `${blobFolder}/${pdfFileName}`);
+            uploadedPdf = `${blobFolder}/${pdfFileName}`;
+          } catch (err) {
+            console.warn(`⚠️ Blob PDF upload failed for ${pdfFileName}:`, err.message);
+          }
         }
-      }
 
-      let uploadedDocx = null;
-      if (draft.docxPath && fs.existsSync(draft.docxPath)) {
-        try {
-          await azureBlobService.uploadFile(draft.docxPath, `${blobFolder}/${docxFileName}`);
-          uploadedDocx = `${blobFolder}/${docxFileName}`;
-        } catch (err) {
-          console.warn(`⚠️ Blob DOCX upload failed for ${docxFileName}:`, err.message);
+        let uploadedDocx = null;
+        if (draft.docxPath && fs.existsSync(draft.docxPath)) {
+          try {
+            await azureBlobService.uploadFile(draft.docxPath, `${blobFolder}/${docxFileName}`);
+            uploadedDocx = `${blobFolder}/${docxFileName}`;
+          } catch (err) {
+            console.warn(`⚠️ Blob DOCX upload failed for ${docxFileName}:`, err.message);
+          }
         }
+
+        const doc = {
+          certNo: merged.certNo || draft.fileName,
+          scheme: merged.scheme || '',
+          status: merged.status || '',
+          issueDate: merged.issueDate || '',
+          applicant: merged.applicant || '',
+          protection: merged.protection || '',
+          equipment: merged.equipment || '',
+          manufacturer: merged.manufacturer || '',
+          exmarking: merged.exmarking || '',
+          xcondition: merged.xcondition || false,
+          ucondition: merged.ucondition || false,
+          specCondition: merged.specCondition || '',
+          description: merged.description || '',
+          fileName: draft.fileName,
+          fileUrl: uploadedPdf,
+          docxUrl: uploadedDocx,
+          createdBy: userId,
+          company: merged.scheme?.toLowerCase() === 'atex' ? 'global' : user.company,
+          isDraft: false,
+        };
+
+        try {
+          // Try create — catch duplicates and continue with others
+          await Certificate.create(doc);
+          resultsSaved.push(draft._id.toString());
+          cleanupItems.push({
+            pdfPath: draft.originalPdfPath,
+            docxPath: draft.docxPath,
+            uploadId: draft.uploadId
+          });
+        } catch (insErr) {
+          if (isDuplicateKeyError(insErr)) {
+            conflicts.push({ company: doc.company, certNo: doc.certNo, issueDate: doc.issueDate });
+          } else {
+            otherErrors.push({ id: draft._id.toString(), error: insErr.message || 'Insert error' });
+          }
+          // do not delete draft on failure — user can fix/retry
+          continue;
+        }
+      } catch (innerErr) {
+        otherErrors.push({ id: (draft && draft._id ? draft._id.toString() : 'n/a'), error: innerErr.message || 'Finalize error' });
+        // continue with next draft
       }
-
-      certificates.push({
-        certNo: merged.certNo || draft.fileName,
-        scheme: merged.scheme || '',
-        status: merged.status || '',
-        issueDate: merged.issueDate || '',
-        applicant: merged.applicant || '',
-        protection: merged.protection || '',
-        equipment: merged.equipment || '',
-        manufacturer: merged.manufacturer || '',
-        exmarking: merged.exmarking || '',
-        xcondition: merged.xcondition || false,
-        ucondition: merged.ucondition || false,
-        specCondition: merged.specCondition || '',
-        description: merged.description || '',
-        fileName: draft.fileName,
-        fileUrl: uploadedPdf,
-        docxUrl: uploadedDocx,
-        createdBy: userId,
-        company: user.company,
-        isDraft: false,
-      });
-
-      cleanupItems.push({
-        pdfPath: draft.originalPdfPath,
-        docxPath: draft.docxPath,
-        uploadId: draft.uploadId
-      });
     }
 
-    // 2) Insert + Delete tranzakcióban (ha lehet)
-    let session = null;
-    try {
-      session = await mongoose.startSession();
-      await session.withTransaction(async () => {
-        await Certificate.insertMany(certificates, { session });
-        await DraftCertificate.deleteMany({ _id: { $in: draftIds } }, { session });
-      });
-      session.endSession();
-    } catch (txErr) {
-      if (session) session.endSession();
-      // Fallback: tranzakció nélkül
-      await Certificate.insertMany(certificates);
-      await DraftCertificate.deleteMany({ _id: { $in: draftIds } });
+    // Delete only successfully finalized drafts; leave duplicates/failed in place
+    if (resultsSaved.length > 0) {
+      // Convert string IDs to ObjectIds to avoid any type mismatch
+      const savedObjectIds = resultsSaved.map(id => new mongoose.Types.ObjectId(id));
+      // Mark as finalized (so getPendingUploads won't include them even if deletion is delayed)
+      await DraftCertificate.updateMany(
+        { _id: { $in: savedObjectIds } },
+        { $set: { status: 'finalized' } }
+      );
+      // Hard delete them
+      await DraftCertificate.deleteMany({ _id: { $in: savedObjectIds } });
     }
 
-    // 3) Lokális fájlok törlése + mappa takarítás
+    // Cleanup files only for saved ones
     for (const it of cleanupItems) {
       safeUnlink(it.pdfPath);
       safeUnlink(it.docxPath);
     }
+    // If no more drafts under this upload, remove folder
     const remaining = await DraftCertificate.countDocuments({ uploadId });
     if (remaining === 0) {
       removeDraftFolderIfEmpty(uploadId);
     }
 
-    return res.json({
-      message: '✅ Certificates finalized successfully',
-      count: certificates.length,
-      removedIds: draftIds.map(x => x.toString())
+    // Build response
+    const payload = {
+      message: conflicts.length
+        ? '✅ Partial success: some certificates saved, some duplicates detected.'
+        : '✅ Certificates finalized successfully',
+      savedCount: resultsSaved.length,
+      removedIds: resultsSaved,
+      conflicts,        // duplicates (not saved)
+      otherErrors       // non-duplicate errors (not saved)
+    };
+
+    if (resultsSaved.length > 0 && conflicts.length === 0 && otherErrors.length === 0) {
+      // full success
+      return res.json(payload);
+    }
+
+    if (resultsSaved.length > 0 && (conflicts.length > 0 || otherErrors.length > 0)) {
+      // partial success – return 200 with details so frontend can remove saved rows and still show hints
+      payload.partial = true;
+      return res.status(200).json(payload);
+    }
+
+    // nothing saved at all
+    if (conflicts.length > 0 && resultsSaved.length === 0 && otherErrors.length === 0) {
+      // pure duplicate case -> 409 to keep existing UX
+      return sendDuplicateResponse(res, conflicts);
+    }
+
+    // other errors only (or mixed with duplicates but none saved)
+    return res.status(500).json({
+      error: 'FINALIZE_FAILED',
+      message: 'No certificates could be saved.',
+      conflicts,
+      otherErrors
     });
   } catch (err) {
     console.error('❌ Finalization error:', err.message);
@@ -522,7 +608,7 @@ exports.finalizeSingleDraftById = async (req, res) => {
       fileUrl: uploadedPdf,
       docxUrl: uploadedDocx,
       createdBy: userId,
-      company: user.company,
+      company: merged.scheme?.toLowerCase() === 'atex' ? 'global' : user.company,
       isDraft: false,
     };
 
@@ -536,8 +622,20 @@ exports.finalizeSingleDraftById = async (req, res) => {
       session.endSession();
     } catch (txErr) {
       if (session) session.endSession();
-      await Certificate.create(doc);
-      await DraftCertificate.deleteOne({ _id: id });
+      if (isDuplicateKeyError(txErr)) {
+        const conflicts = await findCertificateConflicts([{ company: doc.company, certNo: doc.certNo, issueDate: doc.issueDate }]);
+        return sendDuplicateResponse(res, conflicts);
+      }
+      try {
+        await Certificate.create(doc);
+        await DraftCertificate.deleteOne({ _id: id });
+      } catch (insErr) {
+        if (isDuplicateKeyError(insErr)) {
+          const conflicts = await findCertificateConflicts([{ company: doc.company, certNo: doc.certNo, issueDate: doc.issueDate }]);
+          return sendDuplicateResponse(res, conflicts);
+        }
+        throw insErr;
+      }
     }
 
     // FS cleanup after successful DB operations

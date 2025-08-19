@@ -44,6 +44,8 @@ router.get('/cert-sas', authMiddleware(), async (req, res) => {
     return res.status(500).json({ error: 'Failed to generate SAS URL' });
   }
 });
+router.put("/certificates/update-company", certificateController.updateCompanyToGlobal);
+
 
 // Lekérés certNo alapján
 router.get('/certificates/:certNo', authMiddleware(), certificateController.getCertificateByCertNo);

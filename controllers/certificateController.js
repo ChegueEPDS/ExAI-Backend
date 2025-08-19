@@ -9,6 +9,31 @@ const azureBlobService = require('../services/azureBlobService');
 const upload = multer({ dest: 'uploads/' });
 const today = new Date();
 
+// --- Helper: standardized duplicate (unique index) error response ---
+function sendDuplicateError(res, err) {
+  // MongoServerError E11000 handler
+  const isDup =
+    err?.code === 11000 ||
+    err?.name === 'MongoServerError' && /E11000/i.test(err?.message || '');
+  if (!isDup) return false;
+
+  // Try to extract key/values if available
+  const keyValue = err.keyValue || {};
+  const details = {
+    company: keyValue.company,
+    certNo: keyValue.certNo,
+    issueDate: keyValue.issueDate
+  };
+
+  // Prefer 409 Conflict for duplicates
+  res.status(409).json({
+    error: 'DUPLICATE_CERTIFICATE',
+    message: 'Már létezik tanúsítvány ezzel a (company, certNo, issueDate) kombinációval.',
+    details
+  });
+  return true;
+}
+
 // Fájl feltöltési endpoint
 exports.uploadCertificate = async (req, res) => {
   upload.single('file')(req, res, async (err) => {
@@ -112,7 +137,21 @@ exports.uploadCertificate = async (req, res) => {
         isDraft: false
       });
 
-      await certificate.save();
+      try {
+        await certificate.save();
+      } catch (e) {
+        // If duplicate, return a clean 409 that the frontend can display
+        if (sendDuplicateError(res, e)) {
+          // Optional: try to clean uploaded blobs when DB save fails with duplicate
+          try { if (uploadedPdfPath && typeof azureBlobService.deleteFile === 'function') await azureBlobService.deleteFile(uploadedPdfPath); } catch {}
+          try { if (uploadedDocxPath && typeof azureBlobService.deleteFile === 'function') await azureBlobService.deleteFile(uploadedDocxPath); } catch {}
+          // Also cleanup local temp files
+          try { if (fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath); } catch {}
+          try { if (fs.existsSync(docxTempPath)) fs.unlinkSync(docxTempPath); } catch {}
+          return;
+        }
+        throw e;
+      }
 
       // Helyi ideiglenes fájlok törlése
       try { if (fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath); } catch {}
@@ -124,6 +163,8 @@ exports.uploadCertificate = async (req, res) => {
         data: certificate
       });
     } catch (error) {
+      // If duplicate error, send standardized 409
+      if (sendDuplicateError(res, error)) return;
       console.error('❌ Hiba a feltöltés során:', error.response?.data || error.message);
       return res.status(500).send('❌ Hiba a feltöltés során');
     }
@@ -253,11 +294,41 @@ exports.updateCertificate = async (req, res) => {
     certificate.specCondition = specCondition ?? certificate.specCondition;
     certificate.description = description ?? certificate.description;
 
-    await certificate.save();
+    try {
+      await certificate.save();
+    } catch (e) {
+      if (sendDuplicateError(res, e)) return;
+      throw e;
+    }
 
     return res.json({ message: '✅ Certificate updated successfully', data: certificate });
   } catch (error) {
+    if (sendDuplicateError(res, error)) return;
     console.error('❌ Error updating certificate:', error);
     return res.status(500).send('❌ Error updating certificate');
+  }
+};
+
+// Tanúsítványok company mezőjének frissítése
+exports.updateCompanyToGlobal = async (req, res) => {
+  try {
+    const { ids } = req.body; // kijelölt cert ID-k
+
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ message: "❌ No certificate IDs provided!" });
+    }
+
+    const result = await Certificate.updateMany(
+      { _id: { $in: ids } },
+      { $set: { company: "global" } }
+    );
+
+    return res.json({
+      message: "✅ Company mező sikeresen frissítve 'global'-ra!",
+      updatedCount: result.modifiedCount
+    });
+  } catch (error) {
+    console.error("❌ Error updating company to global:", error);
+    return res.status(500).json({ message: "❌ Error updating company to global" });
   }
 };
