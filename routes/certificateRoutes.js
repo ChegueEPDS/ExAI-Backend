@@ -7,6 +7,9 @@ const azureBlob = require('../services/azureBlobService'); // <-- SAS-hoz kell
 // Tanúsítvány feltöltés
 router.post('/certificates/upload', certificateController.uploadCertificate);
 
+// ATEX preview (server-side OCR + AI; no save, no blob upload)
+router.post('/certificates/preview-atex', authMiddleware(), certificateController.previewAtex);
+
 // Listázás
 router.get('/certificates', authMiddleware(), certificateController.getCertificates);
 

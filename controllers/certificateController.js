@@ -5,6 +5,8 @@ const User = require('../models/user'); // 🔹 Importáljuk a User modellt
 const multer = require('multer');
 const { generateDocxFile } = require('../helpers/docx'); // 🔹 DOCX generálás importálása
 const azureBlobService = require('../services/azureBlobService');
+const { uploadPdfWithFormRecognizerInternal } = require('../helpers/ocrHelper');
+const { extractCertFieldsFromOCR } = require('../helpers/openaiCertExtractor');
 
 const upload = multer({ dest: 'uploads/' });
 const today = new Date();
@@ -331,4 +333,63 @@ exports.updateCompanyToGlobal = async (req, res) => {
     console.error("❌ Error updating company to global:", error);
     return res.status(500).json({ message: "❌ Error updating company to global" });
   }
+};
+
+// ATEX előnézet OCR+AI feldolgozással (nem ment DB-be, csak visszaadja az eredményt)
+exports.previewAtex = async (req, res) => {
+  upload.single('file')(req, res, async (err) => {
+    if (err) return res.status(500).send('❌ Fájl feltöltési hiba.');
+    if (!req.file) {
+      return res.status(400).json({ message: '❌ Hiányzó fájl a kérésben.' });
+    }
+
+    try {
+      const pdfPath = path.resolve(req.file.path);
+      const originalPdfName = req.file.originalname;
+
+      // --- Real OCR + AI extract (same stack as bulk) ---
+      const pdfBuffer = fs.readFileSync(pdfPath);
+
+      // 1) Azure OCR
+      console.info(JSON.stringify({ level: 'info', message: '🚀 [ATEX preview] Sending PDF to Azure OCR...', name: originalPdfName }));
+      const { recognizedText } = await uploadPdfWithFormRecognizerInternal(pdfBuffer);
+      console.info(JSON.stringify({ level: 'info', message: '✅ [ATEX preview] Azure OCR done.' }));
+
+      // 2) OpenAI field extraction (ATEX profile inside the helper)
+      console.info(JSON.stringify({ level: 'info', message: '🧠 [ATEX preview] Extracting fields with OpenAI...' }));
+      const aiData = await extractCertFieldsFromOCR(recognizedText || '');
+      console.info(JSON.stringify({ level: 'info', message: '✅ [ATEX preview] Field extraction done.', extracted: aiData }));
+
+      // 3) Normalize keys for the frontend (expects lower-case keys like in IECEx path)
+      const certStr = (aiData?.certNo || aiData?.certificateNumber || '').toString().trim().toUpperCase();
+      const extracted = {
+        certNo: aiData?.certNo || aiData?.certificateNumber || '',
+        status: aiData?.status || '',
+        issueDate: aiData?.issueDate || '',
+        applicant: aiData?.applicant || '',
+        manufacturer: aiData?.manufacturer || '',
+        equipment: aiData?.equipment || '',
+        exmarking: aiData?.exmarking || aiData?.exMarking || '',
+        protection: aiData?.protection || '',
+        specCondition: aiData?.specCondition || aiData?.specialConditions || '',
+        description: aiData?.description || '',
+        xcondition: certStr ? (certStr.endsWith('X') || /\bX\b/.test(certStr)) : false,
+        ucondition: certStr ? (certStr.endsWith('U') || /\bU\b/.test(certStr)) : false
+      };
+
+      // Cleanup temp
+      try { if (fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath); } catch {}
+
+      return res.json({
+        message: '✅ ATEX preview kész',
+        recognizedText: recognizedText || '',
+        extracted
+      });
+    } catch (error) {
+      console.error('❌ Hiba ATEX preview során:', error?.response?.data || error?.message || error);
+      // Cleanup temp
+      try { if (req?.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); } catch {}
+      return res.status(500).send('❌ Hiba ATEX preview során');
+    }
+  });
 };
