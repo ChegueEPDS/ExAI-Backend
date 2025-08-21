@@ -92,6 +92,60 @@ app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
 
+/**
+ * SSE-friendly timeout and logging
+ * Ensures that for EventSource/fetch streams we don't time out at the socket level,
+ * and we can see if the browser navigates away (aborted).
+ */
+app.use((req, res, next) => {
+  const acceptsSSE =
+    (req.headers.accept && req.headers.accept.includes('text/event-stream')) ||
+    (req.headers['content-type'] && req.headers['content-type'].includes('text/event-stream'));
+
+  if (acceptsSSE) {
+    // Extra SSE headers for proxy compatibility and to avoid transforms/buffering
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    // Mark request for downstream handlers (controllers) if needed
+    req.isSSE = true;
+
+    if (res.socket && typeof res.socket.setTimeout === 'function') {
+      res.socket.setTimeout(0); // disable idle socket timeout for SSE
+    }
+    req.on('aborted', () => logger.warn('SSE client aborted the connection'));
+    req.on('close',   () => logger.warn('SSE connection closed by client'));
+    res.on('error',   (err) => logger.error('SSE response stream error', err));
+  }
+  next();
+});
+
+// SSE hardening for the stream endpoint
+app.use((req, res, next) => {
+  if (req.path === '/api/upload-and-summarize/stream') {
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // nginx: disable buffering
+    res.setHeader('Vary', 'Origin');
+
+    // avoid idle timeouts on this request only
+    if (res.socket && typeof res.socket.setTimeout === 'function') {
+      res.socket.setTimeout(0);
+    }
+    if (req.socket && typeof req.socket.setKeepAlive === 'function') {
+      req.socket.setKeepAlive(true);
+    }
+
+    // if your handler uses res.write() immediately, you can flush headers:
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+    req.isSSE = true; // jelölő, ha a controllerben használni szeretnéd
+  }
+  next();
+});
+
+// (opcionális) explicit OPTIONS a streamre – a globális CORS amúgy is kezeli
+app.options('/api/upload-and-summarize/stream', cors({ origin: true, credentials: true }));
+
 // Use routes
 app.use('/api', authRoutes);
 app.use('/api', conversationRoutes);
@@ -126,8 +180,17 @@ process.on('uncaughtException', (err) => {
   logger.error(`Uncaught Exception: ${err.stack || err.message}`);
   // Consider graceful shutdown in production
 });
-app.listen(port, () => {
+
+const server = app.listen(port, () => {
   console.log(`Server running on port ${port}`);
   console.log("Azure Tenant ID:", process.env.AZURE_TENANT_ID);
   console.log("Azure Redirect URI:", process.env.AZURE_REDIRECT_URI);
 });
+
+// --- Keep long SSE connections alive and avoid premature timeouts ---
+// Never time out HTTP requests (Node's default can cut long streams)
+server.requestTimeout = 0;
+// Keep the TCP connection alive long enough for proxies (ALB/Nginx) to stay happy
+server.keepAliveTimeout = 75_000;
+// Must be greater than keepAliveTimeout (Node requirement)
+server.headersTimeout = 80_000;

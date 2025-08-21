@@ -8,9 +8,12 @@ const {
   getConversations,
   getConversationById,
   searchAndRespond,
-
+  uploadAndSummarizeStream
 } = require('../controllers/conversationController');
 const authMiddleware = require('../middlewares/authMiddleware');
+const multer = require('multer');
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
 const router = express.Router();
 
@@ -25,5 +28,12 @@ router.post('/aisearch', authMiddleware(), searchAndRespond);
 
 // Korábbi beszélgetés betöltése
 router.get('/conversation', authMiddleware(['Admin', 'User']), getConversationById);
+
+router.post(
+  '/upload-and-summarize/stream',
+  authMiddleware(),
+  upload.array('files', 10),
+  uploadAndSummarizeStream
+);
 
 module.exports = router;
