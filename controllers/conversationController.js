@@ -1,3 +1,401 @@
+// SSE streaming chat endpoint (real Assistants API token stream)
+exports.sendMessageStream = async (req, res) => {
+  const send = sseInit(req, res);
+
+  try {
+    const { message, threadId, category } = req.body || {};
+    const userId = req.userId;
+
+    // ---- Validations ----
+    if (!userId) {
+      send('error', { message: 'Bejelentkezett felhasználó azonosítója hiányzik.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      send('error', { message: 'A message kötelező, nem lehet üres.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    if (!threadId || typeof threadId !== 'string' || !threadId.trim()) {
+      send('error', { message: 'A threadId kötelező, nem lehet üres.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+
+    logger.info(`[STREAM] Üzenet fogadva a szálhoz: ${threadId}`);
+
+    // ---- Resolve user & assistant ----
+    const user = await User.findById(userId).select('company');
+    if (!user) {
+      send('error', { message: 'Felhasználó nem található.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    const companyId = user.company;
+    const assistantId = assistants[companyId] || assistants['default'];
+
+    // ---- Optional injection rules (Wolff) ----
+    let applicableInjection = null;
+    if (companyId === 'wolff' || assistantId === process.env.ASSISTANT_ID_WOLFF) {
+      const allRules = await InjectionRule.find();
+      const scoredMatches = allRules
+        .map(rule => {
+          try {
+            const regex = new RegExp(rule.pattern, 'gi');
+            const matches = message.match(regex);
+            const score = matches ? matches.length : 0;
+            return score > 0 ? { rule, score } : null;
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.score - a.score);
+      const matchingRule = scoredMatches.length > 0 ? scoredMatches[0].rule : null;
+      if (matchingRule) {
+        logger.info('[STREAM] 💡 Injection rule alkalmazva:', matchingRule);
+        applicableInjection = matchingRule.injectedKnowledge;
+      }
+    }
+
+    // ---- Category detection (optional) ----
+    let finalCategory = category;
+    if (!finalCategory) {
+      try {
+        finalCategory = await categorizeMessageUsingAI(message);
+        logger.info('[STREAM] Automatikusan kategorizált:', finalCategory);
+      } catch (err) {
+        logger.warn('[STREAM] Nem sikerült automatikusan kategorizálni:', err.message);
+        finalCategory = null;
+      }
+    }
+
+    // ---- Conversation ownership check ----
+    const conversation = await Conversation.findOne({ threadId });
+    if (!conversation) {
+      send('error', { message: 'A megadott szál nem található.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    if (String(conversation.userId) !== String(userId)) {
+      send('error', { message: 'A beszélgetés nem tartozik a felhasználóhoz.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+
+    // ---- Check there is no active run ----
+    const runsResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/runs`, {
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2' },
+    });
+    const activeRun = runsResponse.data.data.find(r => ['queued', 'in_progress', 'requires_action', 'cancelling'].includes(r.status));
+    if (activeRun) {
+      send('error', { message: `Már fut egy aktív feldolgozás (${activeRun.status}). Kérlek, várj amíg véget ér.`, activeRunId: activeRun.id, status: activeRun.status });
+      send('done', { ok: false });
+      return res.end();
+    }
+
+    // ---- Post user message to thread ----
+    await axios.post(
+      `https://api.openai.com/v1/threads/${threadId}/messages`,
+      { role: 'user', content: message },
+      { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2' } }
+    );
+
+    // ---- Prepare run payload, add instructions if we have an injection ----
+    const runPayload = { assistant_id: assistantId, stream: true };
+    if (applicableInjection) {
+      const assistantData = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {
+        headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2' }
+      });
+      const assistantPrompt = assistantData.data.instructions || '';
+      const finalInstructions = `${assistantPrompt}\n\nAlways put the following sentence at the end of the explanation part as a <strong>Note:</strong>, exactly as written, in a separate paragraph between <em> tags: :\n\n"${applicableInjection}"`;
+      logger.info('[STREAM] 📋 Final instructions before sending:', finalInstructions);
+      runPayload.instructions = finalInstructions;
+    }
+
+    // ---- OpenAI SSE stream ----
+    const openaiResp = await axios({
+      method: 'post',
+      url: `https://api.openai.com/v1/threads/${threadId}/runs`,
+      data: runPayload,
+      responseType: 'stream',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        'OpenAI-Beta': 'assistants=v2',
+        Connection: 'keep-alive'
+      },
+      httpAgent: new http.Agent({ keepAlive: true }),
+      httpsAgent: new https.Agent({ keepAlive: true }),
+      timeout: 0
+    });
+
+    send('assistant.status', { stage: 'openai.stream.start' });
+
+    let accText = '';
+    let lastAssistantMessageId = null;
+    const stream = openaiResp.data;
+    let buffer = '';
+    let hadTokens = false;
+
+    const flushBlocks = (raw) => {
+      const blocks = raw.split('\n\n');
+      for (const block of blocks) {
+        if (!block.trim()) continue;
+        const lines = block.split('\n');
+        let eventName = null;
+        let dataStr = '';
+        for (const line of lines) {
+          if (line.startsWith('event:')) eventName = line.slice(6).trim();
+          else if (line.startsWith('data:')) dataStr += line.slice(5).trim();
+        }
+        if (!eventName) continue;
+        if (eventName === 'ping' || dataStr === '[DONE]') continue;
+
+        let payload = null;
+        try { payload = dataStr ? JSON.parse(dataStr) : null; } catch {}
+
+        // --- helper to normalize delta shapes from OpenAI (Assistants v2 and fallbacks) ---
+        const extractDeltaPieces = (payloadObj) => {
+          const pieces = [];
+
+          // 1) Canonical Assistants v2: payload.delta.content[] variants
+          const contentArr = payloadObj?.delta?.content;
+          if (Array.isArray(contentArr)) {
+            for (const part of contentArr) {
+              // a) output_text.delta (some providers nest text under .text or .delta.text)
+              if (part?.type === 'output_text.delta') {
+                const txt =
+                  (typeof part?.text === 'string' ? part.text : '') ||
+                  (typeof part?.delta?.text === 'string' ? part.delta.text : '');
+                if (txt) pieces.push(txt);
+              }
+              // b) text_delta (alternate naming)
+              if (part?.delta?.type === 'text_delta' && typeof part?.delta?.text === 'string') {
+                pieces.push(part.delta.text);
+              }
+              // c) direct text value (rare in deltas but seen with some gateways)
+              if (part?.type === 'text' && typeof part?.text?.value === 'string') {
+                pieces.push(part.text.value);
+              }
+            }
+          }
+
+          // 2) Single delta object forms on the root
+          if (!pieces.length && payloadObj?.delta) {
+            const d = payloadObj.delta;
+            if (d?.type === 'output_text.delta' && typeof d?.text === 'string') {
+              pieces.push(d.text);
+            } else if (d?.type === 'text_delta' && typeof d?.text === 'string') {
+              pieces.push(d.text);
+            } else if (typeof d?.text?.value === 'string') {
+              pieces.push(d.text.value);
+            }
+          }
+
+          // 3) responses-style array on root
+          const deltasArr = payloadObj?.deltas;
+          if (!pieces.length && Array.isArray(deltasArr)) {
+            for (const d of deltasArr) {
+              if (d?.type === 'output_text.delta' && typeof d?.text === 'string') {
+                pieces.push(d.text);
+              }
+              if (d?.type === 'text_delta' && typeof d?.text === 'string') {
+                pieces.push(d.text);
+              }
+            }
+          }
+
+          // 4) Fallbacks
+          if (!pieces.length && typeof payloadObj?.text === 'string') {
+            pieces.push(payloadObj.text);
+          }
+          if (!pieces.length && typeof payloadObj?.message?.content?.[0]?.text?.value === 'string') {
+            pieces.push(payloadObj.message.content[0].text.value);
+          }
+
+          return pieces;
+        };
+
+        switch (eventName) {
+          case 'thread.message.delta': {
+            const pieces = extractDeltaPieces(payload || {});
+            if (pieces.length) {
+              for (const piece of pieces) {
+                accText += piece;
+                hadTokens = true;
+                send('token', { delta: piece });
+              }
+            }
+            break;
+          }
+          case 'message.delta': {
+            const pieces = extractDeltaPieces(payload || {});
+            if (pieces.length) {
+              for (const piece of pieces) {
+                accText += piece;
+                hadTokens = true;
+                send('token', { delta: piece });
+              }
+            }
+            break;
+          }
+          case 'thread.message.completed': {
+            if (payload?.id) lastAssistantMessageId = payload.id;
+            // Some gateways attach the final content here; harvest if present
+            try {
+              const maybeText =
+                (Array.isArray(payload?.message?.content) && payload.message.content
+                  .map(p => (p?.type === 'text' && p?.text?.value) ? p.text.value : '')
+                  .join('')) || '';
+              if (maybeText) {
+                accText += maybeText;
+                hadTokens = true;
+                send('token', { delta: maybeText });
+              }
+            } catch {}
+            break;
+          }
+          case 'run.step.delta':
+          case 'run.step.completed':
+          case 'run.requires_action':
+          case 'run.in_progress':
+          case 'run.completed': {
+            send('assistant.status', { stage: eventName });
+            break;
+          }
+          case 'error': {
+            const msg = payload?.message || 'OpenAI stream error';
+            if (!hadTokens) {
+              // Only forward to client if nothing was streamed yet
+              send('error', { message: msg });
+            } else {
+              // We already have content; just log and let finalization handle it.
+              logger.warn('[STREAM] Error event received after tokens; suppressing to client:', msg);
+            }
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    };
+
+    stream.on('data', (chunk) => {
+      try {
+        buffer += chunk.toString('utf8');
+        const lastSep = buffer.lastIndexOf('\n\n');
+        if (lastSep !== -1) {
+          const processPart = buffer.slice(0, lastSep);
+          buffer = buffer.slice(lastSep + 2);
+          flushBlocks(processPart);
+        }
+      } catch (e) {
+        send('error', { message: e.message || 'Failed to parse stream chunk' });
+      }
+    });
+
+    stream.on('end', async () => {
+      // Small grace period to allow OpenAI to persist the final assistant message
+      try { await delay(800); } catch {}
+      try {
+        // 🔁 Final fallback: if no deltas were captured, fetch the latest assistant message
+        if (!accText || !accText.trim()) {
+          // Try up to 6 times with 500ms delay to let OpenAI persist the final assistant message
+          let attempts = 0;
+          let fetchedText = '';
+          while (attempts < 6 && !fetchedText) {
+            attempts++;
+            try {
+              const msgResp = await axios.get(`https://api.openai.com/v1/threads/${threadId}/messages`, {
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+                  'OpenAI-Beta': 'assistants=v2'
+                }
+              });
+              const assistantMsg = msgResp.data?.data?.find(m => m.role === 'assistant');
+              if (assistantMsg?.content) {
+                let fallbackTxt = '';
+                if (Array.isArray(assistantMsg.content)) {
+                  for (const item of assistantMsg.content) {
+                    if (item?.type === 'text' && typeof item?.text?.value === 'string') {
+                      fallbackTxt += item.text.value;
+                    }
+                  }
+                }
+                if (!fallbackTxt && typeof assistantMsg?.content === 'string') {
+                  fallbackTxt = assistantMsg.content;
+                }
+                if (fallbackTxt) {
+                  fetchedText = fallbackTxt;
+                  if (assistantMsg?.id && !lastAssistantMessageId) {
+                    lastAssistantMessageId = assistantMsg.id;
+                  }
+                  break;
+                }
+              }
+            } catch (e) {
+              logger.warn('[STREAM] Fallback fetch of messages failed (attempt ' + attempts + '):', e?.message);
+            }
+            try { await delay(500); } catch {}
+          }
+          if (fetchedText) {
+            accText = fetchedText;
+          }
+        }
+        const cleaned = (accText || '').replace(/【.*?】/g, '');
+        const sanitized = sanitizeHtml(cleaned, {
+          allowedTags: ['a','b','i','strong','em','u','s','br','p','ul','ol','li','blockquote','code','pre','span','h1','h2','h3','h4','h5','h6','table','thead','tbody','tr','th','td'],
+          allowedAttributes: { 'span': ['class'], 'a': ['href','title','target','rel'] },
+          transformTags: {
+            'a': sanitizeHtml.simpleTransform('a', { target: '_blank', rel: 'noopener noreferrer' }, true)
+          },
+          disallowedTagsMode: 'discard'
+        });
+        let finalHtml = marked(sanitized);
+        if (finalCategory) {
+          finalHtml = finalHtml.replace(/<h3>According to the document:<\/h3>/, `<h3>According to ${finalCategory}:<\/h3>`);
+        }
+
+        // Persist user + assistant messages
+        conversation.messages.push({ role: 'user', content: message, ...(finalCategory && { category: finalCategory }) });
+        conversation.messages.push({ role: 'assistant', content: finalHtml });
+        await conversation.save();
+        const savedAssistant = conversation.messages.slice().reverse().find(m => m.role === 'assistant');
+
+        send('final', { html: finalHtml, messageId: savedAssistant?._id || lastAssistantMessageId || null });
+      } catch (e) {
+        send('error', { message: e.message || 'Failed to finalize message' });
+      } finally {
+        send('done', { ok: true });
+        res.end();
+      }
+    });
+
+    stream.on('error', (err) => {
+      send('error', { message: err?.message || 'OpenAI stream connection error' });
+      try { res.end(); } catch {}
+    });
+
+  } catch (error) {
+    // If streaming fails early, report and close
+    logger.error('[STREAM] Hiba az üzenetküldés során:', {
+      message: error.message,
+      stack: error.stack,
+      response: error.response?.data,
+      status: error.response?.status,
+    });
+    try {
+      send('error', { message: error.message || 'Váratlan hiba történt.' });
+      send('done', { ok: false });
+    } finally {
+      return res.end();
+    }
+  }
+};
 const Conversation = require('../models/conversation');
 const InjectionRule = require('../models/injectionRule');
 const axios = require('axios');

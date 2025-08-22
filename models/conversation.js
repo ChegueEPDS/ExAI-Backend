@@ -8,9 +8,9 @@ const MessageSchema = new mongoose.Schema({
   rating: { type: Number, min: 1, max: 5 },
   category: { type: String },
   feedback: {
-    comment: String,
-    references: [String],
-    submittedAt: Date,
+    comment: { type: String, default: '' },
+    references: { type: String, default: '' },
+    submittedAt: { type: Date, default: null },
   },
   createdAt: { type: Date, default: Date.now },
 }, { _id: true });

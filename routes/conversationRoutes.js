@@ -20,6 +20,7 @@ const router = express.Router();
 // Define conversation routes
 router.post('/new-conversation', authMiddleware(['Admin', 'User']), startNewConversation);
 router.post('/chat', authMiddleware(), sendMessage);
+router.post('/chat/stream', authMiddleware(), require('../controllers/conversationController').sendMessageStream);
 router.post('/rate-message', authMiddleware(['Admin', 'User']), rateMessage);
 router.post('/save-feedback', authMiddleware(['Admin', 'User']), saveFeedback);
 router.delete('/conversation/:threadId', authMiddleware(['Admin', 'User']), deleteConversation);
