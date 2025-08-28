@@ -11,15 +11,24 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }
 });
 
+// Végpont-specifikus function key kiválasztása
+function pickFunctionCode(path = "") {
+  const p = String(path);
+  if (p.includes('/process_dxf/start')) return process.env.DXF_FUNC_CODE_START || process.env.DXF_FUNC_CODE;
+  if (p.includes('/process_dxf/status')) return process.env.DXF_FUNC_CODE_STATUS || process.env.DXF_FUNC_CODE;
+  if (p.includes('/process_dxf/result')) return process.env.DXF_FUNC_CODE_RESULT || process.env.DXF_FUNC_CODE;
+  // szinkron /process_dxf
+  if (p.endsWith('/process_dxf') || p.includes('/process_dxf?')) return process.env.DXF_FUNC_CODE_SYNC || process.env.DXF_FUNC_CODE;
+  return process.env.DXF_FUNC_CODE; // végső fallback
+}
+
 function buildFunctionUrl(path = "/api/process_dxf") {
   const base = process.env.DXF_FUNC_URL;   // pl. https://<app>.azurewebsites.net vagy lokál root
-  const code = process.env.DXF_FUNC_CODE;  // opcionális function key
-
-  // Root URL (ne az endpoint legyen beégetve)
   const root = new URL(base || "http://localhost:7071");
   const u = new URL(path, root);           // pl. /api/process_dxf/start
 
-  // ha nincs code= a query-ben, de van DXF_FUNC_CODE, fűzzük hozzá
+  // per-végpont kulcs
+  const code = pickFunctionCode(path);
   if (code && !u.searchParams.has('code')) {
     u.searchParams.set('code', code);
   }
@@ -111,7 +120,9 @@ router.post('/start', upload.single('file'), async (req, res) => {
       dispatcher: keepAliveAgent
     });
 
-    const data = await resp.json();
+    const text = await resp.text();
+    let data; try { data = text ? JSON.parse(text) : undefined; } catch { data = undefined; }
+
     if (!resp.ok) return res.status(resp.status).json(data);
 
     const jobId = data.job_id;
@@ -138,7 +149,14 @@ router.get('/status/:jobId', async (req, res) => {
       dispatcher: keepAliveAgent
     });
 
-    const data = await resp.json();
+    const text = await resp.text();
+    let data; try { data = text ? JSON.parse(text) : undefined; } catch { data = undefined; }
+    if (!resp.ok || !data) {
+      return res.status(resp.status || 502).json({
+        error: (data && (data.error || data.message)) || text || 'Azure Function hiba',
+        status: resp.status
+      });
+    }
     return res.status(resp.status).json(data);
   } catch (err) {
     console.error(err);
@@ -159,14 +177,20 @@ router.get('/result/:jobId', async (req, res) => {
     });
 
     if (resp.status === 409) {
-      const j = await resp.json();
-      return res.status(409).json(j);
+      const j = await resp.text();
+      let jj; try { jj = j ? JSON.parse(j) : undefined; } catch { jj = undefined; }
+      return res.status(409).json(jj || { status: 'queued' });
     }
 
     const text = await resp.text();
-    res.status(resp.status);
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    return res.send(text);
+    let data; try { data = text ? JSON.parse(text) : undefined; } catch { data = undefined; }
+    if (!resp.ok || !data) {
+      return res.status(resp.status || 502).json({
+        error: (data && (data.error || data.message)) || text || 'Azure Function hiba',
+        status: resp.status
+      });
+    }
+    return res.json(data);
   } catch (err) {
     console.error(err);
     return res.status(502).json({ error: 'Result failed', detail: String(err?.message || err) });
