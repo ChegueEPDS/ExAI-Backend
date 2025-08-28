@@ -1112,3 +1112,12 @@
 2025-08-08 10:08:47,416 [INFO] 5168 'unknown' DN mentve ide: results/debug_unknowns_1754647727.json
 2025-08-08 10:08:47,423 [INFO] 2 szerelvénytípus azonosítva: {'VALVE': 17, 'ELBOW': 63}
 2025-08-08 10:08:48,141 [INFO] Excel mentve: results/output_1754647727.xlsx
+2025-08-22 14:34:06,885 [INFO] DXF fájl beolvasása: /Users/chegue/AI demok/Backend/uploads/8f86b4092e3b669f513fb6d73b605edc
+2025-08-22 14:34:08,479 [INFO] 14415 LINE objektum beolvasva.
+2025-08-22 14:34:08,486 [INFO] 265 szövegobjektum beolvasva, köztük 89 DN-azonosított.
+2025-08-22 14:34:14,759 [INFO] 9247 csőszakaszhoz sikerült DN-t rendelni.
+2025-08-22 14:34:14,759 [INFO] 5168 csőszakaszhoz nem talált DN szöveget (>= 500 egység távolság).
+2025-08-22 14:34:14,759 [INFO] 14415 csőszakasz feldolgozva.
+2025-08-22 14:34:14,808 [INFO] 5168 'unknown' DN mentve ide: results/debug_unknowns_1755873254.json
+2025-08-22 14:34:14,814 [INFO] 2 szerelvénytípus azonosítva: {'VALVE': 17, 'ELBOW': 63}
+2025-08-22 14:34:15,504 [INFO] Excel mentve: results/output_1755873254.xlsx

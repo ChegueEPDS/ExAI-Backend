@@ -8,8 +8,8 @@ const MessageSchema = new mongoose.Schema({
   rating: { type: Number, min: 1, max: 5 },
   category: { type: String },
   feedback: {
-    comment: { type: String, default: '' },
-    references: { type: String, default: '' },
+    comment: { type: String, default: null },
+    references: { type: String, default: null },
     submittedAt: { type: Date, default: null },
   },
   createdAt: { type: Date, default: Date.now },

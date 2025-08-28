@@ -42,6 +42,7 @@
     "sanitize-html": "^2.14.0",
     "sharp": "^0.33.5",
     "tiktoken": "^1.0.17",
+    "undici": "^7.15.0",
     "winston": "^3.14.2",
     "winston-daily-rotate-file": "^5.0.0",
     "xlsx": "^0.18.5"
