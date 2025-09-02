@@ -25,7 +25,7 @@ const siteRoutes = require('./routes/siteRoutes');
 const xlsCompareRoutes = require('./routes/xlsCompareRoutes')
 const graphRoutes = require('./routes/graphRoutes');
 const injectionRoutes = require('./routes/injectionRoutes');
-const dxfRoute = require('./routes/dxf');
+const dxfRoute = require('./routes/dxfRoutes');
 const certificateDraftRoutes = require('./routes/certificateDraftRoutes');
 const notificationsRoutes = require('./routes/notificationsRoutes');
 

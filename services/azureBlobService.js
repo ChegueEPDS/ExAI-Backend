@@ -15,6 +15,54 @@ const CONTAINER_NAME = process.env.AZURE_BLOB_CONTAINER_NAME || 'certificates';
 const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION_STRING);
 const containerClient = blobServiceClient.getContainerClient(CONTAINER_NAME);
 
+// ---- Helpers to normalize blob names and build URLs ----
+/**
+ * Normalize an incoming blob identifier (URL or relative path) to a
+ * container-relative path like "folder/name.ext". Any SAS or query string
+ * will be stripped. Leading slashes are removed.
+ */
+function toBlobPath(input) {
+  if (!input) return '';
+  const s = String(input).trim();
+  try {
+    // If full URL, cut after the container segment
+    if (s.startsWith('http://') || s.startsWith('https://')) {
+      const u = new URL(s);
+      // container URL base (no trailing slash)
+      const contBase = containerClient.url.replace(/\/+$/,'');
+      const full = u.origin + u.pathname; // drop query
+      if (full.startsWith(contBase + '/')) {
+        return full.slice((contBase + '/').length).replace(/^\/+/, '');
+      }
+      // Fallback: try to find the container segment in the path
+      const parts = u.pathname.split('/').filter(Boolean);
+      const idx = parts.findIndex(p => p === containerClient.containerName);
+      if (idx !== -1) {
+        return parts.slice(idx + 1).join('/');
+      }
+      // If we can't detect, return the last path segment
+      return parts.pop() || '';
+    }
+    // If already looks like a path, drop any query and leading slashes
+    const qIdx = s.indexOf('?');
+    const noQuery = qIdx !== -1 ? s.slice(0, qIdx) : s;
+    return noQuery.replace(/^\/+/, '');
+  } catch {
+    // Non-URL strings
+    const qIdx = s.indexOf('?');
+    const noQuery = qIdx !== -1 ? s.slice(0, qIdx) : s;
+    return noQuery.replace(/^\/+/, '');
+  }
+}
+
+/**
+ * Return the HTTPS URL of a blob (without SAS).
+ */
+function getBlobUrl(blobPath) {
+  const p = toBlobPath(blobPath);
+  return containerClient.getBlockBlobClient(p).url;
+}
+
 // Helper: parse AccountName/AccountKey from connection string for SAS generation
 function parseConnStr(connStr) {
   const entries = String(connStr || '')
@@ -89,6 +137,31 @@ async function getReadSasUrl(blobName, opts = {}) {
   return `${blobClient.url}?${sasParams.toString()}`;
 }
 
+/**
+ * Delete all blobs under a given container-relative prefix (e.g. "dxf/<jobId>/").
+ * Returns a summary with the number of deleted blobs.
+ * @param {string} prefix
+ * @returns {Promise<{ deleted: number }>}
+ */
+async function deletePrefix(prefix) {
+  const pfx = toBlobPath(prefix).replace(/^\/+/, '');
+  if (!pfx) return { deleted: 0 };
+  let deleted = 0;
+
+  // list and delete iteratively; continue on individual errors
+  for await (const item of containerClient.listBlobsFlat({ prefix: pfx })) {
+    try {
+      const block = containerClient.getBlockBlobClient(item.name);
+      const resp = await block.deleteIfExists();
+      if (resp.succeeded) deleted++;
+    } catch (e) {
+      try { console.warn('[blob] deletePrefix item failed:', item.name, e?.message || e); } catch {}
+    }
+  }
+  try { console.info('[blob] deletePrefix done', { prefix: pfx, deleted }); } catch {}
+  return { deleted };
+}
+
 module.exports = {
   async uploadFile(filePath, blobName) {
     const blockBlobClient = containerClient.getBlockBlobClient(blobName);
@@ -119,5 +192,41 @@ module.exports = {
     return { renamed: true };
   },
 
-  getReadSasUrl
+  /**
+   * Upload an in-memory Buffer as a blob.
+   * @param {string} blobNameOrPath - URL or container-relative path where to store.
+   * @param {Buffer|Uint8Array} buffer
+   * @param {string} [contentType='application/octet-stream']
+   * @param {{ metadata?: Record<string,string> }} [opts]
+   * @returns {Promise<string>} The container-relative path of the uploaded blob.
+   */
+  async uploadBuffer(blobNameOrPath, buffer, contentType = 'application/octet-stream', opts = {}) {
+    const blobPath = toBlobPath(blobNameOrPath);
+    if (!blobPath) throw new Error('uploadBuffer: missing blob name/path');
+    const blockBlobClient = containerClient.getBlockBlobClient(blobPath);
+
+    // optional debug logs
+    try {
+      console.info('[blob] uploadBuffer ->', {
+        container: containerClient.containerName,
+        blobPath,
+        bytes: buffer ? (buffer.byteLength || buffer.length || 0) : 0,
+        contentType
+      });
+    } catch {}
+
+    await blockBlobClient.uploadData(buffer, {
+      blobHTTPHeaders: { blobContentType: contentType },
+      metadata: opts.metadata || undefined
+    });
+
+    return blobPath; // return relative path for DB storage
+  },
+
+  
+
+  getReadSasUrl,
+  deletePrefix,
+  getBlobUrl,
+  toBlobPath
 };
