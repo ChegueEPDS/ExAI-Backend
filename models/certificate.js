@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const CompanyCertificateLink = require('./companyCertificateLink');
 
 const CertificateSchema = new mongoose.Schema({
   certNo: { type: String, required: true },
@@ -61,5 +62,36 @@ CertificateSchema.index(
   { company: 1, certNo: 1, issueDate: 1 },
   { unique: true, name: 'uniq_company_certNo_issueDate', collation: { locale: 'en', strength: 2 } }
 );
+
+// --- Cascade cleanup: töröljük a linkeket, ha egy certificate törlődik ---
+
+// findByIdAndDelete / findOneAndDelete esetek
+CertificateSchema.post('findOneAndDelete', async function (doc) {
+  try {
+    if (doc?._id) {
+      await mongoose.model('CompanyCertificateLink').deleteMany({ certId: doc._id });
+    }
+  } catch (err) {
+    console.warn('⚠️ [cascade] Link törlés sikertelen lehetett (findOneAndDelete):', doc?._id?.toString(), err?.message || err);
+  }
+});
+
+// Document-alapú törlés esetére (doc.deleteOne() / doc.remove())
+CertificateSchema.post('deleteOne', { document: true, query: false }, async function () {
+  try {
+    await mongoose.model('CompanyCertificateLink').deleteMany({ certId: this._id });
+  } catch (err) {
+    console.warn('⚠️ [cascade] Link törlés sikertelen lehetett (doc.deleteOne):', this._id?.toString(), err?.message || err);
+  }
+});
+
+// (Opcionális) Régebbi kódokhoz: doc.remove()
+CertificateSchema.post('remove', { document: true, query: false }, async function () {
+  try {
+    await mongoose.model('CompanyCertificateLink').deleteMany({ certId: this._id });
+  } catch (err) {
+    console.warn('⚠️ [cascade] Link törlés sikertelen lehetett (doc.remove):', this._id?.toString(), err?.message || err);
+  }
+});
 
 module.exports = mongoose.model('Certificate', CertificateSchema);

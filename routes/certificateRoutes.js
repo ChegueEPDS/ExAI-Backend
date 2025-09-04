@@ -12,6 +12,11 @@ router.post('/certificates/preview-atex', authMiddleware(), certificateControlle
 
 // Listázás
 router.get('/certificates', authMiddleware(), certificateController.getCertificates);
+router.get('/certificates/global', authMiddleware(), certificateController.getGlobalCertificates);
+
+// Adopt / Unadopt
+router.post('/certificates/:id/adopt', authMiddleware(), certificateController.adoptGlobal);
+router.delete('/certificates/:id/adopt', authMiddleware(), certificateController.unadoptGlobal);
 
 // SAS link generálás tanúsítvány letöltéséhez
 // FONTOS: ez a route legyen MINDEN dinamikus (:param) route ELŐTT!

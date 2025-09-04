@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const Certificate = require('../models/certificate');
+const CompanyCertificateLink = require('../models/companyCertificateLink');
 const User = require('../models/user'); // 🔹 Importáljuk a User modellt
 const multer = require('multer');
 const { generateDocxFile } = require('../helpers/docx'); // 🔹 DOCX generálás importálása
@@ -174,30 +175,66 @@ exports.uploadCertificate = async (req, res) => {
 };
 
 
-// Tanúsítványok lekérdezési endpoint
-exports.getCertificates = async (req, res) => {
-    try {
-      // 🔹 Csak a bejelentkezett felhasználó cégéhez tartozó tanúsítványokat listázzuk
-      const company = req.user.company;
-      if (!company) {
-        return res.status(400).json({ message: "❌ Hiányzó company adat a felhasználó tokenjében!" });
-      }
-  
-      console.log(`🔍 Keresés a következő cégre: ${company}`);
-  
-      const certificates = await Certificate.find({
-          $or: [
-            { company },             // saját cég
-            { company: 'global' }    // globális
-          ]
-        });
-  
-      res.json(certificates);
-    } catch (error) {
-      console.error('❌ Hiba a lekérdezés során:', error);
-      res.status(500).send('❌ Hiba a lekérdezés során');
-    }
-  };
+ // Tanúsítványok lekérdezése – SAJÁT cég + adoptált GLOBAL-ok
+ exports.getCertificates = async (req, res) => {
+   try {
+     const company = req.user.company;
+     if (!company) {
+       return res.status(400).json({ message: "❌ Hiányzó company adat a felhasználó tokenjében!" });
+     }
+
+   console.log(`🔍 Saját (${company}) + adoptált GLOBAL lekérés`);
+
+    const own = await Certificate.find({ company });
+
+    const links = await CompanyCertificateLink.find({ company })
+      .select('certId')
+      .lean();
+    const adoptedIds = links.map(l => l.certId);
+
+    const adoptedGlobals = adoptedIds.length
+      ? await Certificate.find({ _id: { $in: adoptedIds }, company: 'global' })
+      : [];
+
+    // összevonás (globálisak nem ütköznek saját cégbeliekkel)
+    const merged = [...own, ...adoptedGlobals];
+    res.json(merged);
+   } catch (error) {
+     console.error('❌ Hiba a lekérdezés során:', error);
+     res.status(500).send('❌ Hiba a lekérdezés során');
+   }
+ };
+
+// Tanúsítványok lekérdezése – CSAK GLOBAL, adoptedByMe jelzéssel
+ exports.getGlobalCertificates = async (req, res) => {
+   try {
+    const company = req.user?.company;
+    console.log('🔍 Keresés GLOBAL tanúsítványokra (adoptedByMe flaggel)');
+    const certificates = await Certificate.aggregate([
+      { $match: { company: 'global' } },
+      {
+        $lookup: {
+          from: 'companycertificatelinks', // <-- a modell pluralizált neve
+          let: { certId: '$_id' },
+          pipeline: [
+            { $match: { $expr: { $and: [
+              { $eq: ['$certId', '$$certId'] },
+              { $eq: ['$company', company] }
+            ]}}},
+            { $limit: 1 }
+          ],
+          as: 'myLink'
+        }
+      },
+      { $addFields: { adoptedByMe: { $gt: [{ $size: '$myLink' }, 0] } } },
+      { $project: { myLink: 0 } }
+    ]);
+    res.json(certificates);
+   } catch (error) {
+     console.error('❌ Hiba a global lekérdezés során:', error);
+     res.status(500).send('❌ Hiba a global lekérdezés során');
+   }
+ };
 
 exports.getCertificateByCertNo = async (req, res) => {
     try {
@@ -264,6 +301,12 @@ exports.deleteCertificate = async (req, res) => {
     }
 
     await Certificate.findByIdAndDelete(id);
+    // töröljük a kapcsoló rekordokat is
+   try {
+     await CompanyCertificateLink.deleteMany({ certId: id });
+   } catch (e) {
+     console.warn('⚠️ Linkek törlése sikertelen lehetett:', e?.message);
+   }
     return res.json({ message: '✅ Certificate deleted successfully (Azure Blob + DB).' });
   } catch (error) {
     console.error('❌ Error deleting certificate:', error);
@@ -311,27 +354,64 @@ exports.updateCertificate = async (req, res) => {
   }
 };
 
-// Tanúsítványok company mezőjének frissítése
+// Tanúsítványok company mezőjének frissítése -> 'global'
+// + azonnali adopt link létrehozása az EREDETI céghez (hogy ott is megmaradjon)
+// Megjegyzés: Ez a változat nem használ Mongo tranzakciót, így standalone mongod alatt is működik.
 exports.updateCompanyToGlobal = async (req, res) => {
-  try {
-    const { ids } = req.body; // kijelölt cert ID-k
+  const { ids } = req.body;
+  if (!ids || !Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ message: "❌ No certificate IDs provided!" });
+  }
 
-    if (!ids || !Array.isArray(ids) || ids.length === 0) {
-      return res.status(400).json({ message: "❌ No certificate IDs provided!" });
+  try {
+    // 1) Előre kiolvassuk az érintett cert-ek *eredeti* company értékét
+    const certs = await Certificate.find({ _id: { $in: ids } })
+      .select('_id company')
+      .lean();
+
+    if (!certs.length) {
+      return res.json({ message: 'ℹ️ No certificates found for given IDs.', updatedCount: 0 });
     }
 
-    const result = await Certificate.updateMany(
-      { _id: { $in: ids } },
-      { $set: { company: "global" } }
+    // Csak azok, amelyek még nem global-ok
+    const toUpdate = certs.filter(c => (c.company || '').toLowerCase() !== 'global');
+    if (!toUpdate.length) {
+      return res.json({ message: "ℹ️ All selected certificates are already 'global'.", updatedCount: 0 });
+    }
+
+    // 2) Először hozzuk létre (upsert) a linkeket az EREDETI company-khoz.
+    //    Ez idempotens és biztonságos: ha az update később hibázna, a link legfeljebb felesleges, de kárt nem okoz.
+    const linkOps = toUpdate.map(c => ({
+      updateOne: {
+        filter: { company: c.company, certId: c._id },
+        update: {
+          $setOnInsert: {
+            company: c.company,
+            certId: c._id,
+            addedAt: new Date()
+          }
+        },
+        upsert: true
+      }
+    }));
+
+    if (linkOps.length) {
+      await CompanyCertificateLink.bulkWrite(linkOps);
+    }
+
+    // 3) Majd átállítjuk a cert-ek company mezőjét 'global'-ra.
+    const updateRes = await Certificate.updateMany(
+      { _id: { $in: toUpdate.map(c => c._id) } },
+      { $set: { company: 'global' } }
     );
 
     return res.json({
-      message: "✅ Company mező sikeresen frissítve 'global'-ra!",
-      updatedCount: result.modifiedCount
+      message: "✅ Moved to 'global' and linked back to original companies (no transaction).",
+      updatedCount: updateRes?.modifiedCount ?? toUpdate.length
     });
   } catch (error) {
-    console.error("❌ Error updating company to global:", error);
-    return res.status(500).json({ message: "❌ Error updating company to global" });
+    console.error("❌ Error updating company to global (no-tx):", error);
+    return res.status(500).json({ message: "❌ Error updating company to global", details: error?.message });
   }
 };
 
@@ -392,4 +472,58 @@ exports.previewAtex = async (req, res) => {
       return res.status(500).send('❌ Hiba ATEX preview során');
     }
   });
+};
+
+// Global certificate adoptálása a cég saját listájába (link létrehozása)
+exports.adoptGlobal = async (req, res) => {
+  try {
+    const company = req.user?.company;
+    const userId = req.user?._id;
+    const { id } = req.params; // certificate _id
+
+    if (!company) return res.status(400).json({ message: '❌ Hiányzó company az auth tokenből' });
+
+    const cert = await Certificate.findById(id);
+    if (!cert) return res.status(404).json({ message: '❌ Certificate not found' });
+    if (cert.company !== 'global') {
+      return res.status(400).json({ message: '❌ Csak global certificate adoptálható' });
+    }
+
+    await CompanyCertificateLink.updateOne(
+      { company, certId: cert._id },
+      { $setOnInsert: { company, certId: cert._id, addedBy: userId, addedAt: new Date() } },
+      { upsert: true }
+    );
+
+    return res.json({ message: '✅ Adoptálva a cég listájába' });
+  } catch (error) {
+    if (error?.code === 11000) {
+      // unique index miatt idempotens – már létezik a link
+      return res.json({ message: 'ℹ️ Már adoptálva volt' });
+    }
+    console.error('❌ Adopt hiba:', error);
+    return res.status(500).json({ message: '❌ Adopt hiba' });
+  }
+};
+
+// Global certificate unadopt (link törlése a cég listájából)
+exports.unadoptGlobal = async (req, res) => {
+  try {
+    const company = req.user?.company;
+    const { id } = req.params; // certificate _id
+
+    if (!company) return res.status(400).json({ message: '❌ Hiányzó company az auth tokenből' });
+
+    const cert = await Certificate.findById(id);
+    if (!cert) return res.status(404).json({ message: '❌ Certificate not found' });
+    if (cert.company !== 'global') {
+      return res.status(400).json({ message: '❌ Csak global certificate-ről vehető le az adopt' });
+    }
+
+    await CompanyCertificateLink.deleteOne({ company, certId: cert._id });
+    return res.json({ message: '✅ Eltávolítva a cég listájáról' });
+  } catch (error) {
+    console.error('❌ Unadopt hiba:', error);
+    return res.status(500).json({ message: '❌ Unadopt hiba' });
+  }
 };
