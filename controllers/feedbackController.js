@@ -5,7 +5,16 @@ exports.saveFeedback = async (req, res) => {
   const { threadId, messageIndex, comment, references } = req.body;
 
   try {
-    const conversation = await Conversation.findOne({ threadId });
+    const role = req.role;
+    const tenantId = req.scope?.tenantId;
+    let query;
+    if (role === 'SuperAdmin') {
+      query = { threadId };
+    } else {
+      if (!tenantId) return res.status(403).json({ error: 'Missing tenantId in auth scope' });
+      query = { threadId, tenantId };
+    }
+    const conversation = await Conversation.findOne(query);
     if (!conversation || !conversation.messages[messageIndex]) {
       return res.status(404).json({ error: 'Message not found' });
     }
@@ -25,7 +34,14 @@ exports.saveFeedback = async (req, res) => {
 // Get all feedback
 exports.getAllFeedback = async (req, res) => {
   try {
-    const conversations = await Conversation.find();
+    const role = req.role;
+    const tenantId = req.scope?.tenantId;
+    let query = {};
+    if (role !== 'SuperAdmin') {
+      if (!tenantId) return res.status(403).json({ error: 'Missing tenantId in auth scope' });
+      query = { tenantId };
+    }
+    const conversations = await Conversation.find(query);
     const feedbackList = [];
 
     conversations.forEach((conversation) => {

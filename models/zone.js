@@ -32,47 +32,44 @@ const ZoneSchema = new mongoose.Schema(
             type: mongoose.Schema.Types.ObjectId, 
             ref: 'User'
         },
-        Company: { 
-            type: String,
+        tenantId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'Tenant',
+            required: true,
+            index: true
         },
         Site: {
             type: mongoose.Schema.Types.ObjectId,
             ref: 'Site',
         },
-        oneDriveFolderUrl: { type: String },
-        oneDriveFolderId: { type: String },
-        sharePointFolderUrl: { type: String },
-        sharePointFolderId: { type: String },
-        sharePointSiteId: { type: String },
-        sharePointDriveId: { type: String },
         documents: [
             {
               name: { type: String },
               alias: { type: String },
-              oneDriveId: { type: String },
-              oneDriveUrl: { type: String },
-              sharePointId: { type: String },
-              sharePointUrl: { type: String },
               type: { type: String, enum: ['document', 'image'], default: 'document' },
-              uploadedAt: { type: Date, default: Date.now }
+              uploadedAt: { type: Date, default: Date.now },
+              blobPath: { type: String },
+              blobUrl: { type: String },
+              contentType: { type: String },
+              size: { type: Number }
             }
           ]
     }, 
     { timestamps: true }
 );
 
-// Pre-save hook: csak az új rekordoknál állítja be a Company-t
 ZoneSchema.pre('save', async function (next) {
-    if (!this.Company) {
-        try {
-            const user = await mongoose.model('User').findById(this.CreatedBy);
-            if (!user) return next(new Error('Érvénytelen CreatedBy felhasználó.'));
-            this.Company = user.company;
-        } catch (error) {
-            return next(error);
+    try {
+        const user = await mongoose.model('User').findById(this.CreatedBy).select('tenantId');
+        if (!user) return next(new Error('Érvénytelen CreatedBy felhasználó.'));
+        
+        if (!this.tenantId && user.tenantId) {
+            this.tenantId = user.tenantId;
         }
+        next();
+    } catch (error) {
+        return next(error);
     }
-    next();
 });
 
 // Pre-update hook: minden módosításkor frissíti a ModifiedBy mezőt

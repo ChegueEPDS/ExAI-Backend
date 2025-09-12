@@ -6,6 +6,8 @@ const QuestionsSchema = new mongoose.Schema({
         hun: { type: String }
         },
 
+  tenantId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', required: true, index: true },
+
   standard: {
     type: String
   },
@@ -45,5 +47,7 @@ const QuestionsSchema = new mongoose.Schema({
     enum: ["General", "Motors", "Lighting", "Installation", "Installation Heating System", "Installation Motors", "Environment"],
   },
 });
+
+QuestionsSchema.index({ tenantId: 1, equipmentType: 1 });
 
 module.exports = mongoose.model('Question', QuestionsSchema);

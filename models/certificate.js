@@ -33,34 +33,63 @@ const CertificateSchema = new mongoose.Schema({
     ref: 'User',
     required: true
   },
-  company: {
+  tenantId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Tenant',
+    index: true,
+    required: false,
+  },
+  visibility: {
     type: String,
-    required: true
+    enum: ['public', 'private'],
+    default: 'private',
+    index: true
   },
 }, { timestamps: true });
 
-// 🔹 Automatikus Company kitöltés CreatedBy alapján
+// 🔹 Automatikus tenant kitöltés CreatedBy alapján (company mező kivezetve)
 CertificateSchema.pre('save', async function (next) {
   try {
-    // Ha a company már be van állítva (pl. 'global'), hagyjuk békén
-    if (this.company) return next();
-
-    // Csak akkor töltsük ki user.company-vel, ha még nincs érték
-    if (this.isModified('createdBy')) {
-      const user = await mongoose.model('User').findById(this.createdBy);
-      if (!user) return next(new Error('Invalid CreatedBy user'));
-      this.company = user.company || 'global';
+    // ⚠️ Ha PUBLIC, akkor maradhat tenantId=null (ne töltsük vissza)
+    if (this.visibility === 'public') {
+      return next();
     }
-    next();
+
+    // Csak nem-PUBLIC esetben töltsük be a tenantId-t
+    if (this.isModified('createdBy') || !this.tenantId) {
+      const user = await mongoose.model('User').findById(this.createdBy).select('tenantId');
+      if (!user) return next(new Error('Invalid CreatedBy user'));
+
+      if (!this.tenantId && user.tenantId) {
+        this.tenantId = user.tenantId;
+      }
+    }
+    return next();
   } catch (err) {
-    next(err);
+    return next(err);
   }
 });
 
-// 🔹 Egyedi index cégenként: certNo + issueDate
+// 🔹 Egyedi index tenanton belül: tenantId + certNo + issueDate (csak ahol van tenantId)
 CertificateSchema.index(
-  { company: 1, certNo: 1, issueDate: 1 },
-  { unique: true, name: 'uniq_company_certNo_issueDate', collation: { locale: 'en', strength: 2 } }
+  { tenantId: 1, certNo: 1, issueDate: 1 },
+  {
+    unique: true,
+    name: 'uniq_tenant_certNo_issueDate',
+    partialFilterExpression: { tenantId: { $exists: true, $type: 'objectId' } },
+    collation: { locale: 'en', strength: 2 },
+  }
+);
+
+// 🔹 Egyedi index publikus rekordokra: visibility='public' + certNo + issueDate
+CertificateSchema.index(
+  { visibility: 1, certNo: 1, issueDate: 1 },
+  {
+    unique: true,
+    name: 'uniq_public_certNo_issueDate',
+    partialFilterExpression: { visibility: 'public' },
+    collation: { locale: 'en', strength: 2 },
+  }
 );
 
 // --- Cascade cleanup: töröljük a linkeket, ha egy certificate törlődik ---

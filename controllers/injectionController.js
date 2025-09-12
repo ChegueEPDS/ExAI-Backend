@@ -5,7 +5,10 @@ exports.createInjectionRule = async (req, res) => {
   try {
     const { pattern, injectedKnowledge } = req.body;
     const createdBy = req.userId;
-    const newRule = new InjectionRule({ pattern, injectedKnowledge, createdBy });
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) return res.status(403).json({ error: 'Missing tenantId in auth scope' });
+
+    const newRule = new InjectionRule({ pattern, injectedKnowledge, createdBy, tenantId });
     await newRule.save();
     res.status(201).json(newRule);
   } catch (error) {
@@ -15,7 +18,15 @@ exports.createInjectionRule = async (req, res) => {
 
 exports.getAllInjectionRules = async (req, res) => {
   try {
-    const rules = await InjectionRule.find().sort({ createdAt: -1 });
+    const role = req.role;
+    const tenantId = req.scope?.tenantId;
+
+    const query = (role === 'SuperAdmin') ? {} : { tenantId };
+    if (role !== 'SuperAdmin' && !tenantId) {
+      return res.status(403).json({ error: 'Missing tenantId in auth scope' });
+    }
+
+    const rules = await InjectionRule.find(query).sort({ createdAt: -1 });
     res.status(200).json(rules);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch injection rules' });
@@ -25,7 +36,17 @@ exports.getAllInjectionRules = async (req, res) => {
 exports.deleteInjectionRule = async (req, res) => {
   try {
     const { id } = req.params;
-    await InjectionRule.findByIdAndDelete(id);
+    const role = req.role;
+    const tenantId = req.scope?.tenantId;
+
+    const filter = (role === 'SuperAdmin') ? { _id: id } : { _id: id, tenantId };
+    if (role !== 'SuperAdmin' && !tenantId) {
+      return res.status(403).json({ error: 'Missing tenantId in auth scope' });
+    }
+
+    const deleted = await InjectionRule.findOneAndDelete(filter);
+    if (!deleted) return res.status(404).json({ error: 'Injection rule not found' });
+
     res.status(200).json({ message: 'Injection rule deleted' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete injection rule' });
@@ -81,9 +102,16 @@ exports.updateInjectionRule = async (req, res) => {
   try {
     const { id } = req.params;
     const { pattern, injectedKnowledge } = req.body;
+    const role = req.role;
+    const tenantId = req.scope?.tenantId;
 
-    const updatedRule = await InjectionRule.findByIdAndUpdate(
-      id,
+    const filter = (role === 'SuperAdmin') ? { _id: id } : { _id: id, tenantId };
+    if (role !== 'SuperAdmin' && !tenantId) {
+      return res.status(403).json({ error: 'Missing tenantId in auth scope' });
+    }
+
+    const updatedRule = await InjectionRule.findOneAndUpdate(
+      filter,
       { pattern, injectedKnowledge },
       { new: true }
     );

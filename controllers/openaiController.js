@@ -1,6 +1,6 @@
-/******************************************************************************************/ 
+/**********************************************************************************/ 
 /*** Az OpenAI beállítások lekérdezése, és módosítása. Asszisztens választása a userhez ***/
-/******************************************************************************************/
+/**********************************************************************************/
 
 const axios = require('axios');
 const logger = require('../config/logger');
@@ -20,13 +20,31 @@ async function getVectorStoreId(assistantId) {
   return response.data.tool_resources?.file_search?.vector_store_ids?.[0];
 }
 
+/**
+ * Resolve assistant ID with priority: tenant → default
+ * (company has been removed)
+ */
+function resolveAssistantId(tenantId) {
+  try {
+    if (assistants?.byTenant && tenantId && assistants.byTenant[tenantId]) {
+      return assistants.byTenant[tenantId];
+    }
+    return assistants['default'] || assistants.default;
+  } catch (e) {
+    return assistants['default'] || assistants.default;
+  }
+}
+
 // 📥 Fájlok listázása a vector store-ból – névvel együtt
 exports.listAssistantFiles = async (req, res) => {
   try {
-    const user = await User.findById(req.userId).select('company');
+    const user = await User.findById(req.userId).select('tenantId');
     if (!user) return res.status(404).json({ error: 'Felhasználó nem található.' });
 
-    const assistantId = assistants[user.company] || assistants['default'];
+    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
+    const assistantId = resolveAssistantId(tenantId);
+    logger.info(`Vector store list – assistant: ${assistantId} (tenant=${tenantId})`);
+
     const vectorStoreId = await getVectorStoreId(assistantId);
     if (!vectorStoreId) return res.status(404).json({ error: 'Nincs vector store társítva az asszisztenshez.' });
 
@@ -73,10 +91,13 @@ exports.listAssistantFiles = async (req, res) => {
 // 📤 Fájl feltöltése és hozzárendelése a vector store-hoz
 exports.uploadAssistantFile = async (req, res) => {
   try {
-    const user = await User.findById(req.userId).select('company');
+    const user = await User.findById(req.userId).select('tenantId');
     if (!user) return res.status(404).json({ error: 'Felhasználó nem található.' });
 
-    const assistantId = assistants[user.company] || assistants['default'];
+    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
+    const assistantId = resolveAssistantId(tenantId);
+    logger.info(`Vector store upload – assistant: ${assistantId} (tenant=${tenantId})`);
+
     const vectorStoreId = await getVectorStoreId(assistantId);
     if (!vectorStoreId) return res.status(404).json({ error: 'Nincs vector store társítva az asszisztenshez.' });
 
@@ -127,10 +148,13 @@ exports.uploadAssistantFile = async (req, res) => {
 // 📤 Fájl törlése a vector store-ból és az OpenAI fájltárból
 exports.deleteAssistantFile = async (req, res) => {
   try {
-    const user = await User.findById(req.userId).select('company');
+    const user = await User.findById(req.userId).select('tenantId');
     if (!user) return res.status(404).json({ error: 'Felhasználó nem található.' });
 
-    const assistantId = assistants[user.company] || assistants['default'];
+    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
+    const assistantId = resolveAssistantId(tenantId);
+    logger.info(`Vector store delete – assistant: ${assistantId} (tenant=${tenantId})`);
+
     const vectorStoreId = await getVectorStoreId(assistantId);
     if (!vectorStoreId) return res.status(404).json({ error: 'Nincs vector store társítva az asszisztenshez.' });
 
@@ -172,16 +196,16 @@ exports.getAssistantInstructions = async (req, res) => {
     }
 
     // Felhasználói adatok lekérése az adatbázisból
-    const user = await User.findById(userId).select('company');
+    const user = await User.findById(userId).select('tenantId');
     if (!user) {
       logger.error('Felhasználó nem található.');
       return res.status(404).json({ error: 'Felhasználó nem található.' });
     }
 
-    // Az asszisztens azonosító kiválasztása a company alapján
-    const company = user.company;
-    const assistantId = assistants[company] || assistants['default'];
-    logger.info(`Lekérdezett asszisztens ID: ${assistantId} (Company: ${company})`);
+    // Az asszisztens azonosító kiválasztása tenant alapján
+    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
+    const assistantId = resolveAssistantId(tenantId);
+    logger.info(`Lekérdezett asszisztens ID: ${assistantId} (Tenant: ${tenantId})`);
 
     // OpenAI API hívás az asszisztens utasításaiért
     const response = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {

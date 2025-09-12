@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 
 const CompanyCertificateLinkSchema = new mongoose.Schema({
-  company: { type: String, required: true }, // pl. user.company
+  tenantId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', index: true, required: true },
   certId: { type: mongoose.Schema.Types.ObjectId, ref: 'Certificate', required: true },
   // opcionális meta:
   addedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
@@ -10,7 +10,10 @@ const CompanyCertificateLinkSchema = new mongoose.Schema({
   tags: { type: [String], default: [] }
 }, { timestamps: true });
 
-// Egy cég ugyanazt a tanúsítványt csak egyszer adoptálhatja
-CompanyCertificateLinkSchema.index({ company: 1, certId: 1 }, { unique: true });
+// Egy tenant ugyanazt a tanúsítványt csak egyszer adoptálhatja
+CompanyCertificateLinkSchema.index(
+  { tenantId: 1, certId: 1 },
+  { unique: true, name: 'uniq_tenant_cert_link' }
+);
 
 module.exports = mongoose.model('CompanyCertificateLink', CompanyCertificateLinkSchema);

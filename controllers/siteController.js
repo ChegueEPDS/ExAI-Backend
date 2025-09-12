@@ -3,92 +3,127 @@ const Site = require('../models/site'); // Importáljuk a Site modellt
 const User = require('../models/user'); // Importáljuk a User modellt
 const Zone = require('../models/zone'); // Ez kell a file tetejére is
 const Equipment = require('../models/dataplate'); // 👈 importáljuk a modell tetején
-const { getOrCreateFolder, deleteOneDriveItemById } = require('../controllers/graphController');
+// LEGACY (OneDrive/SharePoint) — kept for reference:
+// const { getOrCreateFolder, deleteOneDriveItemById } = require('../controllers/graphController');
+const azureBlob = require('../services/azureBlobService');
+const path = require('path');
 const mongoose = require('mongoose');
 const fs = require('fs');
-const axios = require('axios');
+const mime = require('mime-types');
+
+// LEGACY: const axios = require('axios');
+
+// Helper: convert string to ObjectId safely
+const toObjectId = (id) =>
+  mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
 
 function cleanFileName(filename) {
     return filename
       .normalize("NFKD")                         // Szétbontott ékezetek eltávolítása
       .replace(/[\u0300-\u036f]/g, "")           // Diakritikus jelek eltávolítása
       .replace(/[^a-zA-Z0-9.\-_ ]/g, "_");       // Biztonságos karakterek megtartása
-  }
+}
+
+function slug(s) {
+  return String(s || '')
+    .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9._ -]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function buildTenantRoot(tenantName, tenantId) {
+  const tn = slug(tenantName) || `TENANT_${tenantId}`;
+  return `${tn}`;
+}
+function buildSitePrefix(tenantName, tenantId, siteName) {
+  return `${buildTenantRoot(tenantName, tenantId)}/projects/${slug(siteName)}`;
+}
 
 // 🔹 Új site létrehozása
 exports.createSite = async (req, res) => {
-    try {
-        const CreatedBy = req.userId;
-        const Company = req.user.company;
-
-        if (!Company) {
-            return res.status(400).json({ message: "Company is missing in token" });
-        }
-
-        // 🔎 Felhasználó lekérése tenantId ellenőrzéshez
-        const user = await User.findById(CreatedBy);
-        const hasEntraID = !!user?.tenantId;
-
-        // 1️⃣ Site létrehozása és mentése
-        const newSite = new Site({
-            Name: req.body.Name,
-            Client: req.body.Client,
-            CreatedBy: CreatedBy,
-            Company: Company,
-        });
-
-        await newSite.save();
-
-        // 2️⃣ OneDrive mappa létrehozása CSAK Entra ID-s usernél
-        const accessToken = req.headers['x-ms-graph-token'];
-        if (hasEntraID && accessToken) {
-            console.log('🔐 Entra ID-s user. Access token megvan, próbáljuk létrehozni a mappát...');
-            
-            const oneDrivePath = `ExAI/Projects/${newSite.Name}`;
-            const userCompany = (req.user.company ?? 'NO_COMPANY').toUpperCase();
-            const sharePointPath = `${userCompany}/Projects/${newSite.Name}`;
-
-            // 👉 OneDrive mappa
-            const folderResult = await getOrCreateFolder(accessToken, oneDrivePath);
-            if (folderResult?.folderId) {
-                newSite.oneDriveFolderUrl = folderResult.folderUrl;
-                newSite.oneDriveFolderId = folderResult.folderId;
-            }
-
-            // 👉 SharePoint mappa
-            const { getOrCreateSharePointFolder } = require('../helpers/sharePointHelpers');
-            const spFolderResult = await getOrCreateSharePointFolder(accessToken, sharePointPath);
-            if (spFolderResult?.folderId) {
-                newSite.sharePointFolderUrl = spFolderResult.folderUrl;
-                newSite.sharePointFolderId = spFolderResult.folderId;
-                newSite.sharePointSiteId = spFolderResult.siteId;
-                newSite.sharePointDriveId = spFolderResult.driveId;
-            }
-
-            await newSite.save();
-            console.log(`✅ OneDrive és SharePoint mappa mentve: ${oneDrivePath}, ${sharePointPath}`);
-        } else {
-            console.log(`🔹 OneDrive/SharePoint mappa kihagyva. hasEntraID: ${hasEntraID}, token: ${!!accessToken}`);
-        }
-
-        // 4️⃣ Válasz kiküldése
-        res.status(201).json(newSite);
-    } catch (error) {
-        res.status(500).json({ message: "Server error", error: error.message });
+  try {
+    const CreatedBy = req.userId;
+    const tenantIdStr = req.scope?.tenantId;
+    const tenantName = req.scope?.tenantName || '';
+    const tenantObjectId = toObjectId(tenantIdStr);
+    if (!tenantObjectId) {
+      return res.status(400).json({ message: "Invalid or missing tenantId in auth" });
     }
+
+    if (!req.body?.Name) {
+      return res.status(400).json({ message: "Site Name is required" });
+    }
+
+    // 1) Site létrehozása és mentése
+    const newSite = new Site({
+      Name: req.body.Name,
+      Client: req.body.Client,
+      CreatedBy: CreatedBy,
+      tenantId: tenantObjectId,
+    });
+    await newSite.save();
+
+    // 2) Azure Blob „mappa” létrehozása (.keep üres blob)
+    const sitePrefix = buildSitePrefix(tenantName, tenantIdStr, newSite.Name);
+    try {
+      await azureBlob.uploadBuffer(`${sitePrefix}/.keep`, Buffer.alloc(0), 'application/octet-stream', {
+        metadata: { createdAt: new Date().toISOString(), kind: 'folder-keep' }
+      });
+    } catch (e) {
+      console.warn('⚠️ Could not create .keep blob for site folder:', e?.message);
+    }
+    // store site blob prefix for convenience
+    try {
+      newSite.blobPrefix = sitePrefix;
+      await newSite.save();
+    } catch (e) {
+      console.warn('⚠️ Could not persist blobPrefix on site:', e?.message);
+    }
+
+    // LEGACY (OneDrive + SharePoint) — removed in favor of Azure Blob:
+    /*
+    const user = await User.findById(CreatedBy);
+    const hasEntraID = !!user?.tenantId;
+    const accessToken = req.headers['x-ms-graph-token'];
+    if (hasEntraID && accessToken) {
+      const oneDrivePath = `ExAI/Projects/${newSite.Name}`;
+      const tenantLabel = `TENANT_${tenantIdStr}`.toUpperCase();
+      const sharePointPath = `${tenantLabel}/Projects/${newSite.Name}`;
+      const folderResult = await getOrCreateFolder(accessToken, oneDrivePath);
+      if (folderResult?.folderId) {
+        newSite.oneDriveFolderUrl = folderResult.folderUrl;
+        newSite.oneDriveFolderId = folderResult.folderId;
+      }
+      const { getOrCreateSharePointFolder } = require('../helpers/sharePointHelpers');
+      const spFolderResult = await getOrCreateSharePointFolder(accessToken, sharePointPath);
+      if (spFolderResult?.folderId) {
+        newSite.sharePointFolderUrl = spFolderResult.folderUrl;
+        newSite.sharePointFolderId = spFolderResult.folderId;
+        newSite.sharePointSiteId = spFolderResult.siteId;
+        newSite.sharePointDriveId = spFolderResult.driveId;
+      }
+      await newSite.save();
+    }
+    */
+
+    return res.status(201).json(newSite);
+  } catch (error) {
+    console.error('❌ createSite error:', error);
+    return res.status(500).json({ message: "Server error", error: error.message });
+  }
 };
 
 // 🔹 Összes site listázása
 exports.getAllSites = async (req, res) => {
     try {
-        const userCompany = req.user.company;
-
-        if (!userCompany) {
-            return res.status(400).json({ message: "Company is missing in token" });
+        const tenantIdStr = req.scope?.tenantId;
+        const tenantObjectId = toObjectId(tenantIdStr);
+        if (!tenantObjectId) {
+            return res.status(400).json({ message: "Invalid or missing tenantId in auth" });
         }
 
-        const sites = await Site.find({ Company: userCompany })
-            .populate('CreatedBy', 'firstName lastName nickname company');
+        const sites = await Site.find({ tenantId: tenantObjectId })
+            .populate('CreatedBy', 'firstName lastName nickname');
 
         res.status(200).json(sites);
     } catch (error) {
@@ -99,12 +134,17 @@ exports.getAllSites = async (req, res) => {
 // 🔹 Egy site lekérése ID alapján
 exports.getSiteById = async (req, res) => {
     try {
-        const siteId = req.params.id || req.query.siteId; // ⚠️ Kereshetünk params-ban és query-ben is
+        const siteId = req.params.id || req.query.siteId;
         if (!siteId) {
             return res.status(400).json({ message: "Missing site ID" });
         }
-
-        const site = await Site.findById(siteId).populate('CreatedBy', 'firstName lastName nickname company');
+        const tenantIdStr = req.scope?.tenantId;
+        const tenantObjectId = toObjectId(tenantIdStr);
+        if (!tenantObjectId) {
+            return res.status(400).json({ message: "Invalid or missing tenantId in auth" });
+        }
+        const site = await Site.findOne({ _id: siteId, tenantId: tenantObjectId })
+          .populate('CreatedBy', 'firstName lastName nickname');
         if (!site) {
             return res.status(404).json({ message: "Site not found" });
         }
@@ -118,61 +158,84 @@ exports.getSiteById = async (req, res) => {
 // 🔹 Site módosítása
 exports.updateSite = async (req, res) => {
   try {
-      const { Name, Client, CreatedBy } = req.body;
+    const { Name, Client, CreatedBy } = req.body;
 
-      // 🔍 Site lekérése
-      let site = await Site.findById(req.params.id);
-      if (!site) {
-          return res.status(404).json({ message: "Site not found" });
-      }
+    const tenantIdStr = req.scope?.tenantId;
+    const tenantName = req.scope?.tenantName || '';
+    const tenantObjectId = toObjectId(tenantIdStr);
+    if (!tenantObjectId) return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
 
-      const oldName = site.Name;
-      const newName = Name;
+    let site = await Site.findOne({ _id: req.params.id, tenantId: tenantObjectId });
+    if (!site) {
+      return res.status(404).json({ message: "Site not found" });
+    }
 
-      // 🔍 Felhasználó ellenőrzés
-      const user = await User.findById(req.userId);
-      const hasEntraID = !!user?.tenantId;
-      const accessToken = req.headers['x-ms-graph-token'];
+    const oldName = site.Name;
+    const newName = Name;
 
-      // ✏️ OneDrive mappa átnevezés, ha változott a név
-      if (hasEntraID && accessToken && site.oneDriveFolderId && newName && newName !== oldName) {
-          console.log(`✏️ OneDrive mappa átnevezése: ${oldName} → ${newName}`);
-          const { renameOneDriveItemById } = require('../controllers/graphController');
-          const renameResult = await renameOneDriveItemById(site.oneDriveFolderId, accessToken, newName);
-          if (renameResult?.webUrl) {
-              site.oneDriveFolderUrl = renameResult.webUrl;
+    // Blob „átköltöztetés” ha a név változott
+    if (newName && newName !== oldName) {
+      const oldPrefix = buildSitePrefix(tenantName, tenantIdStr, oldName);
+      const newPrefix = buildSitePrefix(tenantName, tenantIdStr, newName);
+      try {
+        await azureBlob.renameFile(`${oldPrefix}/.keep`, `${newPrefix}/.keep`);
+      } catch (_) {}
+      if (Array.isArray(site.documents) && site.documents.length) {
+        for (const doc of site.documents) {
+          // prefer new blobPath, fall back to legacy oneDriveId if present
+          const legacyPath = doc.oneDriveId || '';
+          const currentPath = doc.blobPath || legacyPath || '';
+          if (!currentPath || !currentPath.startsWith(oldPrefix + '/')) continue;
+          const fileName = path.posix.basename(currentPath);
+          const newBlobPath = `${newPrefix}/${fileName}`;
+          try {
+            await azureBlob.renameFile(currentPath, newBlobPath);
+            // set new fields
+            doc.blobPath = newBlobPath;
+            doc.blobUrl = azureBlob.getBlobUrl(newBlobPath);
+            // cleanup legacy if present
+            if (doc.oneDriveId) delete doc.oneDriveId;
+            if (doc.oneDriveUrl) delete doc.oneDriveUrl;
+            if (doc.sharePointId) delete doc.sharePointId;
+            if (doc.sharePointUrl) delete doc.sharePointUrl;
+          } catch (e) {
+            console.warn('⚠️ Blob move failed:', currentPath, '→', newBlobPath, e?.message);
           }
+        }
       }
+      // update site's stored blob prefix
+      site.blobPrefix = newPrefix;
+    }
 
-      // ✏️ SharePoint mappa átnevezés, ha változott a név
-      if (hasEntraID && accessToken && site.sharePointFolderId && newName && newName !== oldName) {
-          console.log(`✏️ SharePoint mappa átnevezése: ${oldName} → ${newName}`);
-          const { renameSharePointItemById } = require('../helpers/sharePointHelpers');
-          const renameResult = await renameSharePointItemById(accessToken, site.sharePointFolderId, newName, site.sharePointDriveId);
-          if (renameResult?.webUrl) {
-              site.sharePointFolderUrl = renameResult.webUrl;
-          }
-      }
+    site.Name = newName || site.Name;
+    site.Client = Client || site.Client;
 
-      // Ha változik a CreatedBy, akkor frissítjük a Company mezőt is
-      if (CreatedBy && CreatedBy !== site.CreatedBy.toString()) {
-          const user = await User.findById(CreatedBy);
-          if (!user) {
-              return res.status(404).json({ message: "User not found" });
-          }
-          site.Company = user.company;
-      }
+    if (CreatedBy && CreatedBy !== String(site.CreatedBy)) {
+      const u = await User.findById(CreatedBy);
+      if (!u) return res.status(404).json({ message: "User not found" });
+      site.CreatedBy = CreatedBy;
+    }
 
-      // ✅ Módosítások alkalmazása
-      site.Name = newName || site.Name;
-      site.Client = Client || site.Client;
-      site.CreatedBy = CreatedBy || site.CreatedBy;
+    // LEGACY rename (OneDrive/SharePoint) — removed:
+    /*
+    const user = await User.findById(req.userId);
+    const hasEntraID = !!user?.tenantId;
+    const accessToken = req.headers['x-ms-graph-token'];
+    if (hasEntraID && accessToken && site.oneDriveFolderId && newName && newName !== oldName) {
+      const { renameOneDriveItemById } = require('../controllers/graphController');
+      await renameOneDriveItemById(site.oneDriveFolderId, accessToken, newName);
+    }
+    if (hasEntraID && accessToken && site.sharePointFolderId && newName && newName !== oldName) {
+      const { renameSharePointItemById } = require('../helpers/sharePointHelpers');
+      await renameSharePointItemById(accessToken, site.sharePointFolderId, newName, site.sharePointDriveId);
+    }
+    */
 
-      await site.save();
-      res.status(200).json(site);
+    await site.save();
+    res.status(200).json(site);
   } catch (error) {
-      console.error("❌ Site módosítás hiba:", error);
-      res.status(500).json({ message: "Server error", error: error.message });
+    console.error("❌ Site módosítás hiba:", error);
+    res.status(500).json({ message: "Server error", error: error.message });
   }
 };
 
@@ -180,52 +243,41 @@ exports.updateSite = async (req, res) => {
 exports.deleteSite = async (req, res) => {
   try {
     const siteId = req.params.id;
-    const accessToken = req.headers['x-ms-graph-token'];
+    const tenantIdStr = req.scope?.tenantId;
+    const tenantName = req.scope?.tenantName || '';
+    const tenantObjectId = toObjectId(tenantIdStr);
+    if (!tenantObjectId) return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
 
-    const site = await Site.findById(siteId);
+    const site = await Site.findOne({ _id: siteId, tenantId: tenantObjectId });
     if (!site) return res.status(404).json({ message: "Site not found" });
 
-    const user = await User.findById(req.userId);
-    const hasEntraID = !!user?.tenantId;
+    // child records
+    await Equipment.deleteMany({ Site: siteId, tenantId: tenantObjectId });
+    await Zone.deleteMany({ Site: siteId, tenantId: tenantObjectId });
 
-    const zones = await Zone.find({ Site: siteId });
-
-    // 🔹 Importálás itt a site törléshez is
-    const { deleteSharePointItemById } = require('../helpers/sharePointHelpers');
-
-    if (hasEntraID && accessToken) {
-      // 🔹 OneDrive törlés, ha van
-      if (site.oneDriveFolderId) {
-        await deleteOneDriveItemById(site.oneDriveFolderId, accessToken);
-        console.log(`🗑️ Site mappa törölve OneDrive-ról (ID: ${site.oneDriveFolderId})`);
-      }
-
-      // 🔹 SharePoint törlés, ha van
-      if (site.sharePointFolderId) {
-        await deleteSharePointItemById(accessToken, site.sharePointFolderId);
-        console.log(`🗑️ Site mappa törölve SharePoint-ról (ID: ${site.sharePointFolderId})`);
-      }
-
-      // 🔹 Zóna mappák törlése
-      for (const zone of zones) {
-        if (zone.oneDriveFolderId) {
-          await deleteOneDriveItemById(zone.oneDriveFolderId, accessToken);
-          console.log(`🗑️ Zóna mappa törölve OneDrive-ról: ${zone.Name}`);
-        }
-
-        if (zone.sharePointFolderId) {
-          await deleteSharePointItemById(accessToken, zone.sharePointFolderId);
-          console.log(`🗑️ Zóna mappa törölve SharePoint-ról: ${zone.Name}`);
-        }
-      }
+    // Blob prefix törlése
+    const sitePrefix = buildSitePrefix(tenantName, tenantIdStr, site.Name);
+    try {
+      await azureBlob.deletePrefix(`${sitePrefix}/`);
+    } catch (e) {
+      console.warn('⚠️ deletePrefix warning:', e?.message);
     }
 
-    // 🔹 Adatbázisból törlés
-    await Equipment.deleteMany({ Site: siteId });
-    await Zone.deleteMany({ Site: siteId });
     await site.deleteOne();
 
-    res.status(200).json({ message: "Site, related zones, equipment, and folders deleted from DB, OneDrive and SharePoint" });
+    // LEGACY (Graph/SharePoint) — removed:
+    /*
+    const accessToken = req.headers['x-ms-graph-token'];
+    const user = await User.findById(req.userId);
+    const hasEntraID = !!user?.tenantId;
+    const { deleteSharePointItemById } = require('../helpers/sharePointHelpers');
+    if (hasEntraID && accessToken) {
+      if (site.oneDriveFolderId) await deleteOneDriveItemById(site.oneDriveFolderId, accessToken);
+      if (site.sharePointFolderId) await deleteSharePointItemById(accessToken, site.sharePointFolderId);
+    }
+    */
+
+    res.status(200).json({ message: "Site, related zones, equipment deleted (DB) and Blob folder cleared." });
   } catch (error) {
     console.error("❌ Site törlés hiba:", error);
     res.status(500).json({ message: "Server error", error: error.message });
@@ -234,90 +286,63 @@ exports.deleteSite = async (req, res) => {
 
 exports.uploadFileToSite = async (req, res) => {
   try {
-    const site = await Site.findById(req.params.id);
+    const tenantIdStr = req.scope?.tenantId;
+    const tenantName = req.scope?.tenantName || '';
+    const tenantObjectId = toObjectId(tenantIdStr);
+    if (!tenantObjectId) return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
+
+    const site = await Site.findOne({ _id: req.params.id, tenantId: tenantObjectId });
     if (!site) return res.status(404).json({ message: "Site not found" });
 
-    const accessToken = req.headers['x-ms-graph-token'];
-    const files = req.files; // Tömb
+    const files = req.files || [];
     const aliasFromForm = req.body.alias;
-    const enableOneDrive = req.body.enableOneDrive !== 'false';
-    const enableSharePoint = req.body.enableSharePoint !== 'false';
-
-    const oneDrivePath = req.body.oneDrivePath;
-    const sharePointPath = req.body.sharePointPath;
-
-    if (!oneDrivePath && !sharePointPath) {
-      return res.status(400).json({ message: "Missing oneDrivePath and/or sharePointPath" });
+    if (!files.length) {
+      return res.status(400).json({ message: "No files provided" });
     }
 
-    console.log('📁 OneDrive path (backend):', oneDrivePath);
-    console.log('📁 SharePoint path (backend):', sharePointPath);
-
+    const sitePrefix = buildSitePrefix(tenantName, tenantIdStr, site.Name);
     const uploadedFiles = [];
 
     for (const file of files) {
-      const fileName = cleanFileName(file.originalname);
-      const alias = aliasFromForm || fileName;
-      const fileBuffer = fs.readFileSync(file.path);
-
-      let oneDriveResult = null;
-      let sharePointResult = null;
-
-      // ☁️ OneDrive feltöltés
-      if (enableOneDrive && accessToken && oneDrivePath) {
-        const { getOrCreateFolder } = require('../controllers/graphController');
-        const folder = await getOrCreateFolder(accessToken, oneDrivePath);
-        if (folder?.folderId) {
-          const uploadResp = await axios.put(
-            `https://graph.microsoft.com/v1.0/me/drive/items/${folder.folderId}:/${fileName}:/content`,
-            fileBuffer,
-            {
-              headers: {
-                Authorization: `Bearer ${accessToken}`,
-                'Content-Type': 'application/octet-stream',
-              },
-            }
-          );
-          oneDriveResult = uploadResp.data;
-        }
-      }
-
-      // 🏢 SharePoint feltöltés
-      if (enableSharePoint && accessToken && sharePointPath) {
-        const { uploadSharePointFile } = require('../helpers/sharePointHelpers');
-        try {
-          sharePointResult = await uploadSharePointFile(accessToken, sharePointPath, file.path, fileName);
-        } catch (spErr) {
-          console.warn('⚠️ SharePoint upload failed:', spErr.message);
-        }
-      }
+      const safeName = cleanFileName(file.originalname);
+      const blobPath = `${sitePrefix}/${safeName}`;
+      const guessedType = file.mimetype || mime.lookup(safeName) || 'application/octet-stream';
+      await azureBlob.uploadFile(file.path, blobPath, guessedType);
 
       uploadedFiles.push({
-        name: fileName,
-        alias,
-        oneDriveId: oneDriveResult?.id || null,
-        oneDriveUrl: oneDriveResult?.webUrl || null,
-        sharePointId: sharePointResult?.id || null,
-        sharePointUrl: sharePointResult?.webUrl || null,
-        type: file.mimetype.startsWith('image') ? 'image' : 'document',
+        name: safeName,
+        alias: aliasFromForm || safeName,
+        blobPath: blobPath,                              // container-relative path
+        blobUrl: azureBlob.getBlobUrl(blobPath),         // https url (no SAS)
+        type: (guessedType && String(guessedType).startsWith('image')) ? 'image' : 'document',
+        url: azureBlob.getBlobUrl(blobPath), // convenience for the frontend
       });
+      // strip legacy fields in case older clients send them
+      ['oneDriveId','oneDriveUrl','sharePointId','sharePointUrl'].forEach(k => { try { delete uploadedFiles[uploadedFiles.length - 1][k]; } catch {} });
 
-      fs.unlinkSync(file.path); // Temp fájl törlése
+      try { fs.unlinkSync(file.path); } catch {}
     }
 
     site.documents.push(...uploadedFiles);
     await site.save();
 
-    res.status(200).json({ message: "Files uploaded and saved", files: uploadedFiles });
+    res.status(200).json({ message: "Files uploaded to Azure Blob", files: uploadedFiles });
   } catch (error) {
     console.error("❌ Multiple file upload error:", error.message || error);
     res.status(500).json({ message: "Failed to upload files", error: error.message });
   }
 };
+/*
+// LEGACY upload (OneDrive/SharePoint) — kept for reference:
+// ... previous implementation using getOrCreateFolder, uploadSharePointFile, axios PUT ...
+*/
 
 exports.getFilesOfSite = async (req, res) => {
   try {
-    const site = await Site.findById(req.params.id);
+    const tenantIdStr = req.scope?.tenantId;
+    const tenantObjectId = toObjectId(tenantIdStr);
+    if (!tenantObjectId) return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
+    const site = await Site.findOne({ _id: req.params.id, tenantId: tenantObjectId });
     if (!site) return res.status(404).json({ message: "Site not found" });
 
     res.status(200).json(site.documents || []);
@@ -330,47 +355,28 @@ exports.getFilesOfSite = async (req, res) => {
 exports.deleteFileFromSite = async (req, res) => {
   try {
     const { siteId, fileId } = req.params;
-    const accessToken = req.headers['x-ms-graph-token'];
+    const tenantIdStr = req.scope?.tenantId;
+    const tenantObjectId = toObjectId(tenantIdStr);
+    if (!tenantObjectId) return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
 
-    const site = await Site.findById(siteId);
+    const site = await Site.findOne({ _id: siteId, tenantId: tenantObjectId });
     if (!site) return res.status(404).json({ message: "Site not found" });
 
     const fileToDelete = site.documents.find(
-      doc => doc.oneDriveId === fileId || doc.sharePointId === fileId || doc._id.toString() === fileId
+      doc => doc._id.toString() === fileId || doc.blobPath === fileId || doc.oneDriveId === fileId
     );
-
     if (!fileToDelete) return res.status(404).json({ message: "File not found in site" });
 
-    if (!accessToken) {
-      return res.status(400).json({ message: "Missing access token" });
+    const targetPath = fileToDelete.blobPath || fileToDelete.oneDriveId;
+    if (targetPath) {
+      try { await azureBlob.deleteFile(targetPath); }
+      catch (e) { console.warn('⚠️ Blob delete failed:', e?.message); }
     }
 
-    // 🔹 OneDrive törlés, ha van
-    if (fileToDelete.oneDriveId) {
-      try {
-        await deleteOneDriveItemById(fileToDelete.oneDriveId, accessToken);
-        console.log(`🗑️ OneDrive fájl törölve: ${fileToDelete.oneDriveId}`);
-      } catch (err) {
-        console.warn(`⚠️ OneDrive törlés sikertelen: ${fileToDelete.oneDriveId}`);
-      }
-    }
-
-    // 🔹 SharePoint törlés, ha van
-    if (fileToDelete.sharePointId) {
-      try {
-        const { deleteSharePointItemById } = require('../helpers/sharePointHelpers');
-        await deleteSharePointItemById(accessToken, fileToDelete.sharePointId);
-        console.log(`🗑️ SharePoint fájl törölve: ${fileToDelete.sharePointId}`);
-      } catch (err) {
-        console.warn(`⚠️ SharePoint törlés sikertelen: ${fileToDelete.sharePointId}`);
-      }
-    }
-
-    // 🔹 DB frissítés
     site.documents = site.documents.filter(doc => doc._id.toString() !== fileToDelete._id.toString());
     await site.save();
 
-    res.status(200).json({ message: "File deleted from site, OneDrive and SharePoint if applicable" });
+    res.status(200).json({ message: "File deleted from Azure Blob and DB" });
   } catch (error) {
     console.error("❌ File delete error:", error.message || error);
     res.status(500).json({ message: "Failed to delete file", error: error.message });

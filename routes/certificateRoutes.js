@@ -5,18 +5,18 @@ const authMiddleware = require('../middlewares/authMiddleware');
 const azureBlob = require('../services/azureBlobService'); // <-- SAS-hoz kell
 
 // Tanúsítvány feltöltés
-router.post('/certificates/upload', certificateController.uploadCertificate);
+router.post('/certificates/upload', authMiddleware(), certificateController.uploadCertificate);
 
 // ATEX preview (server-side OCR + AI; no save, no blob upload)
 router.post('/certificates/preview-atex', authMiddleware(), certificateController.previewAtex);
 
 // Listázás
 router.get('/certificates', authMiddleware(), certificateController.getCertificates);
-router.get('/certificates/global', authMiddleware(), certificateController.getGlobalCertificates);
+router.get('/certificates/public', authMiddleware(), certificateController.getPublicCertificates);
 
 // Adopt / Unadopt
-router.post('/certificates/:id/adopt', authMiddleware(), certificateController.adoptGlobal);
-router.delete('/certificates/:id/adopt', authMiddleware(), certificateController.unadoptGlobal);
+router.post('/certificates/:id/adopt', authMiddleware(), certificateController.adoptPublic);
+router.delete('/certificates/:id/adopt', authMiddleware(), certificateController.unadoptPublic);
 
 // SAS link generálás tanúsítvány letöltéséhez
 // FONTOS: ez a route legyen MINDEN dinamikus (:param) route ELŐTT!
@@ -52,16 +52,16 @@ router.get('/cert-sas', authMiddleware(), async (req, res) => {
     return res.status(500).json({ error: 'Failed to generate SAS URL' });
   }
 });
-router.put("/certificates/update-company", certificateController.updateCompanyToGlobal);
+router.put('/certificates/update-to-public', authMiddleware(), certificateController.updateToPublic);
 
 
 // Lekérés certNo alapján
 router.get('/certificates/:certNo', authMiddleware(), certificateController.getCertificateByCertNo);
 
 // Törlés
-router.delete('/certificates/:id', certificateController.deleteCertificate);
+router.delete('/certificates/:id', authMiddleware(), certificateController.deleteCertificate);
 
 // Módosítás
-router.put('/certificates/:id', certificateController.updateCertificate);
+router.put('/certificates/:id', authMiddleware(), certificateController.updateCertificate);
 
 module.exports = router;

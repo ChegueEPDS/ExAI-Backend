@@ -119,8 +119,17 @@ function getUserId(req) {
 
 function isAdmin(req) {
   try {
-    const u = req.user || {};
-    return u.role === 'admin' || u.isAdmin === true;
+    const role = req.role || req.user?.role;
+    return role === 'Admin' || role === 'SuperAdmin';
+  } catch {
+    return false;
+  }
+}
+
+function isSuperAdmin(req) {
+  try {
+    const role = req.role || req.user?.role;
+    return role === 'SuperAdmin';
   } catch {
     return false;
   }
@@ -137,6 +146,12 @@ function startTracker(jobId) {
   async function tick(delay = pollMin) {
     if (t.stopped) return;
     clearTimeout(t.timer);
+    // Resolve tenantId for this job (used for notifications)
+    let tenantId = null;
+    try {
+      const jobDoc = await DxfJob.findOne({ job_id: jobId }).select('tenantId').lean();
+      tenantId = jobDoc?.tenantId || null;
+    } catch {}
     try {
       // status
       const su = new URL(buildFunctionUrl('/api/process_dxf/status'));
@@ -186,7 +201,16 @@ function startTracker(jobId) {
           );
         } catch {}
         dbg('result endpoint error', { jobId, http: rResp?.status, bodyLen: (rText && rText.length) || 0 });
-        try { await notifyAndStore(userId, { type: 'dxf-failed', title: 'DXF feldolgozás sikertelen', message: msg, data: { jobId } }); } catch {}
+        try {
+          await notifyAndStore(userId, {
+            type: 'dxf-failed',
+            title: 'DXF feldolgozás sikertelen',
+            message: msg,
+            data: { jobId },
+            tenantId,
+            audience: 'user'
+          });
+        } catch {}
         stopTracker(jobId);
         return;
       }
@@ -211,7 +235,16 @@ function startTracker(jobId) {
             { $set: { status: 'failed', finished_at: new Date(), error_message: msg } }
           );
         } catch {}
-        try { await notifyAndStore(userId, { type: 'dxf-failed', title: 'DXF feldolgozás sikertelen', message: msg, data: { jobId } }); } catch {}
+        try {
+          await notifyAndStore(userId, {
+            type: 'dxf-failed',
+            title: 'DXF feldolgozás sikertelen',
+            message: msg,
+            data: { jobId },
+            tenantId,
+            audience: 'user'
+          });
+        } catch {}
         stopTracker(jobId);
         return;
       }
@@ -279,7 +312,9 @@ function startTracker(jobId) {
           title: 'DXF feldolgozás kész',
           message: data?.source?.filename || 'A feldolgozás befejeződött',
           data: { jobId, blobs: { result: resultPath, svg: svgPath } },
-          meta: { route: '/dxf/view', query: { jobId } }
+          meta: { route: '/dxf/view', query: { jobId } },
+          tenantId,
+          audience: 'user'
         });
       } catch {}
       dbg('done notification sent', { jobId, userId });
@@ -389,8 +424,8 @@ exports.startAsync = async (req, res) => {
 
     const jobId = json.job_id;
     const userId = getUserId(req);
-    const ownerCompany = (req.user && (req.user.company || req.user.org || req.user.tenant)) || null;
-    dbg('startAsync identified owner', { jobId, userId, ownerCompany });
+    const tenantId = req.scope?.tenantId || req.user?.tenantId || null;
+    dbg('startAsync identified owner', { jobId, userId, tenantId });
 
     // raw file → blob
     let rawUrl = null;
@@ -414,9 +449,9 @@ exports.startAsync = async (req, res) => {
         size_bytes: typeof req.file.size === 'number' ? req.file.size : undefined,
         content_type: req.file.mimetype || 'application/dxf',
 
-        // owner info for filtering/history
+        // owner info for filtering/history (tenant-only; company removed)
         owner_user_id: userId || null,
-        owner_company: ownerCompany,
+        tenantId: tenantId || undefined,
 
         status: 'queued',
         raw_blob_url: rawPath,
@@ -426,7 +461,7 @@ exports.startAsync = async (req, res) => {
 
     owners.set(jobId, userId);
     startTracker(jobId);
-    dbg('job created', { jobId, userId, ownerCompany });
+    dbg('job created', { jobId, userId });
 
     // NINCS start notification — csak DONE/ERROR
 
@@ -525,6 +560,16 @@ exports.getJob = async (req, res) => {
     const doc = await DxfJob.findOne({ job_id: req.params.jobId }).lean();
     if (!doc) return res.status(404).json({ error: 'Not found' });
 
+    const requesterId = getUserId(req);
+    const tenantId = req.scope?.tenantId || req.user?.tenantId || null;
+
+    const sameOwner = doc.owner_user_id && requesterId && String(doc.owner_user_id) === String(requesterId);
+    const sameTenant = doc.tenantId && tenantId && String(doc.tenantId) === String(tenantId);
+
+    if (!(isSuperAdmin(req) || sameOwner || (isAdmin(req) && sameTenant))) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
     // If we have stored blob paths, generate fresh SAS URLs for client consumption
     let result_sas_url = null;
     let svg_sas_url = null;
@@ -578,9 +623,18 @@ exports.listJobs = async (req, res) => {
     const status = typeof q.status === 'string' ? q.status.trim().toLowerCase() : null;
 
     const allowStatuses = new Set(['queued','running','succeeded','failed']);
-    const filter = {
-      owner_user_id: userId || null
-    };
+    const role = req.role || req.user?.role;
+    const tenantId = req.scope?.tenantId || req.user?.tenantId || null;
+
+    let filter = {};
+    if (isSuperAdmin(req)) {
+      filter = {};
+    } else if (role === 'Admin' && tenantId) {
+      filter = { tenantId };
+    } else {
+      filter = { owner_user_id: userId || null };
+    }
+
     if (status && allowStatuses.has(status)) {
       filter.status = status;
     }
@@ -677,8 +731,12 @@ exports.deleteJob = async (req, res) => {
     }
 
     const ownerId = doc.owner_user_id || null;
-    if (!(isAdmin(req) || (ownerId && requesterId && String(ownerId) === String(requesterId)))) {
-      dbg('deleteJob forbidden', { jobId, requesterId, ownerId });
+    const tenantId = req.scope?.tenantId || req.user?.tenantId || null;
+    const sameOwner = ownerId && requesterId && String(ownerId) === String(requesterId);
+    const sameTenant = doc.tenantId && tenantId && String(doc.tenantId) === String(tenantId);
+
+    if (!(isSuperAdmin(req) || sameOwner || (isAdmin(req) && sameTenant))) {
+      dbg('deleteJob forbidden', { jobId, requesterId, ownerId, docTenant: doc.tenantId, reqTenant: tenantId });
       return res.status(403).json({ error: 'Forbidden' });
     }
 

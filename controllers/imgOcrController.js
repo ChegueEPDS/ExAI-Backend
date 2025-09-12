@@ -1,12 +1,63 @@
 const multer = require('multer');
 const fs = require('fs');
+const path = require('path');
 const axios = require('axios');
 const logger = require('../config/logger');
 const DocumentIntelligence = require("@azure-rest/ai-document-intelligence").default;
 const { getLongRunningPoller, isUnexpected } = require("@azure-rest/ai-document-intelligence");
 
-// Multer fájlfeltöltés konfiguráció
-const upload = multer({ dest: 'uploads/' });
+/* ---------------------------
+   Retry helper (exponential backoff)
+---------------------------- */
+const wait = (ms) => new Promise(r => setTimeout(r, ms));
+async function withRetry(fn, {
+  retries = 5,
+  baseDelay = 500, // ms
+  onError = () => {}
+} = {}) {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await fn();
+    } catch (err) {
+      const status = err?.response?.status;
+      const retriable = [408, 429, 500, 502, 503, 504].includes(status) || !status; // network
+      onError(err, attempt);
+      if (!retriable || attempt >= retries) throw err;
+
+      // Retry-After header support
+      const ra = err?.response?.headers?.['retry-after'];
+      let delay = ra ? Number(ra) * 1000 : (baseDelay * Math.pow(2, attempt) + Math.floor(Math.random() * 150));
+      delay = Math.min(delay, 8000);
+      await wait(delay);
+      attempt++;
+    }
+  }
+}
+
+// Multer fájlfeltöltés – tenant- és fájlnév-biztonság
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const tenantId = req.scope?.tenantId ? String(req.scope.tenantId) : 'public';
+    const dir = path.join(__dirname, '..', 'uploads', tenantId, 'ocr');
+    fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    const base = path.basename(file.originalname).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const stamped = `${Date.now()}_${base}`;
+    cb(null, stamped);
+  }
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
+  fileFilter: (req, file, cb) => {
+    const ok = file.mimetype?.startsWith('image/') || file.mimetype === 'application/pdf';
+    cb(ok ? null : new Error('Unsupported file type'), ok);
+  }
+});
 
 
 /**********************************/
@@ -32,16 +83,19 @@ exports.uploadImage = [
 
       const imageBuffer = fs.readFileSync(filePath);
 
-      const response = await axios.post(
+      const response = await withRetry(() => axios.post(
         `${endpoint}/computervision/imageanalysis:analyze?api-version=2024-02-01&features=read`,
         imageBuffer,
         {
           headers: {
             'Ocp-Apim-Subscription-Key': subscriptionKey,
             'Content-Type': 'application/octet-stream'
-          }
+          },
+          timeout: 30000
         }
-      );
+      ), {
+        onError: (e, a) => logger.warn(`⚠️ OCR retry #${a}, status=${e?.response?.status || 'n/a'}`)
+      });
 
       logger.info('🔍 OCR response:', JSON.stringify(response.data, null, 2));
 
@@ -116,16 +170,22 @@ exports.uploadImage = [
       res.json({
         recognizedText: `Show the dataplate information in a table format:<br><br>${formattedText.replace(/\n/g, '<br>')}`
       });
-
-      fs.unlinkSync(filePath);
-      logger.info('🗑️ File deleted after processing.');
     } catch (error) {
       logger.error('❌ Error during image upload:', {
         message: error.message,
-        responseData: error.response?.data,
-        stack: error.stack
+        status: error?.response?.status,
+        data: error?.response?.data,
+        url: error?.config?.url
       });
-      res.status(500).json({ error: 'Image upload failed.' });
+      const upstreamStatus = error?.response?.status || 503;
+      const upstreamMessage = error?.response?.data?.error?.message || error?.response?.data || error.message;
+      res.status(502).json({
+        error: 'UPLOAD_UPSTREAM_FAILED',
+        upstreamStatus,
+        upstreamMessage
+      });
+    } finally {
+      try { if (req?.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); } catch {}
     }
   }
 ];
@@ -134,6 +194,7 @@ exports.uploadImage = [
 exports.uploadMultipleImages = [
   upload.array('files', 5),
   async (req, res) => {
+    const tempFiles = [];
     try {
       if (!req.files || req.files.length === 0) {
         console.error('❌ Nincsenek fájlok a kérésben.');
@@ -148,6 +209,7 @@ exports.uploadMultipleImages = [
         console.log(`📥 Fájl feldolgozása: ${file.originalname}`);
 
         const imageBuffer = fs.readFileSync(file.path);
+        tempFiles.push(file.path);
         const endpoint = process.env.AZURE_OCR_ENDPOINT;
         const key = process.env.AZURE_OCR_KEY;
 
@@ -156,16 +218,19 @@ exports.uploadMultipleImages = [
           return res.status(500).json({ error: 'Missing Azure credentials' });
         }
 
-        const response = await axios.post(
+        const response = await withRetry(() => axios.post(
           `${endpoint}/computervision/imageanalysis:analyze?api-version=2024-02-01&features=read`,
           imageBuffer,
           {
             headers: {
               'Ocp-Apim-Subscription-Key': key,
               'Content-Type': 'application/octet-stream'
-            }
+            },
+            timeout: 30000
           }
-        );
+        ), {
+          onError: (e, a) => logger?.warn ? logger.warn(`⚠️ OCR retry #${a}, status=${e?.response?.status || 'n/a'}`) : null
+        });
 
         console.log('🔍 OCR válasz:', JSON.stringify(response.data, null, 2));
 
@@ -179,7 +244,6 @@ exports.uploadMultipleImages = [
           .join('\n');
 
         allText.push(extractedText);
-        fs.unlinkSync(file.path);
       }
 
       const combinedText = allText.join('\n');
@@ -247,8 +311,18 @@ exports.uploadMultipleImages = [
         recognizedText: `This text was extracted from several images of the same equipment dataplate using OCR. The text might include duplicates, noise, or misreadings. Please the dataplate information in a table format, extract and organize<br><br>${formattedText.replace(/\n/g, '<br>')}`
       });
     } catch (error) {
-      console.error('❌ Hiba történt multi-image OCR közben:', error.response?.data || error.message);
-      res.status(500).json({ error: 'Multi-image OCR failed.' });
+      console.error('❌ Multi-image OCR failed', {
+        message: error.message,
+        status: error?.response?.status,
+        data: error?.response?.data
+      });
+      const upstreamStatus = error?.response?.status || 503;
+      const upstreamMessage = error?.response?.data?.error?.message || error?.response?.data || error.message;
+      res.status(502).json({ error: 'MULTI_UPLOAD_UPSTREAM_FAILED', upstreamStatus, upstreamMessage });
+    } finally {
+      for (const p of tempFiles) {
+        try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+      }
     }
   }
 ];

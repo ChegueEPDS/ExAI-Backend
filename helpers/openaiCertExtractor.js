@@ -542,6 +542,8 @@ async function extractCertFieldsFromOCR(ocrText) {
     "For 'specCondition', extract the exact text under headings like:",
     "'Special conditions for safe use', 'Specific conditions of use', 'Schedule of Limitations',",
     "'Special Conditions', 'Specific Conditions', 'Conditions for safe use', or similar.",
+    "Preserve the original language of the certificate. Do NOT translate anything.",
+    "Return all text fields exactly as they appear in the source (including accents/diacritics and capitalization); only normalize whitespace.",
     "Return 'specCondition' as a single line; separate multiple items with '; '.",
     "IMPORTANT rules for X/U conditions:",
     "- Set xcondition = true if the certificate number contains an 'X' token AFTER the word ATEX or IECEx,",
@@ -555,6 +557,7 @@ async function extractCertFieldsFromOCR(ocrText) {
 
   const userPrompt = [
     "Check the OCR result of the ATEX / IECEx certificate and return these fields in JSON:",
+    "IMPORTANT: Preserve original language from OCR; DO NOT translate any field (manufacturer, product, exmarking, specCondition, status, etc.).",
     "scheme, certNo, manufacturer, product, exmarking, specCondition, xcondition, ucondition, status, issueDate.",
     "For 'specCondition', use any of these headings if present: Special conditions for safe use; Specific conditions of use;",
     "Schedule of Limitations; Special/Specific Conditions; Conditions for safe use.",

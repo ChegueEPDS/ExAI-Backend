@@ -11,10 +11,23 @@ const sharp = require('sharp');
 // Betöltjük a .env változókat
 dotenv.config();
 
-// Konstansok meghatározása
+// Helpers for multi-tenant uploads
+function getTenantId(req) {
+  return (req?.scope?.tenantId ? String(req.scope.tenantId) : 'public');
+}
+function ensureDir(p) {
+  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+}
+function getBaseUrl(req) {
+  // Prefer request host to avoid stale BASE_URL across tenants/environments
+  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+  const host = req.headers['x-forwarded-host'] || req.get('host');
+  if (host) return `${proto}://${host}`;
+  return process.env.BASE_URL || 'http://localhost:3000';
+}
+
+// Konstansok meghatározása – csak a gyökér mappa, a tenant alkönyvtár kérésenként készül el
 const UPLOADS_DIR = path.join(__dirname, '../uploads');
-const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
-const UPLOADS_URL = `${BASE_URL}/uploads`;
 
 // Ellenőrizzük, hogy az upload mappa létezik-e, és ha nem, létrehozzuk
 if (!fs.existsSync(UPLOADS_DIR)) {
@@ -35,9 +48,12 @@ const uploadImage = async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'Csak JPEG, PNG és GIF formátumok engedélyezettek.' });
         }
 
-        // Egyedi fájlnév generálása
+        // Egyedi fájlnév generálása + tenant alkönyvtár
+        const tenantId = getTenantId(req);
+        const tenantDir = path.join(UPLOADS_DIR, tenantId);
+        ensureDir(tenantDir);
         const uniqueName = `${Date.now()}_${image.originalname}`;
-        const uploadPath = path.join(UPLOADS_DIR, uniqueName);
+        const uploadPath = path.join(tenantDir, uniqueName);
 
         // Ha a fájlméret meghaladja az 5MB-ot, skálázd le
         if (image.size > 5 * 1024 * 1024) {
@@ -62,9 +78,11 @@ const uploadImage = async (req, res) => {
             fs.writeFileSync(uploadPath, image.buffer);
         }
 
-        const imageUrl = `${UPLOADS_URL}/${uniqueName}`;
+        const baseUrl = getBaseUrl(req);
+        const imageUrl = `${baseUrl}/uploads/${tenantId}/${uniqueName}`;
         res.status(200).json({ status: 'success', image_url: imageUrl });
     } catch (error) {
+        console.error('uploadImage error:', error);
         res.status(500).json({ status: 'error', message: 'Hiba történt a kép feltöltése során.', error: error.message });
     }
 };
@@ -112,23 +130,33 @@ const analyzeImages = async (req, res) => {
 
         const result = response.data.choices[0]?.message?.content || 'No result from API';
 
-        // Képek törlése az uploads mappából
-        image_urls.forEach((imageUrl) => {
-            const filename = imageUrl.split('/').pop(); // Fájlnév kinyerése az URL-ből
-            const filePath = path.join(UPLOADS_DIR, filename);
-
+        // Képek törlése az uploads mappából (tenant-alkönyvtárban)
+        image_urls.forEach((urlStr) => {
+          try {
+            const u = new URL(urlStr, getBaseUrl(req));
+            // Várt minta: /uploads/<tenantId>/<filename>
+            const parts = u.pathname.split('/').filter(Boolean);
+            const idx = parts.indexOf('uploads');
+            const tenantId = (idx !== -1 && parts[idx + 1]) ? parts[idx + 1] : getTenantId(req);
+            const filename = parts.pop();
+            if (!filename) return;
+            const filePath = path.join(UPLOADS_DIR, tenantId, filename);
             fs.unlink(filePath, (err) => {
-                if (err) {
-                    console.error(`Hiba történt a fájl törlésekor: ${filename}`, err);
-                } else {
-                    console.log(`✅ Törölve: ${filename}`);
-                }
+              if (err) {
+                console.warn(`⚠️ Nem sikerült törölni: ${filePath} –`, err.message);
+              } else {
+                console.log(`✅ Törölve: ${filePath}`);
+              }
             });
+          } catch (e) {
+            console.warn('⚠️ Érvénytelen kép URL, törlés kihagyva:', urlStr);
+          }
         });
 
         res.status(200).json({ status: 'success', result });
 
     } catch (error) {
+        console.error('analyzeImages error:', error);
         res.status(500).json({ status: 'error', message: 'Hiba az OpenAI API hívás során.', error: error.message });
     }
 };

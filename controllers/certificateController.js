@@ -8,9 +8,40 @@ const { generateDocxFile } = require('../helpers/docx'); // 🔹 DOCX generálá
 const azureBlobService = require('../services/azureBlobService');
 const { uploadPdfWithFormRecognizerInternal } = require('../helpers/ocrHelper');
 const { extractCertFieldsFromOCR } = require('../helpers/openaiCertExtractor');
+const mongoose = require('mongoose');
 
 const upload = multer({ dest: 'uploads/' });
+
 const today = new Date();
+
+// Helper to ensure link between tenant and certificate (adoption)
+async function ensureLinkForTenant(tenantId, certId, userId, session) {
+  if (!tenantId || !certId) return;
+  await CompanyCertificateLink.updateOne(
+    { tenantId, certId },
+    { $setOnInsert: { tenantId, certId, addedBy: userId, addedAt: new Date() } },
+    { upsert: true, session }
+  );
+}
+
+// Detect if MongoDB supports transactions (i.e., running on a replica set / mongos)
+async function supportsTransactions() {
+  let session;
+  try {
+    session = await mongoose.startSession();
+    // Try to start & immediately abort a transaction; if this throws,
+    // the server/topology does not support transactions (standalone).
+    session.startTransaction();
+    await session.abortTransaction();
+    return true;
+  } catch (e) {
+    return false;
+  } finally {
+    if (session) {
+      try { await session.endSession(); } catch {}
+    }
+  }
+}
 
 // --- Helper: standardized duplicate (unique index) error response ---
 function sendDuplicateError(res, err) {
@@ -23,15 +54,14 @@ function sendDuplicateError(res, err) {
   // Try to extract key/values if available
   const keyValue = err.keyValue || {};
   const details = {
-    company: keyValue.company,
+    tenant: keyValue.tenantId,
     certNo: keyValue.certNo,
     issueDate: keyValue.issueDate
   };
-
   // Prefer 409 Conflict for duplicates
   res.status(409).json({
     error: 'DUPLICATE_CERTIFICATE',
-    message: 'Már létezik tanúsítvány ezzel a (company, certNo, issueDate) kombinációval.',
+    message: 'Már létezik tanúsítvány ezzel a (tenant, certNo, issueDate) kombinációval.',
     details
   });
   return true;
@@ -49,7 +79,6 @@ exports.uploadCertificate = async (req, res) => {
 
     try {
       const {
-        userId,
         certNo,
         scheme,
         status,
@@ -65,14 +94,17 @@ exports.uploadCertificate = async (req, res) => {
         ucondition,
         recognizedText
       } = req.body;
+      const visibility = (req.body.visibility || '').toString().toLowerCase();
+      const isPublicFlag = req.body.isPublic === true || req.body.isPublic === 'true';
 
-      if (!userId || !certNo) {
-        return res.status(400).json({ message: '❌ User ID és certNo kötelező!' });
+      if (!certNo) {
+        return res.status(400).json({ message: '❌ certNo kötelező!' });
       }
-
-      const user = await User.findById(userId);
-      if (!user || !user.company) {
-        return res.status(400).json({ message: '❌ Érvénytelen user vagy hiányzó company!' });
+      // Tenant-alapú szkóp az authMiddleware-ből
+      const tenantId = req.scope?.tenantId;
+      const ownerUserId = req.scope?.userId || req.user?.id;
+      if (!tenantId || !ownerUserId) {
+        return res.status(403).json({ message: '❌ Hiányzó tenantId vagy user azonosító az authból' });
       }
 
       // --- REPLACE PDF/DOCX GENERATION & AZURE UPLOAD BLOCK ---
@@ -118,7 +150,12 @@ exports.uploadCertificate = async (req, res) => {
       // --- END REPLACEMENT BLOCK ---
 
       // ===== Mentés MongoDB-be =====
+      const finalVisibility = (visibility === 'public' || isPublicFlag) ? 'public' : 'private';
+
       const certificate = new Certificate({
+        // PRIVATE esetben marad a tenant alatti tulajdon
+        // PUBLIC esetben először még mentjük tenantId-vel (pre-save miatt), aztán azonnal nullázzuk
+        tenantId,
         certNo,
         scheme,
         status,
@@ -135,13 +172,25 @@ exports.uploadCertificate = async (req, res) => {
         fileName: originalPdfName,
         fileUrl: uploadedPdfPath,
         docxUrl: uploadedDocxPath,
-        createdBy: userId,
-        company: user.company,
+        createdBy: ownerUserId,
+        visibility: finalVisibility,
         isDraft: false
       });
 
       try {
         await certificate.save();
+
+        if (finalVisibility === 'public') {
+          // 1) tenantId kivezetése (NULL) – updateOne, hogy ne fusson pre('save')
+          await Certificate.updateOne(
+            { _id: certificate._id },
+            { $unset: { tenantId: "" } }
+          );
+
+          // 2) saját tenant link létrehozása, hogy a saját listában megmaradjon (adoptáltként)
+          await ensureLinkForTenant(tenantId, certificate._id, ownerUserId);
+        }
+
       } catch (e) {
         // If duplicate, return a clean 409 that the frontend can display
         if (sendDuplicateError(res, e)) {
@@ -175,52 +224,61 @@ exports.uploadCertificate = async (req, res) => {
 };
 
 
- // Tanúsítványok lekérdezése – SAJÁT cég + adoptált GLOBAL-ok
- exports.getCertificates = async (req, res) => {
-   try {
-     const company = req.user.company;
-     if (!company) {
-       return res.status(400).json({ message: "❌ Hiányzó company adat a felhasználó tokenjében!" });
-     }
+// Tanúsítványok lekérdezése – SAJÁT tenant + adoptált PUBLIC-ok
+exports.getCertificates = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) {
+      return res.status(400).json({ message: '❌ Hiányzó tenantId az authból!' });
+    }
 
-   console.log(`🔍 Saját (${company}) + adoptált GLOBAL lekérés`);
+    console.log(`🔍 Saját (tenant=${tenantId}) + adoptált PUBLIC lekérés`);
 
-    const own = await Certificate.find({ company });
+    // Saját tenant összes tanúsítványa (független a visibility-től)
+    const own = await Certificate.find({ tenantId }).lean();
 
-    const links = await CompanyCertificateLink.find({ company })
-      .select('certId')
-      .lean();
+    // Adoptáltak: csak PUBLIC cert-ek adoptálhatók/láthatók
+    const links = await CompanyCertificateLink.find({ tenantId }).select('certId').lean();
     const adoptedIds = links.map(l => l.certId);
 
-    const adoptedGlobals = adoptedIds.length
-      ? await Certificate.find({ _id: { $in: adoptedIds }, company: 'global' })
-      : [];
+    let adoptedPublic = [];
+    if (adoptedIds.length) {
+      adoptedPublic = await Certificate.find({ _id: { $in: adoptedIds }, visibility: 'public' }).lean();
+      adoptedPublic = adoptedPublic.map(c => ({ ...c, adoptedByMe: true }));
+    }
 
-    // összevonás (globálisak nem ütköznek saját cégbeliekkel)
-    const merged = [...own, ...adoptedGlobals];
-    res.json(merged);
-   } catch (error) {
-     console.error('❌ Hiba a lekérdezés során:', error);
-     res.status(500).send('❌ Hiba a lekérdezés során');
-   }
- };
+    res.json([...own, ...adoptedPublic]);
+  } catch (error) {
+    console.error('❌ Hiba a lekérdezés során:', error);
+    res.status(500).send('❌ Hiba a lekérdezés során');
+  }
+};
 
-// Tanúsítványok lekérdezése – CSAK GLOBAL, adoptedByMe jelzéssel
- exports.getGlobalCertificates = async (req, res) => {
-   try {
-    const company = req.user?.company;
-    console.log('🔍 Keresés GLOBAL tanúsítványokra (adoptedByMe flaggel)');
+// Tanúsítványok lekérdezése – CSAK PUBLIC, adoptedByMe jelzéssel
+exports.getPublicCertificates = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) return res.status(400).json({ message: '❌ Hiányzó tenantId az authból!' });
+
+    const tenantObjectId = new mongoose.Types.ObjectId(tenantId);
+
     const certificates = await Certificate.aggregate([
-      { $match: { company: 'global' } },
+      { $match: { visibility: 'public' } },
       {
         $lookup: {
-          from: 'companycertificatelinks', // <-- a modell pluralizált neve
+          from: 'companycertificatelinks',
           let: { certId: '$_id' },
           pipeline: [
-            { $match: { $expr: { $and: [
-              { $eq: ['$certId', '$$certId'] },
-              { $eq: ['$company', company] }
-            ]}}},
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ['$certId', '$$certId'] },
+                    { $eq: ['$tenantId', tenantObjectId] }
+                  ]
+                }
+              }
+            },
             { $limit: 1 }
           ],
           as: 'myLink'
@@ -230,11 +288,11 @@ exports.uploadCertificate = async (req, res) => {
       { $project: { myLink: 0 } }
     ]);
     res.json(certificates);
-   } catch (error) {
-     console.error('❌ Hiba a global lekérdezés során:', error);
-     res.status(500).send('❌ Hiba a global lekérdezés során');
-   }
- };
+  } catch (error) {
+    console.error('❌ Hiba a public lekérdezés során:', error);
+    res.status(500).send('❌ Hiba a public lekérdezés során');
+  }
+};
 
 exports.getCertificateByCertNo = async (req, res) => {
     try {
@@ -325,6 +383,7 @@ exports.updateCertificate = async (req, res) => {
       return res.status(404).json({ message: '❌ Certificate not found' });
     }
 
+    // Alap mezők frissítése
     certificate.certNo = certNo ?? certificate.certNo;
     certificate.scheme = scheme ?? certificate.scheme;
     certificate.status = status ?? certificate.status;
@@ -339,6 +398,51 @@ exports.updateCertificate = async (req, res) => {
     certificate.specCondition = specCondition ?? certificate.specCondition;
     certificate.description = description ?? certificate.description;
 
+    const prevVisibility = certificate.visibility;
+    let newVisibility = prevVisibility;
+
+    if (typeof req.body.visibility === 'string') {
+      const v = req.body.visibility.toLowerCase();
+      if (v === 'public' || v === 'private') {
+        newVisibility = v;
+      }
+    } else if (typeof req.body.isPublic !== 'undefined') {
+      newVisibility = (req.body.isPublic === true || req.body.isPublic === 'true') ? 'public' : 'private';
+    }
+
+    certificate.visibility = newVisibility;
+
+    // --- VÁLTÁSOK KEZELÉSE ---
+    if (prevVisibility !== 'public' && newVisibility === 'public') {
+      // PRIVATE -> PUBLIC
+      await certificate.save();
+
+      // tenantId eltávolítása (updateOne, hogy a pre('save') ne rakja vissza)
+      await Certificate.updateOne({ _id: certificate._id }, { $unset: { tenantId: "" } });
+
+      // saját tenant link, hogy a listádban maradjon
+      await ensureLinkForTenant(req.scope?.tenantId, certificate._id, req.scope?.userId);
+
+      return res.json({ message: '✅ Visibility changed to PUBLIC (migrated tenantId -> null + linked)', data: certificate });
+    }
+
+    if (prevVisibility === 'public' && newVisibility !== 'public') {
+      // PUBLIC -> PRIVATE
+      certificate.tenantId = certificate.tenantId || req.scope?.tenantId;
+      try {
+        await certificate.save();
+      } catch (e) {
+        if (sendDuplicateError(res, e)) return;
+        throw e;
+      }
+
+      // (opcionális) link törlése – nem kötelező
+      // await CompanyCertificateLink.deleteOne({ tenantId: req.scope?.tenantId, certId: certificate._id });
+
+      return res.json({ message: '✅ Visibility changed to PRIVATE (owned by tenant)', data: certificate });
+    }
+
+    // Ha nincs visibility váltás, normál mentés
     try {
       await certificate.save();
     } catch (e) {
@@ -354,65 +458,97 @@ exports.updateCertificate = async (req, res) => {
   }
 };
 
-// Tanúsítványok company mezőjének frissítése -> 'global'
-// + azonnali adopt link létrehozása az EREDETI céghez (hogy ott is megmaradjon)
-// Megjegyzés: Ez a változat nem használ Mongo tranzakciót, így standalone mongod alatt is működik.
-exports.updateCompanyToGlobal = async (req, res) => {
+// Batch migrate certificates to public (unset tenantId and ensure link).
+// Uses transactions when available; otherwise falls back to idempotent non-transactional updates.
+exports.updateToPublic = async (req, res) => {
   const { ids } = req.body;
   if (!ids || !Array.isArray(ids) || ids.length === 0) {
-    return res.status(400).json({ message: "❌ No certificate IDs provided!" });
+    return res.status(400).json({ message: '❌ No certificate IDs provided!' });
   }
 
-  try {
-    // 1) Előre kiolvassuk az érintett cert-ek *eredeti* company értékét
-    const certs = await Certificate.find({ _id: { $in: ids } })
-      .select('_id company')
-      .lean();
+  const tenantId = req.scope?.tenantId;
+  const userId = req.scope?.userId || req.user?.id;
 
-    if (!certs.length) {
-      return res.json({ message: 'ℹ️ No certificates found for given IDs.', updatedCount: 0 });
-    }
+  const canTx = await supportsTransactions();
+  const results = [];
+  let updatedCount = 0;
 
-    // Csak azok, amelyek még nem global-ok
-    const toUpdate = certs.filter(c => (c.company || '').toLowerCase() !== 'global');
-    if (!toUpdate.length) {
-      return res.json({ message: "ℹ️ All selected certificates are already 'global'.", updatedCount: 0 });
-    }
+  if (canTx) {
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        for (const id of ids) {
+          try {
+            const cert = await Certificate.findById(id).session(session);
+            if (!cert) {
+              results.push({ id, ok: false, error: 'Not found' });
+              continue;
+            }
 
-    // 2) Először hozzuk létre (upsert) a linkeket az EREDETI company-khoz.
-    //    Ez idempotens és biztonságos: ha az update később hibázna, a link legfeljebb felesleges, de kárt nem okoz.
-    const linkOps = toUpdate.map(c => ({
-      updateOne: {
-        filter: { company: c.company, certId: c._id },
-        update: {
-          $setOnInsert: {
-            company: c.company,
-            certId: c._id,
-            addedAt: new Date()
+            if (cert.visibility !== 'public') {
+              // set to public and drop tenantId
+              await Certificate.updateOne(
+                { _id: id },
+                { $set: { visibility: 'public' }, $unset: { tenantId: '' } },
+                { session }
+              );
+              updatedCount++;
+            }
+
+            // ensure requesting tenant keeps seeing it
+            await ensureLinkForTenant(tenantId, id, userId, session);
+            results.push({ id, ok: true });
+          } catch (e) {
+            results.push({ id, ok: false, error: e?.message || 'Error' });
           }
-        },
-        upsert: true
-      }
-    }));
-
-    if (linkOps.length) {
-      await CompanyCertificateLink.bulkWrite(linkOps);
+        }
+      });
+      await session.endSession();
+      return res.json({
+        message: "✅ Visibility set to 'public' for selected certificates (migrated with link, transactional).",
+        updatedCount,
+        results
+      });
+    } catch (e) {
+      await session.endSession();
+      return res.status(500).json({
+        message: '❌ Transaction failed',
+        details: e?.message || String(e),
+        updatedCount,
+        results
+      });
     }
-
-    // 3) Majd átállítjuk a cert-ek company mezőjét 'global'-ra.
-    const updateRes = await Certificate.updateMany(
-      { _id: { $in: toUpdate.map(c => c._id) } },
-      { $set: { company: 'global' } }
-    );
-
-    return res.json({
-      message: "✅ Moved to 'global' and linked back to original companies (no transaction).",
-      updatedCount: updateRes?.modifiedCount ?? toUpdate.length
-    });
-  } catch (error) {
-    console.error("❌ Error updating company to global (no-tx):", error);
-    return res.status(500).json({ message: "❌ Error updating company to global", details: error?.message });
   }
+
+  // ---- Fallback: no transactions (standalone MongoDB) ----
+  for (const id of ids) {
+    try {
+      const cert = await Certificate.findById(id);
+      if (!cert) {
+        results.push({ id, ok: false, error: 'Not found' });
+        continue;
+      }
+
+      if (cert.visibility !== 'public') {
+        await Certificate.updateOne(
+          { _id: id },
+          { $set: { visibility: 'public' }, $unset: { tenantId: '' } }
+        );
+        updatedCount++;
+      }
+
+      await ensureLinkForTenant(tenantId, id, userId);
+      results.push({ id, ok: true });
+    } catch (e) {
+      results.push({ id, ok: false, error: e?.message || 'Error' });
+    }
+  }
+
+  return res.json({
+    message: "✅ Visibility set to 'public' for selected certificates (migrated with link, fallback mode).",
+    updatedCount,
+    results
+  });
 };
 
 // ATEX előnézet OCR+AI feldolgozással (nem ment DB-be, csak visszaadja az eredményt)
@@ -448,7 +584,10 @@ exports.previewAtex = async (req, res) => {
         issueDate: aiData?.issueDate || '',
         applicant: aiData?.applicant || '',
         manufacturer: aiData?.manufacturer || '',
-        equipment: aiData?.equipment || '',
+        // Fill equipment from product if equipment is empty
+        equipment: aiData?.equipment || aiData?.product || '',
+        // Also expose product explicitly for clients that prefer it
+        product: aiData?.product || aiData?.equipment || '',
         exmarking: aiData?.exmarking || aiData?.exMarking || '',
         protection: aiData?.protection || '',
         specCondition: aiData?.specCondition || aiData?.specialConditions || '',
@@ -474,28 +613,28 @@ exports.previewAtex = async (req, res) => {
   });
 };
 
-// Global certificate adoptálása a cég saját listájába (link létrehozása)
-exports.adoptGlobal = async (req, res) => {
+// Public certificate adoptálása a tenant saját listájába (link létrehozása)
+exports.adoptPublic = async (req, res) => {
   try {
-    const company = req.user?.company;
-    const userId = req.user?._id;
+    const tenantId = req.scope?.tenantId;
+    const userId = req.scope?.userId || req.user?.id;
     const { id } = req.params; // certificate _id
 
-    if (!company) return res.status(400).json({ message: '❌ Hiányzó company az auth tokenből' });
+    if (!tenantId) return res.status(400).json({ message: '❌ Hiányzó tenantId az authból' });
 
     const cert = await Certificate.findById(id);
     if (!cert) return res.status(404).json({ message: '❌ Certificate not found' });
-    if (cert.company !== 'global') {
-      return res.status(400).json({ message: '❌ Csak global certificate adoptálható' });
+    if (cert.visibility !== 'public') {
+      return res.status(400).json({ message: '❌ Csak PUBLIC certificate adoptálható' });
     }
 
     await CompanyCertificateLink.updateOne(
-      { company, certId: cert._id },
-      { $setOnInsert: { company, certId: cert._id, addedBy: userId, addedAt: new Date() } },
+      { tenantId, certId: cert._id },
+      { $setOnInsert: { tenantId, certId: cert._id, addedBy: userId, addedAt: new Date() } },
       { upsert: true }
     );
 
-    return res.json({ message: '✅ Adoptálva a cég listájába' });
+    return res.json({ message: '✅ Adoptálva a tenant listájába' });
   } catch (error) {
     if (error?.code === 11000) {
       // unique index miatt idempotens – már létezik a link
@@ -506,22 +645,22 @@ exports.adoptGlobal = async (req, res) => {
   }
 };
 
-// Global certificate unadopt (link törlése a cég listájából)
-exports.unadoptGlobal = async (req, res) => {
+// Public certificate unadopt (link törlése a tenant listájából)
+exports.unadoptPublic = async (req, res) => {
   try {
-    const company = req.user?.company;
+    const tenantId = req.scope?.tenantId;
     const { id } = req.params; // certificate _id
 
-    if (!company) return res.status(400).json({ message: '❌ Hiányzó company az auth tokenből' });
+    if (!tenantId) return res.status(400).json({ message: '❌ Hiányzó tenantId az authból' });
 
     const cert = await Certificate.findById(id);
     if (!cert) return res.status(404).json({ message: '❌ Certificate not found' });
-    if (cert.company !== 'global') {
-      return res.status(400).json({ message: '❌ Csak global certificate-ről vehető le az adopt' });
+    if (cert.visibility !== 'public') {
+      return res.status(400).json({ message: '❌ Csak PUBLIC certificate-ről vehető le az adopt' });
     }
 
-    await CompanyCertificateLink.deleteOne({ company, certId: cert._id });
-    return res.json({ message: '✅ Eltávolítva a cég listájáról' });
+    await CompanyCertificateLink.deleteOne({ tenantId, certId: cert._id });
+    return res.json({ message: '✅ Eltávolítva a tenant listájáról' });
   } catch (error) {
     console.error('❌ Unadopt hiba:', error);
     return res.status(500).json({ message: '❌ Unadopt hiba' });

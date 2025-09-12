@@ -100,8 +100,13 @@ exports.bulkUpload = [
 
       // 🔹 1. Létrehozzuk az uploadId-t
       const uploadId = `${Date.now()}-${uuidv4().slice(0, 6)}`;
-      // the authenticated user who owns this upload
-      const createdBy = req.userId || null;
+      // tenant/user scope from auth
+      const tenantId = req.scope?.tenantId;
+      const ownerUserId = req.scope?.userId || req.userId || null;
+      if (!tenantId || !ownerUserId) {
+        return res.status(403).json({ error: 'Missing tenantId or user from auth' });
+      }
+      const createdBy = ownerUserId;
       const targetDir = path.join('storage', 'certificates', 'draft', uploadId);
 
       fs.mkdirSync(targetDir, { recursive: true });
@@ -113,6 +118,7 @@ exports.bulkUpload = [
 
         // 🔹 3. Mentés az ideiglenes DB-be
         await DraftCertificate.create({
+          tenantId,
           uploadId,
           fileName: file.originalname,
           originalPdfPath: targetPath,
@@ -202,7 +208,8 @@ async function _processDraftsInternal(uploadId) {
         meta: {
           route: '/cert',
           query: { tab: 'upload', uploadId }
-        }
+        },
+        audience: 'user'
       });
 
       console.log(`Bulk processing finished for uploadId=${uploadId}: ${ready} ready, ${error} error, total ${total}`);
@@ -308,31 +315,39 @@ function sanitizeOverrides(src = {}) {
   return out;
 }
 
-// ---- Duplicate handling helpers (company + certNo + issueDate) ----
+// ---- Duplicate handling helpers (visibility/tenant + certNo + issueDate) ----
 function isDuplicateKeyError(err) {
   // MongoServerError duplicate
-  return err && (err.code === 11000 || err.name === 'MongoServerError' && err.message && err.message.includes('E11000'));
+  return err && (err.code === 11000 || (err.name === 'MongoServerError' && err.message && err.message.includes('E11000')));
 }
 
 /**
- * Build a conflicts array by checking which (company, certNo, issueDate) combos already exist.
- * @param {Array<{company:string, certNo:string, issueDate:string}>} items
- * @returns {Promise<Array<{company:string, certNo:string, issueDate:string}>>}
+ * Build a conflicts array by checking which (scope, certNo, issueDate) combos already exist.
+ * Scope rules:
+ *   - visibility === 'public'  -> unique by (visibility='public', certNo, issueDate)
+ *   - visibility === 'private' -> unique by (tenantId, certNo, issueDate)
+ * @param {Array<{visibility:'public'|'private', certNo:string, issueDate:string}>} items
+ * @param {string|ObjectId} tenantId
+ * @returns {Promise<Array<{visibility:'public'|'private', certNo:string, issueDate:string}>>}
  */
-async function findCertificateConflicts(items = []) {
+async function findCertificateConflicts(items = [], tenantId) {
   const unique = new Map();
   for (const it of items) {
-    const key = `${(it.company||'').toLowerCase()}|${(it.certNo||'').trim()}|${(it.issueDate||'').trim()}`;
-    if (!unique.has(key)) unique.set(key, it);
+    const v = (it.visibility || 'private').toLowerCase();
+    const key = `${v}|${(it.certNo || '').trim()}|${(it.issueDate || '').trim()}`;
+    if (!unique.has(key)) unique.set(key, { ...it, visibility: v });
   }
+
   const checks = Array.from(unique.values()).map(async it => {
-    const exists = await Certificate.exists({
-      company: it.company,
-      certNo: it.certNo,
-      issueDate: it.issueDate
-    });
-    return exists ? { company: it.company, certNo: it.certNo, issueDate: it.issueDate } : null;
+    const v = (it.visibility || 'private').toLowerCase();
+    const query = (v === 'public')
+      ? { visibility: 'public', certNo: it.certNo, issueDate: it.issueDate }
+      : { tenantId: tenantId, visibility: 'private', certNo: it.certNo, issueDate: it.issueDate };
+
+    const exists = await Certificate.exists(query);
+    return exists ? { visibility: v, certNo: it.certNo, issueDate: it.issueDate } : null;
   });
+
   const results = await Promise.all(checks);
   return results.filter(Boolean);
 }
@@ -343,7 +358,7 @@ async function findCertificateConflicts(items = []) {
 function sendDuplicateResponse(res, conflicts) {
   return res.status(409).json({
     error: 'DUPLICATE_CERTIFICATE',
-    message: 'One or more certificates already exist with the same (company, certNo, issueDate).',
+    message: 'One or more certificates already exist with the same (visibility/tenant, certNo, issueDate).',
     conflicts
   });
 }
@@ -358,11 +373,12 @@ exports.updateDraftExtractedById = async (req, res) => {
     if (!draft) {
       return res.status(404).json({ message: '❌ Draft not found' });
     }
-
-    // Optional: ownership/company check (keep it lightweight; same as finalize uses)
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(400).json({ message: '❌ Invalid user' });
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) {
+      return res.status(403).json({ message: '❌ Missing tenantId' });
+    }
+    if (draft.tenantId && String(draft.tenantId) !== String(tenantId)) {
+      return res.status(403).json({ message: '❌ Forbidden (wrong tenant)' });
     }
 
     const overrides = sanitizeOverrides(req.body?.extractedData || req.body || {});
@@ -388,12 +404,12 @@ exports.finalizeDrafts = async (req, res) => {
   const userId = req.userId;
 
   try {
-    const user = await User.findById(userId);
-    if (!user || !user.company) {
-      return res.status(400).json({ message: '❌ Invalid user or missing company' });
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) {
+      return res.status(403).json({ message: '❌ Missing tenantId' });
     }
 
-    const drafts = await DraftCertificate.find({ uploadId, status: 'ready' });
+    const drafts = await DraftCertificate.find({ uploadId, status: 'ready', tenantId });
     if (drafts.length === 0) {
       return res.status(404).json({ message: '❌ No ready drafts found for this uploadId' });
     }
@@ -437,6 +453,8 @@ exports.finalizeDrafts = async (req, res) => {
         }
 
         const doc = {
+          tenantId,
+          visibility: (merged.scheme || '').toLowerCase() === 'atex' ? 'public' : 'private',
           certNo: merged.certNo || draft.fileName,
           scheme: merged.scheme || '',
           status: merged.status || '',
@@ -454,7 +472,6 @@ exports.finalizeDrafts = async (req, res) => {
           fileUrl: uploadedPdf,
           docxUrl: uploadedDocx,
           createdBy: userId,
-          company: merged.scheme?.toLowerCase() === 'atex' ? 'global' : user.company,
           isDraft: false,
         };
 
@@ -469,7 +486,7 @@ exports.finalizeDrafts = async (req, res) => {
           });
         } catch (insErr) {
           if (isDuplicateKeyError(insErr)) {
-            conflicts.push({ company: doc.company, certNo: doc.certNo, issueDate: doc.issueDate });
+            conflicts.push({ visibility: doc.visibility, certNo: doc.certNo, issueDate: doc.issueDate });
           } else {
             otherErrors.push({ id: draft._id.toString(), error: insErr.message || 'Insert error' });
           }
@@ -553,14 +570,17 @@ exports.finalizeSingleDraftById = async (req, res) => {
   const userId = req.userId;
 
   try {
-    const user = await User.findById(userId);
-    if (!user || !user.company) {
-      return res.status(400).json({ message: '❌ Invalid user or missing company' });
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) {
+      return res.status(403).json({ message: '❌ Missing tenantId' });
     }
 
     const draft = await DraftCertificate.findById(id);
     if (!draft || draft.status !== 'ready') {
       return res.status(404).json({ message: '❌ Draft not found or not ready' });
+    }
+    if (draft.tenantId && String(draft.tenantId) !== String(tenantId)) {
+      return res.status(403).json({ message: '❌ Forbidden (wrong tenant)' });
     }
 
     const data = draft.extractedData || {};
@@ -591,6 +611,8 @@ exports.finalizeSingleDraftById = async (req, res) => {
     }
 
     const doc = {
+      tenantId,
+      visibility: (merged.scheme || '').toLowerCase() === 'atex' ? 'public' : 'private',
       certNo: merged.certNo || draft.fileName,
       scheme: merged.scheme || '',
       status: merged.status || '',
@@ -608,7 +630,6 @@ exports.finalizeSingleDraftById = async (req, res) => {
       fileUrl: uploadedPdf,
       docxUrl: uploadedDocx,
       createdBy: userId,
-      company: merged.scheme?.toLowerCase() === 'atex' ? 'global' : user.company,
       isDraft: false,
     };
 
@@ -623,7 +644,7 @@ exports.finalizeSingleDraftById = async (req, res) => {
     } catch (txErr) {
       if (session) session.endSession();
       if (isDuplicateKeyError(txErr)) {
-        const conflicts = await findCertificateConflicts([{ company: doc.company, certNo: doc.certNo, issueDate: doc.issueDate }]);
+        const conflicts = await findCertificateConflicts([{ visibility: doc.visibility, certNo: doc.certNo, issueDate: doc.issueDate }], tenantId);
         return sendDuplicateResponse(res, conflicts);
       }
       try {
@@ -631,7 +652,7 @@ exports.finalizeSingleDraftById = async (req, res) => {
         await DraftCertificate.deleteOne({ _id: id });
       } catch (insErr) {
         if (isDuplicateKeyError(insErr)) {
-          const conflicts = await findCertificateConflicts([{ company: doc.company, certNo: doc.certNo, issueDate: doc.issueDate }]);
+          const conflicts = await findCertificateConflicts([{ visibility: doc.visibility, certNo: doc.certNo, issueDate: doc.issueDate }], tenantId);
           return sendDuplicateResponse(res, conflicts);
         }
         throw insErr;
@@ -659,9 +680,14 @@ exports.finalizeSingleDraftById = async (req, res) => {
 // Olyan uploadId-k, amelyekhez tartozik legalább egy 'draft' vagy 'ready' (esetleg 'error') státuszú draft.
 exports.getPendingUploads = async (req, res) => {
   try {
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) {
+      return res.status(403).json({ error: 'Missing tenantId' });
+    }
     const limit = req.query.limit ? parseInt(req.query.limit, 10) : null;
 
     const pipeline = [
+      { $match: { tenantId: new mongoose.Types.ObjectId(tenantId) } },
       {
         $match: {
           status: { $in: ['draft', 'ready', 'error'] }, // 'finalized' kikerül
@@ -759,11 +785,10 @@ exports.deletePendingUpload = async (req, res) => {
   const userId = req.userId;
 
   try {
-    // opcionális: tulajdonjog vizsgálat
-    // const user = await User.findById(userId);
-    // if (!user) return res.status(400).json({ message: '❌ Invalid user' });
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) return res.status(403).json({ error: 'Missing tenantId' });
 
-    const drafts = await DraftCertificate.find({ uploadId });
+    const drafts = await DraftCertificate.find({ uploadId, tenantId });
     if (!drafts.length) {
       return res.status(404).json({ message: 'No drafts found for this uploadId' });
     }
@@ -777,7 +802,7 @@ exports.deletePendingUpload = async (req, res) => {
     // mappa törlése
     removeDraftFolderIfEmpty(uploadId);
     // draft rekordok törlése
-    const del = await DraftCertificate.deleteMany({ uploadId });
+    const del = await DraftCertificate.deleteMany({ uploadId, tenantId });
 
     return res.json({
       message: '✅ Pending upload deleted',
@@ -795,7 +820,10 @@ exports.getDraftPdfById = async (req, res) => {
   try {
     const draft = await DraftCertificate.findById(id).lean();
     if (!draft) return res.status(404).json({ error: 'Draft not found' });
-
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId || (draft.tenantId && String(draft.tenantId) !== String(tenantId))) {
+      return res.status(403).json({ error: 'Forbidden (wrong tenant)' });
+    }
     if (!draft.originalPdfPath || !fs.existsSync(draft.originalPdfPath)) {
       return res.status(404).json({ error: 'PDF file not found' });
     }
@@ -817,7 +845,10 @@ exports.deleteDraftById = async (req, res) => {
     if (!draft) {
       return res.status(404).json({ message: '❌ Draft not found' });
     }
-
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId || (draft.tenantId && String(draft.tenantId) !== String(tenantId))) {
+      return res.status(403).json({ message: '❌ Forbidden (wrong tenant)' });
+    }
     // ideiglenes fájlok törlése
     safeUnlink(draft.originalPdfPath);
     safeUnlink(draft.docxPath);

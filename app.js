@@ -63,7 +63,15 @@ const corsOptions = {
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   credentials: true,
-  allowedHeaders: ['Authorization', 'Content-Type', 'x-ms-graph-token'],
+  allowedHeaders: [
+    'Authorization',
+    'Content-Type',
+    'x-ms-graph-token',
+    'x-user-id',        // frontend legacy header (allowed for backwards-compat)
+    'x-tenant-id',      // optional explicit tenant header if ever sent
+    'x-request-id',     // optional tracing
+    'x-client-version'  // optional client versioning
+  ],
   // make sure caches/proxies vary on Origin
   preflightContinue: false,
   optionsSuccessStatus: 204

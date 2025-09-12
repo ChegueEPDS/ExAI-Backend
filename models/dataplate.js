@@ -34,39 +34,38 @@ const EquipmentSchema = new mongoose.Schema({
   "Qualitycheck": { type: Boolean, default: false },
   "CreatedBy": { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   "ModifiedBy": { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // 🆕 Módosító felhasználó
-  "Company": { type: String, required: true },
+  "tenantId": { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', required: true, index: true },
   "Zone": { type: mongoose.Schema.Types.ObjectId, ref: 'Zone' },
   "Site": { type: mongoose.Schema.Types.ObjectId, ref: 'Site' },
   "Pictures": [
     {
-      name: { type: String },
-      oneDriveId: { type: String },
-      oneDriveUrl: { type: String },
-      SharePointId: { type: String },
-      SharePointUrl: { type: String },
+      name: { type: String },            // original filename (cleaned)
+      alias: { type: String },           // optional display name
+      blobPath: { type: String },        // container-relative path (e.g. TENANT_X/projects/.../EqID/file.jpg)
+      blobUrl: { type: String },         // direct HTTPS (no SAS)
+      contentType: { type: String },     // MIME type, e.g. image/jpeg
+      size: { type: Number },            // bytes
       uploadedAt: { type: Date, default: Date.now }
     }
-  ],
-  "OneDriveFolderId": { type: String },
-  "OneDriveFolderUrl": { type: String },
-  "SharePointId": { type: String },
-  "SharePointUrl": { type: String },
+  ]
 }, { timestamps: true }); // ⏳ Timestamps (createdAt, updatedAt)
 
-// 🔹 Pre-save middleware: beállítja a CreatedBy és Company mezőt az első mentéskor
+// 🔹 Pre-save middleware: kezeli a tenantId és Company mezőket mentéskor
 EquipmentSchema.pre('save', async function (next) {
     if (!this.CreatedBy) {
         return next(new Error('CreatedBy mező szükséges.'));
     }
 
     try {
-        const user = await mongoose.model('User').findById(this.CreatedBy);
+        const user = await mongoose.model('User').findById(this.CreatedBy).select('company tenantId');
         if (!user) {
             return next(new Error('Invalid CreatedBy user.'));
         }
 
-        // Beállítjuk a Company mezőt a felhasználó cégéhez
-        this.Company = user.company;
+        // Fill tenantId if missing
+        if (!this.tenantId && user.tenantId) {
+            this.tenantId = user.tenantId;
+        }
 
         next();
     } catch (error) {

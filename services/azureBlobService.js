@@ -163,9 +163,12 @@ async function deletePrefix(prefix) {
 }
 
 module.exports = {
-  async uploadFile(filePath, blobName) {
+  async uploadFile(filePath, blobName, contentType) {
     const blockBlobClient = containerClient.getBlockBlobClient(blobName);
-    const uploadBlobResponse = await blockBlobClient.uploadFile(filePath);
+    const options = contentType
+      ? { blobHTTPHeaders: { blobContentType: contentType } }
+      : undefined; // if not provided, Azure will use default (application/octet-stream)
+    const uploadBlobResponse = await blockBlobClient.uploadFile(filePath, options);
     return uploadBlobResponse;
   },
 

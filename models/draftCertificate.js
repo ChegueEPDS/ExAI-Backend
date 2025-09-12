@@ -27,13 +27,35 @@ const DraftCertificateSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
   },
-  company: {
-    type: String
-  },
+  tenantId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', required: true, index: true },
 
   createdAt: {
     type: Date,
     default: Date.now
+  }
+});
+
+DraftCertificateSchema.index(
+  { tenantId: 1, uploadId: 1, fileName: 1 },
+  {
+    unique: true,
+    name: 'uniq_tenant_draft_upload_file',
+    partialFilterExpression: { tenantId: { $exists: true, $type: 'objectId' } }
+  }
+);
+
+DraftCertificateSchema.pre('save', async function (next) {
+  try {
+    const user = await mongoose.model('User').findById(this.createdBy).select('tenantId');
+    if (!user) return next(new Error('Invalid createdBy user'));
+
+    if (!this.tenantId && user.tenantId) {
+      this.tenantId = user.tenantId;
+    }
+
+    return next();
+  } catch (err) {
+    return next(err);
   }
 });
 

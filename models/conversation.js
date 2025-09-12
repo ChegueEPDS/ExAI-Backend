@@ -65,6 +65,7 @@ const JobSchema = new mongoose.Schema({
 const ConversationSchema = new mongoose.Schema({
   threadId: { type: String, required: true, unique: true, index: true },
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  tenantId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', required: true, index: true },
   title: { type: String },
 
   messages: { type: [MessageSchema], default: [] },
@@ -79,5 +80,6 @@ const ConversationSchema = new mongoose.Schema({
 // hasznos indexek a listázáshoz és rendezéshez
 ConversationSchema.index({ userId: 1, 'job.status': 1, updatedAt: -1 });
 ConversationSchema.index({ createdAt: -1 });
+ConversationSchema.index({ tenantId: 1, updatedAt: -1 });
 
 module.exports = mongoose.model('Conversation', ConversationSchema);

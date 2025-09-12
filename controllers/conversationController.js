@@ -26,18 +26,30 @@ exports.sendMessageStream = async (req, res) => {
     logger.info(`[STREAM] Üzenet fogadva a szálhoz: ${threadId}`);
 
     // ---- Resolve user & assistant ----
-    const user = await User.findById(userId).select('company');
+    const user = await User.findById(userId).select('tenantId');
+    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
+    if (!tenantId) {
+      send('error', { message: 'Hiányzó tenant azonosító.' });
+      send('done', { ok: false });
+      return res.end();
+    }
     if (!user) {
       send('error', { message: 'Felhasználó nem található.' });
       send('done', { ok: false });
       return res.end();
     }
-    const companyId = user.company;
-    const assistantId = assistants[companyId] || assistants['default'];
+    const tenantDoc = await Tenant.findById(tenantId).select('name');
+    if (!tenantDoc) {
+      send('error', { message: 'Tenant nem található.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    const tenantKey = String(tenantDoc.name || '').toLowerCase();
+    const assistantId = assistants[tenantKey] || assistants['default'];
 
     // ---- Optional injection rules (Wolff) ----
     let applicableInjection = null;
-    if (companyId === 'wolff' || assistantId === process.env.ASSISTANT_ID_WOLFF) {
+    if (tenantKey === 'wolff' || assistantId === process.env.ASSISTANT_ID_WOLFF) {
       const allRules = await InjectionRule.find();
       const scoredMatches = allRules
         .map(rule => {
@@ -72,7 +84,7 @@ exports.sendMessageStream = async (req, res) => {
     }
 
     // ---- Conversation ownership check ----
-    const conversation = await Conversation.findOne({ threadId });
+    const conversation = await Conversation.findOne({ threadId, userId, tenantId });
     if (!conversation) {
       send('error', { message: 'A megadott szál nem található.' });
       send('done', { ok: false });
@@ -409,6 +421,7 @@ const { marked } = require('marked');
 const tiktoken = require('tiktoken');
 const assistants = require('../config/assistants');
 const User = require('../models/user'); 
+const Tenant = require('../models/tenant');
 const { fetchFromAzureSearch } = require('../helpers/azureSearchHelpers');
 console.log('fetchFromAzureSearch:', typeof fetchFromAzureSearch);
 const { createEmbedding } = require('../helpers/openaiHelpers');
@@ -597,7 +610,7 @@ exports.uploadAndSummarizeStream = async (req, res) => {
     }
 
     // Validate conversation belongs to the current user
-    conversation = await Conversation.findOne({ threadId, userId });
+    conversation = await Conversation.findOne({ threadId, userId, tenantId: (req.scope?.tenantId || undefined) });
     if (!conversation) {
       send('error', { message: 'A beszélgetés nem található vagy nem hozzáférhető.' });
       send('done', { ok: false });
@@ -612,14 +625,26 @@ exports.uploadAndSummarizeStream = async (req, res) => {
     }
 
     // Pick assistant based on user's company
-    const user = await User.findById(userId).select('company');
+    const user = await User.findById(userId).select('tenantId');
+    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
+    if (!tenantId) {
+      send('error', { message: 'Hiányzó tenant azonosító.' });
+      send('done', { ok: false });
+      return res.end();
+    }
     if (!user) {
       send('error', { message: 'Felhasználó nem található.' });
       send('done', { ok: false });
       return res.end();
     }
-    const companyId = user.company;
-    const assistantId = assistants[companyId] || assistants['default'];
+    const tenantDoc = await Tenant.findById(tenantId).select('name');
+    if (!tenantDoc) {
+      send('error', { message: 'Tenant nem található.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    const tenantKey = String(tenantDoc.name || '').toLowerCase();
+    const assistantId = assistants[tenantKey] || assistants['default'];
 
     // Initialize job in DB
     await jobInit(conversation, 'upload_and_summarize', {
@@ -746,7 +771,8 @@ exports.startNewConversation = async (req, res) => {
     const newConversation = new Conversation({
       threadId,
       messages: [],
-      userId, // A beszélgetéshez hozzárendeljük a felhasználót
+      userId,
+      tenantId: req.scope?.tenantId || undefined,
     });
 
     await newConversation.save();
@@ -801,16 +827,24 @@ exports.sendMessage = [
 
       logger.info(`Üzenet fogadva a szálhoz: ${threadId}, Üzenet: ${message}`);
 
-      const user = await User.findById(userId).select('company');
+      const user = await User.findById(userId).select('tenantId');
+      const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
+      if (!tenantId) {
+        return res.status(403).json({ error: 'Hiányzó tenant azonosító.' });
+      }
       if (!user) {
         return res.status(404).json({ error: 'Felhasználó nem található.' });
       }
 
-      const companyId = user.company;
-      const assistantId = assistants[companyId] || assistants['default'];
+      const tenantDoc = await Tenant.findById(tenantId).select('name');
+      if (!tenantDoc) {
+        return res.status(404).json({ error: 'Tenant nem található.' });
+      }
+      const tenantKey = String(tenantDoc.name || '').toLowerCase();
+      const assistantId = assistants[tenantKey] || assistants['default'];
 
       let applicableInjection = null;
-      if (companyId === 'wolff' || assistantId === process.env.ASSISTANT_ID_WOLFF) {
+      if (tenantKey === 'wolff' || assistantId === process.env.ASSISTANT_ID_WOLFF) {
         const allRules = await InjectionRule.find();
         // Kiválasztjuk azt a szabályt, ami a legtöbb kulcsszót találja meg
         const scoredMatches = allRules
@@ -845,7 +879,7 @@ exports.sendMessage = [
         }
       }
 
-      const conversation = await Conversation.findOne({ threadId });
+      const conversation = await Conversation.findOne({ threadId, userId, tenantId });
       if (!conversation) {
         logger.error('Beszélgetés nem található a megadott szálhoz:', threadId);
         return res.status(404).json({ error: 'A megadott szál nem található.' });
@@ -1034,7 +1068,7 @@ exports.rateMessage = async (req, res) => {
   const { threadId, messageIndex, rating } = req.body;
 
     try {
-      const conversation = await Conversation.findOne({ threadId });
+      const conversation = await Conversation.findOne({ threadId, userId: req.userId, tenantId: (req.scope?.tenantId || undefined) });
 
       if (!conversation) {
         return res.status(404).json({ error: 'A beszélgetés nem található.' });
@@ -1061,7 +1095,7 @@ exports.saveFeedback = async (req, res) => {
   const { threadId, messageIndex, comment, references } = req.body;
 
   try {
-    const conversation = await Conversation.findOne({ threadId });
+    const conversation = await Conversation.findOne({ threadId, userId: req.userId, tenantId: (req.scope?.tenantId || undefined) });
     if (!conversation) {
       return res.status(404).json({ error: 'A beszélgetés nem található.' });
     }
@@ -1086,7 +1120,7 @@ exports.saveFeedback = async (req, res) => {
 exports.deleteConversation = async (req, res) => {
   const { threadId } = req.params;
   try {
-    const conversation = await Conversation.findOneAndDelete({ threadId });
+    const conversation = await Conversation.findOneAndDelete({ threadId, userId: req.userId, tenantId: (req.scope?.tenantId || undefined) });
 
     if (!conversation) {
       return res.status(404).json({ error: 'A megadott szál nem található.' });
@@ -1103,13 +1137,13 @@ exports.deleteConversation = async (req, res) => {
 exports.getConversations = async (req, res) => {
   try {
     const userId = req.userId;  // Bejelentkezett felhasználó azonosítója
-    const conversations = await Conversation.find({ userId });  // Csak a bejelentkezett user beszélgetései
+    const conversations = await Conversation.find({ userId, tenantId: (req.scope?.tenantId || undefined) });  // Csak a bejelentkezett user beszélgetései tenant szerint
     const conversationList = conversations.map(c => ({
-  threadId: c.threadId,
-  messages: c.messages,
-  job: c.job || null,
-  hasBackgroundJob: !!c.hasBackgroundJob,
-}));
+      threadId: c.threadId,
+      messages: c.messages,
+      job: c.job || null,
+      hasBackgroundJob: !!c.hasBackgroundJob,
+    }));
 
     res.status(200).json(conversationList);  // Az összes beszélgetés visszaküldése
   } catch (error) {
@@ -1122,7 +1156,7 @@ exports.getConversations = async (req, res) => {
 exports.getConversationById = async (req, res) => {
   const { threadId } = req.query;  // A szál ID-je a kérésből
   try {
-    const conversation = await Conversation.findOne({ threadId, userId: req.userId });
+    const conversation = await Conversation.findOne({ threadId, userId: req.userId, tenantId: (req.scope?.tenantId || undefined) });
 
     if (!conversation) {
       return res.status(404).json({ error: 'A megadott szál nem található vagy nem hozzáférhető.' });

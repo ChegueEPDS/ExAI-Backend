@@ -9,7 +9,7 @@ const DxfJobSchema = new mongoose.Schema({
 
   // ⬇️ ÚJ: tulaj / létrehozó
   owner_user_id: { type: String },   // req.userId vagy JWT sub
-  owner_company: { type: String },   // ha a tokenben van
+  tenantId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', required: false, index: true },
 
   created_at:   { type: Date, default: Date.now },
   finished_at:  { type: Date },
@@ -32,5 +32,7 @@ DxfJobSchema.index({ created_at: -1 });
 DxfJobSchema.index({ status: 1 });
 // ⬇️ ÚJ: sajátjaim gyors listázásához
 DxfJobSchema.index({ owner_user_id: 1, created_at: -1 });
+// tenant + status + created_at for fast tenant-scoped listing
+DxfJobSchema.index({ tenantId: 1, status: 1, created_at: -1 });
 
 module.exports = mongoose.model('DxfJob', DxfJobSchema);
