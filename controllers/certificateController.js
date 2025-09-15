@@ -294,6 +294,21 @@ exports.getPublicCertificates = async (req, res) => {
   }
 };
 
+// Tanúsítvány minták – csak PUBLIC, csak minimális mezők (auth NEM szükséges)
+exports.getCertificatesSamples = async (req, res) => {
+  try {
+    // Csak a publikus tanúsítványok és csak a szükséges mezők
+    const samples = await Certificate.find({ visibility: 'public' })
+      .select('certNo manufacturer equipment')
+      .lean();
+
+    return res.json(samples);
+  } catch (error) {
+    console.error('❌ Hiba a getCertificatesSamples lekérdezés során:', error);
+    return res.status(500).send('❌ Hiba a getCertificatesSamples lekérdezés során');
+  }
+};
+
 exports.getCertificateByCertNo = async (req, res) => {
     try {
       const rawCertNo = req.params.certNo;

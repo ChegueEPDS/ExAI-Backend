@@ -6,6 +6,7 @@ const logger = require('./config/logger');
 const limiter = require('./middlewares/rateLimiter');
 const cleanupService = require('./services/cleanupService');
 const path = require('path');
+const fs = require('fs');
 
 // Routes
 const authRoutes = require('./routes/authRoutes');
@@ -93,9 +94,6 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(limiter);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/results', express.static(path.join(__dirname, 'results')));
-app.get('/', (req, res) => {
-  res.send('Welcome to the application!');
-});
 app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
@@ -175,6 +173,45 @@ app.use('/api', injectionRoutes);
 app.use('/api/dxf', dxfRoute);
 app.use('/api', certificateDraftRoutes);
 app.use('/api', notificationsRoutes);
+
+/**
+ * -----------------------------
+ * Frontend (Angular) static host + SPA fallback
+ * -----------------------------
+ * Serves files from the compiled Angular 'dist' folder and rewrites
+ * all non-API, non-static requests to index.html so deep links like /cert work.
+ *
+ * You can override the path with FRONTEND_DIST env var if needed.
+ */
+const frontendDist = process.env.FRONTEND_DIST
+  ? path.resolve(process.env.FRONTEND_DIST)
+  : path.join(__dirname, '..', 'Frontend', 'dist'); // adjust if your dist path differs
+
+if (fs.existsSync(frontendDist)) {
+  // Serve static assets
+  app.use(express.static(frontendDist));
+
+  // SPA fallback: anything that's not /api or a known static path should return index.html
+  app.get('*', (req, res, next) => {
+    // Keep API and asset folders untouched
+    if (
+      req.path.startsWith('/api') ||
+      req.path.startsWith('/uploads') ||
+      req.path.startsWith('/results')
+    ) {
+      return next();
+    }
+    // If the requested file actually exists, let express.static handle it
+    const maybeFile = path.join(frontendDist, req.path);
+    if (fs.existsSync(maybeFile) && fs.statSync(maybeFile).isFile()) {
+      return res.sendFile(maybeFile);
+    }
+    // Otherwise return index.html for Angular router
+    return res.sendFile(path.join(frontendDist, 'index.html'));
+  });
+} else {
+  console.warn('[SPA] Frontend dist folder not found:', frontendDist);
+}
 
 // Periodikus tisztítás
 setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum

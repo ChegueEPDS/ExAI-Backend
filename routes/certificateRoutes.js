@@ -11,6 +11,7 @@ router.post('/certificates/upload', authMiddleware(), certificateController.uplo
 router.post('/certificates/preview-atex', authMiddleware(), certificateController.previewAtex);
 
 // Listázás
+router.get('/certificates/samples', certificateController.getCertificatesSamples);
 router.get('/certificates', authMiddleware(), certificateController.getCertificates);
 router.get('/certificates/public', authMiddleware(), certificateController.getPublicCertificates);
 
