@@ -6,6 +6,7 @@ const User = require('../models/user'); // 🔹 Importáljuk a User modellt
 const multer = require('multer');
 const { generateDocxFile } = require('../helpers/docx'); // 🔹 DOCX generálás importálása
 const azureBlobService = require('../services/azureBlobService');
+const { getReadSasUrl, toBlobPath } = azureBlobService;
 const { uploadPdfWithFormRecognizerInternal } = require('../helpers/ocrHelper');
 const { extractCertFieldsFromOCR } = require('../helpers/openaiCertExtractor');
 const mongoose = require('mongoose');
@@ -223,6 +224,32 @@ exports.uploadCertificate = async (req, res) => {
   });
 };
 
+// Build a short-lived read SAS URL for an existing blob path
+// Body: { fileUrl, contentType? }
+// Returns: { sasUrl }
+exports.getCertificateSas = async (req, res) => {
+  try {
+    const { fileUrl, contentType } = req.body || {};
+    const blobPath = (typeof toBlobPath === 'function') ? toBlobPath(fileUrl) : (fileUrl || '');
+    if (!blobPath || typeof blobPath !== 'string') {
+      return res.status(400).json({ error: 'Invalid file.' });
+    }
+
+    if (typeof getReadSasUrl !== 'function') {
+      console.error('[cert] getCertificateSas error: getReadSasUrl not available');
+      return res.status(500).json({ error: 'SAS service not available' });
+    }
+
+    const sas = await getReadSasUrl(blobPath, {
+      ttlSeconds: 300,
+      contentType: contentType || 'application/pdf'
+    });
+    return res.json({ sasUrl: sas });
+  } catch (e) {
+    console.error('[cert] getCertificateSas error', e);
+    return res.status(500).json({ error: 'Failed to build SAS URL' });
+  }
+};
 
 // Tanúsítványok lekérdezése – SAJÁT tenant + adoptált PUBLIC-ok
 exports.getCertificates = async (req, res) => {
@@ -291,6 +318,33 @@ exports.getPublicCertificates = async (req, res) => {
   } catch (error) {
     console.error('❌ Hiba a public lekérdezés során:', error);
     res.status(500).send('❌ Hiba a public lekérdezés során');
+  }
+};
+
+// Saját PUBLIC tanúsítványok darabszáma
+exports.countMyPublicCertificates = async (req, res) => {
+  try {
+    const userId = req.scope?.userId || req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ message: '❌ Hiányzik a user azonosító az authból!' });
+    }
+
+    // Ha ObjectId, konvertáljuk; ha stringként tárolod a createdBy-t, elég maga a string.
+    let createdBy = userId;
+    const isObjId = /^[a-fA-F0-9]{24}$/.test(userId);
+    if (isObjId) {
+      createdBy = new (require('mongoose')).Types.ObjectId(userId);
+    }
+
+    const count = await Certificate.countDocuments({
+      visibility: 'public',
+      createdBy
+    });
+
+    return res.json({ count });
+  } catch (error) {
+    console.error('❌ Hiba a countMyOwnPublicCertificates során:', error);
+    return res.status(500).json({ message: '❌ Hiba a countMyOwnPublicCertificates során' });
   }
 };
 

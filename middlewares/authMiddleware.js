@@ -88,4 +88,18 @@ const authMiddleware = (roles = []) => {
   };
 };
 
+// Basic requireAuth middleware (no role restriction)
+const requireAuth = authMiddleware();
+
+// Role-based guard factory
+const requireRole = (role) => {
+  return authMiddleware([role]);
+};
+
+// Backward-compatible exports:
+// - const authMiddleware = require('../middlewares/authMiddleware');            // default function
+// - const { authMiddleware, requireAuth, requireRole } = require('../middlewares/authMiddleware'); // named
 module.exports = authMiddleware;
+module.exports.authMiddleware = authMiddleware;
+module.exports.requireAuth = requireAuth;
+module.exports.requireRole = requireRole;

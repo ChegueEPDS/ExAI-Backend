@@ -5,6 +5,7 @@ const connectDB = require('./config/db');
 const logger = require('./config/logger');
 const limiter = require('./middlewares/rateLimiter');
 const cleanupService = require('./services/cleanupService');
+const subscriptionSweeper = require('./services/subscriptionSweeper');
 const path = require('path');
 const fs = require('fs');
 
@@ -29,6 +30,10 @@ const injectionRoutes = require('./routes/injectionRoutes');
 const dxfRoute = require('./routes/dxfRoutes');
 const certificateDraftRoutes = require('./routes/certificateDraftRoutes');
 const notificationsRoutes = require('./routes/notificationsRoutes');
+const billingRoutes = require('./routes/billing');
+const billingWebhook = require('./routes/billingWebhook');
+const upgradeRoutes = require('./routes/upgrade');
+const tenantRoutes = require('./routes/tenantRoutes');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -88,6 +93,9 @@ app.use((req, res, next) => {
   res.setHeader('X-Accel-Buffering', 'no'); // nginx
   next();
 });
+
+// Fontos: webhook raw body-val, a JSON parser ELŐTT:
+app.use('/api', billingWebhook);
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -173,6 +181,9 @@ app.use('/api', injectionRoutes);
 app.use('/api/dxf', dxfRoute);
 app.use('/api', certificateDraftRoutes);
 app.use('/api', notificationsRoutes);
+app.use('/api/billing', billingRoutes);
+app.use('/api', upgradeRoutes);
+app.use('/api', tenantRoutes);
 
 /**
  * -----------------------------
@@ -216,6 +227,7 @@ if (fs.existsSync(frontendDist)) {
 // Periodikus tisztítás
 setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum
 setInterval(cleanupService.cleanupDxfResults, 3 * 60 * 60 * 1000);
+setInterval(subscriptionSweeper.sweepExpiredSubscriptions, 60 * 60 * 1000);
 
 console.log("Starting application...");
 process.on('unhandledRejection', (reason) => {
@@ -228,8 +240,6 @@ process.on('uncaughtException', (err) => {
 
 const server = app.listen(port, () => {
   console.log(`Server running on port ${port}`);
-  console.log("Azure Tenant ID:", process.env.AZURE_TENANT_ID);
-  console.log("Azure Redirect URI:", process.env.AZURE_REDIRECT_URI);
 });
 
 // --- Keep long SSE connections alive and avoid premature timeouts ---
