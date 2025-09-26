@@ -353,7 +353,7 @@ exports.getCertificatesSamples = async (req, res) => {
   try {
     // Csak a publikus tanúsítványok és csak a szükséges mezők
     const samples = await Certificate.find({ visibility: 'public' })
-      .select('certNo manufacturer equipment')
+      .select('certNo manufactur          er equipment')
       .lean();
 
     return res.json(samples);

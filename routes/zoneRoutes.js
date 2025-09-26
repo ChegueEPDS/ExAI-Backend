@@ -6,36 +6,36 @@ const multer = require('multer');
 const upload = multer({ dest: 'uploads/' });
 
 // Új projekt létrehozása
-router.post('/', authMiddleware(['Admin', 'User']), zoneController.createZone);
+router.post('/', authMiddleware(), zoneController.createZone);
 
 // Összes projekt lekérdezése
-router.get('/', authMiddleware(['Admin', 'User']), zoneController.getZones);
+router.get('/', authMiddleware(), zoneController.getZones);
 
 // Egy konkrét projekt lekérdezése ID alapján
-router.get('/:id', authMiddleware(['Admin', 'User']), zoneController.getZoneById);
+router.get('/:id', authMiddleware(), zoneController.getZoneById);
 
 // Projekt módosítása ID alapján
-router.put('/:id', authMiddleware(['Admin', 'User']), zoneController.updateZone);
+router.put('/:id', authMiddleware(), zoneController.updateZone);
 
 // Projekt törlése ID alapján
-router.delete('/:id', authMiddleware(['Admin', 'User']), zoneController.deleteZone);
+router.delete('/:id', authMiddleware(), zoneController.deleteZone);
 
 router.post(
     '/:id/upload-file',
-    authMiddleware(['Admin', 'User']),
+    authMiddleware(),
     upload.array('files'),
     zoneController.uploadFileToZone
   );
   
   router.get(
     '/:id/files',
-    authMiddleware(['Admin', 'User']),
+    authMiddleware(),
     zoneController.getFilesOfZone
   );
   
   router.delete(
     '/:zoneId/files/:fileId',
-    authMiddleware(['Admin', 'User']),
+    authMiddleware(),
     zoneController.deleteFileFromZone
   );
 

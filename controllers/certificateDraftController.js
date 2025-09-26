@@ -873,3 +873,58 @@ exports.deleteDraftById = async (req, res) => {
     return res.status(500).json({ error: 'Failed to delete draft' });
   }
 };
+
+// -------------------------
+// COUNT my pending drafts (not finalized/deleted)
+// -------------------------
+// Returns total and per-status counts for the current tenant+user,
+// considering only statuses that are still pending in the drafts collection.
+exports.countMyPendingDrafts = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const userId = req.scope?.userId || req.userId;
+
+    if (!tenantId || !userId) {
+      return res.status(403).json({ error: 'Missing tenantId or userId' });
+    }
+
+    const tenantObjectId = new mongoose.Types.ObjectId(tenantId);
+    // If your createdBy is stored as ObjectId, convert; else leave as string.
+    const isObjId = /^[a-fA-F0-9]{24}$/.test(String(userId));
+    const createdByValue = isObjId ? new mongoose.Types.ObjectId(String(userId)) : String(userId);
+
+    // Only drafts that are still active/pending in the collection
+    const PENDING_STATUSES = ['draft', 'ready', 'error'];
+
+    const pipeline = [
+      { $match: { tenantId: tenantObjectId, createdBy: createdByValue, status: { $in: PENDING_STATUSES } } },
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 }
+        }
+      }
+    ];
+
+    const rows = await DraftCertificate.aggregate(pipeline);
+
+    const byStatus = { draft: 0, ready: 0, error: 0 };
+    let total = 0;
+    for (const r of rows) {
+      const k = r?._id;
+      const c = Number(r?.count || 0);
+      if (k && typeof byStatus[k] !== 'undefined') {
+        byStatus[k] = c;
+        total += c;
+      }
+    }
+
+    return res.json({
+      total,
+      byStatus
+    });
+  } catch (err) {
+    console.error('❌ countMyPendingDrafts error:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to count pending drafts' });
+  }
+};

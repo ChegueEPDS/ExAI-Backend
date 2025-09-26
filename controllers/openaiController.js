@@ -8,6 +8,7 @@ const assistants = require('../config/assistants');
 const User = require('../models/user'); // Felhasználói modell
 const fs = require('fs');
 const FormData = require('form-data');
+const Tenant = require('../models/tenant');
 
 // Segédfüggvény: asszisztenshez tartozó vector store ID lekérése
 async function getVectorStoreId(assistantId) {
@@ -24,16 +25,32 @@ async function getVectorStoreId(assistantId) {
  * Resolve assistant ID with priority: tenant → default
  * (company has been removed)
  */
-function resolveAssistantId(tenantId) {
-  try {
-    if (assistants?.byTenant && tenantId && assistants.byTenant[tenantId]) {
-      return assistants.byTenant[tenantId];
+async function resolveAssistantId(tenantId) {
+    try {
+      logger.debug('[ASSISTANT PICK][INSTR] incoming tenantId:', String(tenantId || ''));
+      // 1) közvetlen ID mapping (ha használsz ilyet)
+      if (assistants?.byTenantId && tenantId && assistants.byTenantId[String(tenantId)]) {
+        const id = assistants.byTenantId[String(tenantId)];
+        logger.debug('[ASSISTANT PICK][INSTR] byTenantId hit:', id);
+        return id;
+      }
+      // 2) tenant name -> byTenant
+      if (tenantId && assistants?.byTenant) {
+        const t = await Tenant.findById(tenantId).select('name');
+        logger.debug('[ASSISTANT PICK][INSTR] tenant doc:', t ? { _id: t._id, name: t.name } : null);
+        const key = String(t?.name || '').toLowerCase();
+        const hit = key && assistants.byTenant[key];
+        logger.debug('[ASSISTANT PICK][INSTR] tenantKey:', key, 'hit:', !!hit);
+        if (hit) return hit;
+      }
+      const def = assistants.default || assistants['default'];
+      logger.debug('[ASSISTANT PICK][INSTR] fallback default:', def);
+      return def;
+    } catch (e) {
+      logger.warn('[ASSISTANT PICK][INSTR] error, falling back to default:', e?.message);
+      return assistants.default || assistants['default'];
     }
-    return assistants['default'] || assistants.default;
-  } catch (e) {
-    return assistants['default'] || assistants.default;
   }
-}
 
 // 📥 Fájlok listázása a vector store-ból – névvel együtt
 exports.listAssistantFiles = async (req, res) => {
@@ -42,7 +59,7 @@ exports.listAssistantFiles = async (req, res) => {
     if (!user) return res.status(404).json({ error: 'Felhasználó nem található.' });
 
     const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-    const assistantId = resolveAssistantId(tenantId);
+    const assistantId = await resolveAssistantId(tenantId);
     logger.info(`Vector store list – assistant: ${assistantId} (tenant=${tenantId})`);
 
     const vectorStoreId = await getVectorStoreId(assistantId);
@@ -95,7 +112,7 @@ exports.uploadAssistantFile = async (req, res) => {
     if (!user) return res.status(404).json({ error: 'Felhasználó nem található.' });
 
     const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-    const assistantId = resolveAssistantId(tenantId);
+    const assistantId = await resolveAssistantId(tenantId);
     logger.info(`Vector store upload – assistant: ${assistantId} (tenant=${tenantId})`);
 
     const vectorStoreId = await getVectorStoreId(assistantId);
@@ -152,7 +169,7 @@ exports.deleteAssistantFile = async (req, res) => {
     if (!user) return res.status(404).json({ error: 'Felhasználó nem található.' });
 
     const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-    const assistantId = resolveAssistantId(tenantId);
+    const assistantId = await resolveAssistantId(tenantId);
     logger.info(`Vector store delete – assistant: ${assistantId} (tenant=${tenantId})`);
 
     const vectorStoreId = await getVectorStoreId(assistantId);
@@ -204,7 +221,7 @@ exports.getAssistantInstructions = async (req, res) => {
 
     // Az asszisztens azonosító kiválasztása tenant alapján
     const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-    const assistantId = resolveAssistantId(tenantId);
+    const assistantId = await resolveAssistantId(tenantId);
     logger.info(`Lekérdezett asszisztens ID: ${assistantId} (Tenant: ${tenantId})`);
 
     // OpenAI API hívás az asszisztens utasításaiért
@@ -216,12 +233,18 @@ exports.getAssistantInstructions = async (req, res) => {
       },
     });
 
-    // Az utasítások a válaszból
-    const instructions = response.data;
-    logger.info('Asszisztens info lekérdezve:', instructions);
+    // Asszisztens teljes objektum a válaszból
+    const asst = response.data;
+    logger.info('Asszisztens info lekérdezve:', { id: asst.id, name: asst.name, model: asst.model });
 
-    // JSON formában küldi vissza a kliensnek
-    res.status(200).json(instructions);
+    // Csak a frontend által elvárt mezőket adjuk vissza
+    res.status(200).json({
+      name: asst.name || '',
+      model: asst.model || '',
+      instructions: asst.instructions || '',
+      temperature: typeof asst.temperature === 'number' ? asst.temperature : 1,
+      top_p: typeof asst.top_p === 'number' ? asst.top_p : 1
+    });
   } catch (error) {
     if (error.response) {
       // Az API válaszolt, de hibás státuszkódot adott
@@ -239,6 +262,81 @@ exports.getAssistantInstructions = async (req, res) => {
     } else {
       // Valami más hiba történt a kérés beállításában
       logger.error('Kérés beállítási hiba:', error.message);
+      res.status(500).json({ error: 'Belső szerver hiba történt.' });
+    }
+  }
+};
+
+exports.updateAssistantConfig = async (req, res) => {
+  try {
+    const userId = req.userId;
+    if (!userId) {
+      logger.error('Hiányzó userId a kérésből.');
+      return res.status(400).json({ error: 'Bejelentkezett felhasználó azonosítója hiányzik.' });
+    }
+
+    const { instructions, model, temperature, top_p } = req.body;
+
+    // Normalizáljuk az esetleges human label model értékeket API-kompatibilis ID-vá
+    const modelMap = {
+      'GPT 4.1': 'gpt-4.1',
+      'GPT 4.1 mini': 'gpt-4.1-mini',
+      'GPT 4.1 nano': 'gpt-4.1-nano',
+      'GPT 4o': 'gpt-4o',
+      'GPT 4o mini': 'gpt-4o-mini',
+      'o3 mini': 'o3-mini',
+      'o1': 'o1',
+      'GPT 4': 'gpt-4',
+      'GPT 4 turbo': 'gpt-4-turbo'
+    };
+    const normalizedModel = (typeof model === 'string' && modelMap[model]) ? modelMap[model] : model;
+
+    // Felhasználói adatok lekérése az adatbázisból
+    const user = await User.findById(userId).select('tenantId');
+    if (!user) {
+      logger.error('Felhasználó nem található.');
+      return res.status(404).json({ error: 'Felhasználó nem található.' });
+    }
+
+    // Az asszisztens azonosító kiválasztása tenant alapján
+    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
+    const assistantId = await resolveAssistantId(tenantId);
+    logger.info(`Asszisztens konfiguráció frissítése – assistant: ${assistantId} (tenant=${tenantId})`);
+
+    // Összeállítjuk a frissítendő adatokat csak a megadott mezőkkel
+    const payload = {};
+    if (instructions !== undefined) payload.instructions = instructions;
+    if (normalizedModel !== undefined) payload.model = normalizedModel;
+    if (temperature !== undefined) payload.temperature = temperature;
+    if (top_p !== undefined) payload.top_p = top_p;
+
+    const response = await axios.post(
+      `https://api.openai.com/v1/assistants/${assistantId}`,
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json',
+          'OpenAI-Beta': 'assistants=v2'
+        }
+      }
+    );
+
+    res.status(200).json(response.data);
+  } catch (error) {
+    if (error.response) {
+      logger.error('OpenAI API frissítési hiba:', {
+        status: error.response.status,
+        data: error.response.data,
+      });
+      res.status(error.response.status).json({
+        error: error.response.data.error || 'Hiba történt az API frissítése során.',
+      });
+    } else if (error.request) {
+      logger.error('OpenAI API frissítés nem érhető el:', error.request);
+      res.status(500).json({ error: 'Az OpenAI API nem érhető el.' });
+    } else {
+      logger.error('Kérés beállítási hiba frissítéskor:', error.message);
       res.status(500).json({ error: 'Belső szerver hiba történt.' });
     }
   }

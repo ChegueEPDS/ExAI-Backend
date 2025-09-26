@@ -9,6 +9,10 @@ const sanitizeHtml = require('sanitize-html');
 const { marked } = require('marked');
 const tiktoken = require('tiktoken');
 
+// --- Completions model config
+const DEFAULT_COMPLETIONS_MODEL = process.env.SUMMARY_COMPLETIONS_MODEL || 'gpt-5-mini';
+const COMPLETIONS_FALLBACK_MODEL = process.env.SUMMARY_COMPLETIONS_FALLBACK || 'gpt-4o-mini';
+
 const encoder = tiktoken.get_encoding('o200k_base');
 
 function estimateTokens(str, outputFactor = 1.6) {
@@ -42,6 +46,175 @@ function parseRetryAfterSeconds(msg) {
     if (!isNaN(s)) return Math.ceil(s * 1000);
   }
   return null;
+}
+
+// --- Helper: Chat Completions API
+async function chatComplete({ model, messages, openaiApiKey, max_tokens = 800, temperature = 0.2 }) {
+  // Normalize model name and decide which token-limit key to use
+  const modelName = String(model || '').trim();
+  const isGpt5Family = /^gpt-5/i.test(modelName);
+
+  // Build payload
+  const payload = { model: modelName, messages };
+
+  // For gpt-5 family, do NOT set max_tokens or max_completion_tokens at all.
+  // For other models, set max_tokens as before.
+  if (!isGpt5Family) {
+    payload.max_tokens = max_tokens;
+  }
+
+  // Temperature handling:
+  // gpt-5 family only supports the default temperature (1) — omit the field entirely.
+  if (isGpt5Family) {
+    if (temperature !== undefined && temperature !== null && temperature !== 1) {
+      console.info(`[summaryCore] '${modelName}' (gpt-5 family) supports only default temperature; omitting provided temperature=${temperature}.`);
+    } else {
+      console.info(`[summaryCore] Chat Completions call → model=${modelName}, NO max tokens sent (gpt-5 family), temperature=(default)`);
+    }
+    // DO NOT set payload.temperature for gpt-5 family
+  } else {
+    payload.temperature = temperature;
+    console.info(`[summaryCore] Chat Completions call → model=${modelName}, max_tokens=${max_tokens}, temperature=${temperature}`);
+  }
+
+  try {
+    const resp = await axiosClient.post('https://api.openai.com/v1/chat/completions', payload, {
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${openaiApiKey}`
+      }
+    });
+    return resp.data?.choices?.[0]?.message?.content || '';
+  } catch (err) {
+    // Mark so caller can handle fallback
+    err.__chat_completions__ = true;
+
+    // Extra debug to surface server message for troubleshooting
+    const status = err?.response?.status;
+    const serverMsg = err?.response?.data?.error?.message;
+    if (status || serverMsg) {
+      console.warn(`[summaryCore] Chat Completions request failed${status ? ` (${status})` : ''}: ${serverMsg || err.message}`);
+    }
+    throw err;
+  }
+}
+
+// --- Helper: Try primary completions model, fallback if error; supports forcePrimary option
+async function chatCompleteWithFallback({ messages, openaiApiKey, max_tokens, temperature, forcePrimary = false }) {
+  if (forcePrimary) {
+    // Always use the primary model (e.g., gpt-5-mini) and do not fallback
+    console.info(`[summaryCore] Final synthesis: forcing primary model '${DEFAULT_COMPLETIONS_MODEL}' (no fallback).`);
+    const result = await chatComplete({
+      model: DEFAULT_COMPLETIONS_MODEL,
+      messages,
+      openaiApiKey,
+      max_tokens,
+      temperature
+    });
+    console.info(`[summaryCore] Final synthesis produced by '${DEFAULT_COMPLETIONS_MODEL}'.`);
+    return result;
+  }
+  try {
+    const result = await chatComplete({ model: DEFAULT_COMPLETIONS_MODEL, messages, openaiApiKey, max_tokens, temperature });
+    console.info(`[summaryCore] Model selection: primary '${DEFAULT_COMPLETIONS_MODEL}' succeeded.`);
+    return result;
+  } catch (e) {
+    const status = e?.response?.status;
+    const msg = e?.response?.data?.error?.message || e.message || 'unknown error';
+    console.warn(`[summaryCore] Primary model '${DEFAULT_COMPLETIONS_MODEL}' failed${status ? ` (${status})` : ''}: ${msg}`);
+    console.info(`[summaryCore] Falling back to '${COMPLETIONS_FALLBACK_MODEL}'...`);
+    const result = await chatComplete({ model: COMPLETIONS_FALLBACK_MODEL, messages, openaiApiKey, max_tokens, temperature });
+    console.info(`[summaryCore] Model selection: fallback '${COMPLETIONS_FALLBACK_MODEL}' succeeded.`);
+    return result;
+  }
+}
+
+// --- Helper: Robust final synthesis with retries and non-empty guarantee
+async function finalSynthesisRobust({ messages, openaiApiKey, max_tokens = 1500 }) {
+  const primary = DEFAULT_COMPLETIONS_MODEL;
+  const fallback = COMPLETIONS_FALLBACK_MODEL;
+  let lastText = '';
+  let attempts = [];
+
+  // Up to 2 attempts on primary
+  for (let i = 1; i <= 2; i++) {
+    console.info(`[summaryCore] Final synthesis (primary try #${i}) on '${primary}'...`);
+    try {
+      const txt = await chatComplete({
+        model: primary,
+        messages,
+        openaiApiKey,
+        max_tokens,
+        // DO NOT set temperature for gpt-5 family (handled in chatComplete)
+        temperature: undefined
+      });
+      const trimmed = String(txt || '').trim();
+      attempts.push({ model: primary, ok: !!trimmed, len: trimmed.length });
+      if (!trimmed) {
+        console.warn(`[summaryCore] Primary '${primary}' returned EMPTY content on try #${i}.`);
+        lastText = trimmed;
+        continue;
+      }
+      console.info(`[summaryCore] Final synthesis produced by '${primary}' on try #${i}, len=${trimmed.length}.`);
+      return { text: trimmed, modelUsed: primary, attempts };
+    } catch (e) {
+      const status = e?.response?.status;
+      const msg = e?.response?.data?.error?.message || e.message || 'unknown';
+      attempts.push({ model: primary, ok: false, err: msg, status });
+      console.warn(`[summaryCore] Primary '${primary}' failed on try #${i}${status ? ` (${status})` : ''}: ${msg}`);
+      lastText = '';
+    }
+  }
+
+  // Fallback once if still empty
+  console.info(`[summaryCore] Falling back to '${fallback}' for final synthesis...`);
+  try {
+    const txt = await chatComplete({
+      model: fallback,
+      messages,
+      openaiApiKey,
+      max_tokens,
+      temperature: 0.2
+    });
+    const trimmed = String(txt || '').trim();
+    attempts.push({ model: fallback, ok: !!trimmed, len: trimmed.length });
+    if (!trimmed) {
+      console.warn(`[summaryCore] Fallback '${fallback}' also returned EMPTY content.`);
+      return { text: '', modelUsed: fallback, attempts };
+    }
+    console.info(`[summaryCore] Final synthesis produced by '${fallback}', len=${trimmed.length}.`);
+    return { text: trimmed, modelUsed: fallback, attempts };
+  } catch (e) {
+    const status = e?.response?.status;
+    const msg = e?.response?.data?.error?.message || e.message || 'unknown';
+    attempts.push({ model: fallback, ok: false, err: msg, status });
+    console.warn(`[summaryCore] Fallback '${fallback}' failed${status ? ` (${status})` : ''}: ${msg}`);
+    return { text: '', modelUsed: fallback, attempts };
+  }
+}
+
+// --- Helper: Post plain user message into Assistants thread
+async function postUserMessageToThread({ threadId, content, openaiApiKey, metadata }) {
+  const body = { role: 'user', content };
+  if (metadata) body.metadata = metadata;
+  await axiosClient.post(
+    `https://api.openai.com/v1/threads/${threadId}/messages`,
+    body,
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${openaiApiKey}`,
+        'OpenAI-Beta': 'assistants=v2',
+      }
+    }
+  );
+}
+
+// --- Helper: Push an assistant reply (verbatim) into Assistants thread
+async function pushAssistantReply({ threadId, assistantId, openaiApiKey, text, emit }) {
+  // Disabled to avoid assistants ignoring verbatim echo prompts and replying generically.
+  // We keep the function for optional future use behind an env flag.
+  throw new Error('pushAssistantReply is disabled. Use postUserMessageToThread() to inject context.');
 }
 
 async function runAssistantOnce({ threadId, assistantId, promptText, label, openaiApiKey, emit }) {
@@ -173,6 +346,10 @@ async function runUploadAndSummarize(ctx, hooks) {
   const { files, threadId, assistantId, baseUrl, openaiApiKey } = ctx;
   const { emit, patch } = hooks;
 
+  // Inform which model is in use
+  emit('progress', { stage: 'model.info', completionsModel: DEFAULT_COMPLETIONS_MODEL, fallback: COMPLETIONS_FALLBACK_MODEL });
+  console.info(`[summaryCore] Using Chat Completions primary model: ${DEFAULT_COMPLETIONS_MODEL} (fallback: ${COMPLETIONS_FALLBACK_MODEL})`);
+  console.info('[summaryCore] Mode: chunk summaries via Assistants API; final synthesis via Chat Completions (gpt-5-mini). Injecting final summary into thread as USER message to avoid noisy assistant replies.');
   // 1) Kinyerés
   const extracted = [];
   for (const f of files) {
@@ -294,12 +471,19 @@ async function runUploadAndSummarize(ctx, hooks) {
   const combinedCorpus = extracted.map(x => `### ${x.name}\n${x.content || ''}`).join('\n\n---\n\n');
   const corpusChunks = chunkByTokens(combinedCorpus, FILE_CHUNK_TOKENS);
 
-  // === Optional stronger mode: push the FULL corpus into the thread as multiple user messages,
+  // === Assistants thread-split summarization (disabled by default; uses Assistants API). Enable with: SUMMARY_THREAD_SPLIT=1
   // then ask for one final summary. This avoids map->reduce compression bias.
-  // Enable with: SUMMARY_THREAD_SPLIT=1
   // Optional: SUMMARY_THREAD_PART_TOKENS (default 6000) – approx token size per part
   {
-    const USE_THREAD_SPLIT = String(process.env.SUMMARY_THREAD_SPLIT || '0') === '1';
+    const ENV_THREAD_SPLIT = String(process.env.SUMMARY_THREAD_SPLIT || '0') === '1';
+    // Force-disable thread-split to keep the desired behavior:
+    //  - chunk summaries via Assistants API (assistant-defined model)
+    //  - final synthesis via Chat Completions (gpt-5-mini or fallback)
+    const USE_THREAD_SPLIT = false;
+    console.info('[summaryCore] Thread-split summarization is DISABLED to guarantee final summary by gpt-5-mini.');
+    if (ENV_THREAD_SPLIT && !USE_THREAD_SPLIT) {
+      console.warn('[summaryCore] SUMMARY_THREAD_SPLIT=1 detected, but overriding to disabled to ensure: chunk via Assistant, final via Chat Completions (gpt-5-mini).');
+    }
     if (USE_THREAD_SPLIT) {
       const PART_TOKENS = Math.max(1000, parseInt(process.env.SUMMARY_THREAD_PART_TOKENS || '6000', 10) || 6000);
 
@@ -349,6 +533,7 @@ async function runUploadAndSummarize(ctx, hooks) {
       emit('progress', { stage: 'tokens.estimate', label: 'thread-split.final', estTok });
       await throttleForBudget(estTok, 'thread-split.final');
 
+      console.info('[summaryCore] Using Assistants API for thread-split final synthesis (model comes from the Assistant).');
       const finalText = await runAssistantOnce({
         threadId,
         assistantId,
@@ -403,10 +588,34 @@ async function runUploadAndSummarize(ctx, hooks) {
     emit('progress', { stage: 'tokens.estimate', label, estTok });
     await throttleForBudget(estTok, label);
 
+    console.info('[summaryCore] Chunk summarization via Assistants API (assistant-defined model).');
     const partial = await runAssistantOnce({
-      threadId, assistantId, promptText: chunkPrompt, label, openaiApiKey, emit
+      threadId,
+      assistantId,
+      promptText: [
+        'You are a precise technical summarizer. Be terse, factual, extract units and numbers, avoid speculation.',
+        '',
+        chunkPrompt
+      ].join('\n'),
+      label,
+      openaiApiKey,
+      emit
     });
     chunkSummaries.push((partial || '').trim());
+  }
+
+  // After chunk summaries, post all summaries as context to the Assistant thread
+  try {
+    const chunksPayload = [
+      'Chunk-level summaries prepared by the Assistant (to retain context in thread):',
+      '',
+      chunkSummaries.map((s, idx) => `--- Chunk ${idx + 1} ---\n${s}`).join('\n\n')
+    ].join('\n');
+    await postUserMessageToThread({ threadId, content: chunksPayload, openaiApiKey });
+    emit('progress', { stage: 'assistant.thread_chunk_summaries_pushed', count: chunkSummaries.length });
+    console.info(`[summaryCore] Posted ${chunkSummaries.length} chunk summaries into the Assistants thread.`);
+  } catch (e) {
+    emit('error', { stage: 'assistant.thread_push_failed', message: e.message });
   }
 
   emit('progress', { stage: 'combined.reduce.start', parts: chunkSummaries.length });
@@ -432,9 +641,26 @@ async function runUploadAndSummarize(ctx, hooks) {
     const estTok = estimateTokens(reducePrompt, 1.8);
     emit('progress', { stage: 'tokens.estimate', label: 'final-synthesis', estTok });
     await throttleForBudget(estTok, 'final-synthesis');
-    var finalText = await runAssistantOnce({
-      threadId, assistantId, promptText: reducePrompt, label: 'final-synthesis', openaiApiKey, emit
+    console.info(`[summaryCore] Final synthesis via Chat Completions — primary '${DEFAULT_COMPLETIONS_MODEL}' with robust retry; fallback '${COMPLETIONS_FALLBACK_MODEL}' if empty.`);
+    emit('progress', { stage: 'final_synthesis.robust', primary: DEFAULT_COMPLETIONS_MODEL, fallback: COMPLETIONS_FALLBACK_MODEL });
+
+    const synth = await finalSynthesisRobust({
+      messages: [
+        { role: 'system', content: 'You are a senior technical analyst. Merge multiple partial summaries into one comprehensive, non-redundant report following the requested structure. Always include concrete values when present.' },
+        { role: 'user', content: reducePrompt }
+      ],
+      openaiApiKey,
+      max_tokens: 1500
     });
+
+    var finalText = synth.text || '';
+    const modelResolved = synth.modelUsed || DEFAULT_COMPLETIONS_MODEL;
+    console.info(`[summaryCore] Final synthesis model resolved to: ${modelResolved}. Attempts: ${JSON.stringify(synth.attempts)}`);
+
+    if (!finalText.trim()) {
+      console.warn('[summaryCore] Final synthesis still EMPTY after robust attempts. Inserting placeholder text.');
+      finalText = 'Summary generation did not produce content. Please try again, reduce the input size, or ask for a specific section.';
+    }
   }
 
   // Clean + HTML
@@ -446,7 +672,90 @@ async function runUploadAndSummarize(ctx, hooks) {
   });
   const finalHtml = marked(sanitized);
 
-  return { finalHtml, messageId: null };
+  // --- Inject the final summary into the Assistants thread as a USER message (context-only)
+  const plainSummary = sanitizeHtml(finalHtml, { allowedTags: [], allowedAttributes: {} })
+    .replace(/\u00A0/g, ' ')
+    .replace(/\s+\n/g, '\n')
+    .trim();
+
+  // Log the raw plain summary before HTML render
+  try {
+    // Log model resolved before final text
+    const modelResolved = typeof synth !== 'undefined' && synth.modelUsed ? synth.modelUsed : DEFAULT_COMPLETIONS_MODEL;
+    console.info(`[summaryCore] FINAL_MODEL_USED: ${modelResolved}`);
+    console.info('[summaryCore] FINAL_TEXT_RAW (before HTML render):\n' + (finalText || ''));
+    console.info('[summaryCore] FINAL_HTML (rendered by gpt-5-mini):\n' + finalHtml);
+    emit && emit('progress', { stage: 'final.html.log', bytes: finalHtml.length });
+  } catch (_) {}
+
+  let pushedMessageId = null;
+  try {
+    const userPayload = plainSummary;
+    // Use modelResolved and attempts in metadata if available
+    const modelResolved = typeof synth !== 'undefined' && synth.modelUsed ? synth.modelUsed : DEFAULT_COMPLETIONS_MODEL;
+    await postUserMessageToThread({
+      threadId,
+      content: userPayload,
+      openaiApiKey,
+      metadata: { injected_by: 'summaryCore', type: 'final_summary', model: DEFAULT_COMPLETIONS_MODEL, model_used: modelResolved }
+    });
+    emit && emit('progress', {
+      stage: 'assistant.thread_context_pushed_as_user',
+      bytes: userPayload.length
+    });
+
+    // Try to fetch the message id of the injected USER message (optional)
+    try {
+      const headers = {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${openaiApiKey}`,
+        'OpenAI-Beta': 'assistants=v2',
+      };
+      const msgs = await axiosClient.get(
+        `https://api.openai.com/v1/threads/${threadId}/messages?order=desc&limit=5`,
+        { headers }
+      );
+      const lastUser = Array.isArray(msgs.data?.data)
+        ? msgs.data.data.find(m =>
+            m.role === 'user' &&
+            m.metadata &&
+            m.metadata.type === 'final_summary' &&
+            m.metadata.injected_by === 'summaryCore'
+          )
+        : null;
+      pushedMessageId = lastUser?.id || null;
+      if (pushedMessageId) {
+        emit && emit('progress', { stage: 'assistant.thread_user_message_id', messageId: pushedMessageId });
+      }
+    } catch (e) {
+      emit && emit('error', { stage: 'assistant.thread_user_fetch_message_failed', message: e?.message });
+    }
+  } catch (e) {
+    emit && emit('error', { stage: 'assistant.thread_user_push_failed', message: e?.message });
+  }
+
+  // Surface the result HTML to frontend via patch hook as well
+  try {
+    await patch({
+      stage: 'final.html',
+      result: { html: finalHtml }
+    });
+  } catch (e) {
+    console.warn('[summaryCore] Could not patch final HTML to frontend:', e?.message || e);
+  }
+
+  // Use modelResolved for return value
+  const modelResolved = typeof synth !== 'undefined' && synth.modelUsed ? synth.modelUsed : DEFAULT_COMPLETIONS_MODEL;
+  return {
+    finalHtml,
+    html: finalHtml,
+    injectedUserMessageId: pushedMessageId,
+    modelUsed: modelResolved,
+    modelInfo: {
+      completionsPrimary: DEFAULT_COMPLETIONS_MODEL,
+      completionsFallback: COMPLETIONS_FALLBACK_MODEL
+    }
+  };
 }
 
 module.exports = { runUploadAndSummarize };

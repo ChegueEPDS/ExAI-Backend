@@ -52,6 +52,18 @@ const authMiddleware = (roles = []) => {
         }
       }
 
+      // --- Attach full decoded JWT and normalize subscription/plan snapshot ---
+      req.auth = decoded;
+      const subscriptionSnap = decoded.subscription || null;
+      const planFromToken =
+        (subscriptionSnap && (subscriptionSnap.plan || subscriptionSnap.tier)) ||
+        decoded.plan ||
+        null;
+
+      // Keep these on req.auth for convenience, too
+      req.auth.subscription = subscriptionSnap || null;
+      req.auth.plan = planFromToken;
+
       // egységes user objektum (company kivezetve – csak akkor adjuk vissza, ha a token tartalmazta)
       req.user = {
         id: decoded.userId || decoded._id || decoded.sub,
@@ -62,6 +74,10 @@ const authMiddleware = (roles = []) => {
         tenantName,
         tenantType,
         tokenType: decoded.type || 'access',
+        // normalized subscription snapshot from JWT (if present)
+        subscription: subscriptionSnap || null,
+        // convenience: derived plan from subscription snapshot (plan or tier)
+        plan: planFromToken || undefined,
         // backward-compat: ha régi token tartalmazta, átadjuk, de az új kódban ne használd már
         company: Object.prototype.hasOwnProperty.call(decoded, 'company') ? decoded.company : undefined,
       };
@@ -79,6 +95,8 @@ const authMiddleware = (roles = []) => {
         tenantId,
         tenantName,
         tenantType,
+        // expose plan so downstream controllers can quickly check entitlements
+        plan: planFromToken || null,
       };
 
       next();

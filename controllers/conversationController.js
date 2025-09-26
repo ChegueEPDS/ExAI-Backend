@@ -45,7 +45,45 @@ exports.sendMessageStream = async (req, res) => {
       return res.end();
     }
     const tenantKey = String(tenantDoc.name || '').toLowerCase();
-    const assistantId = assistants[tenantKey] || assistants['default'];
+    const assistantId = assistants.byTenant?.[tenantKey] || assistants['default'];
+    // DEBUG: Assistant selection trace (STREAM)
+    logger.debug('[ASSISTANT PICK][STREAM] req.scope.tenantId:', req.scope?.tenantId);
+    logger.debug('[ASSISTANT PICK][STREAM] user.tenantId:', user?.tenantId ? String(user.tenantId) : null);
+    logger.debug('[ASSISTANT PICK][STREAM] resolved tenantId:', tenantId);
+    logger.debug('[ASSISTANT PICK][STREAM] tenantDoc:', { id: tenantDoc?._id, name: tenantDoc?.name });
+    logger.debug('[ASSISTANT PICK][STREAM] tenantKey:', tenantKey);
+    logger.debug('[ASSISTANT PICK][STREAM] assistants.byTenant keys:', Object.keys(assistants.byTenant || {}));
+    logger.debug('[ASSISTANT PICK][STREAM] assistants.byTenant[tenantKey]:', (assistants.byTenant || {})[tenantKey] || null);
+    logger.debug('[ASSISTANT PICK][STREAM] default assistantId:', assistants['default']);
+    logger.debug('[ASSISTANT PICK][STREAM] chosen assistantId:', assistantId);
+
+    // ---- Determine user plan (best-effort from various middleware-attached places) ----
+    // 1) Try req.auth.subscription?.plan (auth controller attaches subscription snapshot)
+    // 2) Fallbacks to req.user.subscription?.tier, req.user.plan, req.auth.subscription?.tier, req.auth.plan, req.scope.plan
+    // 3) Final fallback: query DB (Subscription / Tenant) by tenantId
+    let userPlan =
+      (req.auth && req.auth.subscription?.plan) ||
+      (req.user && (req.user.subscription?.tier || req.user.plan)) ||
+      (req.auth && (req.auth.subscription?.tier || req.auth.plan)) ||
+      (req.scope && req.scope.plan) ||
+      null;
+
+    if (!userPlan) {
+      try {
+        const subDoc = await Subscription.findOne({ tenantId }).select('tier');
+        const tenDoc = await Tenant.findById(tenantId).select('plan');
+        userPlan = (subDoc?.tier || tenDoc?.plan || 'unknown');
+        if (userPlan !== 'unknown') {
+          logger.info(`[STREAM] Plan resolved via DB fallback: plan=${userPlan}`);
+        }
+      } catch (e) {
+        userPlan = 'unknown';
+        logger.warn('[STREAM] Failed to resolve plan from DB fallback:', e?.message);
+      }
+    }
+    logger.info(
+      `[STREAM] Context: thread=${threadId} tenant=${tenantKey} plan=${userPlan} assistantId=${assistantId}`
+    );
 
     // ---- Optional injection rules (Wolff) ----
     let applicableInjection = null;
@@ -115,7 +153,9 @@ exports.sendMessageStream = async (req, res) => {
     );
 
     // ---- Prepare run payload, add instructions if we have an injection ----
-    const runPayload = { assistant_id: assistantId, stream: true };
+    const payload = { assistant_id: assistantId, stream: true };
+
+    // If we have injection, fetch assistant instructions and append
     if (applicableInjection) {
       const assistantData = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {
         headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2' }
@@ -123,14 +163,14 @@ exports.sendMessageStream = async (req, res) => {
       const assistantPrompt = assistantData.data.instructions || '';
       const finalInstructions = `${assistantPrompt}\n\nAlways put the following sentence at the end of the explanation part as a <strong>Note:</strong>, exactly as written, in a separate paragraph between <em> tags: :\n\n"${applicableInjection}"`;
       logger.info('[STREAM] 📋 Final instructions before sending:', finalInstructions);
-      runPayload.instructions = finalInstructions;
+      payload.instructions = finalInstructions;
     }
 
-    // ---- OpenAI SSE stream ----
+    // ---- OpenAI SSE stream (no model override; use assistant default) ----
     const openaiResp = await axios({
       method: 'post',
       url: `https://api.openai.com/v1/threads/${threadId}/runs`,
-      data: runPayload,
+      data: payload,
       responseType: 'stream',
       headers: {
         'Content-Type': 'application/json',
@@ -143,7 +183,7 @@ exports.sendMessageStream = async (req, res) => {
       httpsAgent: new https.Agent({ keepAlive: true }),
       timeout: 0
     });
-
+    logger.info(`[STREAM] Using assistant default model (no override).`);
     send('assistant.status', { stage: 'openai.stream.start' });
 
     let accText = '';
@@ -151,6 +191,7 @@ exports.sendMessageStream = async (req, res) => {
     const stream = openaiResp.data;
     let buffer = '';
     let hadTokens = false;
+    let lastSeenModel = null;
 
     const flushBlocks = (raw) => {
       const blocks = raw.split('\n\n');
@@ -273,9 +314,25 @@ exports.sendMessageStream = async (req, res) => {
           case 'run.step.delta':
           case 'run.step.completed':
           case 'run.requires_action':
-          case 'run.in_progress':
+          case 'run.in_progress': {
+            send('assistant.status', { stage: eventName });
+            break;
+          }
           case 'run.completed': {
             send('assistant.status', { stage: eventName });
+
+            // Try to extract the used model from various possible payload shapes
+            const usedModel =
+              (payload && (payload.model || payload?.run?.model || payload?.response?.model || payload?.metadata?.model)) ||
+              null;
+
+            if (usedModel) {
+              lastSeenModel = usedModel;
+            }
+
+            logger.info(
+              `[STREAM] Run completed: thread=${threadId} plan=${userPlan} model=${usedModel || 'unknown'}`
+            );
             break;
           }
           case 'error': {
@@ -310,6 +367,28 @@ exports.sendMessageStream = async (req, res) => {
     });
 
     stream.on('end', async () => {
+      // --- Post-end: if we haven't seen a model in-stream, query the latest run for model info and log plan+model
+      try {
+        if (!lastSeenModel) {
+          const runsList = await axios.get(
+            `https://api.openai.com/v1/threads/${threadId}/runs`,
+            { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2' } }
+          );
+          const latest = runsList.data?.data?.[0];
+          if (latest) {
+            lastSeenModel = latest.model || latest.response?.model || lastSeenModel;
+            logger.info(
+              `[STREAM] Run (post-end) info: thread=${threadId} plan=${userPlan} model=${lastSeenModel || 'unknown'} status=${latest.status}`
+            );
+          } else {
+            logger.info(`[STREAM] Run (post-end) info: thread=${threadId} plan=${userPlan} model=unknown (no runs found)`);
+          }
+        } else {
+          logger.info(`[STREAM] Run (post-end) info: thread=${threadId} plan=${userPlan} model=${lastSeenModel}`);
+        }
+      } catch (e) {
+        logger.warn('[STREAM] Nem sikerült utólag lekérdezni a run-t a modellhez:', e?.message);
+      }
       // Small grace period to allow OpenAI to persist the final assistant message
       try { await delay(800); } catch {}
       try {
@@ -400,6 +479,28 @@ exports.sendMessageStream = async (req, res) => {
       response: error.response?.data,
       status: error.response?.status,
     });
+    // Extra detail for non-JSON or opaque error bodies
+    if (error?.response) {
+      const hdrs = error.response.headers || {};
+      const reqId = hdrs['x-request-id'] || hdrs['openai-request-id'] || hdrs['request-id'] || null;
+      let raw = '';
+      try {
+        if (typeof error.response.data === 'string') raw = error.response.data;
+        else if (Buffer.isBuffer(error.response.data)) raw = error.response.data.toString('utf8');
+        else raw = JSON.stringify(error.response.data);
+      } catch (_) {
+        raw = String(error.response.data || '');
+      }
+      logger.error(`[STREAM] error response headers: reqId=${reqId || 'n/a'} content-type=${hdrs['content-type'] || 'n/a'}`);
+      logger.error(`[STREAM] error raw body (first 2KB): ${raw.slice(0, 2048)}`);
+    }
+    if (error?.response?.status === 400) {
+      try {
+        logger.error(`[STREAM] 400 detailed body: ${JSON.stringify(error.response.data)}`);
+      } catch (_) {
+        logger.error(`[STREAM] 400 detailed text: ${String(error?.response?.data || error.message)}`);
+      }
+    }
     try {
       send('error', { message: error.message || 'Váratlan hiba történt.' });
       send('done', { ok: false });
@@ -644,7 +745,17 @@ exports.uploadAndSummarizeStream = async (req, res) => {
       return res.end();
     }
     const tenantKey = String(tenantDoc.name || '').toLowerCase();
-    const assistantId = assistants[tenantKey] || assistants['default'];
+    const assistantId = assistants.byTenant?.[tenantKey] || assistants['default'];
+    // DEBUG: Assistant selection trace (UPLOAD_SUMMARY)
+    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] req.scope.tenantId:', req.scope?.tenantId);
+    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] user.tenantId:', user?.tenantId ? String(user.tenantId) : null);
+    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] resolved tenantId:', tenantId);
+    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] tenantDoc:', { id: tenantDoc?._id, name: tenantDoc?.name });
+    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] tenantKey:', tenantKey);
+    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] assistants.byTenant keys:', Object.keys(assistants.byTenant || {}));
+    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] assistants.byTenant[tenantKey]:', (assistants.byTenant || {})[tenantKey] || null);
+    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] default assistantId:', assistants['default']);
+    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] chosen assistantId:', assistantId);
 
     // Initialize job in DB
     await jobInit(conversation, 'upload_and_summarize', {
@@ -661,7 +772,7 @@ exports.uploadAndSummarizeStream = async (req, res) => {
     const baseUrl = (process.env.BASE_URL || 'http://localhost:3000').replace(/\/+$/, '');
 
     // Delegate to service: it will emit SSE updates through `emit`, and persist via `patch`
-    const { finalHtml, messageId } = await runUploadAndSummarize(
+    const { finalHtml, injectedUserMessageId } = await runUploadAndSummarize(
       {
         files,
         threadId,
@@ -685,8 +796,32 @@ exports.uploadAndSummarizeStream = async (req, res) => {
     const metaUserMsg = (typeof userMessage === 'string' && userMessage.trim())
       ? userMessage.trim()
       : fallbackMsg;
+
+    // 1) add the meta/user message first (as if user wrote a prompt about the upload)
     conversation.messages.push({ role: 'user', content: metaUserMsg });
-    conversation.messages.push({ role: 'assistant', content: finalHtml });
+
+    // 2) use the finalHtml produced by gpt-5-mini directly as the assistant reply
+    const assistantHtmlToStore = finalHtml;
+
+    // Log the entire assistant answer for debugging / comparison
+    try {
+      const fullLen = (assistantHtmlToStore || '').length;
+      const shortPreview = (assistantHtmlToStore || '').replace(/\s+/g, ' ').slice(0, 200);
+      logger.info(`[SUMMARY] Storing assistant summary into DB | thread=${conversation.threadId} len=${fullLen} preview="${shortPreview}"`);
+      logger.debug(`[SUMMARY] FULL_ASSISTANT_HTML_BEGIN\n${assistantHtmlToStore}\nFULL_ASSISTANT_HTML_END`);
+      if (typeof injectedUserMessageId === 'string' && injectedUserMessageId.length) {
+        logger.info(`[SUMMARY] Context-only USER message injected into thread: ${injectedUserMessageId}`);
+      }
+    } catch (e) {
+      logger.warn('[SUMMARY] Failed to log full assistant HTML:', e?.message);
+    }
+
+    // 3) store the assistant message in DB exactly like normal chat replies
+    conversation.messages.push({
+      role: 'assistant',
+      content: assistantHtmlToStore,
+      images: []
+    });
     await conversation.save();
 
     const lastAssistantMessage = conversation.messages.slice().reverse().find(m => m.role === 'assistant');
@@ -713,7 +848,7 @@ exports.uploadAndSummarizeStream = async (req, res) => {
 
     // Mark job success and finish SSE
     await jobSucceed(conversation);
-    send('final', { html: finalHtml, messageId: lastAssistantMessage?._id || messageId || null });
+    send('final', { html: assistantHtmlToStore, messageId: lastAssistantMessage?._id || null });
     send('done', { ok: true });
     return res.end();
 
@@ -841,7 +976,33 @@ exports.sendMessage = [
         return res.status(404).json({ error: 'Tenant nem található.' });
       }
       const tenantKey = String(tenantDoc.name || '').toLowerCase();
-      const assistantId = assistants[tenantKey] || assistants['default'];
+      const assistantId = assistants.byTenant?.[tenantKey] || assistants['default'];
+
+      // Determine user plan (best effort) and log context
+      // 1) Try req.auth.subscription?.plan (auth controller attaches subscription snapshot)
+      // 2) Fallbacks to req.user.subscription?.tier, req.user.plan, req.auth.subscription?.tier, req.auth.plan, req.scope.plan
+      // 3) Final fallback: query DB (Subscription / Tenant) by tenantId
+      let userPlan =
+        (req.auth && req.auth.subscription?.plan) ||
+        (req.user && (req.user.subscription?.tier || req.user.plan)) ||
+        (req.auth && (req.auth.subscription?.tier || req.auth.plan)) ||
+        (req.scope && req.scope.plan) ||
+        null;
+
+      if (!userPlan) {
+        try {
+          const subDoc = await Subscription.findOne({ tenantId }).select('tier');
+          const tenDoc = await Tenant.findById(tenantId).select('plan');
+          userPlan = (subDoc?.tier || tenDoc?.plan || 'unknown');
+          if (userPlan !== 'unknown') {
+            logger.info(`[CHAT] Plan resolved via DB fallback: plan=${userPlan}`);
+          }
+        } catch (e) {
+          userPlan = 'unknown';
+          logger.warn('[CHAT] Failed to resolve plan from DB fallback:', e?.message);
+        }
+      }
+      logger.info(`[CHAT] Context: thread=${threadId} tenant=${tenantKey} plan=${userPlan} assistantId=${assistantId}`);
 
       let applicableInjection = null;
       if (tenantKey === 'wolff' || assistantId === process.env.ASSISTANT_ID_WOLFF) {
@@ -921,8 +1082,11 @@ exports.sendMessage = [
         }
       });
 
-      let runPayload = { assistant_id: assistantId };
+      // ---- Prepare run payload (non-stream, no model override) ----
+      const baseRunPayload = { assistant_id: assistantId };
 
+      // Optional instructions if injection is active
+      let finalInstructions = null;
       if (applicableInjection) {
         const assistantData = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {
           headers: {
@@ -930,24 +1094,21 @@ exports.sendMessage = [
             'OpenAI-Beta': 'assistants=v2'
           }
         });
-
         const assistantPrompt = assistantData.data.instructions || '';
-
-        const finalInstructions = `${assistantPrompt}\n\nAlways put the following sentence at the end of the explanation part as a <strong>Note:</strong>, exactly as written, in a separate paragraph between <em> tags: :\n\n"${applicableInjection}"`;
-
+        finalInstructions = `${assistantPrompt}\n\nAlways put the following sentence at the end of the explanation part as a <strong>Note:</strong>, exactly as written, in a separate paragraph between <em> tags: :\n\n"${applicableInjection}"`;
         logger.info('📋 Final instructions before sending:', finalInstructions);
-        console.log('📋 Final instructions before sending:', finalInstructions);
-
-        runPayload.instructions = finalInstructions;
       }
 
-      const runResponse = await axios.post(`https://api.openai.com/v1/threads/${threadId}/runs`, runPayload, {
+      // Create run (no model override; use assistant default)
+      const payload = { ...baseRunPayload, ...(finalInstructions ? { instructions: finalInstructions } : {}) };
+      const runResponse = await axios.post(`https://api.openai.com/v1/threads/${threadId}/runs`, payload, {
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
           'OpenAI-Beta': 'assistants=v2',
         }
       });
+      logger.info(`[CHAT] Using assistant default model (no override).`);
 
       let completed = false;
       let retries = 0;
@@ -975,6 +1136,23 @@ exports.sendMessage = [
 
         // opcionális: logolás minden lépésben
         logger.debug(`⏳ Run státusz (${retries}/${maxRetries}): ${status}`);
+      }
+
+      // Log the final used model for this run
+      try {
+        const finalRunResp = await axios.get(
+          `https://api.openai.com/v1/threads/${threadId}/runs/${runResponse.data.id}`,
+          {
+            headers: {
+              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+              'OpenAI-Beta': 'assistants=v2',
+            },
+          }
+        );
+        const usedModel = finalRunResp.data?.model || finalRunResp.data?.response?.model || 'unknown';
+        logger.info(`[CHAT] Run completed: thread=${threadId} plan=${userPlan} model=${usedModel}`);
+      } catch (e) {
+        logger.warn(`[CHAT] Could not fetch final run model: ${e?.message}`);
       }
 
       const messagesResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/messages`, {
@@ -1055,6 +1233,26 @@ exports.sendMessage = [
         response: error.response?.data,
         status: error.response?.status,
       });
+      if (error?.response) {
+        const hdrs = error.response.headers || {};
+        const reqId = hdrs['x-request-id'] || hdrs['openai-request-id'] || hdrs['request-id'] || null;
+        let raw = '';
+        try {
+          if (typeof error.response.data === 'string') raw = error.response.data;
+          else if (Buffer.isBuffer(error.response.data)) raw = error.response.data.toString('utf8');
+          else raw = JSON.stringify(error.response.data);
+        } catch (_) {
+          raw = String(error.response.data || '');
+        }
+        logger.error(`[CHAT] error response headers: reqId=${reqId || 'n/a'} content-type=${hdrs['content-type'] || 'n/a'}`);
+        logger.error(`[CHAT] error raw body (first 2KB): ${raw.slice(0, 2048)}`);
+      }
+      if (error?.response?.status === 400) {
+        try {
+          logger.error(`[CHAT] 400 detailed body: ${JSON.stringify(error.response.data)}`);
+        } catch (_) {}
+        logger.error(`[CHAT] 400 detailed text: ${String(error?.response?.data || error.message)}`);
+      }
       res.status(500).json({ error: 'Váratlan hiba történt.' });
     }
   }

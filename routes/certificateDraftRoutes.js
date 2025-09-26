@@ -14,5 +14,6 @@ router.get('/certificates/uploads/pending', authMiddleware(), certificateDraftCo
 router.delete('/certificates/uploads/:uploadId', authMiddleware(), certificateDraftController.deletePendingUpload);
 router.get('/certificates/drafts/by-id/:id/pdf', authMiddleware(), certificateDraftController.getDraftPdfById);
 router.delete('/certificates/drafts/by-id/:id', authMiddleware(), certificateDraftController.deleteDraftById);
+router.get('/certificates/drafts/pending/count', authMiddleware(), certificateDraftController.countMyPendingDrafts);
 
 module.exports = router;

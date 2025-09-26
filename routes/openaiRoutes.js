@@ -7,6 +7,7 @@ const authMiddleware = require('../middlewares/authMiddleware');
 const openAIController = require('../controllers/openaiController');
 
 router.get('/instructions', authMiddleware(), openAIController.getAssistantInstructions);
+router.put('/instructions', authMiddleware(), openAIController.updateAssistantConfig);
 router.get('/vector-files', authMiddleware(), openAIController.listAssistantFiles);
 router.post('/vector-files', authMiddleware(), upload.single('file'), openAIController.uploadAssistantFile);
 router.delete('/vector-files/:fileId', authMiddleware(), openAIController.deleteAssistantFile);
