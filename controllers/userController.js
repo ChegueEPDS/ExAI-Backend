@@ -1,3 +1,4 @@
+// controllers/userController.js
 const User = require('../models/user');
 const bcrypt = require('bcrypt');
 const mongoose = require('mongoose');
@@ -5,6 +6,7 @@ const DownloadQuota = require('../models/downloadQuota');
 const Subscription = require('../models/subscription');
 const SubscriptionModel = Subscription; // alias for clarity if needed elsewhere
 const Tenant = require('../models/tenant');
+const { migrateAllUserDataToTenant } = require('../services/tenantMigration');
 
 // --- Daily download quota (Free plan) helpers ---
 const FREE_DAILY_LIMIT = 3;
@@ -67,6 +69,76 @@ exports.getUserProfile = async (req, res) => {
 };
 
 // ---------------------------
+// Delete User (Admin/SuperAdmin)
+// DELETE /api/users/:userId
+// - Admin: csak a saját tenantjából törölhet
+// - SuperAdmin: bárkit törölhet
+// - Seats: ha volt tenant, seats.used -- (min 0-ig)
+// Megjegyzés: tranzakció helyett best-effort, hogy standalone MongoDB-n is működjön
+// ---------------------------
+exports.deleteUser = async (req, res) => {
+  const role = (req.role || '').toString();
+  const callerTenantId = req.scope?.tenantId || null;
+  const { userId } = req.params || {};
+
+  if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+  try {
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Cross-tenant védelem Admin esetén
+    if (role !== 'SuperAdmin' && String(user.tenantId || '') !== String(callerTenantId || '')) {
+      return res.status(403).json({ error: 'Forbidden: cannot delete user from another tenant' });
+    }
+
+    // Admin nem törölhet SuperAdmint
+    if (user.role === 'SuperAdmin' && role !== 'SuperAdmin') {
+      return res.status(403).json({ error: 'Forbidden: cannot delete a SuperAdmin' });
+    }
+
+    const tenantId = user.tenantId ? String(user.tenantId) : null;
+
+    // Törlés (best-effort)
+    const del = await User.deleteOne({ _id: userId });
+    if (!del?.acknowledged) {
+      return res.status(500).json({ error: 'Failed to delete user (not acknowledged)' });
+    }
+    if (del.deletedCount === 0) {
+      return res.status(404).json({ error: 'User not found (already deleted)' });
+    }
+
+    // Seats used -- ha volt tenant (race-safe feltétellel, min 0-ig)
+    if (tenantId) {
+      await Tenant.updateOne(
+        { _id: tenantId, 'seats.used': { $gt: 0 } },
+        { $inc: { 'seats.used': -1 } }
+      );
+
+      // EXTRA: ha a tenant 'personal' és árva/owner volt a törölt user → töröljük a tenantot is
+      try {
+        const t = await Tenant.findById(tenantId).select('_id type ownerUserId').lean();
+        if (t && t.type === 'personal') {
+          const remaining = await User.countDocuments({ tenantId });
+          const ownedByDeleted = t.ownerUserId && String(t.ownerUserId) === String(userId);
+          if (ownedByDeleted || remaining === 0) {
+            await Tenant.deleteOne({ _id: tenantId });
+          }
+        }
+      } catch (_) {
+        // swallow – a felhasználó törlését ne blokkolja
+      }
+    }
+
+    return res.json({ message: 'User deleted.' });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || 'Failed to delete user' });
+  }
+};
+
+// ---------------------------
 // List Users (search/sort/paginate)
 // GET /api/users?search=&page=1&limit=10&sortBy=firstName&sortDir=asc
 // Roles: SuperAdmin -> all tenants; Admin -> only same tenant; User -> forbidden
@@ -96,9 +168,39 @@ exports.listUsers = async (req, res) => {
     pipeline.push(
       { $lookup: { from: 'tenants', localField: 'tenantId', foreignField: '_id', as: 'tenant' } },
       { $unwind: { path: '$tenant', preserveNullAndEmptyArrays: true } },
+      // Subscription snapshot (latest by updatedAt) for the user's tenant
+      {
+        $lookup: {
+          from: 'subscriptions',
+          let: { tId: '$tenantId' },
+          pipeline: [
+            { $match: { $expr: { $eq: ['$tenantId', '$$tId'] } } },
+            { $sort: { updatedAt: -1 } },
+            { $limit: 1 },
+            { $project: { _id: 0, tier: 1, status: 1, expiresAt: 1 } }
+          ],
+          as: 'subscription'
+        }
+      },
+      { $unwind: { path: '$subscription', preserveNullAndEmptyArrays: true } },
       // Stabil, determinisztikus sorrend (kliens oldali szűrés/rendezés/lapozás lesz)
       { $sort: { firstName: 1, _id: 1 } },
-      { $project: { _id: 0, id: '$_id', firstName: 1, lastName: 1, email: 1, tenantName: '$tenant.name', azureId: 1 } }
+      {
+        $project: {
+          _id: 0,
+          id: '$_id',
+          firstName: 1,
+          lastName: 1,
+          email: 1,
+          azureId: 1,
+          tenantId: 1,
+          tenantName: '$tenant.name',
+          tenantPlan: '$tenant.plan',
+          subscriptionTier: '$subscription.tier',
+          subscriptionStatus: '$subscription.status',
+          subscriptionExpiresAt: '$subscription.expiresAt'
+        }
+      }
     );
 
     const rows = await User.aggregate(pipeline);
@@ -110,6 +212,77 @@ exports.listUsers = async (req, res) => {
   } catch (error) {
     console.error('listUsers error:', error);
     return res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// ---------------------------
+// Admin move user to tenant (seat-safe, transactional)
+// POST /api/admin/tenants/:toTenantId/move-user
+// Body: { userId }
+// Guard: Admin (csak saját tenantba mozgathat), SuperAdmin (bárhova)
+// ---------------------------
+// ---------------------------
+// Admin move user to tenant (seat-safe, non-transactional)
+// POST /api/admin/tenants/:toTenantId/move-user
+// Body: { userId }
+// Guard: Admin (csak saját tenantba mozgathat), SuperAdmin (bárhova)
+// ---------------------------
+exports.moveUserToTenant = async (req, res) => {
+  const role = (req.role || '').toString();
+  const callerTenantId = req.scope?.tenantId || null;
+  const { toTenantId } = req.params;
+  const { userId } = req.body || {};
+
+  if (!userId || !toTenantId) {
+    return res.status(400).json({ error: 'userId és toTenantId kötelező.' });
+  }
+
+  // Admin csak a SAJÁT tenantjába mozgathat
+  if (role !== 'SuperAdmin' && String(callerTenantId) !== String(toTenantId)) {
+    return res.status(403).json({ error: 'Admin csak a saját tenantjába mozgathat felhasználót.' });
+  }
+
+  try {
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ error: 'User nem található.' });
+
+    const fromTenantId = user.tenantId ? String(user.tenantId) : null;
+    if (String(user.tenantId) === String(toTenantId)) {
+      return res.json({ message: 'User már a cél tenantban van. Nincs teendő.' });
+    }
+
+    const toTenant = await Tenant.findById(toTenantId).select('seats').lean();
+    if (!toTenant) return res.status(404).json({ error: 'Cél tenant nem található.' });
+
+    // Seat ellenőrzés + atomikus foglalás feltétellel
+    const seatInc = await Tenant.updateOne(
+      { _id: toTenantId, 'seats.used': { $lt: toTenant.seats.max } },
+      { $inc: { 'seats.used': 1 } }
+    );
+    if (!seatInc?.acknowledged || seatInc.modifiedCount !== 1) {
+      return res.status(400).json({ error: 'Nincs szabad seat a cél tenantban.' });
+    }
+
+    // Migráció a user korábbi tenantjáról az újra (best-effort)
+    if (fromTenantId) {
+      try { await migrateAllUserDataToTenant(fromTenantId, toTenantId); } catch (_) {}
+    }
+
+    // User áthelyezés (szerepkört nem írjuk felül itt)
+    user.tenantId = toTenantId;
+    await user.save();
+
+    // Forrás tenant used-- (ha volt) – feltételes, hogy ne menjen 0 alá
+    if (fromTenantId) {
+      await Tenant.updateOne(
+        { _id: fromTenantId, 'seats.used': { $gt: 0 } },
+        { $inc: { 'seats.used': -1 } }
+      );
+    }
+
+    return res.json({ message: '✅ Felhasználó áthelyezve a cél tenantba.' });
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
   }
 };
 

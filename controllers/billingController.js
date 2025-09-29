@@ -11,6 +11,9 @@ if (stripeKey) {
     stripe = new Stripe(stripeKey, { apiVersion: '2024-06-20' });
 }
 
+// Env-driven toggle for phone collection in Checkout (default: false)
+const COLLECT_PHONE = String(process.env.STRIPE_CHECKOUT_COLLECT_PHONE || 'false').toLowerCase() === 'true';
+
 // kis helper, hogy endpoint elején ellenőrizzünk
 function requireStripeOrFail(res) {
     if (!stripe) {
@@ -173,6 +176,15 @@ exports.createCheckoutSession = async (req, res) => {
                     price: chosenPriceId,
                     quantity: qty,
                 }],
+                // Collect full billing details & tax IDs in Checkout
+                billing_address_collection: 'required',
+                tax_id_collection: { enabled: true },
+                // Optional: collect phone number (env-controlled)
+                phone_number_collection: { enabled: COLLECT_PHONE },
+                // Enable Stripe Tax (if configured on Dashboard)
+                automatic_tax: { enabled: true },
+                // Copy name & address from Checkout to the Customer automatically
+                customer_update: { address: 'auto', name: 'auto' },
                 allow_promotion_codes: true,
                 client_reference_id: String(tenant._id),
                 success_url: SUCCESS_URL + '?session_id={CHECKOUT_SESSION_ID}',
@@ -221,6 +233,15 @@ exports.createCheckoutSession = async (req, res) => {
                         price: chosenPriceId,
                         quantity: qty,
                     }],
+                    // Collect full billing details & tax IDs in Checkout
+                    billing_address_collection: 'required',
+                    tax_id_collection: { enabled: true },
+                    // Optional: collect phone number (env-controlled)
+                    phone_number_collection: { enabled: COLLECT_PHONE },
+                    // Enable Stripe Tax (if configured on Dashboard)
+                    automatic_tax: { enabled: true },
+                    // Copy name & address from Checkout to the Customer automatically
+                    customer_update: { address: 'auto', name: 'auto' },
                     allow_promotion_codes: true,
                     client_reference_id: clientRef,
                     success_url: SUCCESS_URL + '?session_id={CHECKOUT_SESSION_ID}',
@@ -260,6 +281,15 @@ exports.createCheckoutSession = async (req, res) => {
                         price: chosenPriceId,
                         quantity: qty,
                     }],
+                    // Collect full billing details & tax IDs in Checkout
+                    billing_address_collection: 'required',
+                    tax_id_collection: { enabled: true },
+                    // Optional: collect phone number (env-controlled)
+                    phone_number_collection: { enabled: COLLECT_PHONE },
+                    // Enable Stripe Tax (if configured on Dashboard)
+                    automatic_tax: { enabled: true },
+                    // Copy name & address from Checkout to the Customer automatically
+                    customer_update: { address: 'auto', name: 'auto' },
                     allow_promotion_codes: true,
                     client_reference_id: String(tenant._id),
                     success_url: SUCCESS_URL + '?session_id={CHECKOUT_SESSION_ID}',

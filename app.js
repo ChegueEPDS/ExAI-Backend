@@ -34,6 +34,7 @@ const billingRoutes = require('./routes/billing');
 const billingWebhook = require('./routes/billingWebhook');
 const upgradeRoutes = require('./routes/upgrade');
 const tenantRoutes = require('./routes/tenantRoutes');
+const inviteRoutes = require('./routes/inviteRoutes');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -184,6 +185,7 @@ app.use('/api', notificationsRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api', upgradeRoutes);
 app.use('/api', tenantRoutes);
+app.use('/api', inviteRoutes);
 
 /**
  * -----------------------------
