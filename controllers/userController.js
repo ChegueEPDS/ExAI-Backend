@@ -6,6 +6,9 @@ const DownloadQuota = require('../models/downloadQuota');
 const Subscription = require('../models/subscription');
 const SubscriptionModel = Subscription; // alias for clarity if needed elsewhere
 const Tenant = require('../models/tenant');
+
+const mailService = require('../services/mailService');
+const { tenantInviteEmailHtml } = require('../services/mailTemplates');
 const { migrateAllUserDataToTenant } = require('../services/tenantMigration');
 
 // --- Daily download quota (Free plan) helpers ---
@@ -251,7 +254,7 @@ exports.moveUserToTenant = async (req, res) => {
       return res.json({ message: 'User már a cél tenantban van. Nincs teendő.' });
     }
 
-    const toTenant = await Tenant.findById(toTenantId).select('seats').lean();
+    const toTenant = await Tenant.findById(toTenantId).select('seats name').lean();
     if (!toTenant) return res.status(404).json({ error: 'Cél tenant nem található.' });
 
     // Seat ellenőrzés + atomikus foglalás feltétellel
@@ -279,6 +282,29 @@ exports.moveUserToTenant = async (req, res) => {
         { $inc: { 'seats.used': -1 } }
       );
     }
+
+    // --- fire-and-forget tenant-added e-mail ---
+    (async () => {
+      try {
+        const appBase = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
+        const html = tenantInviteEmailHtml({
+          firstName: user.firstName || '',
+          lastName:  user.lastName  || '',
+          tenantName: (toTenant && toTenant.name) || 'your organization',
+          loginUrl: appBase,
+          password: req.body?.generatedPassword || user._tempGeneratedPassword || null,
+        });
+        await mailService.sendMail({
+          to: user.email,
+          subject: `You have been added to ${(toTenant && toTenant.name) || 'ATEXdb Certs'}`,
+          html,
+          from: process.env.MAIL_SENDER_UPN, // app-perm küldő (UPN/GUID)
+        });
+        console.log('[mail] Tenant-added email sent to', user.email);
+      } catch (err) {
+        console.warn('[mail] Tenant-added e-mail failed:', err?.message || err);
+      }
+    })();
 
     return res.json({ message: '✅ Felhasználó áthelyezve a cél tenantba.' });
   } catch (e) {
@@ -376,7 +402,7 @@ async function createTenantForRegistration({ plan, companyName, ownerUserId }) {
 //  - Does NOT start Stripe automatically (frontend can call a billing endpoint after)
 //  - Returns minimal safe payload
 // ---------------------------
-exports.register = async (req, res) => {
+/*exports.register = async (req, res) => {
   try {
     const {
       email,
@@ -427,6 +453,27 @@ exports.register = async (req, res) => {
       user.role = 'Admin';
     }
     await user.save();
+
+    // Fire-and-forget welcome e-mail (do not block registration flow)
+    (async () => {
+      try {
+        const loginUrl = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
+        const html = registrationEmailHtml({
+          firstName: user.firstName || '',
+          lastName:  user.lastName  || '',
+          loginUrl
+        });
+        await mailService.sendMail({
+          to: user.email,
+          subject: 'Welcome to ATEXdb Certs',
+          html,
+          from: process.env.MAIL_SENDER_UPN
+        });
+        console.log('[mail] Registration welcome email sent to', user.email);
+      } catch (err) {
+        console.warn('[mail] Registration e-mail failed:', err?.message || err);
+      }
+    })();
 
     // NOTE: Stripe: frontend should now open a checkout session for pro/team.
     // We intentionally do not start Stripe here to keep controller cohesive.
@@ -489,7 +536,7 @@ exports.createTenant = async (req, res) => {
     console.error('createTenant error:', error);
     return res.status(500).json({ error: 'Internal server error' });
   }
-};
+}; */
 
 // ---------------------------
 // GET /api/users/me/quota

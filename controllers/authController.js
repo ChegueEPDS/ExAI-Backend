@@ -4,6 +4,8 @@ const { validationResult } = require('express-validator');
 const User = require('../models/user');
 const Tenant = require('../models/tenant');
 const Subscription = require('../models/subscription');
+const mailService = require('../services/mailService');
+const { registrationEmailHtml, forgotPasswordEmailHtml } = require('../services/mailTemplates');
 
 /**
  * ------------------------------------------------------------
@@ -17,6 +19,22 @@ const Subscription = require('../models/subscription');
  */
 
 // --------- Helpers ---------
+
+// Strong temporary password generator (2-2 lower/upper/digit/special)
+function generateTempPassword() {
+  const lowers = 'abcdefghijklmnopqrstuvwxyz';
+  const uppers = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const digits = '0123456789';
+  const specials = '!@#$%^&*()-_=+[]{};:,.?/';
+  const pick = s => s[Math.floor(Math.random() * s.length)];
+
+  let pwd = pick(lowers) + pick(lowers) +
+            pick(uppers) + pick(uppers) +
+            pick(digits) + pick(digits) +
+            pick(specials) + pick(specials);
+  // Shuffle
+  return pwd.split('').sort(() => Math.random() - 0.5).join('');
+}
 
 const pick = (obj, keys) => keys.reduce((o, k) => { o[k] = obj?.[k]; return o; }, {});
 
@@ -225,6 +243,26 @@ exports.register = async (req, res) => {
     user.tenantId = personalTenant._id;
     await user.save();
 
+    // Fire-and-forget: welcome email after successful registration
+    try {
+      const loginUrl = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
+      const html = registrationEmailHtml({
+        firstName: user.firstName || '',
+        lastName: user.lastName || '',
+        loginUrl
+      });
+      mailService.sendMail({
+        to: user.email,
+        subject: 'Welcome to ATEXdb Certs',
+        html,
+        from: process.env.MAIL_SENDER_UPN
+      })
+      .then(() => console.log('[mail] Registration welcome email sent to', user.email))
+      .catch(err => console.warn('[mail] Registration e-mail failed:', err?.message || err));
+    } catch (err) {
+      console.warn('[mail] Registration e-mail setup failed:', err?.message || err);
+    }
+
     const token = await signAccessTokenWithSubscription(user);
 
     return res.status(201).json({
@@ -390,5 +428,116 @@ exports.logout = (req, res) => {
     });
   } else {
     return res.status(200).json({ message: 'Successfully logged out' });
+  }
+};
+
+// ----------------------
+// 🔹 Forgot Password – generates a new temporary password and emails it
+//   Body: { email }
+//   Always returns 200 to avoid user enumeration.
+// ----------------------
+exports.forgotPassword = async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    const user = await User.findOne({ email });
+    // Respond 200 regardless, to avoid user enumeration
+    if (!user) {
+      return res.status(200).json({ message: 'If that email exists, a reset message has been sent.' });
+    }
+
+    // Generate and set temporary password
+    const tempPassword = generateTempPassword();
+    const hashed = await bcrypt.hash(tempPassword, 10);
+    user.password = hashed;
+    await user.save();
+
+    // Send email with the new temporary password
+    const loginUrl = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
+    const html = forgotPasswordEmailHtml({
+      firstName: user.firstName || '',
+      lastName: user.lastName || '',
+      loginUrl,
+      tempPassword
+    });
+
+    // fire-and-forget
+    mailService.sendMail({
+      to: email,
+      subject: 'Your ATEXdb Certs password reset',
+      html,
+      from: process.env.MAIL_SENDER_UPN
+    })
+    .then(() => console.log('[mail] Forgot password email sent to', email))
+    .catch(err => console.warn('[mail] Forgot password email failed:', err?.message || err));
+
+    return res.status(200).json({ message: 'If that email exists, a reset message has been sent.' });
+  } catch (error) {
+    console.error('❌ Forgot password error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * POST /api/auth/change-password
+ * Body: { newPassword: string, currentPassword?: string }
+ * Auth required
+ */
+exports.changePassword = async (req, res) => {
+  try {
+    const userId = req.scope?.userId || req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ message: 'Authentication required.' });
+    }
+
+    const { newPassword, currentPassword } = req.body || {};
+    if (!newPassword || typeof newPassword !== 'string' || !newPassword.trim()) {
+      return res.status(400).json({ message: 'New password is required.' });
+    }
+
+    // Alap jelszó policy – igény szerint szigorítható
+    const pwd = newPassword.trim();
+    const strongEnough =
+      pwd.length >= 8 &&
+      /[a-z]/.test(pwd) &&
+      /[A-Z]/.test(pwd) &&
+      /[0-9]/.test(pwd);
+    if (!strongEnough) {
+      return res.status(400).json({
+        message: 'Password is too weak. Use at least 8 characters with upper, lower case and a digit.'
+      });
+    }
+
+    const user = await User.findById(userId).select('+password'); // ha a sémában select:false volt
+    if (!user) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    // Ha van lokális jelszava a usernek és kaptunk currentPassword-t, akkor ellenőrizzük.
+    // (A jelenlegi UI nem kéri a régit, ezért opcionális marad.)
+    if (currentPassword && user.password) {
+      const ok = await bcrypt.compare(String(currentPassword), String(user.password));
+      if (!ok) {
+        return res.status(401).json({ message: 'Current password is incorrect.' });
+      }
+    }
+
+    // Hash + mentés
+    const hash = await bcrypt.hash(pwd, 10);
+    user.password = hash;
+    // ha volt valami flag a kényszerített jelszócserére:
+    if (user.forcePasswordChange) user.forcePasswordChange = false;
+
+    await user.save();
+
+    // (Opcionális) – ha szeretnéd a régi session érvénytelenítését, itt megteheted (token blacklist / token ver. bump).
+
+    return res.json({ message: 'Password updated successfully.' });
+  } catch (e) {
+    console.error('[auth/change-password] error', e);
+    return res.status(500).json({ message: 'Failed to change password.' });
   }
 };

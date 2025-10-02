@@ -1,214 +1,189 @@
 // controllers/inviteController.js
-const mongoose = require('mongoose');
-const Invite = require('../models/invite');
 const Tenant = require('../models/tenant');
 const User = require('../models/user');
-const { migrateAllUserDataToTenant } = require('../services/tenantMigration');
+const bcrypt = require('bcrypt');
+const mailService = require('../services/mailService');
+const { tenantInviteEmailHtml } = require('../services/mailTemplates');
+
+/** Erős ideiglenes jelszó (2-2 kis/nagy/ szám/ spec) */
+function generatePassword() {
+  const lowers = 'abcdefghijklmnopqrstuvwxyz';
+  const uppers = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const digits = '0123456789';
+  const specials = '!@#$%^&*()-_=+[]{};:,.?/';
+  const pick = (s) => s[Math.floor(Math.random() * s.length)];
+
+  let pwd = pick(lowers) + pick(lowers) +
+            pick(uppers) + pick(uppers) +
+            pick(digits) + pick(digits) +
+            pick(specials) + pick(specials);
+  return pwd.split('').sort(() => Math.random() - 0.5).join('');
+}
 
 /**
- * POST /api/invitations
- * Body: { tenantId?, email?, role?, expiresInHours?, maxUses? }
- * Admin: csak a saját tenantjához hozhat létre. SuperAdmin bármelyikhez.
- * Visszaad: { code, token, link }
+ * POST /api/invitations  (LEGYEGYSZERŰSÍTETT FLOW)
+ * Body: { tenantId?, email (required), role?('User'|'Admin'), firstName?, lastName?, nickname? }
+ *
+ * - Admin: csak a saját tenantjába hívhat; SuperAdmin: bármelyikbe.
+ * - Ha az e-mail nem létezik:
+ *    - seat +1 (atomikus check)
+ *    - user létrehozása generált jelszóval és tenantId-vel
+ *    - e-mail küldés jelszóval
+ * - Ha létező user tenant nélkül:
+ *    - seat +1 (atomikus check)
+ *    - hozzárendelés a tenantodhoz (role beállítás), név kitöltése ha hiányzott
+ *    - e-mail küldés (jelszó nélkül)
+ * - Ha már a cél tenant tagja:
+ *    - nincs seat módosítás
+ *    - e-mail küldés (jelszó nélkül)
+ * - Ha másik tenant tagja → 409
+ *
+ * Front kompatibilitás:
+ *  Visszaküld egy "invite" objektumot (legacy mezőkkel null-ra állítva), és ha új user készült,
+ *  külön "tempPassword" mezőt is.
  */
 exports.createInvite = async (req, res) => {
-  const role = (req.role || '').toString();
+  const callerRole = (req.role || '').toString();
   const callerTenantId = req.scope?.tenantId || null;
 
   const {
     tenantId: bodyTenantId,
     email,
     role: targetRole = 'User',
-    expiresInHours = 168, // 7 nap
-    maxUses = 1
+    firstName: bodyFirstName,
+    lastName: bodyLastName,
+    nickname: bodyNickname,
   } = req.body || {};
 
-  const tenantId = role === 'SuperAdmin' ? (bodyTenantId || callerTenantId) : callerTenantId;
+  const tenantId = callerRole === 'SuperAdmin' ? (bodyTenantId || callerTenantId) : callerTenantId;
   if (!tenantId) return res.status(400).json({ error: 'tenantId hiányzik.' });
 
-  // Admin csak a saját tenantjára készíthet meghívót
-  if (role !== 'SuperAdmin' && String(tenantId) !== String(callerTenantId)) {
-    return res.status(403).json({ error: 'Csak a saját tenantodra hozhatsz létre meghívót.' });
+  if (callerRole !== 'SuperAdmin' && String(tenantId) !== String(callerTenantId)) {
+    return res.status(403).json({ error: 'Csak a saját tenantodra adhatsz hozzá felhasználót.' });
   }
 
-  // Minimális seat-ellenőrzés: legyen legalább 1 szabad (nem fogyaszt ekkor, csak check)
-  const t = await Tenant.findById(tenantId).select('seats').lean();
+  if (!email) {
+    return res.status(400).json({ error: 'email kötelező.' });
+  }
+  const normalizedEmail = String(email).trim().toLowerCase();
+
+  // Név fallback e-mailből, ha nem kaptunk
+  const emailLocal = normalizedEmail.split('@')[0];
+  let fallbackFirst = '';
+  let fallbackLast = '';
+  const parts = emailLocal.split('.');
+  if (parts.length >= 2) {
+    fallbackFirst = parts[0].charAt(0).toUpperCase() + parts[0].slice(1);
+    const lastRaw = parts.slice(1).join(' ');
+    fallbackLast = lastRaw.charAt(0).toUpperCase() + lastRaw.slice(1);
+  } else {
+    fallbackFirst = emailLocal.charAt(0).toUpperCase() + emailLocal.slice(1);
+    fallbackLast = 'User';
+  }
+  const firstName = bodyFirstName?.trim() || fallbackFirst || 'User';
+  const lastName  = bodyLastName?.trim()  || fallbackLast  || 'User';
+  const nickname  = bodyNickname?.trim()  || null;
+
+  // Tenant és seat meta
+  const t = await Tenant.findById(tenantId).select('seats plan name').lean();
   if (!t) return res.status(404).json({ error: 'Tenant nem található.' });
-  if ((t.seats?.max || 0) <= (t.seats?.used || 0)) {
-    return res.status(400).json({ error: 'Nincs szabad seat – nem hozható létre meghívó.' });
-  }
 
-  const code = Invite.generateCode();
-  const token = Invite.generateToken();
-  const expiresAt = new Date(Date.now() + Number(expiresInHours) * 3600 * 1000);
+  let user = await User.findOne({ email: normalizedEmail });
+  let createdNewUser = false;
+  let tempPassword = null;
 
-  const invite = await Invite.create({
-    tenantId,
-    email: email ? String(email).trim().toLowerCase() : undefined,
-    role: targetRole === 'Admin' ? 'Admin' : 'User', // ne engedjük feljebb
-    code,
-    token,
-    expiresAt,
-    maxUses: Math.max(1, Number(maxUses) || 1),
-    createdBy: req.scope?.userId || null
-  });
-
-  const link = `${process.env.APP_BASE_URL || 'https://app.example.com'}/accept-invite?token=${token}`;
-
-  return res.status(201).json({
-    message: 'Invite created.',
-    invite: {
-      id: invite._id,
-      tenantId,
-      email: invite.email || null,
-      role: invite.role,
-      code,
-      token,
-      link,
-      expiresAt,
-      maxUses: invite.maxUses
-    }
-  });
-};
-
-/**
- * POST /api/invitations/accept
- * Body: { token? , code? }
- * Auth szükséges: a meghívást **a belépett user** fogadja el.
- * Lépések (tranzakció):
- *  - Meghívó ellenőrzése (usable)
- *  - Seat foglalás (used +1, ha van hely)
- *  - (Ha user már ebben a tenantban van → idempotens: csak used nem nő)
- *  - Ha más tenantban volt → migráció + from.used--
- *  - user.role csak akkor frissül Adminra, ha invite.role='Admin' és a caller nem SuperAdmin (SuperAdmin marad)
- *  - usedCount++
- */
-/**
- * POST /api/invitations/accept
- * Body: { token? , code? }
- * Auth szükséges: a meghívást **a belépett user** fogadja el.
- * Non-transactional verzió, standalone MongoDB-hez.
- */
-exports.acceptInvite = async (req, res) => {
-  const userId = req.scope?.userId || req.user?.id;
-  if (!userId) return res.status(401).json({ error: 'Bejelentkezés szükséges a meghívás elfogadásához.' });
-
-  const { token, code } = req.body || {};
-  if (!token && !code) return res.status(400).json({ error: 'Adj meg token-t vagy kódot.' });
-
-  try {
-    const invite = await Invite.findOne(token ? { token } : { code });
-    if (!invite) return res.status(404).json({ error: 'Meghívó nem található.' });
-
-    // Usability check
-    if (!invite.isUsable()) return res.status(400).json({ error: 'Meghívó lejárt, felhasznált vagy visszavonva.' });
-
-    const user = await User.findById(userId);
-    if (!user) return res.status(404).json({ error: 'User nem található.' });
-
-    const toTenantId = String(invite.tenantId);
-    const fromTenantId = user.tenantId ? String(user.tenantId) : null;
-
-    // Ha már bent van → idempotens: csak meghívó számláló
-    if (String(user.tenantId) === toTenantId) {
-      invite.usedCount += 1;
-      if (invite.usedCount >= invite.maxUses) invite.status = 'expired';
-      await invite.save();
-      return res.json({ message: 'Már tagja vagy a tenantnak. Meghívó elfogadva (idempotens).' });
-    }
-
-    // Seat foglalás a cél tenantban – atomikus feltétellel
-    const toTenant = await Tenant.findById(toTenantId).select('seats').lean();
-    if (!toTenant) return res.status(404).json({ error: 'Cél tenant nem található.' });
-
+  if (!user) {
+    // seat +1 atomikusan
     const seatInc = await Tenant.updateOne(
-      { _id: toTenantId, 'seats.used': { $lt: toTenant.seats.max } },
+      { _id: tenantId, 'seats.used': { $lt: t.seats.max } },
       { $inc: { 'seats.used': 1 } }
     );
     if (!seatInc?.acknowledged || seatInc.modifiedCount !== 1) {
-      return res.status(400).json({ error: 'Nincs szabad seat a cél tenantban.' });
+      return res.status(400).json({ error: 'Nincs szabad seat a tenantban.' });
     }
 
-    // Migráció (ha volt forrás tenant)
-    if (fromTenantId) {
-      try { await migrateAllUserDataToTenant(fromTenantId, toTenantId); } catch (_) {}
-    }
+    // Új user generált jelszóval
+    tempPassword = generatePassword();
+    const hash = await bcrypt.hash(String(tempPassword), 10);
+    user = await User.create({
+      email: normalizedEmail,
+      password: hash,
+      firstName,
+      lastName,
+      nickname,
+      role: targetRole === 'Admin' ? 'Admin' : 'User',
+      tenantId,
+      subscriptionTier: t.plan || 'free',
+    });
+    createdNewUser = true;
+  } else {
+    const currentTenant = user.tenantId ? String(user.tenantId) : null;
 
-    // User átpakolása + szerepkör (SuperAdmin-t nem írjuk felül)
-    user.tenantId = toTenantId;
-    if (user.role !== 'SuperAdmin' && invite.role === 'Admin') {
-      user.role = 'Admin';
-    }
-    await user.save();
-
-    // Forrás tenant felszabadítás
-    if (fromTenantId) {
-      await Tenant.updateOne(
-        { _id: fromTenantId, 'seats.used': { $gt: 0 } },
-        { $inc: { 'seats.used': -1 } }
+    if (!currentTenant) {
+      // seat +1 és hozzárendelés
+      const seatInc = await Tenant.updateOne(
+        { _id: tenantId, 'seats.used': { $lt: t.seats.max } },
+        { $inc: { 'seats.used': 1 } }
       );
+      if (!seatInc?.acknowledged || seatInc.modifiedCount !== 1) {
+        return res.status(400).json({ error: 'Nincs szabad seat a tenantban.' });
+      }
+      user.tenantId = tenantId;
+      if (user.role !== 'SuperAdmin') {
+        user.role = targetRole === 'Admin' ? 'Admin' : 'User';
+      }
+      if ((!user.firstName || !user.firstName.trim()) && firstName) user.firstName = firstName;
+      if ((!user.lastName  || !user.lastName.trim())  && lastName)  user.lastName  = lastName;
+      if ((!user.nickname  || !user.nickname.trim())  && nickname)  user.nickname  = nickname;
+      await user.save();
+    } else if (currentTenant === String(tenantId)) {
+      // már tag → nincs seat módosítás
+    } else {
+      // másik tenant tagja → explicit flow
+      return res.status(409).json({ error: 'A megadott e-mail már másik tenant tagja. Használd az áthelyezés folyamatot.' });
     }
-
-    // Meghívó fogyasztása
-    invite.usedCount += 1;
-    if (invite.usedCount >= invite.maxUses) invite.status = 'expired';
-    await invite.save();
-
-    return res.json({ message: '✅ Meghívás elfogadva, csatlakoztál a tenanthoz.' });
-  } catch (e) {
-    return res.status(400).json({ error: e.message });
   }
-};
 
-/**
- * GET /api/invitations/open?token=...
- * - Frontend validációhoz: visszaadja a meghívó metaadatait (tenant neve, role, lejárat).
- */
-exports.openInvite = async (req, res) => {
-  const { token } = req.query || {};
-  if (!token) return res.status(400).json({ error: 'Hiányzó token.' });
+  // --- E-mail (fire-and-forget) ---
+  (async () => {
+    try {
+      const loginUrl = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
+      const html = tenantInviteEmailHtml({
+        firstName: user.firstName || '',
+        lastName:  user.lastName  || '',
+        tenantName: t?.name || 'your organization',
+        loginUrl,
+        password: createdNewUser ? tempPassword : null, // csak új usernél
+      });
 
-  const invite = await Invite.findOne({ token }).populate('tenantId', 'name type plan seats').lean();
-  if (!invite) return res.status(404).json({ error: 'Meghívó nem található.' });
+      await mailService.sendMail({
+        to: normalizedEmail,
+        subject: createdNewUser
+          ? `You have been invited to ${t?.name || 'ATEXdb Certs'}`
+          : `You have been added to ${t?.name || 'ATEXdb Certs'}`,
+        html,
+        from: process.env.MAIL_SENDER_UPN,
+      });
+      console.log('[mail] invite sent →', normalizedEmail, 'newUser=', createdNewUser);
+    } catch (err) {
+      console.warn('[mail] invite send failed:', err?.message || err);
+    }
+  })();
 
-  const usable = (new Invite(invite)).isUsable(); // gyors ellenőrzés
-  return res.json({
-    usable,
+  // Front kompatibilis válasz (legacy invite mezők null-lal)
+  return res.status(201).json({
+    message: 'User added to tenant.',
     invite: {
-      tenantName: invite.tenantId?.name || null,
-      tenantType: invite.tenantId?.type || null,
-      plan: invite.tenantId?.plan || null,
-      role: invite.role,
-      expiresAt: invite.expiresAt,
-      usedCount: invite.usedCount,
-      maxUses: invite.maxUses,
-      status: invite.status
-    }
+      id: null,
+      tenantId,
+      email: normalizedEmail,
+      role: targetRole === 'Admin' ? 'Admin' : 'User',
+      code: null,
+      token: null,
+      link: null,
+      expiresAt: null,
+      maxUses: 1,
+    },
+    tempPassword: createdNewUser ? tempPassword : null,
   });
-};
-
-/**
- * POST /api/invitations/revoke
- * Body: { id? , token? , code? }
- * - Meghívó visszavonása (Admin/SuperAdmin)
- */
-exports.revokeInvite = async (req, res) => {
-  const role = (req.role || '').toString();
-  const callerTenantId = req.scope?.tenantId || null;
-  const { id, token, code } = req.body || {};
-
-  const q = id ? { _id: id } : token ? { token } : code ? { code } : null;
-  if (!q) return res.status(400).json({ error: 'Adj meg id/token/code értéket.' });
-
-  const invite = await Invite.findOne(q);
-  if (!invite) return res.status(404).json({ error: 'Meghívó nem található.' });
-
-  // Admin csak saját tenant meghívóját vonhatja vissza
-  if (role !== 'SuperAdmin' && String(invite.tenantId) !== String(callerTenantId)) {
-    return res.status(403).json({ error: 'Nincs jogosultság a meghívó visszavonásához.' });
-  }
-
-  invite.status = 'revoked';
-  await invite.save();
-  return res.json({ message: 'Meghívó visszavonva.' });
 };
