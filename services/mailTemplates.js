@@ -71,7 +71,7 @@ function tenantInviteEmailHtml({ firstName, lastName, tenantName, loginUrl, pass
           Log in to ATEXdb Certs
         </a>
       </p>
-      <p>Best regards,<br/>The ATEXdb Team<br/><a href="www.atexdb.eu">www.atexdb.eu</a></p>
+      <p>Best regards,<br/>The ATEXdb Team<br/><a href="certs.atexdb.eu">certs.atexdb.eu</a></p>
     `,
   });
 }
