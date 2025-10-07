@@ -2,6 +2,7 @@
 const express = require('express');
 const { body } = require('express-validator');
 const { register, login, logout, renewToken, microsoftLogin, forgotPassword, changePassword } = require('../controllers/authController');
+const captchaVerify = require('../middlewares/captchaMiddleware');
 
 // mindkét forma működik, de most named exportot használunk
 const { requireAuth } = require('../middlewares/authMiddleware');
@@ -15,11 +16,11 @@ router.post('/register', [
   body('password').isLength({ min: 6 }),
 ], register);
 
-router.post('/login', login);
+router.post('/login', captchaVerify,login);
 router.post('/microsoft-login', microsoftLogin);
 router.post('/renew-token', requireAuth, renewToken);
 router.post('/logout', requireAuth, logout);
-router.post('/auth/forgot-password', forgotPassword);
+router.post('/auth/forgot-password', captchaVerify, forgotPassword);
 router.post('/auth/change-password', requireAuth, changePassword);
 
 module.exports = router;

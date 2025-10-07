@@ -1,6 +1,7 @@
+// middlewares/rateLimiter.js
 const rateLimit = require('express-rate-limit');
 
-// Általános limiter – minden API-ra (kivéve SSE és login)
+// Általános limiter – minden API-ra (kivéve SSE/multipart upload stream és login)
 const generalLimiter = rateLimit({
   windowMs: 30 * 60 * 1000, // 30 perc
   max: 1000,                // Max 1000 kérés / IP / 30 perc
@@ -24,13 +25,31 @@ const loginLimiter = rateLimit({
   }
 });
 
+// Feltöltős SSE végpontok (multipart + stream)
+const sseUploadPaths = new Set([
+  '/api/upload-and-summarize/stream',
+  '/api/upload-and-ask/stream'
+]);
+
 module.exports = (req, res, next) => {
   // SSE kivételek
   if (
     req.path === '/api/notifications/stream' ||
-    /^\/api\/dxf\/stream\/[^/]+$/i.test(req.path)
+    /^\/api\/dxf\/stream\/[^/]+$/i.test(req.path) ||
+    req.path === '/api/upload-and-summarize/stream' ||   // <-- ÚJ
+    req.path === '/api/upload-and-ask/stream'            // <-- ÚJ
   ) {
     return next();
+  }
+
+  // ÚJ: multipart feltöltős SSE végpontoknál NE limitáljunk
+  if (sseUploadPaths.has(req.path)) {
+    const ct = (req.headers['content-type'] || '').toLowerCase();
+    const isMultipart = ct.startsWith('multipart/form-data');
+    if (isMultipart) {
+      return next();
+    }
+    // ha valaki nem multiparttal lövi, sima limiter mehet rá
   }
 
   // Login / auth végpontokra a szigorú limiter

@@ -136,32 +136,44 @@ app.use((req, res, next) => {
   next();
 });
 
-// SSE hardening for the stream endpoint
+// SSE hardening for the stream endpoints – SKIP for multipart/form-data uploads
 app.use((req, res, next) => {
-  if (req.path === '/api/upload-and-summarize/stream') {
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no'); // nginx: disable buffering
-    res.setHeader('Vary', 'Origin');
+  const ssePaths = new Set([
+    '/api/upload-and-summarize/stream',
+    '/api/upload-and-ask/stream'
+  ]);
 
-    // avoid idle timeouts on this request only
-    if (res.socket && typeof res.socket.setTimeout === 'function') {
-      res.socket.setTimeout(0);
+  // Ha ez az egyik stream path, de a kérés multipart/form-data -> ne tegyünk SSE header-t itt!
+  if (ssePaths.has(req.path)) {
+    const ct = (req.headers['content-type'] || '').toLowerCase();
+    const isMultipart = ct.startsWith('multipart/form-data');
+
+    if (!isMultipart) {
+      // Csak NEM-multipart esetben tegyünk SSE fejléceket itt
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.setHeader('Vary', 'Origin');
+
+      if (res.socket && typeof res.socket.setTimeout === 'function') {
+        res.socket.setTimeout(0);
+      }
+      if (req.socket && typeof req.socket.setKeepAlive === 'function') {
+        req.socket.setKeepAlive(true);
+      }
+
+      // FONTOS: multipartnál NE flush-oljunk itt!
+      // if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+      req.isSSE = true;
     }
-    if (req.socket && typeof req.socket.setKeepAlive === 'function') {
-      req.socket.setKeepAlive(true);
-    }
-
-    // if your handler uses res.write() immediately, you can flush headers:
-    if (typeof res.flushHeaders === 'function') res.flushHeaders();
-
-    req.isSSE = true; // jelölő, ha a controllerben használni szeretnéd
   }
   next();
 });
 
 // (opcionális) explicit OPTIONS a streamre – a globális CORS amúgy is kezeli
 app.options('/api/upload-and-summarize/stream', cors({ origin: true, credentials: true }));
+app.options('/api/upload-and-ask/stream', cors({ origin: true, credentials: true }));
 
 // Use routes
 app.use('/api', authRoutes);
