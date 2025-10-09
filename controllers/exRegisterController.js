@@ -1,3 +1,4 @@
+// controllers/exRegisterController.js
 const Equipment = require('../models/dataplate');
 const Zone = require('../models/zone')
 const Site = require('../models/site');

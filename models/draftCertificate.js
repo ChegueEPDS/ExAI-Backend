@@ -16,12 +16,8 @@ const DraftCertificateSchema = new mongoose.Schema({
   docxId: String,
   folderId: String,
   folderUrl: String,
-  sharePointFileUrl: String,
-  sharePointDocxUrl: String,
-  sharePointFileId: String,
-  sharePointDocxId: String,
-  sharePointFolderId: String,
-  sharePointFolderUrl: String,
+  blobPdfPath: { type: String },   // pl. "certificates/uploads/<uploadId>/<fileName>.pdf"
+  blobDocxPath: { type: String },  // pl. "certificates/uploads/<uploadId>/<fileName>.docx"
 
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,

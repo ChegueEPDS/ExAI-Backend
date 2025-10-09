@@ -1,3 +1,4 @@
+// routes/certificateDraftRoutes.js
 const express = require('express');
 const router = express.Router();
 const certificateDraftController = require('../controllers/certificateDraftController');
@@ -15,5 +16,6 @@ router.delete('/certificates/uploads/:uploadId', authMiddleware(), certificateDr
 router.get('/certificates/drafts/by-id/:id/pdf', authMiddleware(), certificateDraftController.getDraftPdfById);
 router.delete('/certificates/drafts/by-id/:id', authMiddleware(), certificateDraftController.deleteDraftById);
 router.get('/certificates/drafts/pending/count', authMiddleware(), certificateDraftController.countMyPendingDrafts);
+router.get('/certificates/drafts/by-id/:id/pdf-sas', authMiddleware(), certificateDraftController.getDraftPdfSasById);
 
 module.exports = router;

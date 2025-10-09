@@ -1,4 +1,4 @@
-/* siteController.js: */
+// controllers/siteController.js
 const Site = require('../models/site'); // Importáljuk a Site modellt
 const User = require('../models/user'); // Importáljuk a User modellt
 const Zone = require('../models/zone'); // Ez kell a file tetejére is

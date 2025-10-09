@@ -1,3 +1,4 @@
+// controllers/certificateController.js
 const fs = require('fs');
 const path = require('path');
 const Certificate = require('../models/certificate');

@@ -1,9 +1,12 @@
+//controllers/certificateDraftController.js
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const https = require('https');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 const { uploadPdfWithFormRecognizerInternal } = require('../helpers/ocrHelper');
-const { generateDocxFile } = require('../helpers/docx');
+const { generateDocxFile, generateDocxBuffer } = require('../helpers/docx');
 const azureBlobService = require('../services/azureBlobService');
 const { notifyAndStore } = require('../lib/notifications/notifier');
 
@@ -74,6 +77,95 @@ async function promisePool(items, limit, worker) {
 }
 // -------------------------------------------------------------------
 
+// ---- transient error retry helper (exponential backoff + jitter) ----
+function shouldRetryOpenAI(err) {
+  const msg = (err && (err.message || err.toString())) || '';
+  // common transient markers: 429/5xx/upstream/connect/timeouts/resets
+  return /\b(429|5\d\d|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND)\b/i.test(msg)
+      || /upstream connect error/i.test(msg)
+      || /connection (timeout|terminated|reset)/i.test(msg)
+      || /temporarily unavailable/i.test(msg)
+      || /timeout of \d+ms exceeded/i.test(msg)
+      || /\brequest timed out\b/i.test(msg)
+      || /\bdeadline exceeded\b/i.test(msg)
+      || /\btimeout\b/i.test(msg);
+}
+
+async function retryWithBackoff(fn, opts = {}) {
+  const {
+    retries = parseInt(process.env.OPENAI_RETRY_ATTEMPTS || '5', 10),
+    baseMs = parseInt(process.env.OPENAI_RETRY_BASE_MS || '500', 10),
+    factor = 2,
+    maxDelayMs = parseInt(process.env.OPENAI_RETRY_MAX_MS || '5000', 10),
+    jitter = 0.2,
+    label = 'openai-call',
+    isRetryable = shouldRetryOpenAI,
+    onRetry = (e, attempt, delay) => {
+      try { console.warn(`[retry:${label}] attempt ${attempt} failed:`, e?.message || e); } catch {}
+    }
+  } = opts;
+
+  let attempt = 0;
+  // first try immediately, then retry up to `retries` times
+  while (true) {
+    try {
+      return await fn();
+    } catch (e) {
+      attempt++;
+      if (attempt > retries || !isRetryable(e)) {
+        throw e;
+      }
+      const exp = Math.min(maxDelayMs, Math.round(baseMs * Math.pow(factor, attempt - 1)));
+      const jitterDelta = exp * jitter;
+      const delay = Math.max(0, Math.round(exp + (Math.random() * 2 - 1) * jitterDelta));
+      onRetry(e, attempt, delay);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+}
+// --------------------------------------------------------------------
+
+// ---- blob move with incrementing version suffix (_2, _3, ...) ----
+async function moveBlobWithVersioning(srcPath, baseName, ext) {
+  try { if (!srcPath) return null; } catch {}
+  const cleanBase = String(baseName || '').trim().replace(/\.pdf$/i, '').replace(/\.docx$/i, '');
+  const cleanExt = String(ext || '').replace(/^\./, '').toLowerCase();
+  const makeDest = (b) => `certificates/${b}/${b}.${cleanExt}`;
+
+  // target without version
+  let targetBase = cleanBase;
+  let dest = makeDest(targetBase);
+
+  if (srcPath === dest) return dest; // already at final place
+
+  // first try plain move
+  try {
+    await azureBlobService.renameFile(srcPath, dest);
+    return dest;
+  } catch (e) {
+    console.warn(`⚠️ Blob rename failed ${srcPath} -> ${dest}: ${e?.message || e}`);
+  }
+
+  // incrementing version suffix
+  for (let n = 2; n <= 99; n++) {
+    const vBase = `${cleanBase}_${n}`;
+    const vDest = makeDest(vBase);
+    try {
+      await azureBlobService.renameFile(srcPath, vDest);
+      console.warn(`⚠️ Target existed; stored as versioned name: ${vDest}`);
+      return vDest;
+    } catch (e2) {
+      // continue to next version
+      console.warn(`⚠️ Blob rename (try _${n}) failed ${srcPath} -> ${vDest}: ${e2?.message || e2}`);
+    }
+  }
+
+  // Give up: leave src in place so process doesn't fail
+  console.warn(`⚠️ Could not move blob to any versioned destination for base="${cleanBase}", ext="${cleanExt}". Keeping source: ${srcPath}`);
+  return srcPath;
+}
+// ------------------------------------------------------------------
+
 // ---- local FS cleanup helpers ----
 function safeUnlink(p) {
   try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {}
@@ -87,6 +179,26 @@ function removeDraftFolderIfEmpty(uploadId) {
     }
   } catch {}
 }
+
+// ---- blob download via SAS (no SDK dependency here) ----
+function downloadHttpsToBuffer(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      if (res.statusCode && res.statusCode >= 400) {
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      const chunks = [];
+      res.on('data', (d) => chunks.push(d));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+    }).on('error', reject);
+  });
+}
+
+async function downloadBlobToBufferViaSAS(blobPath, ttlSeconds = 600) {
+  const sasUrl = await azureBlobService.getReadSasUrl(blobPath, ttlSeconds);
+  return await downloadHttpsToBuffer(sasUrl);
+}
+// -------------------------------------------------------------------
 
 
 // 🔹 POST /api/certificates/bulk-upload
@@ -107,23 +219,30 @@ exports.bulkUpload = [
         return res.status(403).json({ error: 'Missing tenantId or user from auth' });
       }
       const createdBy = ownerUserId;
-      const targetDir = path.join('storage', 'certificates', 'draft', uploadId);
 
-      fs.mkdirSync(targetDir, { recursive: true });
-
-      // 🔹 2. Minden fájlt átmásolunk a draft mappába
+      // 🔹 2. Közvetlen blob-feltöltés (nincs lokális storage)
       for (const file of req.files) {
-        const targetPath = path.join(targetDir, file.originalname);
-        fs.renameSync(file.path, targetPath); // áthelyezés uploads → draft mappa
+        // 🔹 2. Közvetlen blob-feltöltés (nincs lokális storage)
+        const blobFolder = `certificates/uploads/${uploadId}`;
+        const blobPdfPath = `${blobFolder}/${file.originalname}`;
+        try {
+          await azureBlobService.uploadFile(file.path, blobPdfPath);
+        } catch (e) {
+          console.warn(`⚠️ Blob upload failed for ${file.originalname}:`, e.message);
+        } finally {
+          // töröljük a multer ideiglenes fájlt
+          try { if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path); } catch {}
+        }
 
-        // 🔹 3. Mentés az ideiglenes DB-be
+        // 🔹 3. Mentés az ideiglenes DB-be (lokális elérési útvonalak nélkül)
         await DraftCertificate.create({
           tenantId,
           uploadId,
           fileName: file.originalname,
-          originalPdfPath: targetPath,
+          originalPdfPath: null,     // nincs lokális storage
           status: 'draft',
           createdBy,
+          blobPdfPath               // elmentjük a blob útvonalat
         });
       }
 
@@ -147,24 +266,55 @@ async function _processDraftsInternal(uploadId) {
 
     await promisePool(drafts, FILE_CONCURRENCY, async (draft) => {
       try {
-        const pdfBuffer = fs.readFileSync(draft.originalPdfPath);
-
-        // 1) OCR
-        const { recognizedText } = await uploadPdfWithFormRecognizerInternal(pdfBuffer);
+        // 1) OCR közvetlenül SAS URL-ről (nincs buffer letöltés), buffer fallback-kal
+        let recognizedText;
+        if (draft.blobPdfPath) {
+          const sasUrl = await azureBlobService.getReadSasUrl(draft.blobPdfPath, { ttlSeconds: 600 });
+          const res = await retryWithBackoff(
+            () => uploadPdfWithFormRecognizerInternal({ sourceUrl: sasUrl }),
+            { label: 'formRecognizer-url' }
+          );
+          recognizedText = res.recognizedText;
+        } else if (draft.originalPdfPath && fs.existsSync(draft.originalPdfPath)) {
+          // Fallback: ha valamiért nincs blob (ritka)
+          const buf = fs.readFileSync(draft.originalPdfPath);
+          const res = await retryWithBackoff(
+            () => uploadPdfWithFormRecognizerInternal(buf),
+            { label: 'formRecognizer-buffer-fallback' }
+          );
+          recognizedText = res.recognizedText;
+        } else {
+          throw new Error('No PDF source found for OCR (blobPdfPath and originalPdfPath both missing)');
+        }
 
         // 2) OpenAI kivonat (backoff + hosszabb timeout a helperben)
-        const extractedData = await extractCertFieldsFromOCR(recognizedText);
+        const extractedData = await retryWithBackoff(
+          () => extractCertFieldsFromOCR(recognizedText),
+          { label: 'extractCertFieldsFromOCR' }
+        );
 
-        // 3) DOCX
+        // 3) DOCX (buffer → blob) – kerüljük a lemezt a controllerben
         const originalFileName = draft.fileName.replace(/\.pdf$/i, '');
         const docxFileName = `${originalFileName}.docx`;
-        const docxFullPath = path.join(path.dirname(draft.originalPdfPath), docxFileName);
-        await generateDocxFile(recognizedText, originalFileName, extractedData?.scheme || 'ATEX', docxFullPath);
+        let blobDocxPath = null;
+        try {
+          const docxBuffer = await generateDocxBuffer(recognizedText, originalFileName, extractedData?.scheme || 'ATEX');
+          const blobFolder = `certificates/uploads/${draft.uploadId}`;
+          blobDocxPath = `${blobFolder}/${docxFileName}`;
+          await azureBlobService.uploadBuffer(
+            blobDocxPath,
+            docxBuffer,
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+          );
+        } catch (e) {
+          console.warn(`⚠️ Blob DOCX upload (buffer) failed for ${draft.fileName}:`, e.message);
+        }
 
-        // 4) Mentés
+        // 5) Mentés (lokális docxPath nélkül)
         draft.recognizedText = recognizedText;
         draft.extractedData = extractedData;
-        draft.docxPath = docxFullPath;
+        draft.docxPath = null;           // nincs lokális storage
+        draft.blobDocxPath = blobDocxPath;
         draft.status = 'ready';
         await draft.save();
 
@@ -281,6 +431,9 @@ exports.getDraftsByUploadId = async (req, res) => {
       status: draft.status,
       docxPath: draft.docxPath,
       pdfPath: draft.originalPdfPath,
+      blobPdfPath: draft.blobPdfPath || null,
+      blobDocxPath: draft.blobDocxPath || null,
+      fileUrl: draft.blobPdfPath || null,
       extractedData: draft.extractedData,
       error: draft.status === 'error' ? 'Feldolgozási hiba' : null
     }));
@@ -428,29 +581,14 @@ exports.finalizeDrafts = async (req, res) => {
         const bodyOverrides = overridesMap[idKey] || overridesMap[draft.fileName] || null;
         const merged = { ...data, ...sanitizeOverrides(bodyOverrides || {}) };
 
-        const pdfFileName = draft.fileName;
-        const docxFileName = path.basename(draft.docxPath || `${draft.fileName}.docx`);
-        const blobFolder = `certificates/${merged.certNo || draft.fileName}`;
+        // Véglegesítéskor: mozgatás a végleges helyre: certificates/<certNo>/<base>.(pdf|docx)
+        const baseName = String((merged.certNo || draft.fileName || '')).replace(/\.pdf$/i, '').trim() || draft.fileName.replace(/\.pdf$/i, '');
 
-        let uploadedPdf = null;
-        if (fs.existsSync(draft.originalPdfPath)) {
-          try {
-            await azureBlobService.uploadFile(draft.originalPdfPath, `${blobFolder}/${pdfFileName}`);
-            uploadedPdf = `${blobFolder}/${pdfFileName}`;
-          } catch (err) {
-            console.warn(`⚠️ Blob PDF upload failed for ${pdfFileName}:`, err.message);
-          }
-        }
+        const srcPdf = draft.blobPdfPath || null;
+        const srcDocx = draft.blobDocxPath || null;
 
-        let uploadedDocx = null;
-        if (draft.docxPath && fs.existsSync(draft.docxPath)) {
-          try {
-            await azureBlobService.uploadFile(draft.docxPath, `${blobFolder}/${docxFileName}`);
-            uploadedDocx = `${blobFolder}/${docxFileName}`;
-          } catch (err) {
-            console.warn(`⚠️ Blob DOCX upload failed for ${docxFileName}:`, err.message);
-          }
-        }
+        const uploadedPdf  = await moveBlobWithVersioning(srcPdf,  baseName, 'pdf');
+        const uploadedDocx = await moveBlobWithVersioning(srcDocx, baseName, 'docx');
 
         const doc = {
           tenantId,
@@ -586,29 +724,14 @@ exports.finalizeSingleDraftById = async (req, res) => {
     const data = draft.extractedData || {};
     const merged = { ...data, ...sanitizeOverrides(req.body?.overrides || req.body || {}) };
 
-    const pdfFileName = draft.fileName;
-    const docxFileName = path.basename(draft.docxPath || `${draft.fileName}.docx`);
-    const blobFolder = `certificates/${merged.certNo || draft.fileName}`;
+    // Véglegesítéskor: mozgatás a végleges helyre: certificates/<certNo>/<base>.(pdf|docx)
+    const baseName = String((merged.certNo || draft.fileName || '')).replace(/\.pdf$/i, '').trim() || draft.fileName.replace(/\.pdf$/i, '');
 
-    let uploadedPdf = null;
-    if (fs.existsSync(draft.originalPdfPath)) {
-      try {
-        await azureBlobService.uploadFile(draft.originalPdfPath, `${blobFolder}/${pdfFileName}`);
-        uploadedPdf = `${blobFolder}/${pdfFileName}`;
-      } catch (err) {
-        console.warn(`⚠️ Blob PDF upload failed for ${pdfFileName}:`, err.message);
-      }
-    }
+    const srcPdf = draft.blobPdfPath || null;
+    const srcDocx = draft.blobDocxPath || null;
 
-    let uploadedDocx = null;
-    if (draft.docxPath && fs.existsSync(draft.docxPath)) {
-      try {
-        await azureBlobService.uploadFile(draft.docxPath, `${blobFolder}/${docxFileName}`);
-        uploadedDocx = `${blobFolder}/${docxFileName}`;
-      } catch (err) {
-        console.warn(`⚠️ Blob DOCX upload failed for ${docxFileName}:`, err.message);
-      }
-    }
+    const uploadedPdf  = await moveBlobWithVersioning(srcPdf,  baseName, 'pdf');
+    const uploadedDocx = await moveBlobWithVersioning(srcDocx, baseName, 'docx');
 
     const doc = {
       tenantId,
@@ -797,6 +920,9 @@ exports.deletePendingUpload = async (req, res) => {
     for (const d of drafts) {
       safeUnlink(d.originalPdfPath);
       safeUnlink(d.docxPath);
+      // 🔹 blob fájlok törlése
+      try { if (d.blobPdfPath)  await azureBlobService.deleteFile(d.blobPdfPath); } catch(e){}
+      try { if (d.blobDocxPath) await azureBlobService.deleteFile(d.blobDocxPath); } catch(e){}
     }
 
     // mappa törlése
@@ -824,16 +950,56 @@ exports.getDraftPdfById = async (req, res) => {
     if (!tenantId || (draft.tenantId && String(draft.tenantId) !== String(tenantId))) {
       return res.status(403).json({ error: 'Forbidden (wrong tenant)' });
     }
-    if (!draft.originalPdfPath || !fs.existsSync(draft.originalPdfPath)) {
-      return res.status(404).json({ error: 'PDF file not found' });
+    if (draft.originalPdfPath && fs.existsSync(draft.originalPdfPath)) {
+      res.setHeader('Content-Type', 'application/pdf');
+      const abs = path.resolve(draft.originalPdfPath);
+      return res.sendFile(abs);
     }
-
-    res.setHeader('Content-Type', 'application/pdf');
-    const abs = path.resolve(draft.originalPdfPath);
-    return res.sendFile(abs);
+    if (draft.blobPdfPath) {
+      try {
+        const sasUrl = await azureBlobService.getReadSasUrl(draft.blobPdfPath, { ttlSeconds: 600 });
+        return res.redirect(302, sasUrl);
+      } catch (e) {
+        console.error('[getDraftPdfById] SAS generation error:', e.message);
+      }
+    }
+    return res.status(404).json({ error: 'PDF file not found' });
   } catch (e) {
     console.error('[getDraftPdfById] error:', e.message);
     return res.status(500).json({ error: 'Failed to stream PDF' });
+  }
+};
+
+// Return SAS URL (JSON) for a draft PDF by ID – suitable for front-end XHR (with Authorization)
+exports.getDraftPdfSasById = async (req, res) => {
+  const { id } = req.params;
+  try {
+    const draft = await DraftCertificate.findById(id).lean();
+    if (!draft) return res.status(404).json({ error: 'Draft not found' });
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId || (draft.tenantId && String(draft.tenantId) !== String(tenantId))) {
+      return res.status(403).json({ error: 'Forbidden (wrong tenant)' });
+    }
+
+    if (draft.blobPdfPath) {
+      try {
+        const sasUrl = await azureBlobService.getReadSasUrl(draft.blobPdfPath, { ttlSeconds: 600 });
+        return res.json({ sasUrl, ttlSeconds: 600 });
+      } catch (e) {
+        console.error('[getDraftPdfSasById] SAS generation error:', e.message);
+        return res.status(500).json({ error: 'Failed to generate SAS URL' });
+      }
+    }
+
+    // Fallback: if there is only a local file, return a 409 to force the client to use the stream endpoint instead
+    if (draft.originalPdfPath && fs.existsSync(draft.originalPdfPath)) {
+      return res.status(409).json({ error: 'Only local file available; use stream endpoint', stream: true });
+    }
+
+    return res.status(404).json({ error: 'PDF file not found' });
+  } catch (e) {
+    console.error('[getDraftPdfSasById] error:', e.message);
+    return res.status(500).json({ error: 'Failed to generate PDF SAS URL' });
   }
 };
 
@@ -852,6 +1018,9 @@ exports.deleteDraftById = async (req, res) => {
     // ideiglenes fájlok törlése
     safeUnlink(draft.originalPdfPath);
     safeUnlink(draft.docxPath);
+    // 🔹 blob fájlok törlése
+    try { if (draft.blobPdfPath)  await azureBlobService.deleteFile(draft.blobPdfPath); } catch(e){}
+    try { if (draft.blobDocxPath) await azureBlobService.deleteFile(draft.blobDocxPath); } catch(e){}
 
     // draft rekord törlés
     await DraftCertificate.deleteOne({ _id: id });
