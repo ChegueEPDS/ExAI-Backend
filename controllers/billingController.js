@@ -350,7 +350,7 @@ exports.createBillingPortal = async (req, res) => {
         }
       } catch (_) {}
     }
-    const apiBase = process.env.API_BASE_URL || 'http://localhost:3000';
+    const apiBase = process.env.BASE_URL || 'http://localhost:3000';
     const callerUserId =
       (req.scope?.userId && String(req.scope.userId)) ||
       (req.user?.id && String(req.user.id)) ||
