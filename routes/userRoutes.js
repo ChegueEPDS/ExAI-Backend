@@ -10,10 +10,10 @@ const router = express.Router();
 router.get('/users', authMiddleware(['Admin', 'SuperAdmin']), listUsers);
 
 // Fetch user profile
-router.get('/user/:userId', authMiddleware(['Admin', 'User']), getUserProfile);
+router.get('/user/:userId', authMiddleware(), getUserProfile);
 
 // Update user profile
-router.put('/user/:userId', authMiddleware(['Admin', 'User']), updateUserProfile);
+router.put('/user/:userId', authMiddleware(), updateUserProfile);
 
 // Delete user profile
 router.delete('/user/:userId', authMiddleware (['Admin', 'SuperAdmin']), deleteUser)

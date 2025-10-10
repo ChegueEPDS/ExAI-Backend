@@ -271,7 +271,9 @@ function extractSpecFromOCRHeuristics(ocr) {
 }
 
 function stripAtexWords(s) {
-  return String(s || '').replace(/ATEX|IECEX/gi, '');
+  // Remove standalone tokens ATEX / IECEX / IECEx / Ex (word-boundary),
+  // so their "x" doesn't trigger X-condition. Preserve other text.
+  return String(s || '').replace(/ATEX|IECEX|EX/gi, '');
 }
 
 function detectXFromCertNo(certNo) {
@@ -627,25 +629,24 @@ async function extractCertFieldsFromOCR(ocrText) {
   parsed.xcondition = !!autoX;
   parsed.ucondition = !!autoU;
 
-  // If neither X nor U is present in certNo, do not carry any conditions text
+  // --- SPEC CONDITION FILL (AI first, then heuristic fallback) ---
   if (!parsed.xcondition && !parsed.ucondition) {
+    // szabály változatlan: ha nincs X/U a certNo-ban, nem keresünk Spec-et
     parsed.specCondition = "";
   } else {
-    // 1) Try deterministic heuristic extraction from the FULL OCR (not truncated)
-    const specFromOCR = extractSpecFromOCRHeuristics(ocrFull);
-    if (specFromOCR && specFromOCR !== "-") {
-      parsed.specCondition = specFromOCR;
-    }
-
-    // 2) If still empty, try chunked LLM follow-up ONLY on segments that might contain the section
+    // 1) CHUNKED LLM próbálkozás ELŐSZÖR (csak olyan chunkokban, ahol van heading-hint)
     if (!parsed.specCondition || !parsed.specCondition.trim()) {
       const chunks = splitIntoChunks(ocrFull, 60000, 1200);
       const headingHint = /(special|specific)\s+conditions|schedule\s+of\s+limitations|conditions\s+for\s+safe\s+use/i;
+
       for (const chunk of chunks) {
-        if (!headingHint.test(chunk)) continue; // skip chunks without any hint to save calls
+        if (!headingHint.test(chunk)) continue;
+
+        // adjunk világos "negatív" példát is, hogy ne kapja fel a 11)-es általános jogi szöveget
         await addMessage(threadId, [
-          "Extract ONLY the Special/Specific conditions text for safe use from the OCR CHUNK below.",
-          "Look under headings like 'Special conditions for safe use', 'Specific conditions of use', 'Schedule of Limitations', 'Special/Specific Conditions', or similar.",
+          "Extract ONLY the 'Special/Specific conditions for safe use' text from the OCR CHUNK below.",
+          "Look under headings like 'Special conditions for safe use', 'Specific conditions of use', 'Schedule of Limitations', or similar.",
+          "Do NOT return generic legal disclaimers like 'This EU-Type Examination Certificate relates only to the design...'.",
           "Return strictly this JSON and nothing else: { \"specCondition\": \"...\" }.",
           "Flatten to one line; separate multiple bullet points with '; '.",
           "",
@@ -659,11 +660,7 @@ async function extractCertFieldsFromOCR(ocrText) {
           assistant_id: ASSISTANT_ID,
           response_format: {
             type: 'json_schema',
-            json_schema: {
-              name: specOnlySchema.name,
-              schema: specOnlySchema.schema,
-              strict: true
-            }
+            json_schema: { name: "spec_only", schema: { type: "object", additionalProperties: false, properties: { specCondition: { type: "string" } }, required: ["specCondition"] }, strict: true }
           }
         });
 
@@ -673,6 +670,14 @@ async function extractCertFieldsFromOCR(ocrText) {
           parsed.specCondition = parsed2.specCondition.trim();
           break;
         }
+      }
+    }
+
+    // 2) Ha LLM után is üres, akkor jön a HEURISZTIKA (determinista kivágás a teljes OCR-ből)
+    if (!parsed.specCondition || !parsed.specCondition.trim()) {
+      const specFromOCR = extractSpecFromOCRHeuristics(ocrFull);
+      if (specFromOCR && specFromOCR !== "-") {
+        parsed.specCondition = specFromOCR;
       }
     }
   }
