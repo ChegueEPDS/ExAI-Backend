@@ -14,7 +14,6 @@ const { extractCertFieldsFromOCR } = require('../helpers/openaiCertExtractor');
 
 const mongoose = require('mongoose');
 
-
 const User = require('../models/user'); // ha még nincs bent
 const upload = multer({ dest: 'uploads/' });
 const DraftCertificate = require('../models/draftCertificate.js');
@@ -449,7 +448,7 @@ const Certificate = require('../models/certificate');
 
 // Allowed keys we accept from the UI for inline edits
 const ALLOWED_EXTRACTED_KEYS = new Set([
-  'certNo','scheme','issueDate','applicant','protection','exmarking','equipment','manufacturer','xcondition','ucondition','specCondition','status','description'
+  'certNo','scheme','issueDate','applicant','protection','exmarking','equipment','manufacturer','xcondition','ucondition','specCondition','status','description','docType'
 ]);
 
 function sanitizeOverrides(src = {}) {
@@ -606,6 +605,7 @@ exports.finalizeDrafts = async (req, res) => {
           ucondition: merged.ucondition || false,
           specCondition: merged.specCondition || '',
           description: merged.description || '',
+          docType: merged.docType || '',
           fileName: draft.fileName,
           fileUrl: uploadedPdf,
           docxUrl: uploadedDocx,
@@ -749,6 +749,7 @@ exports.finalizeSingleDraftById = async (req, res) => {
       ucondition: merged.ucondition || false,
       specCondition: merged.specCondition || '',
       description: merged.description || '',
+      docType: merged.docType || '',
       fileName: draft.fileName,
       fileUrl: uploadedPdf,
       docxUrl: uploadedDocx,

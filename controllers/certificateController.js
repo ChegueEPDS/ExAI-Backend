@@ -170,6 +170,7 @@ exports.uploadCertificate = async (req, res) => {
         xcondition: xcondition === 'true' || xcondition === true,
         specCondition: specCondition || null,
         description,
+        docType: typeof req.body.docType === 'string' ? req.body.docType.trim() : (req.body.docType || null),
         ucondition: ucondition === 'true' || ucondition === true,
         fileName: originalPdfName,
         fileUrl: uploadedPdfPath,
@@ -446,7 +447,7 @@ exports.deleteCertificate = async (req, res) => {
 exports.updateCertificate = async (req, res) => {
   try {
     const { id } = req.params;
-    const { certNo, scheme, status, issueDate, applicant, protection, equipment, manufacturer, exmarking, xcondition, ucondition, specCondition, description } = req.body;
+    const { certNo, scheme, status, issueDate, applicant, protection, equipment, manufacturer, exmarking, xcondition, ucondition, specCondition, description, docType } = req.body;
 
     const certificate = await Certificate.findById(id);
     if (!certificate) {
@@ -467,6 +468,9 @@ exports.updateCertificate = async (req, res) => {
     certificate.ucondition = (typeof ucondition === 'boolean') ? ucondition : (ucondition === 'true' || ucondition === '1') || certificate.ucondition;
     certificate.specCondition = specCondition ?? certificate.specCondition;
     certificate.description = description ?? certificate.description;
+    if (typeof docType !== 'undefined') {
+      certificate.docType = docType;
+    }
 
     const prevVisibility = certificate.visibility;
     let newVisibility = prevVisibility;
@@ -662,6 +666,7 @@ exports.previewAtex = async (req, res) => {
         protection: aiData?.protection || '',
         specCondition: aiData?.specCondition || aiData?.specialConditions || '',
         description: aiData?.description || '',
+        docType: aiData?.docType || '',
         xcondition: certStr ? (certStr.endsWith('X') || /\bX\b/.test(certStr)) : false,
         ucondition: certStr ? (certStr.endsWith('U') || /\bU\b/.test(certStr)) : false
       };

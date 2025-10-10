@@ -4,6 +4,7 @@ const { jsonrepair } = require('jsonrepair');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const certificate = require('../models/certificate');
 
 // Global axios request timeout (per HTTP call)
 axios.defaults.timeout = 60000; // 60s
@@ -57,7 +58,8 @@ const jsonSchema = {
       xcondition: { type: "boolean", description: "true if 'X' condition applies" },
       ucondition: { type: "boolean", description: "true if 'U' component condition applies" },
       status: { type: "string" },
-      issueDate: { type: "string" }
+      issueDate: { type: "string" },
+      docType: { type: "string", description: "One of: 'certificate', 'manufacturer_declaration', or 'unknown'" }
     },
     required: ["certNo", "manufacturer", "product", "exmarking", "specCondition", "xcondition", "ucondition"]
   }
@@ -75,6 +77,51 @@ const specOnlySchema = {
     required: ["specCondition"]
   }
 };
+
+function detectDocTypeHeuristic(ocr) {
+  const text = String(ocr || '').toLowerCase();
+
+  // Strong "certificate" indicators
+  const certHints = [
+    'eu-type examination certificate',
+    'ec-type examination certificate',
+    'eu type examination certificate',
+    'ec type examination certificate',
+    'certificate no',
+    'certificate number',
+    'iecex certificate',
+    'atex certificate',
+    'type examination certificate',
+    'notified body number',
+    'annex iii certificate',
+    'module b certificate'
+  ];
+
+  // Manufacturer declaration indicators
+  const declHints = [
+    "manufacturer's declaration",
+    'manufacturers declaration',
+    'declaration of conformity',
+    'declaration of conformance',
+    'we hereby declare',
+    'we declare that',
+    'is in conformity',
+    'doc (declaration of conformity)',
+    'doc:',
+    'do c ', // tolerate OCR odd spaces
+    'responsible for the conformity'
+  ];
+
+  const hasAny = (arr) => arr.some(h => text.includes(h));
+
+  if (hasAny(certHints)) return 'certificate';
+  if (hasAny(declHints)) return 'manufacturer_declaration';
+
+  // If the document mentions both styles, prefer certificate
+  if (hasAny(certHints) && hasAny(declHints)) return 'certificate';
+
+  return 'unknown';
+}
 
 function assertEnv() {
   if (!OPENAI_KEY) throw new Error("OPENAI_API_KEY is missing");
@@ -433,7 +480,8 @@ function fallbackExtractFromOCR(ocrRaw) {
     xcondition: false,
     ucondition: false,
     status: '',
-    issueDate: ''
+    issueDate: '',
+    docType: ''
   };
 
   // --- scheme detection ---
@@ -518,6 +566,9 @@ function fallbackExtractFromOCR(ocrRaw) {
     if (typeof out[k] === 'string') out[k] = out[k].replace(/\s+/g, ' ').trim();
   }
 
+  // Set docType via heuristic
+  out.docType = detectDocTypeHeuristic(text);
+
   // If we have at least a certNo, consider it a usable fallback
   if (out.certNo) return out;
   return null;
@@ -553,6 +604,7 @@ async function extractCertFieldsFromOCR(ocrText) {
     "  Do NOT treat the 'X' in the words 'ATEX' or 'IECEx' themselves as an X-condition.",
     "- Set ucondition = true if the certificate number has a 'U' token or ends with '...U' (IECEx component).",
     "- ONLY extract and fill 'specCondition' when xcondition or ucondition is true; otherwise set it to an empty string and do not search for it.",
+    "Also return a field 'docType' with one of the following values: 'certificate' (EU/EC-Type Examination Certificate, IECEx Certificate, etc.), 'manufacturer_declaration' (e.g., Declaration of Conformity, manufacturer's declaration), or 'unknown'. If the text looks like a DoC or manufacturer declaration, choose 'manufacturer_declaration'. If unsure, return 'unknown'.",
     "Return JSON only, with no markdown or extra text.",
     "Return ONLY a minified JSON object. No prose. No markdown. No code fences."
   ].join(' ');
@@ -560,7 +612,7 @@ async function extractCertFieldsFromOCR(ocrText) {
   const userPrompt = [
     "Check the OCR result of the ATEX / IECEx certificate and return these fields in JSON:",
     "IMPORTANT: Preserve original language from OCR; DO NOT translate any field (manufacturer, product, exmarking, specCondition, status, etc.).",
-    "scheme, certNo, manufacturer, product, exmarking, specCondition, xcondition, ucondition, status, issueDate.",
+    "scheme, certNo, manufacturer, product, exmarking, specCondition, xcondition, ucondition, status, issueDate, docType.",
     "For 'specCondition', use any of these headings if present: Special conditions for safe use; Specific conditions of use;",
     "Schedule of Limitations; Special/Specific Conditions; Conditions for safe use.",
     "IMPORTANT: Only extract specCondition when the certificate number shows X or U AFTER the word ATEX/IECEx (not the X in 'ATEX' or 'IECEx' themselves).",
@@ -620,6 +672,14 @@ async function extractCertFieldsFromOCR(ocrText) {
   parsed.ucondition = !!parsed.ucondition;
   parsed.status ??= "";
   parsed.issueDate ??= "";
+
+  // Normalize/derive docType
+  const validDocTypes = new Set(['certificate','manufacturer_declaration','unknown']);
+  if (typeof parsed.docType !== 'string' || !validDocTypes.has(parsed.docType.toLowerCase())) {
+    parsed.docType = detectDocTypeHeuristic(ocrFull);
+  } else {
+    parsed.docType = parsed.docType.toLowerCase();
+  }
 
   // Fallback detection for X/U based strictly on the certificate number (ignoring the 'X' in the words 'ATEX'/'IECEx')
   const autoX = detectXFromCertNo(parsed.certNo);

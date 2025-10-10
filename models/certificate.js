@@ -28,6 +28,7 @@ const CertificateSchema = new mongoose.Schema({
   ucondition: { type: Boolean, default: false },
   specCondition: { type: String },
   description: { type: String },
+  docType: { type: String, enum: ['certificate', 'manufacturer_declaration', 'unknown'], default: 'unknown' },
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
