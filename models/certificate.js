@@ -34,6 +34,13 @@ const CertificateSchema = new mongoose.Schema({
     ref: 'User',
     required: true
   },
+  approvedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
+  approvedAt: { type: Date, default: null },
+  
   tenantId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Tenant',

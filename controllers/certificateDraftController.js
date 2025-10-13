@@ -554,14 +554,18 @@ exports.updateDraftExtractedById = async (req, res) => {
 exports.finalizeDrafts = async (req, res) => {
   const { uploadId } = req.params;
   const userId = req.userId;
+  // SuperAdmin role parsing
+  const roleRaw = (req.scope?.role || req.scope?.userRole || req.role || '').toString();
+  const isSuperAdmin = /superadmin/i.test(roleRaw);
 
   try {
     const tenantId = req.scope?.tenantId;
-    if (!tenantId) {
+    if (!isSuperAdmin && !tenantId) {
       return res.status(403).json({ message: '❌ Missing tenantId' });
     }
 
-    const drafts = await DraftCertificate.find({ uploadId, status: 'ready', tenantId });
+    const draftsQuery = isSuperAdmin ? { uploadId, status: 'ready' } : { uploadId, status: 'ready', tenantId };
+    const drafts = await DraftCertificate.find(draftsQuery);
     if (drafts.length === 0) {
       return res.status(404).json({ message: '❌ No ready drafts found for this uploadId' });
     }
@@ -589,8 +593,9 @@ exports.finalizeDrafts = async (req, res) => {
         const uploadedPdf  = await moveBlobWithVersioning(srcPdf,  baseName, 'pdf');
         const uploadedDocx = await moveBlobWithVersioning(srcDocx, baseName, 'docx');
 
+        const targetTenantId = isSuperAdmin ? draft.tenantId : tenantId;
         const doc = {
-          tenantId,
+          tenantId: targetTenantId,
           visibility: (merged.scheme || '').toLowerCase() === 'atex' ? 'public' : 'private',
           certNo: merged.certNo || draft.fileName,
           scheme: merged.scheme || '',
@@ -609,7 +614,13 @@ exports.finalizeDrafts = async (req, res) => {
           fileName: draft.fileName,
           fileUrl: uploadedPdf,
           docxUrl: uploadedDocx,
-          createdBy: userId,
+
+          // Keep original author from the draft
+          createdBy: draft.createdBy,
+          // Audit approver
+          approvedBy: userId,
+          approvedAt: new Date(),
+
           isDraft: false,
         };
 
@@ -706,10 +717,13 @@ exports.finalizeDrafts = async (req, res) => {
 exports.finalizeSingleDraftById = async (req, res) => {
   const { id } = req.params;
   const userId = req.userId;
+  // SuperAdmin role parsing
+  const roleRaw = (req.scope?.role || req.scope?.userRole || req.role || '').toString();
+  const isSuperAdmin = /superadmin/i.test(roleRaw);
 
   try {
     const tenantId = req.scope?.tenantId;
-    if (!tenantId) {
+    if (!isSuperAdmin && !tenantId) {
       return res.status(403).json({ message: '❌ Missing tenantId' });
     }
 
@@ -717,7 +731,7 @@ exports.finalizeSingleDraftById = async (req, res) => {
     if (!draft || draft.status !== 'ready') {
       return res.status(404).json({ message: '❌ Draft not found or not ready' });
     }
-    if (draft.tenantId && String(draft.tenantId) !== String(tenantId)) {
+    if (!isSuperAdmin && draft.tenantId && String(draft.tenantId) !== String(tenantId)) {
       return res.status(403).json({ message: '❌ Forbidden (wrong tenant)' });
     }
 
@@ -733,8 +747,9 @@ exports.finalizeSingleDraftById = async (req, res) => {
     const uploadedPdf  = await moveBlobWithVersioning(srcPdf,  baseName, 'pdf');
     const uploadedDocx = await moveBlobWithVersioning(srcDocx, baseName, 'docx');
 
+    const targetTenantId = isSuperAdmin ? draft.tenantId : tenantId;
     const doc = {
-      tenantId,
+      tenantId: targetTenantId,
       visibility: (merged.scheme || '').toLowerCase() === 'atex' ? 'public' : 'private',
       certNo: merged.certNo || draft.fileName,
       scheme: merged.scheme || '',
@@ -753,7 +768,13 @@ exports.finalizeSingleDraftById = async (req, res) => {
       fileName: draft.fileName,
       fileUrl: uploadedPdf,
       docxUrl: uploadedDocx,
-      createdBy: userId,
+
+      // Keep original author from the draft
+      createdBy: draft.createdBy,
+      // Audit approver
+      approvedBy: userId,
+      approvedAt: new Date(),
+
       isDraft: false,
     };
 
@@ -805,13 +826,21 @@ exports.finalizeSingleDraftById = async (req, res) => {
 exports.getPendingUploads = async (req, res) => {
   try {
     const tenantId = req.scope?.tenantId;
-    if (!tenantId) {
+    const roleRaw = (req.scope?.role || req.scope?.userRole || req.role || '').toString();
+    const isSuperAdmin = /superadmin/i.test(roleRaw);
+
+    if (!isSuperAdmin && !tenantId) {
       return res.status(403).json({ error: 'Missing tenantId' });
     }
+
     const limit = req.query.limit ? parseInt(req.query.limit, 10) : null;
 
+    const matchTenantStage = isSuperAdmin
+      ? { $match: { } } // no tenant filter for SuperAdmin
+      : { $match: { tenantId: new mongoose.Types.ObjectId(tenantId) } };
+
     const pipeline = [
-      { $match: { tenantId: new mongoose.Types.ObjectId(tenantId) } },
+      matchTenantStage,
       {
         $match: {
           status: { $in: ['draft', 'ready', 'error'] }, // 'finalized' kikerül
@@ -821,6 +850,7 @@ exports.getPendingUploads = async (req, res) => {
         $group: {
           _id: '$uploadId',
           uploadId: { $first: '$uploadId' },
+          tenantId: { $first: '$tenantId' },
           createdAt: { $min: '$createdAt' },
           total: { $sum: 1 },
           ready: { $sum: { $cond: [{ $eq: ['$status', 'ready'] }, 1, 0] } },
@@ -833,6 +863,7 @@ exports.getPendingUploads = async (req, res) => {
         $project: {
           _id: 0,
           uploadId: 1,
+          tenantId: 1,
           createdAt: 1,
           counts: {
             total: '$total',
@@ -851,25 +882,22 @@ exports.getPendingUploads = async (req, res) => {
     }
 
     const items = await DraftCertificate.aggregate(pipeline);
-    // 🔹 Enrich with queue state (queued / processing) based on in-memory queue
-    // NOTE: this reflects *current* process state; not persisted in DB.
+
+    // Enrich with live queue state
     const enriched = (items || []).map(it => {
       let queueState = null;
       let queuePosition = null;
 
-      // Determine live queue state first
       if (inFlight.has(it.uploadId)) {
         queueState = 'processing';
       } else {
         const idx = processQueue.findIndex(x => x && x.uploadId === it.uploadId);
         if (idx !== -1) {
           queueState = 'queued';
-          queuePosition = idx + 1; // 1-based position
+          queuePosition = idx + 1;
         }
       }
 
-      // If this upload is already fully processed (ready+error == total),
-      // then do NOT show it as processing/queued anymore
       const c = it.counts || {};
       const ready = Number(c.ready || 0);
       const error = Number(c.error || 0);
@@ -887,14 +915,13 @@ exports.getPendingUploads = async (req, res) => {
       };
     });
 
-
-    // Optionally expose overall concurrency snapshot for UI (useful for diagnostics)
     const concurrency = {
       active: activeProcesses,
       limit: PROCESS_CONCURRENCY,
       queueLength: processQueue.length
     };
-    return res.json({ items: enriched, concurrency });
+
+    return res.json({ items: enriched, concurrency, scope: isSuperAdmin ? 'all-tenants' : 'tenant' });
   } catch (err) {
     console.error('❌ getPendingUploads error:', err.message);
     return res.status(500).json({ error: 'Failed to load pending uploads' });
@@ -974,11 +1001,14 @@ exports.getDraftPdfById = async (req, res) => {
 // Return SAS URL (JSON) for a draft PDF by ID – suitable for front-end XHR (with Authorization)
 exports.getDraftPdfSasById = async (req, res) => {
   const { id } = req.params;
+  // SuperAdmin role parsing
+  const roleRaw = (req.scope?.role || req.scope?.userRole || req.role || '').toString();
+  const isSuperAdmin = /superadmin/i.test(roleRaw);
   try {
     const draft = await DraftCertificate.findById(id).lean();
     if (!draft) return res.status(404).json({ error: 'Draft not found' });
     const tenantId = req.scope?.tenantId;
-    if (!tenantId || (draft.tenantId && String(draft.tenantId) !== String(tenantId))) {
+    if (!isSuperAdmin && (!tenantId || (draft.tenantId && String(draft.tenantId) !== String(tenantId)))) {
       return res.status(403).json({ error: 'Forbidden (wrong tenant)' });
     }
 
@@ -1007,13 +1037,16 @@ exports.getDraftPdfSasById = async (req, res) => {
 // Delete a single draft by its ID (and cleanup files/folder)
 exports.deleteDraftById = async (req, res) => {
   const { id } = req.params;
+  // SuperAdmin role parsing
+  const roleRaw = (req.scope?.role || req.scope?.userRole || req.role || '').toString();
+  const isSuperAdmin = /superadmin/i.test(roleRaw);
   try {
     const draft = await DraftCertificate.findById(id);
     if (!draft) {
       return res.status(404).json({ message: '❌ Draft not found' });
     }
     const tenantId = req.scope?.tenantId;
-    if (!tenantId || (draft.tenantId && String(draft.tenantId) !== String(tenantId))) {
+    if (!isSuperAdmin && (!tenantId || (draft.tenantId && String(draft.tenantId) !== String(tenantId)))) {
       return res.status(403).json({ message: '❌ Forbidden (wrong tenant)' });
     }
     // ideiglenes fájlok törlése
