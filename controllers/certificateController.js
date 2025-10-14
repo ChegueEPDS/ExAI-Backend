@@ -45,6 +45,61 @@ async function supportsTransactions() {
   }
 }
 
+// Whitelist for sorting to avoid collection scans on non-indexed fields
+const ALLOWED_SORT_KEYS = new Set([
+  'certNo', 'manufacturer', 'equipment', 'issueDate', 'createdAt', 'scheme', 'docType'
+]);
+
+// Base projection that matches the table needs
+const BASE_PROJECT = {
+  certNo: 1, scheme: 1, status: 1, issueDate: 1, applicant: 1,
+  protection: 1, equipment: 1, manufacturer: 1, exmarking: 1,
+  fileName: 1, fileUrl: 1, docxUrl: 1, uploadedAt: '$createdAt',
+  xcondition: 1, specCondition: 1, description: 1, visibility: 1, docType: 1,
+  adoptedByMe: 1
+};
+
+/**
+ * Build a $project based on optional "fields" query parameter.
+ * If fields is missing, use BASE_PROJECT. If present, allow a subset
+ * like "certNo,manufacturer,equipment,issueDate".
+ */
+function buildProjectFromFields(fieldsParam) {
+  if (!fieldsParam) return { ...BASE_PROJECT };
+  const out = {};
+  const list = String(fieldsParam)
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  // Always keep minimal identifiers we rely on
+  out._id = 1;
+  for (const f of list) {
+    if (f === 'uploadedAt') {
+      // support alias
+      out.uploadedAt = '$createdAt';
+    } else if (Object.prototype.hasOwnProperty.call(BASE_PROJECT, f)) {
+      out[f] = BASE_PROJECT[f];
+    }
+  }
+  // If nothing valid was requested, fall back to BASE_PROJECT
+  if (Object.keys(out).length <= 1) return { ...BASE_PROJECT };
+  return out;
+}
+
+// Safely handle incoming id parameters (skip CastError)
+function tryObjectId(id) {
+  try {
+    return new mongoose.Types.ObjectId(id);
+  } catch {
+    return null;
+  }
+}
+
+// Small helper to escape user-provided filter strings in regex
+function escapeRegex(s = '') {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // --- Helper: standardized duplicate (unique index) error response ---
 function sendDuplicateError(res, err) {
   // MongoServerError E11000 handler
@@ -323,6 +378,140 @@ exports.getPublicCertificates = async (req, res) => {
   }
 };
 
+// PUBLIC (global) certificates – paginated + with adoptedByMe flag
+// GET /api/certificates/public/paged?page=1&pageSize=25&sort=certNo&dir=asc&certNo=...&manufacturer=...&equipment=...
+exports.getPublicCertificatesPaged = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId || null; // for adoptedByMe
+    const tenantObjectId = tenantId ? new mongoose.Types.ObjectId(tenantId) : null;
+
+    const page     = Math.max(parseInt(req.query.page || '1', 10), 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.pageSize || '25', 10), 1), 200);
+
+    const sortKey  = (req.query.sort || 'certNo').toString();
+    const dir      = (req.query.dir || 'asc').toString().toLowerCase() === 'desc' ? -1 : 1;
+    const key = ALLOWED_SORT_KEYS.has(sortKey) ? sortKey : 'certNo';
+    const sort = { [key]: dir, _id: 1 };
+
+    const f = {
+      certNo:       (req.query.certNo || '').trim(),
+      manufacturer: (req.query.manufacturer || '').trim(),
+      equipment:    (req.query.equipment || '').trim(),
+    };
+
+    const match = { visibility: 'public' };
+    if (f.certNo)       match.certNo       = { $regex: '^' + escapeRegex(f.certNo), $options: 'i' };
+    if (f.manufacturer) match.manufacturer = { $regex: '^' + escapeRegex(f.manufacturer), $options: 'i' };
+    if (f.equipment)    match.equipment    = { $regex: '^' + escapeRegex(f.equipment), $options: 'i' };
+
+    const project = buildProjectFromFields(req.query.fields);
+
+    const pipeline = [
+      { $match: match },
+      { $sort: sort },
+      ...(tenantObjectId ? [{
+        $lookup: {
+          from: 'companycertificatelinks',
+          let: { certId: '$_id' },
+          pipeline: [
+            { $match: { $expr: { $and: [
+              { $eq: ['$certId', '$$certId'] },
+              { $eq: ['$tenantId', tenantObjectId] }
+            ]}}},
+            { $limit: 1 }
+          ],
+          as: 'myLink'
+        }
+      }, { $addFields: { adoptedByMe: { $gt: [{ $size: '$myLink' }, 0] } } },
+         { $project: { myLink: 0 } }] : []),
+      {
+        $facet: {
+          items: [
+            { $skip: (page - 1) * pageSize },
+            { $limit: pageSize },
+            { $project: project }
+          ],
+          total: [{ $count: 'count' }]
+        }
+      }
+    ];
+
+    const [agg] = await Certificate.aggregate(pipeline);
+    const items = agg?.items || [];
+    const total = agg?.total?.[0]?.count || 0;
+
+    return res.json({ items, total, page, pageSize });
+  } catch (e) {
+    console.error('getPublicCertificatesPaged error:', e);
+    return res.status(500).json({ error: 'Failed to load paged public certificates' });
+  }
+};
+
+// Own tenant + adopted PUBLIC – paginated
+// GET /api/certificates/paged?page=1&pageSize=25&sort=certNo&dir=asc&certNo=...&manufacturer=...&equipment=...
+exports.getMyCertificatesPaged = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) return res.status(400).json({ message: 'Missing tenantId' });
+    const tenantObjectId = new mongoose.Types.ObjectId(tenantId);
+
+    const page     = Math.max(parseInt(req.query.page || '1', 10), 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.pageSize || '25', 10), 1), 200);
+
+    const sortKey  = (req.query.sort || 'certNo').toString();
+    const dir      = (req.query.dir || 'asc').toString().toLowerCase() === 'desc' ? -1 : 1;
+    const key = ALLOWED_SORT_KEYS.has(sortKey) ? sortKey : 'certNo';
+    const sort = { [key]: dir, _id: 1 };
+
+    const f = {
+      certNo:       (req.query.certNo || '').trim(),
+      manufacturer: (req.query.manufacturer || '').trim(),
+      equipment:    (req.query.equipment || '').trim(),
+    };
+
+    const ownIds = await Certificate.find({ tenantId: tenantObjectId }).select('_id').lean();
+    const links  = await CompanyCertificateLink.find({ tenantId: tenantObjectId }).select('certId').lean();
+    const adoptedIds = links.map(l => l.certId);
+
+    const allIds = [...ownIds.map(x => x._id), ...adoptedIds];
+    if (allIds.length === 0) {
+      return res.json({ items: [], total: 0, page, pageSize });
+    }
+
+    const match = { _id: { $in: allIds } };
+    if (f.certNo)       match.certNo       = { $regex: '^' + escapeRegex(f.certNo), $options: 'i' };
+    if (f.manufacturer) match.manufacturer = { $regex: '^' + escapeRegex(f.manufacturer), $options: 'i' };
+    if (f.equipment)    match.equipment    = { $regex: '^' + escapeRegex(f.equipment), $options: 'i' };
+
+    const project = buildProjectFromFields(req.query.fields);
+
+    const pipeline = [
+      { $match: match },
+      { $addFields: { adoptedByMe: { $and: [ { $eq: ['$visibility', 'public'] }, { $in: ['$_id', adoptedIds] } ] } } },
+      { $sort: sort },
+      {
+        $facet: {
+          items: [
+            { $skip: (page - 1) * pageSize },
+            { $limit: pageSize },
+            { $project: project }
+          ],
+          total: [{ $count: 'count' }]
+        }
+      }
+    ];
+
+    const [agg] = await Certificate.aggregate(pipeline);
+    const items = agg?.items || [];
+    const total = agg?.total?.[0]?.count || 0;
+
+    return res.json({ items, total, page, pageSize });
+  } catch (e) {
+    console.error('getMyCertificatesPaged error:', e);
+    return res.status(500).json({ error: 'Failed to load paged certificates' });
+  }
+};
+
 // Saját PUBLIC tanúsítványok darabszáma
 exports.countMyPublicCertificates = async (req, res) => {
   try {
@@ -355,7 +544,7 @@ exports.getCertificatesSamples = async (req, res) => {
   try {
     // Csak a publikus tanúsítványok és csak a szükséges mezők
     const samples = await Certificate.find({ visibility: 'public' })
-      .select('certNo manufactur          er equipment')
+      .select({ certNo: 1, manufacturer: 1, equipment: 1, _id: 0 })
       .lean();
 
     return res.json(samples);
@@ -368,31 +557,31 @@ exports.getCertificatesSamples = async (req, res) => {
 exports.getCertificateByCertNo = async (req, res) => {
     try {
       const rawCertNo = req.params.certNo;
-  
+
       const certParts = rawCertNo
         .split(/[/,]/) // Splitelés '/' vagy ',' mentén
         .map(part => part.trim()) // Szóközök eltávolítása
         .filter(part => part.length > 0);
-  
+
       console.log('Keresett Certificate részek:', certParts);
-  
+
       const regexConditions = certParts.map(part => {
         const normalizedPart = part.replace(/\s+/g, '').toLowerCase();
         console.log('Regex keresés részletre:', normalizedPart);
         return { certNo: { $regex: new RegExp(normalizedPart.split('').join('.*'), 'i') } };
       });
-  
+
       console.log('Keresési feltételek:', regexConditions);
-  
+
       const certificate = await Certificate.findOne({
         $or: regexConditions
-      });
-  
+      }).lean();
+
       if (!certificate) {
         console.log('Certificate not found');
         return res.status(404).json({ message: 'Certificate not found' });
       }
-  
+
       console.log('Certificate found:', certificate);
       res.json(certificate);
     } catch (error) {
@@ -405,8 +594,12 @@ exports.getCertificateByCertNo = async (req, res) => {
 exports.deleteCertificate = async (req, res) => {
   try {
     const { id } = req.params;
+    const oid = tryObjectId(id);
+    if (!oid) {
+      return res.status(400).json({ message: '❌ Invalid certificate id' });
+    }
 
-    const certificate = await Certificate.findById(id);
+    const certificate = await Certificate.findById(oid);
     if (!certificate) {
       return res.status(404).json({ message: '❌ Certificate not found' });
     }
@@ -429,10 +622,10 @@ exports.deleteCertificate = async (req, res) => {
       console.warn('⚠️ Blob DOCX delete failed:', e.message);
     }
 
-    await Certificate.findByIdAndDelete(id);
+    await Certificate.findByIdAndDelete(oid);
     // töröljük a kapcsoló rekordokat is
    try {
-     await CompanyCertificateLink.deleteMany({ certId: id });
+     await CompanyCertificateLink.deleteMany({ certId: oid });
    } catch (e) {
      console.warn('⚠️ Linkek törlése sikertelen lehetett:', e?.message);
    }
@@ -447,9 +640,13 @@ exports.deleteCertificate = async (req, res) => {
 exports.updateCertificate = async (req, res) => {
   try {
     const { id } = req.params;
+    const oid = tryObjectId(id);
+    if (!oid) {
+      return res.status(400).json({ message: '❌ Invalid certificate id' });
+    }
     const { certNo, scheme, status, issueDate, applicant, protection, equipment, manufacturer, exmarking, xcondition, ucondition, specCondition, description, docType } = req.body;
 
-    const certificate = await Certificate.findById(id);
+    const certificate = await Certificate.findById(oid);
     if (!certificate) {
       return res.status(404).json({ message: '❌ Certificate not found' });
     }

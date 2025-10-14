@@ -1050,6 +1050,7 @@ exports.deleteDraftById = async (req, res) => {
       return res.status(403).json({ message: '❌ Forbidden (wrong tenant)' });
     }
     // ideiglenes fájlok törlése
+    
     safeUnlink(draft.originalPdfPath);
     safeUnlink(draft.docxPath);
     // 🔹 blob fájlok törlése

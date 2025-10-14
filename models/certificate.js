@@ -100,6 +100,15 @@ CertificateSchema.index(
   }
 );
 
+// 🔹 Gyors keresési indexek (filterekhez és listázáshoz)
+CertificateSchema.index({ visibility: 1, certNo: 1 });
+CertificateSchema.index({ visibility: 1, manufacturer: 1 });
+CertificateSchema.index({ visibility: 1, equipment: 1 });
+CertificateSchema.index({ tenantId: 1, certNo: 1 });
+CertificateSchema.index({ tenantId: 1, manufacturer: 1 });
+CertificateSchema.index({ tenantId: 1, equipment: 1 });
+CertificateSchema.index({ createdAt: -1 }); // ha idő szerinti listázás lesz
+
 // --- Cascade cleanup: töröljük a linkeket, ha egy certificate törlődik ---
 
 // findByIdAndDelete / findOneAndDelete esetek

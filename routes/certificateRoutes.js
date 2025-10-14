@@ -14,6 +14,8 @@ router.post('/certificates/preview-atex', authMiddleware(), certificateControlle
 router.get('/certificates/samples', certificateController.getCertificatesSamples);
 router.get('/certificates', authMiddleware(), certificateController.getCertificates);
 router.get('/certificates/public', authMiddleware(), certificateController.getPublicCertificates);
+router.get('/certificates/public/paged', authMiddleware(), certificateController.getPublicCertificatesPaged);
+router.get('/certificates/paged', authMiddleware(), certificateController.getMyCertificatesPaged);
 router.get('/certificates/public/contribution', authMiddleware(), certificateController.countMyPublicCertificates);
 
 // Adopt / Unadopt
