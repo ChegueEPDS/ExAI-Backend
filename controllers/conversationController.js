@@ -1,3 +1,81 @@
+// === ChatGPT-like formatting instructions (Markdown-first) ===
+function getStyleInstructions(mode = 'plain') {
+  const base = [
+    'You are a helpful, precise assistant in the style of ChatGPT.',
+    'Use clear, natural language. Prefer **well‑structured Markdown** when it improves readability (headings, short lists, and tables).',
+    'Do **not** force a fixed section template; create sections only if they help the reader.',
+    'Leverage the ongoing conversation for context and be consistent with prior answers.',
+    'Be concise by default; expand with details only when useful.',
+    'If you rely on uploaded files or source documents, mention filenames or section titles when that helps attribution.',
+    'Avoid speculation: if something is not in the provided context, say so briefly.',
+    'If crucial details are missing, ask one concise clarifying question before proceeding.',
+    'Tone: professional, friendly, and direct. Avoid filler.',
+    'Always respond in the same language as the user\'s latest message. Detect the language automatically. If the message is multilingual or unclear, reply in the language most used by the user and briefly ask for clarification in that language. Do not switch languages unless the user explicitly asks.',
+    'When quoting from files, keep the original quote language, but write your commentary in the user\'s language.'
+  ].join(' ');
+
+  if (mode === 'sandbox') {
+    return (
+      base +
+      ' You are analyzing a fresh set of uploaded files in isolation. Use only these files and the current conversation turn for evidence. ' +
+      'Cite filenames inline when quoting or extracting data. Do not enumerate all files unless the user asks. Produce a standalone answer tailored to the question.'
+    );
+  }
+  if (mode === 'hybrid') {
+    return (
+      base +
+      ' Continue the discussion using both prior conversation context and any files associated with the thread. ' +
+      'Keep terminology aligned with earlier replies. Do not enumerate all files unless requested; cite filenames only when relevant.'
+    );
+  }
+  return base;
+}
+
+function detectReportOrTableIntent(userMsg = '') {
+  const m = String(userMsg || '').toLowerCase();
+  const kws = [
+    // generic analysis / table cues
+    'kimutatás', 'kimutatas', 'elemzés', 'elemzes', 'összehasonlítás', 'osszehasonlitas',
+    'táblázat', 'tablazat', 'riport', 'report', 'summary', 'összefoglaló', 'osszefoglalo',
+    'kpi', 'mutató', 'mutato', 'statisztika', 'metrics', 'table', 'matrix', 'lista', 'ranking',
+    'top', 'trend', 'pivot', 'dashboard',
+    // compliance / standards cues
+    'compliance', 'non-compliance', 'noncompliance', 'conformance', 'conformity',
+    'standard', 'standards', 'clause', 'clauses', 'requirement', 'requirements',
+    'gap', 'gap analysis', 'audit', 'checklist',
+    // Hungarian compliance cues
+    'megfelelés', 'megfeleles', 'megfelel', 'nem megfelelés', 'nem megfeleles',
+    'szabvány', 'szabvany', 'követelmény', 'kovetelmeny', 'eltérés', 'elteres',
+    'hiányosság', 'hianyossag', 'eltéréslista', 'osszevetes'
+  ];
+  return kws.some(k => m.includes(k));
+}
+
+function detectComplianceIntent(userMsg = '') {
+  const m = String(userMsg || '').toLowerCase();
+  const kws = [
+    'compliance', 'non-compliance', 'noncompliance', 'conformance', 'conformity',
+    'standard', 'standards', 'clause', 'clauses', 'requirement', 'requirements',
+    'gap', 'gap analysis', 'audit', 'checklist',
+    // Hungarian
+    'megfelelés', 'megfeleles', 'megfelel', 'nem megfelelés', 'nem megfeleles',
+    'szabvány', 'szabvany', 'követelmény', 'kovetelmeny', 'eltérés', 'elteres',
+    'hiányosság', 'hianyossag', 'eltéréslista'
+  ];
+  return kws.some(k => m.includes(k));
+}
+
+function buildTabularHint(userMsg = '') {
+  const lines = [
+    'Decide whether a compact **Markdown table** would improve clarity for the current request. If so, include one.',
+    '- Keep ≤ 10 columns and ≤ 30 rows; if larger, show an aggregated/top view and state the filter.',
+    '- Use short column headers and include units; avoid empty columns and do not fabricate data.',
+    '- After the table, add 1–2 bullet takeaways.',
+    'If the request involves standards, clauses, requirements, conformity, audits, or compliance (in any language), include a table titled "Compliance summary" with columns like: Item/Subject, Requirement/Clause, Evidence (short quote with filename), Status (Compliant/Partial/Non‑compliant/Not found), Notes/Gap. Place this table immediately after a short direct answer.'
+  ];
+  return lines.join(' ');
+}
+
 // SSE streaming chat endpoint (real Assistants API token stream)
 exports.sendMessageStream = async (req, res) => {
   const send = sseInit(req, res);
@@ -152,19 +230,25 @@ exports.sendMessageStream = async (req, res) => {
       { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2' } }
     );
 
-    // ---- Prepare run payload, add instructions if we have an injection ----
-    const payload = { assistant_id: assistantId, stream: true };
+    // ---- Prepare run payload, always add ChatGPT-like style instructions; append injection if present ----
+    // Build a concise rolling summary of the conversation so far (tone/continuity aid; not evidence)
+    const rolling = await buildRollingSummary(conversation).catch(() => '');
+    const convBlock = rolling ? `\n\nCONVERSATION SUMMARY (for context—do not use as evidence):\n${rolling}\n` : '';
 
-    // If we have injection, fetch assistant instructions and append
+    const payload = { assistant_id: assistantId, stream: true };
+    const styleForPlain = getStyleInstructions('plain');
+    const tabularHint = buildTabularHint(message);
+
     if (applicableInjection) {
       const assistantData = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {
         headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2' }
       });
       const assistantPrompt = assistantData.data.instructions || '';
-      const finalInstructions = `${assistantPrompt}\n\nAlways put the following sentence at the end of the explanation part as a <strong>Note:</strong>, exactly as written, in a separate paragraph between <em> tags: :\n\n"${applicableInjection}"`;
-      logger.info('[STREAM] 📋 Final instructions before sending:', finalInstructions);
+      const finalInstructions = `${styleForPlain}${convBlock}\n${assistantPrompt}\n\n${tabularHint ? tabularHint + '\n\n' : ''}Always put the following sentence at the end of the explanation part as a <strong>Note:</strong>, exactly as written, in a separate paragraph between <em> tags: :\n\n"${applicableInjection}"`;      logger.info('[STREAM] 📋 Final instructions before sending:', finalInstructions);
       payload.instructions = finalInstructions;
-    }
+    } else {
+      // No injection rule matched → still enforce ChatGPT-like structure
+      payload.instructions = tabularHint ? `${styleForPlain}${convBlock}\n\n${tabularHint}` : `${styleForPlain}${convBlock}`;    }
 
     // ---- OpenAI SSE stream (no model override; use assistant default) ----
     const openaiResp = await axios({
@@ -208,7 +292,7 @@ exports.sendMessageStream = async (req, res) => {
         if (eventName === 'ping' || dataStr === '[DONE]') continue;
 
         let payload = null;
-        try { payload = dataStr ? JSON.parse(dataStr) : null; } catch {}
+        try { payload = dataStr ? JSON.parse(dataStr) : null; } catch { }
 
         // --- helper to normalize delta shapes from OpenAI (Assistants v2 and fallbacks) ---
         const extractDeltaPieces = (payloadObj) => {
@@ -308,7 +392,7 @@ exports.sendMessageStream = async (req, res) => {
                 hadTokens = true;
                 send('token', { delta: maybeText });
               }
-            } catch {}
+            } catch { }
             break;
           }
           case 'run.step.delta':
@@ -390,7 +474,7 @@ exports.sendMessageStream = async (req, res) => {
         logger.warn('[STREAM] Nem sikerült utólag lekérdezni a run-t a modellhez:', e?.message);
       }
       // Small grace period to allow OpenAI to persist the final assistant message
-      try { await delay(800); } catch {}
+      try { await delay(800); } catch { }
       try {
         // 🔁 Final fallback: if no deltas were captured, fetch the latest assistant message
         if (!accText || !accText.trim()) {
@@ -431,7 +515,7 @@ exports.sendMessageStream = async (req, res) => {
             } catch (e) {
               logger.warn('[STREAM] Fallback fetch of messages failed (attempt ' + attempts + '):', e?.message);
             }
-            try { await delay(500); } catch {}
+            try { await delay(500); } catch { }
           }
           if (fetchedText) {
             accText = fetchedText;
@@ -439,8 +523,8 @@ exports.sendMessageStream = async (req, res) => {
         }
         const cleaned = (accText || '').replace(/【.*?】/g, '');
         const sanitized = sanitizeHtml(cleaned, {
-          allowedTags: ['a','b','i','strong','em','u','s','br','p','ul','ol','li','blockquote','code','pre','span','h1','h2','h3','h4','h5','h6','table','thead','tbody','tr','th','td'],
-          allowedAttributes: { 'span': ['class'], 'a': ['href','title','target','rel'] },
+          allowedTags: ['a', 'b', 'i', 'strong', 'em', 'u', 's', 'br', 'p', 'ul', 'ol', 'li', 'blockquote', 'code', 'pre', 'span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table', 'thead', 'tbody', 'tr', 'th', 'td'],
+          allowedAttributes: { 'span': ['class'], 'a': ['href', 'title', 'target', 'rel'] },
           transformTags: {
             'a': sanitizeHtml.simpleTransform('a', { target: '_blank', rel: 'noopener noreferrer' }, true)
           },
@@ -468,7 +552,7 @@ exports.sendMessageStream = async (req, res) => {
 
     stream.on('error', (err) => {
       send('error', { message: err?.message || 'OpenAI stream connection error' });
-      try { res.end(); } catch {}
+      try { res.end(); } catch { }
     });
 
   } catch (error) {
@@ -509,6 +593,620 @@ exports.sendMessageStream = async (req, res) => {
     }
   }
 };
+// ===== Hybrid/Sandbox: Chat with file focus → Assistants v2 (SSE) =====
+// POST is expected to be multipart/form-data (files[]) or JSON with fileIds[].
+// Body:
+//   - mode: "hybrid" | "sandbox"  (default: "hybrid")
+//   - message: string (required)
+//   - threadId: string (required)
+//   - fileIds?: string[] (optional; already uploaded OpenAI file IDs)
+// Uploads come via multer memory storage as req.files (buffer).
+exports.chatWithFilesStream = async (req, res) => {
+  const send = sseInit(req, res);
+
+  // Small util: fetch vector store id bound to an assistant
+  async function getAssistantVectorStoreId(assistantId) {
+    const resp = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        'OpenAI-Beta': 'assistants=v2'
+      }
+    });
+    const vs = resp.data?.tool_resources?.file_search?.vector_store_ids || [];
+    return vs.length ? vs[0] : null;
+  }
+
+  try {
+    const { mode: rawMode, message, threadId } = req.body || {};
+    const mode = (rawMode === 'sandbox' ? 'sandbox' : 'hybrid');
+    const userId = req.userId;
+
+    // fileIds may arrive as JSON-string or array (depending on client)
+    let fileIdsParam = [];
+    if (Array.isArray(req.body?.fileIds)) fileIdsParam = req.body.fileIds;
+    else if (typeof req.body?.fileIds === 'string') {
+      try { fileIdsParam = JSON.parse(req.body.fileIds); } catch { fileIdsParam = []; }
+    }
+
+    if (!userId) {
+      send('error', { message: 'Hiányzó vagy érvénytelen JWT.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      send('error', { message: 'A message kötelező, nem lehet üres.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    if (!threadId || typeof threadId !== 'string' || !threadId.trim()) {
+      send('error', { message: 'A threadId kötelező, nem lehet üres.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+
+    // ---- Resolve user, tenant, assistant (like sendMessageStream) ----
+    const user = await User.findById(userId).select('tenantId');
+    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
+    if (!tenantId) {
+      send('error', { message: 'Hiányzó tenant azonosító.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    if (!user) {
+      send('error', { message: 'Felhasználó nem található.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    const tenantDoc = await Tenant.findById(tenantId).select('name');
+    if (!tenantDoc) {
+      send('error', { message: 'Tenant nem található.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    const tenantKey = String(tenantDoc.name || '').toLowerCase();
+    const baseAssistantId = assistants.byTenant?.[tenantKey] || assistants['default'];
+
+    // ---- Load conversation & ownership ----
+    const conversation = await Conversation.findOne({ threadId, userId, tenantId });
+    if (!conversation) {
+      send('error', { message: 'A megadott szál nem található.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+
+    // Rolling summary to help the model stay consistent with the dialogue (not evidence)
+    const rolling = await buildRollingSummary(conversation).catch(() => '');
+
+    // ---- Ensure no active run on this thread ----
+    const runsResponse = await axios.get(`https://api.openai.com/v1/threads/${threadId}/runs`, {
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2' },
+    });
+    const activeRun = runsResponse.data.data.find(r => ['queued', 'in_progress', 'requires_action', 'cancelling'].includes(r.status));
+    if (activeRun) {
+      send('error', { message: `Már fut egy aktív feldolgozás (${activeRun.status}).`, activeRunId: activeRun.id, status: activeRun.status });
+      send('done', { ok: false });
+      return res.end();
+    }
+
+    // ---- 1) Collect/Transform/Upload files → fileIds[]
+    const uploads = req.files || [];
+    const fileIds = [...fileIdsParam];
+
+    for (const f of uploads) {
+      let uploadBuffer = f.buffer;
+      let uploadName = f.originalname;
+      let uploadMime = f.mimetype || 'application/octet-stream';
+
+      const lowerName = (f.originalname || '').toLowerCase();
+      const isExcel =
+        lowerName.endsWith('.xls') || lowerName.endsWith('.xlsx') ||
+        (uploadMime.includes('excel') || uploadMime.includes('spreadsheetml'));
+
+      if (isExcel) {
+        let converted = false;
+        try {
+          // 1) Excel → CSV (összes sheet)
+          const wb = xlsx.read(f.buffer, { type: 'buffer' });
+          const parts = [];
+          wb.SheetNames.forEach(sheet => {
+            const csv = xlsx.utils.sheet_to_csv(wb.Sheets[sheet], { blankrows: false });
+            parts.push(`-- SHEET: ${sheet} --\n${csv}`);
+          });
+          const csvText = parts.join('\n\n');
+
+          // 2) CSV → TXT (elsődleges út)
+          const txtText = String(csvText || '');
+          const txtBuf = Buffer.from(txtText, 'utf8');
+          if (txtBuf && txtBuf.length > 0) {
+            uploadBuffer = txtBuf;
+            uploadName = f.originalname.replace(/\.(xls|xlsx)$/i, '') + '.txt';
+            uploadMime = 'text/plain';
+            converted = true;
+            send('progress', { stage: 'file.transform', file: f.originalname, as: uploadName, info: 'excel→csv→txt' });
+          }
+
+          // 3) Ha a TXT valamiért nem jött össze (ritka), próbáljunk PDF-et
+          if (!converted) {
+            const pdfBuf = await tryMakePdfFromText(csvText, `Converted from ${f.originalname}`);
+            if (pdfBuf) {
+              uploadBuffer = pdfBuf;
+              uploadName = f.originalname.replace(/\.(xls|xlsx)$/i, '') + '.pdf';
+              uploadMime = 'application/pdf';
+              converted = true;
+              send('progress', { stage: 'file.transform', file: f.originalname, as: uploadName, info: 'excel→pdf (csv/txt failed)' });
+            }
+          }
+
+          // Ha eddig sem sikerült, essünk át a catch-be (skip)
+          if (!converted) {
+            throw new Error('TXT/PDF conversion not achieved after CSV');
+          }
+
+        } catch (e) {
+          logger.warn('[CHAT_WITH_FILES] Excel→(csv/txt) conversion failed, trying PDF fallback. Details:', e?.message);
+
+          // Utolsó próbálkozás: közvetlen PDF a sheet-ek nyers sorainak összeillesztésével
+          try {
+            const wb2 = xlsx.read(f.buffer, { type: 'buffer' });
+            const txtParts = [];
+            wb2.SheetNames.forEach(sheet => {
+              const rows = xlsx.utils.sheet_to_json(wb2.Sheets[sheet], { header: 1, blankrows: false });
+              const lines = rows.map(r => (Array.isArray(r) ? r.join('\t') : String(r))).join('\n');
+              txtParts.push(`-- SHEET: ${sheet} --\n${lines}`);
+            });
+            const fallbackText = txtParts.join('\n\n');
+            const pdfBuf = await tryMakePdfFromText(fallbackText, `Converted from ${f.originalname}`);
+            if (pdfBuf) {
+              uploadBuffer = pdfBuf;
+              uploadName = f.originalname.replace(/\.(xls|xlsx)$/i, '') + '.pdf';
+              uploadMime = 'application/pdf';
+              send('progress', { stage: 'file.transform', file: f.originalname, as: uploadName, info: 'excel→pdf (direct fallback)' });
+            } else {
+              // PDF sem sikerült → SKIP
+              send('progress', { stage: 'file.skipped', file: f.originalname, reason: 'excel conversion and pdf fallback failed' });
+              continue; // ugorjuk ezt a fájlt
+            }
+          } catch (e2) {
+            // Workbook sem olvasható → SKIP
+            send('progress', { stage: 'file.skipped', file: f.originalname, reason: 'excel parse failed, pdf fallback unavailable' });
+            continue; // ugorjuk ezt a fájlt
+          }
+        }
+      }
+
+      const form = new FormData();
+      form.append('purpose', 'assistants');
+      form.append('file', uploadBuffer, { filename: uploadName, contentType: uploadMime });
+
+      const up = await axios.post('https://api.openai.com/v1/files', form, {
+        headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, ...form.getHeaders() },
+        maxBodyLength: Infinity
+      });
+      fileIds.push(up.data.id);
+      send('progress', { stage: 'file.uploaded', file: uploadName, original: f.originalname, fileId: up.data.id });
+    }
+
+    // ---- 2) HYBRID vs SANDBOX resource preparation ----
+    let assistantIdToUse = baseAssistantId;
+    let vectorStoreIdToUse = null;
+
+    if (mode === 'sandbox') {
+      // 2.a) new vector store
+      const vs = await axios.post('https://api.openai.com/v1/vector_stores', { name: `sandbox-${threadId}-${Date.now()}` }, {
+        headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2', 'Content-Type': 'application/json' }
+      });
+      vectorStoreIdToUse = vs.data.id;
+
+      // 2.b) attach files to new store
+      for (const fid of fileIds) {
+        await axios.post(
+          `https://api.openai.com/v1/vector_stores/${vectorStoreIdToUse}/files`,
+          { file_id: fid },
+          { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2', 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // 2.c) create a dedicated assistant bound to this store (gpt-4o-mini)
+      const a = await axios.post('https://api.openai.com/v1/assistants', {
+        model: 'gpt-4o-mini',
+        name: `Sandbox Assistant for ${threadId}`,
+        tools: [{ type: 'file_search' }],
+        tool_resources: { file_search: { vector_store_ids: [vectorStoreIdToUse] } }
+      }, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2', 'Content-Type': 'application/json' } });
+      assistantIdToUse = a.data.id;
+
+      // Persist minimal context so later turns can continue
+      // Ensure job object has required fields (JobSchema requires `type`)
+      if (!conversation.job) conversation.job = {};
+      if (!conversation.job.type) {
+        conversation.job.type = 'chat_with_files';
+        conversation.job.status = conversation.job.status || 'succeeded';
+        conversation.job.stage = conversation.job.stage || 'context';
+        conversation.job.progress = conversation.job.progress || {};
+        conversation.job.error = conversation.job.error || null;
+        conversation.job.startedAt = conversation.job.startedAt || new Date();
+        conversation.job.finishedAt = conversation.job.finishedAt || new Date();
+      }
+      conversation.job.meta = conversation.job.meta || {};
+      conversation.job.meta.sandboxContext = {
+        mode: 'sandbox',
+        assistantId: assistantIdToUse,
+        vectorStoreId: vectorStoreIdToUse,
+        fileIds
+      };
+
+      // Also persist top-level context for easy continuation
+      conversation.mode = 'sandbox';
+      conversation.assistantId = assistantIdToUse;
+      conversation.vectorStoreId = vectorStoreIdToUse;
+      conversation.fileIds = fileIds;
+      await conversation.save();
+    } else {
+      // HYBRID: use existing assistant's vector store and add files there
+      vectorStoreIdToUse = await getAssistantVectorStoreId(baseAssistantId);
+      if (vectorStoreIdToUse && fileIds.length) {
+        for (const fid of fileIds) {
+          try {
+            await axios.post(
+              `https://api.openai.com/v1/vector_stores/${vectorStoreIdToUse}/files`,
+              { file_id: fid },
+              { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2', 'Content-Type': 'application/json' } }
+            );
+          } catch (e) {
+            // ignore 409 already-attached errors
+          }
+        }
+      }
+      // Persist last-used hybrid focus for continuity (under job.meta)
+      if (!conversation.job) conversation.job = {};
+      if (!conversation.job.type) {
+        conversation.job.type = 'chat_with_files';
+        conversation.job.status = conversation.job.status || 'succeeded';
+        conversation.job.stage = conversation.job.stage || 'context';
+        conversation.job.progress = conversation.job.progress || {};
+        conversation.job.error = conversation.job.error || null;
+        conversation.job.startedAt = conversation.job.startedAt || new Date();
+        conversation.job.finishedAt = conversation.job.finishedAt || new Date();
+      }
+      conversation.job.meta = conversation.job.meta || {};
+      conversation.job.meta.hybridContext = {
+        mode: 'hybrid',
+        assistantId: baseAssistantId,
+        vectorStoreId: vectorStoreIdToUse,
+        fileIds
+      };
+
+      // Also persist top-level context for easy continuation
+      conversation.mode = 'hybrid';
+      conversation.assistantId = baseAssistantId;
+      if (vectorStoreIdToUse) conversation.vectorStoreId = vectorStoreIdToUse;
+      conversation.fileIds = fileIds;
+      await conversation.save();
+    }
+
+    // ---- 3) Post the user message (ALWAYS attach message-level files to prioritize them) ----
+    const useMessageAttachments = true; // keep parity with the earlier fixed version: always attach to the message
+    let messagePayload = { role: 'user', content: message };
+
+    if (useMessageAttachments && Array.isArray(fileIds) && fileIds.length) {
+      messagePayload.attachments = fileIds.map(fid => ({ file_id: fid, tools: [{ type: 'file_search' }] }));
+    }
+
+    await axios.post(
+      `https://api.openai.com/v1/threads/${threadId}/messages`,
+      messagePayload,
+      { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2' } }
+    );
+
+    // ---- Build ChatGPT-like instructions with explicit file inventory (attached + DB fileIds + optional store) ----
+    // 1) Freshly attached files (multer)
+    let attachedNames = [];
+    try {
+      if (Array.isArray(req.files)) {
+        attachedNames = req.files.map(f => f.originalname).filter(Boolean);
+      }
+    } catch { }
+
+    // 2) Files already associated in DB (conversation.fileIds → resolve to filenames)
+    let dbNames = [];
+    try {
+      const dbFileIds = Array.isArray(conversation.fileIds) ? conversation.fileIds.filter(Boolean) : [];
+      if (dbFileIds.length) {
+        const batchSize = 20;
+        for (let i = 0; i < dbFileIds.length; i += batchSize) {
+          const batch = dbFileIds.slice(i, i + batchSize);
+          const reqs = batch.map(fid => axios.get(`https://api.openai.com/v1/files/${fid}`, {
+            headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
+          }));
+          const results = await Promise.allSettled(reqs);
+          results.forEach(r => {
+            if (r.status === 'fulfilled') {
+              const nm = r.value?.data?.filename || r.value?.data?.name || null;
+              if (nm) dbNames.push(nm);
+            }
+          });
+        }
+      }
+    } catch (e) {
+      logger.warn('[FILES INVENTORY] Failed to resolve DB fileIds to names:', e?.response?.data || e?.message);
+    }
+
+    // 3) Optional: vector store file names (only if dbNames is empty and a store exists)
+    let storeNames = [];
+    try {
+      if (!dbNames.length && vectorStoreIdToUse) {
+        const list1 = await axios.get(`https://api.openai.com/v1/vector_stores/${vectorStoreIdToUse}/files?limit=200`, {
+          headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2' }
+        });
+        const fileIdsInStore = (list1.data?.data || []).map(x => x.id);
+        const batchSize = 20;
+        for (let i = 0; i < fileIdsInStore.length; i += batchSize) {
+          const batch = fileIdsInStore.slice(i, i + batchSize);
+          const reqs = batch.map(fid => axios.get(`https://api.openai.com/v1/files/${fid}`, {
+            headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
+          }));
+          const results = await Promise.allSettled(reqs);
+          results.forEach(r => {
+            if (r.status === 'fulfilled') {
+              const nm = r.value?.data?.filename || r.value?.data?.name || null;
+              if (nm) storeNames.push(nm);
+            }
+          });
+        }
+      }
+    } catch (e) {
+      logger.warn('[FILES INVENTORY] Failed to enumerate vector store files:', e?.response?.data || e?.message);
+    }
+
+    // 4) Compose final inventory and instructions
+    const inventoryNames = Array.from(new Set([...attachedNames, ...dbNames, ...storeNames]));
+    const inventoryBlock = inventoryNames.length
+      ? 'FILES IN SCOPE (filenames):\n' + inventoryNames.map(n => `- ${n}`).join('\n')
+      : 'FILES IN SCOPE: (none reported)';
+
+    const styleForMode = getStyleInstructions(mode);
+    const tabularHint = buildTabularHint(message);
+    const enforcedIntroParts = [
+      styleForMode,
+      (rolling ? `\nConversation summary (for context—do not use as evidence):\n${rolling}\n` : ''),
+      '\nAt the very top of your answer, output a short bulleted list titled **Files in scope** with the exact filenames below (one per bullet).',
+      inventoryBlock,
+      '\nThen proceed to answer. First, search the files attached to this message (and any files already associated with the thread). Treat these as the PRIMARY source of truth. Only if they clearly do not contain the answer, use prior conversation context or general knowledge.',
+      'When you quote or rely on a document, mention its filename inline.',
+      'Structure your answer dynamically. If a brief direct answer is sufficient, give it first, then optional details.',
+      'Use Markdown selectively (short headings/lists/tables) only when they improve clarity. Avoid boilerplate sections.',
+      'If calculations or data extraction are required, present results clearly and add a short “Method” note only when helpful.',
+      'If information is missing, say so and suggest one next step at most.'
+    ];
+    if (tabularHint) enforcedIntroParts.push(tabularHint);
+    const enforcedIntro = enforcedIntroParts.join('\n');
+
+    // ---- 4) Start the streamed run (same streaming infra as sendMessageStream) ----
+    const runPayload = { assistant_id: assistantIdToUse, stream: true, instructions: enforcedIntro };
+    if (vectorStoreIdToUse) {
+      runPayload.tool_resources = { file_search: { vector_store_ids: [vectorStoreIdToUse] } };
+    }
+
+    const openaiResp = await axios({
+      method: 'post',
+      url: `https://api.openai.com/v1/threads/${threadId}/runs`,
+      data: runPayload,
+      responseType: 'stream',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        'OpenAI-Beta': 'assistants=v2',
+        Connection: 'keep-alive'
+      },
+      httpAgent: new http.Agent({ keepAlive: true }),
+      httpsAgent: new https.Agent({ keepAlive: true }),
+      timeout: 0
+    });
+
+    let accText = '';
+    let lastAssistantMessageId = null;
+    let buffer = '';
+    let hadTokens = false;
+
+    const extractDeltaPieces = (payloadObj) => {
+      const pieces = [];
+      const contentArr = payloadObj?.delta?.content;
+      if (Array.isArray(contentArr)) {
+        for (const part of contentArr) {
+          if (part?.type === 'output_text.delta') {
+            const txt = (typeof part?.text === 'string' ? part.text : '') || (typeof part?.delta?.text === 'string' ? part.delta.text : '');
+            if (txt) pieces.push(txt);
+          }
+          if (part?.delta?.type === 'text_delta' && typeof part?.delta?.text === 'string') pieces.push(part.delta.text);
+          if (part?.type === 'text' && typeof part?.text?.value === 'string') pieces.push(part.text.value);
+        }
+      }
+      if (!pieces.length && payloadObj?.delta) {
+        const d = payloadObj.delta;
+        if (d?.type === 'output_text.delta' && typeof d?.text === 'string') pieces.push(d.text);
+        else if (d?.type === 'text_delta' && typeof d?.text === 'string') pieces.push(d.text);
+        else if (typeof d?.text?.value === 'string') pieces.push(d.text.value);
+      }
+      const deltasArr = payloadObj?.deltas;
+      if (!pieces.length && Array.isArray(deltasArr)) {
+        for (const d of deltasArr) {
+          if (d?.type === 'output_text.delta' && typeof d?.text === 'string') pieces.push(d.text);
+          if (d?.type === 'text_delta' && typeof d?.text === 'string') pieces.push(d.text);
+        }
+      }
+      if (!pieces.length && typeof payloadObj?.text === 'string') pieces.push(payloadObj.text);
+      if (!pieces.length && typeof payloadObj?.message?.content?.[0]?.text?.value === 'string') {
+        pieces.push(payloadObj.message.content[0].text.value);
+      }
+      return pieces;
+    };
+
+    const flushBlocks = (raw) => {
+      const blocks = raw.split('\n\n');
+      for (const block of blocks) {
+        if (!block.trim()) continue;
+        const lines = block.split('\n');
+        let eventName = null;
+        let dataStr = '';
+        for (const line of lines) {
+          if (line.startsWith('event:')) eventName = line.slice(6).trim();
+          else if (line.startsWith('data:')) dataStr += line.slice(5).trim();
+        }
+        if (!eventName) continue;
+        if (eventName === 'ping' || dataStr === '[DONE]') continue;
+
+        let payload = null;
+        try { payload = dataStr ? JSON.parse(dataStr) : null; } catch { }
+
+        switch (eventName) {
+          case 'thread.message.delta':
+          case 'message.delta': {
+            const pieces = extractDeltaPieces(payload || {});
+            if (pieces.length) {
+              for (const piece of pieces) {
+                accText += piece;
+                hadTokens = true;
+                send('token', { delta: piece });
+              }
+            }
+            break;
+          }
+          case 'thread.message.completed': {
+            if (payload?.id) lastAssistantMessageId = payload.id;
+            try {
+              const maybeText =
+                (Array.isArray(payload?.message?.content) && payload.message.content
+                  .map(p => (p?.type === 'text' && p?.text?.value) ? p.text.value : '')
+                  .join('')) || '';
+              if (maybeText) {
+                accText += maybeText;
+                hadTokens = true;
+                send('token', { delta: maybeText });
+              }
+            } catch { }
+            break;
+          }
+          case 'run.step.delta':
+          case 'run.step.completed':
+          case 'run.requires_action':
+          case 'run.in_progress': {
+            send('assistant.status', { stage: eventName });
+            break;
+          }
+          case 'run.completed': {
+            send('assistant.status', { stage: eventName });
+            break;
+          }
+          case 'error': {
+            const msg = payload?.message || 'OpenAI stream error';
+            if (!hadTokens) send('error', { message: msg });
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    };
+
+    const stream = openaiResp.data;
+    stream.on('data', (chunk) => {
+      try {
+        buffer += chunk.toString('utf8');
+        const lastSep = buffer.lastIndexOf('\n\n');
+        if (lastSep !== -1) {
+          const processPart = buffer.slice(0, lastSep);
+          buffer = buffer.slice(lastSep + 2);
+          flushBlocks(processPart);
+        }
+      } catch (e) {
+      }
+    });
+
+    stream.on('end', async () => {
+      try { await delay(600); } catch { }
+      try {
+        if (!accText || !accText.trim()) {
+          const msgResp = await axios.get(`https://api.openai.com/v1/threads/${threadId}/messages`, {
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+              'OpenAI-Beta': 'assistants=v2'
+            }
+          });
+          const assistantMsg = msgResp.data?.data?.find(m => m.role === 'assistant');
+          if (assistantMsg?.content) {
+            let fallbackTxt = '';
+            if (Array.isArray(assistantMsg.content)) {
+              for (const item of assistantMsg.content) {
+                if (item?.type === 'text' && typeof item?.text?.value === 'string') fallbackTxt += item.text.value;
+              }
+            }
+            if (!fallbackTxt && typeof assistantMsg?.content === 'string') fallbackTxt = assistantMsg.content;
+            if (fallbackTxt) accText = fallbackTxt;
+          }
+        }
+
+        const cleaned = (accText || '').replace(/【.*?】/g, '');
+        const sanitized = sanitizeHtml(cleaned, {
+          allowedTags: ['a', 'b', 'i', 'strong', 'em', 'u', 's', 'br', 'p', 'ul', 'ol', 'li', 'blockquote', 'code', 'pre', 'span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table', 'thead', 'tbody', 'tr', 'th', 'td'],
+          allowedAttributes: { 'span': ['class'], 'a': ['href', 'title', 'target', 'rel'] },
+          transformTags: {
+            'a': sanitizeHtml.simpleTransform('a', { target: '_blank', rel: 'noopener noreferrer' }, true)
+          },
+          disallowedTagsMode: 'discard'
+        });
+        const finalHtml = marked(sanitized);
+
+        conversation.messages.push({ role: 'user', content: message, meta: { kind: 'chat-with-files', mode, fileIds } });
+        conversation.messages.push({ role: 'assistant', content: finalHtml, images: [] });
+        await conversation.save();
+        const savedAssistant = conversation.messages.slice().reverse().find(m => m.role === 'assistant');
+
+        send('final', { html: finalHtml, messageId: savedAssistant?._id || lastAssistantMessageId || null });
+
+        // --- finalize job state for chat_with_files so UI won't show Queued after reload ---
+        try {
+          if (!conversation.job) conversation.job = {};
+          conversation.job.type = 'chat_with_files';
+          conversation.job.status = 'succeeded';
+          conversation.job.stage = 'done';
+          conversation.job.finishedAt = new Date();
+          conversation.job.updatedAt = new Date();
+          conversation.hasBackgroundJob = false;
+          await conversation.save();
+        } catch (e2) {
+          logger.warn('[CHAT_WITH_FILES] Failed to finalize job state:', e2?.message);
+        }
+      } catch (e) {
+        send('error', { message: e.message || 'Failed to finalize message' });
+      } finally {
+        send('done', { ok: true });
+        try { res.end(); } catch { }
+      }
+    });
+
+    stream.on('error', (err) => {
+      send('error', { message: err?.message || 'OpenAI stream connection error' });
+      try { res.end(); } catch { }
+    });
+
+  } catch (error) {
+    logger.error('[CHAT_WITH_FILES] Hiba:', {
+      message: error.message,
+      stack: error.stack,
+      response: error.response?.data,
+      status: error.response?.status,
+    });
+    try {
+      send('error', { message: error.message || 'Váratlan hiba történt.' });
+      send('done', { ok: false });
+    } finally {
+      return res.end();
+    }
+  }
+};
+
 const Conversation = require('../models/conversation');
 const InjectionRule = require('../models/injectionRule');
 const axios = require('axios');
@@ -521,7 +1219,7 @@ const { body, validationResult } = require('express-validator');
 const { marked } = require('marked');
 const tiktoken = require('tiktoken');
 const assistants = require('../config/assistants');
-const User = require('../models/user'); 
+const User = require('../models/user');
 const Tenant = require('../models/tenant');
 const { fetchFromAzureSearch } = require('../helpers/azureSearchHelpers');
 console.log('fetchFromAzureSearch:', typeof fetchFromAzureSearch);
@@ -535,6 +1233,31 @@ const { runUploadAndSummarize } = require('../services/summaryCore');
 const { notifyAndStore } = require('../lib/notifications/notifier');
 
 const FormData = require('form-data');
+
+// --- Optional PDF creator (fallbacks to null if 'pdfkit' is not installed) ---
+async function tryMakePdfFromText(text, title = 'Converted from spreadsheet') {
+  try {
+    const PDFDocument = require('pdfkit');
+    return await new Promise((resolve, reject) => {
+      const doc = new PDFDocument({ margin: 50 });
+      const chunks = [];
+      doc.on('data', (b) => chunks.push(b));
+      doc.on('error', (err) => reject(err));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+
+      if (title) {
+        doc.fontSize(14).text(String(title), { underline: true });
+        doc.moveDown(0.5);
+      }
+      const safeText = String(text || '').replace(/\u0000/g, '');
+      doc.fontSize(10).text(safeText, { lineGap: 2 });
+      doc.end();
+    });
+  } catch (e) {
+    logger.warn('[CHAT_WITH_FILES] pdfkit not available; cannot create PDF. Details:', e?.message);
+    return null;
+  }
+}
 
 // ===== Background Job helpers (persist progress to Mongo) =====
 async function jobInit(conversation, type, initial) {
@@ -585,7 +1308,7 @@ async function jobPatch(conversation, patch) {
   if (patch.startedAt !== undefined) job.startedAt = patch.startedAt;
   if (patch.finishedAt !== undefined) job.finishedAt = patch.finishedAt;
   job.updatedAt = new Date();
-  conversation.hasBackgroundJob = ['queued','running'].includes(job.status);
+  conversation.hasBackgroundJob = ['queued', 'running'].includes(job.status);
   await conversation.save();
 }
 
@@ -680,10 +1403,30 @@ function sseInit(req, res) {
   // Stop heartbeat when client disconnects
   res.on('close', () => {
     clearInterval(heartbeat);
-    try { res.end(); } catch {}
+    try { res.end(); } catch { }
   });
 
   return send;
+}
+/** --- Rolling summary + HTML strip (context tone aid; not evidence) --- */
+function stripHtml(input) {
+  return String(input || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+async function buildRollingSummary(conversation) {
+  try {
+    const last = Array.isArray(conversation?.messages) ? conversation.messages.slice(-12) : [];
+    const plain = last.map(m => `${String(m.role || '').toUpperCase()}: ${stripHtml(m.content)}`).join('\n');
+    if (!plain) return '';
+    const sys = 'Summarize the dialogue for the assistant to use as context. Be concise, neutral, 10–15 sentences. No action items, no fluff. Do not invent facts.';
+    const resp = await axios.post('https://api.openai.com/v1/chat/completions', {
+      model: process.env.SUMMARY_COMPLETIONS_MODEL || 'gpt-5-mini',
+      messages: [{ role: 'system', content: sys }, { role: 'user', content: plain }]
+    }, { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } });
+    return resp.data?.choices?.[0]?.message?.content || '';
+  } catch {
+    return '';
+  }
 }
 
 // ===== Mixed-files upload (no vector store) -> full-text extraction -> summarize (SSE) =====
@@ -785,10 +1528,10 @@ exports.uploadAndSummarizeStream = async (req, res) => {
       },
       {
         emit: (event, payload) => {
-          try { send(event, payload); } catch {}
+          try { send(event, payload); } catch { }
         },
         patch: async (patchObj) => {
-          try { await jobPatch(conversation, patchObj); } catch {}
+          try { await jobPatch(conversation, patchObj); } catch { }
         }
       }
     );
@@ -857,7 +1600,7 @@ exports.uploadAndSummarizeStream = async (req, res) => {
 
   } catch (error) {
     if (conversation) {
-      try { await jobFail(conversation, error); } catch {}
+      try { await jobFail(conversation, error); } catch { }
     }
     // Notify user about failure
     try {
@@ -908,6 +1651,7 @@ exports.uploadAndAskStream = [
       const { threadId: tid, question: rawQuestion, userQuestion } = req.body || {};
       threadId = tid;
       const question = (typeof userQuestion === 'string' && userQuestion.trim()) ? userQuestion : (typeof rawQuestion === 'string' ? rawQuestion : '');
+      const reduceTabularHint = buildTabularHint(question);
 
       if (!userId) {
         send('error', { message: 'Hiányzó vagy érvénytelen JWT.' });
@@ -1061,19 +1805,27 @@ exports.uploadAndAskStream = [
         const modelFallback = process.env.SUMMARY_COMPLETIONS_FALLBACK || 'gpt-4o-mini';
 
         const systemMap = [
-          'You are a precise technical assistant.',
-          'Only use the provided CONTEXT CHUNK.',
-          'If the answer cannot be found in this chunk, say exactly: "Not found in this chunk."',
-          'Otherwise, extract the **minimal necessary** quotes (with line excerpts) and mention the source filename shown in the chunk header.',
+          'You are a helpful, precise assistant (ChatGPT style).',
+          'Answer **only** using the provided CONTEXT CHUNK.',
+          'If the answer is not present in this chunk, reply exactly: "Not found in this chunk."',
+          'If relevant text is present, provide the minimal necessary answer with brief supporting quotes and include the source filename from the chunk header when that adds value.',
+          'Be concise; avoid boilerplate sections. Use Markdown only if it improves clarity.',
+          'Respond in the same language as the user question.',
+          'Prefer concise answers; use a short Markdown table only if it clearly improves clarity for this chunk.'
         ].join(' ');
 
-        const systemReduce = [
-          'You are a precise technical assistant.',
-          'Synthesize the final answer ONLY from the provided FINDINGS.',
-          'If contradictory, choose the most specific and directly quoted evidence.',
-          'If overall not present, say: "Not found in provided files."',
-          'Cite exact lines and list the source filename(s).',
+        const systemReduceBase = [
+          'You are a helpful, precise assistant (ChatGPT style).',
+          'Synthesize the final answer **only** from the provided FINDINGS and the user question.',
+          'Structure the response dynamically. If a brief direct answer suffices, present it first, followed by essential evidence only as needed.',
+          'Resolve contradictions by preferring the most specific and directly quoted evidence.',
+          'If the information is not present overall, say exactly: "Not found in provided files."',
+          'Cite filenames inline only when it helps attribution. Avoid unnecessary sections.',
+          'Respond in the same language as the user\'s question.',
+          'If the task implies analysis/compliance/metrics, include a compact Markdown table (≤10 columns, ≤30 rows) where it improves clarity; otherwise use clear prose.',
+          'If crucial details are missing, ask one concise clarifying question at the top, then proceed with the best-possible answer.'
         ].join(' ');
+        const systemReduce = reduceTabularHint ? `${systemReduceBase} ${reduceTabularHint}` : systemReduceBase;
 
         // Per-request retry with backoff + jitter (shared by map & reduce)
         async function chatWithRetry(modelName, messages, stageLabel) {
@@ -1095,7 +1847,7 @@ exports.uploadAndAskStream = [
               const retriable = status === 429 || (status >= 500 && status < 600);
               if (!retriable || attempt >= MAX) {
                 // announce terminal failure
-                try { send('assistant.status', { stage: `${stageLabel}.fail`, model: modelName, status, error: err?.message || 'error' }); } catch {}
+                try { send('assistant.status', { stage: `${stageLabel}.fail`, model: modelName, status, error: err?.message || 'error' }); } catch { }
                 throw err;
               }
               let pause = wait;
@@ -1104,7 +1856,7 @@ exports.uploadAndAskStream = [
                 const raMs = Number(ra) * 1000;
                 if (!Number.isNaN(raMs) && raMs > 0) pause = Math.max(pause, raMs);
               }
-              try { send('assistant.status', { stage: `${stageLabel}.retry`, attempt, waitMs: pause, status }); } catch {}
+              try { send('assistant.status', { stage: `${stageLabel}.retry`, attempt, waitMs: pause, status }); } catch { }
               await delay(jitter(pause));
               wait = Math.min(wait * 2, 8000);
             }
@@ -1128,11 +1880,11 @@ exports.uploadAndAskStream = [
             reply = await chatWithRetry(modelPrimary, mapMessages, 'map.primary');
             send('assistant.status', { stage: 'map.primary.ok', index: i + 1, total: chunks.length, model: modelPrimary });
             // small heartbeat for UI typing feel
-            try { send('token', { delta: '\n' }); } catch {}
+            try { send('token', { delta: '\n' }); } catch { }
           } catch {
             reply = await chatWithRetry(modelFallback, mapMessages, 'map.fallback');
             send('assistant.status', { stage: 'map.fallback.ok', index: i + 1, total: chunks.length, model: modelFallback });
-            try { send('token', { delta: '\n' }); } catch {}
+            try { send('token', { delta: '\n' }); } catch { }
           }
 
           const normalized = (reply || '').trim();
@@ -1206,19 +1958,19 @@ exports.uploadAndAskStream = [
               }
               const msg = [
                 { role: 'system', content: systemReduce },
-                { role: 'user', content: `FINDINGS (batch ${i+1}/${batches.length}):\n\n${bJoined}\n\nQUESTION:\n${question}\n\nReturn a concise, well-structured summary WITH exact quotes and source filenames.` }
+                { role: 'user', content: `FINDINGS (batch ${i + 1}/${batches.length}):\n\n${bJoined}\n\nQUESTION:\n${question}\n\nReturn a concise, well-structured summary WITH exact quotes and source filenames.` }
               ];
               let summary = '';
               try {
-                summary = await chatWithRetry(modelPrimary, msg, `reduce.primary.batch${i+1}.round${round}`);
+                summary = await chatWithRetry(modelPrimary, msg, `reduce.primary.batch${i + 1}.round${round}`);
                 send('assistant.status', { stage: 'reduce.primary.ok', model: modelPrimary, round, batch: i + 1 });
               } catch {
-                summary = await chatWithRetry(modelFallback, msg, `reduce.fallback.batch${i+1}.round${round}`);
+                summary = await chatWithRetry(modelFallback, msg, `reduce.fallback.batch${i + 1}.round${round}`);
                 send('assistant.status', { stage: 'reduce.fallback.ok', model: modelFallback, round, batch: i + 1 });
               }
               next.push(summary.trim());
               // lightweight progress ping for UI
-              try { send('token', { delta: '\n' }); } catch {}
+              try { send('token', { delta: '\n' }); } catch { }
             }
 
             // Prepare for next round with the intermediate summaries
@@ -1233,8 +1985,8 @@ exports.uploadAndAskStream = [
 
         const cleaned = String(combinedText || '').trim().replace(/【.*?】/g, '');
         const sanitized = sanitizeHtml(cleaned, {
-          allowedTags: ['a','b','i','strong','em','u','s','br','p','ul','ol','li','blockquote','code','pre','span','h1','h2','h3','h4','h5','h6','table','thead','tbody','tr','th','td'],
-          allowedAttributes: { 'span': ['class'], 'a': ['href','title','target','rel'] },
+          allowedTags: ['a', 'b', 'i', 'strong', 'em', 'u', 's', 'br', 'p', 'ul', 'ol', 'li', 'blockquote', 'code', 'pre', 'span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table', 'thead', 'tbody', 'tr', 'th', 'td'],
+          allowedAttributes: { 'span': ['class'], 'a': ['href', 'title', 'target', 'rel'] },
           transformTags: {
             'a': sanitizeHtml.simpleTransform('a', { target: '_blank', rel: 'noopener noreferrer' }, true)
           },
@@ -1322,12 +2074,12 @@ const imageMapping = {
   "parkolás": ["KESZ_7_MELL-13.png"],
   "parkoló": ["KESZ_7_MELL-13.png"],
   "garázs": ["KESZ_7_MELL-13.png"],
-  "építési hely meghatározás":["KESZ_7_MELL-7.png"],
-  "utcai párkánymagasság":["KESZ_7_MELL-15.png"],
-  "magassági idom":["KESZ_7_MELL-18.png"],
-  "Az építési övezetek magassági szabályozása":["KESZ_4_MELL_MAGASSAG.png"],
-  "XIII kerület magassági szabályozás":["KESZ_4_MELL_MAGASSAG.png"],
-  "épületmagasság":["KESZ_4_MELL_MAGASSAG.png"],
+  "építési hely meghatározás": ["KESZ_7_MELL-7.png"],
+  "utcai párkánymagasság": ["KESZ_7_MELL-15.png"],
+  "magassági idom": ["KESZ_7_MELL-18.png"],
+  "Az építési övezetek magassági szabályozása": ["KESZ_4_MELL_MAGASSAG.png"],
+  "XIII kerület magassági szabályozás": ["KESZ_4_MELL_MAGASSAG.png"],
+  "épületmagasság": ["KESZ_4_MELL_MAGASSAG.png"],
 };
 
 exports.sendMessage = [
@@ -1608,7 +2360,7 @@ exports.sendMessage = [
 
       const lastAssistantMessage = conversation.messages.slice().reverse().find(m => m.role === 'assistant');
 
-      
+
       res.json({
         html: assistantContentHtml,
         images: imageUrls.length > 0 ? imageUrls : [],
@@ -1639,7 +2391,7 @@ exports.sendMessage = [
       if (error?.response?.status === 400) {
         try {
           logger.error(`[CHAT] 400 detailed body: ${JSON.stringify(error.response.data)}`);
-        } catch (_) {}
+        } catch (_) { }
         logger.error(`[CHAT] 400 detailed text: ${String(error?.response?.data || error.message)}`);
       }
       res.status(500).json({ error: 'Váratlan hiba történt.' });
@@ -1654,27 +2406,27 @@ exports.sendMessage = [
 exports.rateMessage = async (req, res) => {
   const { threadId, messageIndex, rating } = req.body;
 
-    try {
-      const conversation = await Conversation.findOne({ threadId, userId: req.userId, tenantId: (req.scope?.tenantId || undefined) });
+  try {
+    const conversation = await Conversation.findOne({ threadId, userId: req.userId, tenantId: (req.scope?.tenantId || undefined) });
 
-      if (!conversation) {
-        return res.status(404).json({ error: 'A beszélgetés nem található.' });
-      }
-
-      if (conversation.messages[messageIndex]) {
-        conversation.messages[messageIndex] = {
-          ...conversation.messages[messageIndex]._doc,
-          rating: rating
-        };
-        await conversation.save();
-        return res.status(200).json({ message: 'Értékelés mentve.' });
-      } else {
-        return res.status(404).json({ error: 'Az üzenet nem található.' });
-      }
-    } catch (error) {
-      logger.error('Hiba az értékelés mentése során:', error.message);
-      return res.status(500).json({ error: 'Értékelés mentése sikertelen.' });
+    if (!conversation) {
+      return res.status(404).json({ error: 'A beszélgetés nem található.' });
     }
+
+    if (conversation.messages[messageIndex]) {
+      conversation.messages[messageIndex] = {
+        ...conversation.messages[messageIndex]._doc,
+        rating: rating
+      };
+      await conversation.save();
+      return res.status(200).json({ message: 'Értékelés mentve.' });
+    } else {
+      return res.status(404).json({ error: 'Az üzenet nem található.' });
+    }
+  } catch (error) {
+    logger.error('Hiba az értékelés mentése során:', error.message);
+    return res.status(500).json({ error: 'Értékelés mentése sikertelen.' });
+  }
 };
 
 // Visszajelzés mentése
@@ -1836,5 +2588,136 @@ exports.searchAndRespond = async (req, res) => {
   } catch (error) {
     logger.error('Hiba a keresés-válasz folyamat során.', { error: error.message, stack: error.stack });
     res.status(500).json({ error: 'Váratlan hiba történt.' });
+  }
+};
+// ===== Delete conversation + cleanup Hybrid/Sandbox resources =====
+// DELETE /api/conversation/:threadId
+exports.deleteConversation = async (req, res) => {
+  try {
+    const { threadId } = req.params;
+    const userId = req.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'Hiányzó vagy érvénytelen JWT.' });
+    }
+    if (!threadId || typeof threadId !== 'string' || !threadId.trim()) {
+      return res.status(400).json({ error: 'threadId kötelező.' });
+    }
+
+    // Resolve tenant similarly to other endpoints
+    const user = await User.findById(userId).select('tenantId');
+    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
+    if (!tenantId) {
+      return res.status(400).json({ error: 'Hiányzó tenant azonosító.' });
+    }
+
+    // Validate ownership
+    const conversation = await Conversation.findOne({ threadId, userId, tenantId });
+    if (!conversation) {
+      return res.status(404).json({ error: 'Beszélgetés nem található.' });
+    }
+
+    // --- Helpers (scoped) ---
+    const headers = (extra = {}) => ({
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      'OpenAI-Beta': 'assistants=v2',
+      ...extra
+    });
+
+    async function getAssistantVectorStoreId(assistantId) {
+      if (!assistantId) return null;
+      try {
+        const r = await axios.get(
+          `https://api.openai.com/v1/assistants/${assistantId}`,
+          { headers: headers() }
+        );
+        const ids = r.data?.tool_resources?.file_search?.vector_store_ids || [];
+        return ids[0] || null;
+      } catch (e) {
+        logger.warn('[DELETE][CLEANUP] getAssistantVectorStoreId failed:', e?.response?.data || e?.message);
+        return null;
+      }
+    }
+
+    const safeDelete = async (fn) => {
+      try { await fn(); }
+      catch (e) { logger.warn('[DELETE][CLEANUP]', e?.response?.data || e?.message); }
+    };
+
+    // Determine mode and inputs
+    const mode = conversation.mode || (conversation.vectorStoreId ? 'sandbox' : 'default');
+    const fileIds = Array.isArray(conversation.fileIds) ? conversation.fileIds.filter(Boolean) : [];
+
+    if (mode === 'sandbox') {
+      // 1) Delete entire vector store (if any)
+      if (conversation.vectorStoreId) {
+        await safeDelete(() =>
+          axios.delete(`https://api.openai.com/v1/vector_stores/${conversation.vectorStoreId}`, { headers: headers() })
+        );
+      }
+      // 2) Delete the dedicated sandbox assistant (if persisted)
+      if (conversation.assistantId) {
+        await safeDelete(() =>
+          axios.delete(`https://api.openai.com/v1/assistants/${conversation.assistantId}`, { headers: headers() })
+        );
+      }
+      // 3) Delete uploaded File objects (best-effort)
+      for (const fid of fileIds) {
+        await safeDelete(() =>
+          axios.delete(`https://api.openai.com/v1/files/${fid}`, { headers: headers() })
+        );
+      }
+    } else if (mode === 'hybrid') {
+      // Hybrid → remove files from the shared vector store, then (optionally) delete File objects
+      let vectorStoreId = conversation.vectorStoreId || null;
+      if (!vectorStoreId) {
+        // Resolve assistant to get its default store
+        let assistantId = conversation.assistantId;
+        if (!assistantId) {
+          // fallback to tenant default assistant
+          const tenant = await Tenant.findById(tenantId).select('name');
+          const tenantKey = String(tenant?.name || '').toLowerCase();
+          assistantId = assistants.byTenant?.[tenantKey] || assistants['default'];
+        }
+        vectorStoreId = await getAssistantVectorStoreId(assistantId);
+      }
+
+      if (vectorStoreId && fileIds.length) {
+        for (const fid of fileIds) {
+          // 1) Detach from store (ignore 404/409)
+          await safeDelete(() =>
+            axios.delete(
+              `https://api.openai.com/v1/vector_stores/${vectorStoreId}/files/${fid}`,
+              { headers: headers() }
+            )
+          );
+          // 2) (optional) delete the File object itself
+          await safeDelete(() =>
+            axios.delete(`https://api.openai.com/v1/files/${fid}`, { headers: headers() })
+          );
+        }
+      }
+    }
+
+    // Optional: delete the OpenAI thread itself (best-effort)
+    await safeDelete(() =>
+      axios.delete(`https://api.openai.com/v1/threads/${threadId}`, { headers: headers() })
+    );
+
+    // Finally, remove conversation from DB
+    await Conversation.deleteOne({ threadId, userId, tenantId });
+
+    return res.json({
+      ok: true,
+      threadId,
+      cleaned: {
+        mode,
+        files: fileIds.length,
+        vectorStoreDeleted: mode === 'sandbox' && !!conversation.vectorStoreId
+      }
+    });
+  } catch (e) {
+    logger.error('[DELETE][CONVERSATION] hiba:', e?.message);
+    return res.status(500).json({ error: 'Törlés közben hiba történt.' });
   }
 };

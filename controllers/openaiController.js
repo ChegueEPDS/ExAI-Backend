@@ -53,6 +53,7 @@ async function resolveAssistantId(tenantId) {
   }
 
 // 📥 Fájlok listázása a vector store-ból – névvel együtt
+// 📥 Fájlok listázása a vector store-ból – LAPOZÁSSAL (20/db), visszafelé kompatibilisen
 exports.listAssistantFiles = async (req, res) => {
   try {
     const user = await User.findById(req.userId).select('tenantId');
@@ -63,44 +64,124 @@ exports.listAssistantFiles = async (req, res) => {
     logger.info(`Vector store list – assistant: ${assistantId} (tenant=${tenantId})`);
 
     const vectorStoreId = await getVectorStoreId(assistantId);
-    if (!vectorStoreId) return res.status(404).json({ error: 'Nincs vector store társítva az asszisztenshez.' });
+    if (!vectorStoreId) {
+      return res.status(404).json({ error: 'Nincs vector store társítva az asszisztenshez.' });
+    }
 
-    // Alap fájllista lekérése
-    const fileRes = await axios.get(`https://api.openai.com/v1/vector_stores/${vectorStoreId}/files`, {
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'assistants=v2'
-      }
-    });
+    // --- Lapozó beállítások (20/db) ---
+    const PAGE_SIZE = 20;
+    const order = (String(req.query.order || 'desc').toLowerCase() === 'asc') ? 'asc' : 'desc';
 
-    const files = fileRes.data.data;
+    // Két működési mód:
+    // 1) Paged mód: ha van page / after / before => csak 1 oldalt ad vissza, meta adatokkal
+    // 2) Legacy (no params): összes oldalt összegyűjti és sima tömböt ad vissza (visszafelé kompatibilis)
+    const hasPagingParam = !!(req.query.page || req.query.after || req.query.before || req.query.paged);
 
-    // Minden fájlhoz lekérjük a nevét is
-    const detailedFiles = await Promise.all(
-      files.map(async (file) => {
-        try {
-          const detailRes = await axios.get(`https://api.openai.com/v1/files/${file.id}`, {
-            headers: {
-              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
-            }
-          });
-          return {
-            id: file.id,
-            filename: detailRes.data.filename,
-            status: detailRes.data.status,
-            bytes: detailRes.data.bytes,
-            created_at: file.created_at 
-          };
-        } catch (err) {
-          logger.warn(`Nem sikerült lekérni a fájl részleteit: ${file.id}`);
-          return file; // visszatér az alap ID-val, ha nem sikerül
+    // ---- Helper: kérjünk egy OLDALT az OpenAI API-tól ----
+    async function fetchOnePage(opts = {}) {
+      const params = { limit: PAGE_SIZE, order };
+      if (opts.after) params.after = opts.after;
+      if (opts.before) params.before = opts.before;
+
+      const resp = await axios.get(
+        `https://api.openai.com/v1/vector_stores/${vectorStoreId}/files`,
+        {
+          params,
+          headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            'OpenAI-Beta': 'assistants=v2'
+          }
         }
-      })
-    );
+      );
 
-    res.status(200).json(detailedFiles);
+      const { data, has_more, first_id, last_id } = resp.data || {};
+      return { items: data || [], has_more: !!has_more, first_id: first_id || null, last_id: last_id || null };
+    }
+
+    // ---- Helper: feloldjuk a fájlnevet/bytes-t a /files/{id} végponttal ----
+    async function enrich(items) {
+      return Promise.all(
+        (items || []).map(async (file) => {
+          try {
+            const detailRes = await axios.get(`https://api.openai.com/v1/files/${file.id}`, {
+              headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
+            });
+            return {
+              id: file.id,
+              filename: detailRes.data.filename,
+              status: detailRes.data.status,
+              bytes: detailRes.data.bytes,
+              created_at: file.created_at
+            };
+          } catch (e) {
+            logger.warn(`Nem sikerült lekérni a fájl részleteit: ${file.id}`);
+            return {
+              id: file.id,
+              filename: file.filename || '(unknown)',
+              status: file.status || 'unknown',
+              bytes: file.bytes || 0,
+              created_at: file.created_at
+            };
+          }
+        })
+      );
+    }
+
+    if (hasPagingParam) {
+      // ======= 1) PAGED mód =======
+      const page = Math.max(parseInt(String(req.query.page || '1'), 10), 1);
+      const afterQP = req.query.after ? String(req.query.after) : null;
+      const beforeQP = req.query.before ? String(req.query.before) : null;
+
+      let cursorAfter = afterQP;
+      let cursorBefore = beforeQP;
+
+      // Ha page számot kaptunk (és nincs explicit after/before), akkor "átlépkedünk" addig a page-ig
+      if (!cursorAfter && !cursorBefore && page > 1) {
+        let tmpAfter = null;
+        let hasMore = true;
+        for (let p = 1; p < page && hasMore; p++) {
+          const pg = await fetchOnePage({ after: tmpAfter });
+          hasMore = pg.has_more;
+          tmpAfter = pg.last_id || null;
+          if (!tmpAfter) break;
+        }
+        cursorAfter = tmpAfter;
+      }
+
+      const { items, has_more, first_id, last_id } = await fetchOnePage({ after: cursorAfter, before: cursorBefore });
+      const detailed = await enrich(items);
+
+      return res.status(200).json({
+        items: detailed,
+        paging: {
+          page,
+          pageSize: PAGE_SIZE,
+          order,
+          has_more,
+          first_id,
+          last_id,
+          next_after: last_id || null,
+          prev_before: first_id || null
+        }
+      });
+    }
+
+    // ======= 2) LEGACY mód (nincs query param) – ÖSSZES OLDAL LEHÚZÁSA =======
+    const MAX_PAGES = parseInt(process.env.OPENAI_VS_MAX_PAGES || '50', 10);
+    let all = [];
+    let after = null;
+    for (let i = 0; i < MAX_PAGES; i++) {
+      const { items, has_more, last_id } = await fetchOnePage({ after });
+      all = all.concat(items || []);
+      if (!has_more || !last_id) break;
+      after = last_id;
+    }
+
+    const detailedAll = await enrich(all);
+    return res.status(200).json(detailedAll);
   } catch (err) {
-    logger.error('❌ Fájlok listázási hiba:', err.message);
+    logger.error('❌ Fájlok listázási hiba:', err?.response?.data || err?.message || err);
     res.status(500).json({ error: 'Nem sikerült lekérni a fájlokat.' });
   }
 };

@@ -12,6 +12,7 @@ const {
   uploadAndSummarizeStream,
   uploadAndAskStream,
   sendMessageStream,
+  chatWithFilesStream
 } = require('../controllers/conversationController');
 const authMiddleware = require('../middlewares/authMiddleware');
 const multer = require('multer');
@@ -69,6 +70,13 @@ router.post(
   '/upload-and-ask/stream',
   authMiddleware(),
   uploadAndAskStream
+);
+
+router.post(
+  '/chat/with-files/stream',
+  authMiddleware(),
+  safeUploadArray('files', 10), // ugyanaz a Busboy/Multer safe wrapper mint máshol
+  chatWithFilesStream
 );
 
 module.exports = router;
