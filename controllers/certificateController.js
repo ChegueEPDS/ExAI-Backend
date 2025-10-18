@@ -26,22 +26,22 @@ async function ensureLinkForTenant(tenantId, certId, userId, session) {
   );
 }
 
-// Detect if MongoDB supports transactions (i.e., running on a replica set / mongos)
+// Detect if MongoDB supports multi-document transactions (replica set member or mongos)
 async function supportsTransactions() {
-  let session;
   try {
-    session = await mongoose.startSession();
-    // Try to start & immediately abort a transaction; if this throws,
-    // the server/topology does not support transactions (standalone).
-    session.startTransaction();
-    await session.abortTransaction();
-    return true;
-  } catch (e) {
-    return false;
-  } finally {
-    if (session) {
-      try { await session.endSession(); } catch {}
+    const admin = mongoose.connection.db.admin();
+    let info;
+    try {
+      info = await admin.command({ hello: 1 }); // modern servers
+    } catch {
+      info = await admin.command({ isMaster: 1 }); // older servers
     }
+    const isReplicaSet = !!info.setName;               // present on replica set members
+    const isMongos = info.msg === 'isdbgrid';          // mongos routers
+    const hasSessions = typeof info.logicalSessionTimeoutMinutes === 'number';
+    return hasSessions && (isReplicaSet || isMongos);
+  } catch {
+    return false;
   }
 }
 
@@ -782,6 +782,38 @@ exports.updateToPublic = async (req, res) => {
       });
     } catch (e) {
       await session.endSession();
+      // Fallback when topology does not support transactions (standalone / no sessions routed)
+      if (/Transaction numbers are only allowed on a replica set member or mongos/i.test(e?.message || '')) {
+        // Re-run idempotently without a transaction
+        updatedCount = 0;
+        results.length = 0;
+        for (const id of ids) {
+          try {
+            const cert = await Certificate.findById(id);
+            if (!cert) {
+              results.push({ id, ok: false, error: 'Not found' });
+              continue;
+            }
+            if (cert.visibility !== 'public') {
+              await Certificate.updateOne(
+                { _id: id },
+                { $set: { visibility: 'public' }, $unset: { tenantId: '' } }
+              );
+              updatedCount++;
+            }
+            await ensureLinkForTenant(tenantId, id, userId);
+            results.push({ id, ok: true });
+          } catch (err2) {
+            results.push({ id, ok: false, error: err2?.message || 'Error' });
+          }
+        }
+        return res.json({
+          message: "✅ Visibility set to 'public' for selected certificates (migrated with link, fallback mode).",
+          updatedCount,
+          results
+        });
+      }
+      // Other errors: keep previous behavior
       return res.status(500).json({
         message: '❌ Transaction failed',
         details: e?.message || String(e),
