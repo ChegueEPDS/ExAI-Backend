@@ -2476,7 +2476,15 @@ exports.deleteConversation = async (req, res) => {
 exports.getConversations = async (req, res) => {
   try {
     const userId = req.userId;  // Bejelentkezett felhasználó azonosítója
-    const conversations = await Conversation.find({ userId, tenantId: (req.scope?.tenantId || undefined) });  // Csak a bejelentkezett user beszélgetései tenant szerint
+    const tenantId = req.scope?.tenantId || undefined;
+
+    // Rendezés már a DB-ben: legújabbtól a legrégebbiig
+    const conversations = await Conversation
+      .find({ userId, tenantId })
+      .sort({ updatedAt: -1, createdAt: -1 })
+      .select('threadId messages job hasBackgroundJob updatedAt createdAt')
+      .lean();
+
     const conversationList = conversations.map(c => ({
       threadId: c.threadId,
       messages: c.messages,
