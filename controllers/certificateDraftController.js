@@ -18,6 +18,17 @@ const User = require('../models/user'); // ha még nincs bent
 const upload = multer({ dest: 'uploads/' });
 const DraftCertificate = require('../models/draftCertificate.js');
 
+const CompanyCertificateLink = require('../models/companyCertificateLink');
+
+async function ensureLinkForTenant(tenantId, certId, userId, session) {
+  if (!tenantId || !certId) return;
+  await CompanyCertificateLink.updateOne(
+    { tenantId, certId },
+    { $setOnInsert: { tenantId, certId, addedBy: userId, addedAt: new Date() } },
+    { upsert: true, ...(session ? { session } : {}) }
+  );
+}
+
 // Notifications infra (shared)
 
 /* ===== Single-concurrency processing queue (max 1 concurrent) ===== */
@@ -626,7 +637,23 @@ exports.finalizeDrafts = async (req, res) => {
 
         try {
           // Try create — catch duplicates and continue with others
-          await Certificate.create(doc);
+          const created = await Certificate.create(doc);
+
+          // If certificate is PUBLIC, make it global (tenantId=null) and adopt into current tenant
+          if ((doc.visibility || '').toLowerCase() === 'public') {
+            try {
+              await Certificate.updateOne({ _id: created._id }, { $unset: { tenantId: '' } });
+            } catch (e) {
+              console.warn('⚠️ finalizeDrafts: unset tenantId failed:', e?.message);
+            }
+            try {
+              const targetTenantId = isSuperAdmin ? draft.tenantId : tenantId;
+              await ensureLinkForTenant(targetTenantId, created._id, userId);
+            } catch (e) {
+              console.warn('⚠️ finalizeDrafts: ensureLinkForTenant failed:', e?.message);
+            }
+          }
+
           resultsSaved.push(draft._id.toString());
           cleanupItems.push({
             pdfPath: draft.originalPdfPath,
@@ -782,7 +809,23 @@ exports.finalizeSingleDraftById = async (req, res) => {
     try {
       session = await mongoose.startSession();
       await session.withTransaction(async () => {
-        await Certificate.create([doc], { session });
+        const [created] = await Certificate.create([doc], { session });
+
+        // PUBLIC → globalize and adopt within the same transaction
+        if ((doc.visibility || '').toLowerCase() === 'public') {
+          try {
+            await Certificate.updateOne({ _id: created._id }, { $unset: { tenantId: '' } }, { session });
+          } catch (e) {
+            console.warn('⚠️ finalizeSingle(tx): unset tenantId failed:', e?.message);
+          }
+          try {
+            const targetTenantId = isSuperAdmin ? draft.tenantId : tenantId;
+            await ensureLinkForTenant(targetTenantId, created._id, userId, session);
+          } catch (e) {
+            console.warn('⚠️ finalizeSingle(tx): ensureLinkForTenant failed:', e?.message);
+          }
+        }
+
         await DraftCertificate.deleteOne({ _id: id }, { session });
       });
       session.endSession();
@@ -793,7 +836,22 @@ exports.finalizeSingleDraftById = async (req, res) => {
         return sendDuplicateResponse(res, conflicts);
       }
       try {
-        await Certificate.create(doc);
+        const created = await Certificate.create(doc);
+
+        if ((doc.visibility || '').toLowerCase() === 'public') {
+          try {
+            await Certificate.updateOne({ _id: created._id }, { $unset: { tenantId: '' } });
+          } catch (e) {
+            console.warn('⚠️ finalizeSingle(fallback): unset tenantId failed:', e?.message);
+          }
+          try {
+            const targetTenantId = isSuperAdmin ? draft.tenantId : tenantId;
+            await ensureLinkForTenant(targetTenantId, created._id, userId);
+          } catch (e) {
+            console.warn('⚠️ finalizeSingle(fallback): ensureLinkForTenant failed:', e?.message);
+          }
+        }
+
         await DraftCertificate.deleteOne({ _id: id });
       } catch (insErr) {
         if (isDuplicateKeyError(insErr)) {
