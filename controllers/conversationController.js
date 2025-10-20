@@ -2490,6 +2490,7 @@ exports.getConversations = async (req, res) => {
       messages: c.messages,
       job: c.job || null,
       hasBackgroundJob: !!c.hasBackgroundJob,
+      updatedAt: c.updatedAt,
     }));
 
     res.status(200).json(conversationList);  // Az összes beszélgetés visszaküldése
