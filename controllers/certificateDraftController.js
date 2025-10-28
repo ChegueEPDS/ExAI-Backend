@@ -909,6 +909,7 @@ exports.getPendingUploads = async (req, res) => {
           _id: '$uploadId',
           uploadId: { $first: '$uploadId' },
           tenantId: { $first: '$tenantId' },
+          createdBy: { $first: '$createdBy' },
           createdAt: { $min: '$createdAt' },
           total: { $sum: 1 },
           ready: { $sum: { $cond: [{ $eq: ['$status', 'ready'] }, 1, 0] } },
@@ -922,6 +923,7 @@ exports.getPendingUploads = async (req, res) => {
           _id: 0,
           uploadId: 1,
           tenantId: 1,
+          createdBy: 1,
           createdAt: 1,
           counts: {
             total: '$total',
@@ -930,6 +932,59 @@ exports.getPendingUploads = async (req, res) => {
             error: '$error'
           },
           sampleFiles: { $slice: ['$sampleFiles', 5] } // max 5 fájlnév előnézet
+        }
+      },
+      // 🔎 Join tenant name and user email/full name
+      {
+        $lookup: {
+          from: 'tenants',
+          localField: 'tenantId',
+          foreignField: '_id',
+          as: 'tenantDoc'
+        }
+      },
+      { $unwind: { path: '$tenantDoc', preserveNullAndEmptyArrays: true } },
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'createdBy',
+          foreignField: '_id',
+          as: 'userDoc'
+        }
+      },
+      { $unwind: { path: '$userDoc', preserveNullAndEmptyArrays: true } },
+      {
+        $addFields: {
+          tenantName: '$tenantDoc.name',
+          createdByEmail: '$userDoc.email',
+          createdByFullName: {
+            $trim: {
+              input: {
+                $concat: [
+                  { $ifNull: ['$userDoc.firstName', ''] },
+                  {
+                    $cond: [
+                      {
+                        $and: [
+                          { $gt: [{ $strLenCP: { $ifNull: ['$userDoc.firstName', ''] } }, 0] },
+                          { $gt: [{ $strLenCP: { $ifNull: ['$userDoc.lastName', ''] } }, 0] }
+                        ]
+                      },
+                      ' ',
+                      ''
+                    ]
+                  },
+                  { $ifNull: ['$userDoc.lastName', ''] }
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        $project: {
+          tenantDoc: 0,
+          userDoc: 0
         }
       },
       { $sort: { createdAt: -1 } }
@@ -991,30 +1046,40 @@ exports.getPendingUploads = async (req, res) => {
 // -------------------------
 exports.deletePendingUpload = async (req, res) => {
   const { uploadId } = req.params;
-  const userId = req.userId;
+
+  // role parsing to allow SuperAdmin to delete across tenants
+  const roleRaw = (req.scope?.role || req.scope?.userRole || req.role || '').toString();
+  const isSuperAdmin = /superadmin/i.test(roleRaw);
 
   try {
     const tenantId = req.scope?.tenantId;
-    if (!tenantId) return res.status(403).json({ error: 'Missing tenantId' });
 
-    const drafts = await DraftCertificate.find({ uploadId, tenantId });
+    // Non-superadmin must have tenantId in scope
+    if (!isSuperAdmin && !tenantId) {
+      return res.status(403).json({ error: 'Missing tenantId' });
+    }
+
+    // Build a single filter used for both find & delete
+    const findFilter = isSuperAdmin ? { uploadId } : { uploadId, tenantId };
+
+    const drafts = await DraftCertificate.find(findFilter);
     if (!drafts.length) {
       return res.status(404).json({ message: 'No drafts found for this uploadId' });
     }
 
-    // ideiglenes fájlok törlése
+    // Remove any temp/local files and blob artifacts
     for (const d of drafts) {
       safeUnlink(d.originalPdfPath);
       safeUnlink(d.docxPath);
-      // 🔹 blob fájlok törlése
-      try { if (d.blobPdfPath)  await azureBlobService.deleteFile(d.blobPdfPath); } catch(e){}
-      try { if (d.blobDocxPath) await azureBlobService.deleteFile(d.blobDocxPath); } catch(e){}
+      try { if (d.blobPdfPath)  await azureBlobService.deleteFile(d.blobPdfPath); } catch (e) {}
+      try { if (d.blobDocxPath) await azureBlobService.deleteFile(d.blobDocxPath); } catch (e) {}
     }
 
-    // mappa törlése
+    // Remove draft folder if empty
     removeDraftFolderIfEmpty(uploadId);
-    // draft rekordok törlése
-    const del = await DraftCertificate.deleteMany({ uploadId, tenantId });
+
+    // Delete using the same filter
+    const del = await DraftCertificate.deleteMany(findFilter);
 
     return res.json({
       message: '✅ Pending upload deleted',

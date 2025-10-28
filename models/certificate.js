@@ -1,6 +1,17 @@
 const mongoose = require('mongoose');
 const CompanyCertificateLink = require('./companyCertificateLink');
 
+// --- Reports (fake/error) embedded subdocuments for certificates ---
+const ReportSchema = new mongoose.Schema({
+  type: { type: String, enum: ['fake', 'error'], required: true },
+  comment: { type: String, default: '' },
+  status: { type: String, enum: ['new', 'resolved'], default: 'new', index: true },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  createdAt: { type: Date, default: Date.now },
+  resolvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  resolvedAt: { type: Date, default: null }
+}, { _id: true });
+
 const CertificateSchema = new mongoose.Schema({
   certNo: { type: String, required: true },
   scheme: { type: String },
@@ -53,6 +64,8 @@ const CertificateSchema = new mongoose.Schema({
     default: 'private',
     index: true
   },
+  // Embedded reports (moderation/feedback on certificates)
+  reports: { type: [ReportSchema], default: [] }
 }, { timestamps: true });
 
 // 🔹 Automatikus tenant kitöltés CreatedBy alapján (company mező kivezetve)
@@ -108,6 +121,10 @@ CertificateSchema.index({ tenantId: 1, certNo: 1 });
 CertificateSchema.index({ tenantId: 1, manufacturer: 1 });
 CertificateSchema.index({ tenantId: 1, equipment: 1 });
 CertificateSchema.index({ createdAt: -1 }); // ha idő szerinti listázás lesz
+
+// ---- Indexes to query reports quickly ----
+CertificateSchema.index({ 'reports.status': 1, visibility: 1 });
+CertificateSchema.index({ 'reports.createdBy': 1, createdAt: -1 });
 
 // --- Cascade cleanup: töröljük a linkeket, ha egy certificate törlődik ---
 

@@ -186,6 +186,48 @@ exports.listUsers = async (req, res) => {
         }
       },
       { $unwind: { path: '$subscription', preserveNullAndEmptyArrays: true } },
+      // Add: public certificate contribution count per user
+      {
+        $lookup: {
+          from: 'certificates',
+          let: { uid: '$_id' },
+          pipeline: [
+            { $addFields: { _createdByStr: { $toString: '$createdBy' }, _vis: { $toLower: '$visibility' } } },
+            { $match: { $expr: { $and: [
+              { $eq: ['$_createdByStr', { $toString: '$$uid' }] },
+              { $eq: ['$_vis', 'public'] }
+            ] } } },
+            { $count: 'count' }
+          ],
+          as: 'publicContributionAgg'
+        }
+      },
+      { $addFields: { publicContributionCount: { $ifNull: [ { $arrayElemAt: ['$publicContributionAgg.count', 0] }, 0 ] } } },
+      { $unset: 'publicContributionAgg' },
+      // Add: pending drafts count per user (statuses: draft, ready, error), robust id matching
+      {
+        $lookup: {
+          from: 'draftcertificates',
+          let: { uid: '$_id', tId: '$tenantId' },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: [ { $toString: '$createdBy' }, { $toString: '$$uid' } ] },
+                    { $eq: [ { $toString: '$tenantId' }, { $toString: '$$tId' } ] },
+                    { $in: [ '$status', ['draft', 'ready', 'error'] ] }
+                  ]
+                }
+              }
+            },
+            { $count: 'count' }
+          ],
+          as: 'pendingAgg'
+        }
+      },
+      { $addFields: { pendingCount: { $ifNull: [ { $arrayElemAt: ['$pendingAgg.count', 0] }, 0 ] } } },
+      { $unset: 'pendingAgg' },
       // Stabil, determinisztikus sorrend (kliens oldali szűrés/rendezés/lapozás lesz)
       { $sort: { firstName: 1, _id: 1 } },
       {
@@ -201,7 +243,9 @@ exports.listUsers = async (req, res) => {
           tenantPlan: '$tenant.plan',
           subscriptionTier: '$subscription.tier',
           subscriptionStatus: '$subscription.status',
-          subscriptionExpiresAt: '$subscription.expiresAt'
+          subscriptionExpiresAt: '$subscription.expiresAt',
+          publicContributionCount: 1,
+          pendingCount: 1
         }
       }
     );

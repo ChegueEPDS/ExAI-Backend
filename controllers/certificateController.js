@@ -512,19 +512,30 @@ exports.getMyCertificatesPaged = async (req, res) => {
   }
 };
 
-// Saját PUBLIC tanúsítványok darabszáma
+// Saját PUBLIC tanúsítványok darabszáma (superadmin override támogatással)
 exports.countMyPublicCertificates = async (req, res) => {
   try {
-    const userId = req.scope?.userId || req.user?.id;
-    if (!userId) {
+    // Requester's role to allow superadmin override
+    const roleRaw = (req.scope?.role || req.scope?.userRole || req.role || '').toString().toLowerCase();
+    const isSuperAdmin = /superadmin/.test(roleRaw);
+
+    // Default: current authenticated user
+    let targetUserId = req.scope?.userId || req.user?.id || null;
+
+    // SuperAdmin may specify any userId via query (?userId=...)
+    if (isSuperAdmin && req.query && req.query.userId) {
+      targetUserId = String(req.query.userId).trim();
+    }
+
+    if (!targetUserId) {
       return res.status(401).json({ message: '❌ Hiányzik a user azonosító az authból!' });
     }
 
-    // Ha ObjectId, konvertáljuk; ha stringként tárolod a createdBy-t, elég maga a string.
-    let createdBy = userId;
-    const isObjId = /^[a-fA-F0-9]{24}$/.test(userId);
-    if (isObjId) {
-      createdBy = new (require('mongoose')).Types.ObjectId(userId);
+    // If ObjectId-like -> cast; else keep as string (supports string-stored createdBy)
+    let createdBy = targetUserId;
+    const looksLikeObjectId = /^[a-fA-F0-9]{24}$/.test(String(targetUserId));
+    if (looksLikeObjectId) {
+      createdBy = new mongoose.Types.ObjectId(String(targetUserId));
     }
 
     const count = await Certificate.countDocuments({
@@ -532,10 +543,10 @@ exports.countMyPublicCertificates = async (req, res) => {
       createdBy
     });
 
-    return res.json({ count });
+    return res.json({ userId: String(targetUserId), count });
   } catch (error) {
-    console.error('❌ Hiba a countMyOwnPublicCertificates során:', error);
-    return res.status(500).json({ message: '❌ Hiba a countMyOwnPublicCertificates során' });
+    console.error('❌ Hiba a countMyPublicCertificates során:', error);
+    return res.status(500).json({ message: '❌ Hiba a countMyPublicCertificates során' });
   }
 };
 
@@ -968,5 +979,216 @@ exports.unadoptPublic = async (req, res) => {
   } catch (error) {
     console.error('❌ Unadopt hiba:', error);
     return res.status(500).json({ message: '❌ Unadopt hiba' });
+  }
+};
+
+// ===============================
+// REPORTS on certificates (add/list/update)
+// ===============================
+
+// Helper validators for reports
+const REPORT_TYPES = new Set(['fake', 'error']);
+const REPORT_STATUSES = new Set(['new', 'resolved']);
+
+/**
+ * POST /api/certificates/:id/reports
+ * Body: { type: 'fake'|'error', comment?: string }
+ * Creates a new report on a certificate with status 'new'.
+ */
+exports.addReport = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const oid = tryObjectId(id);
+    if (!oid) return res.status(400).json({ message: '❌ Invalid certificate id' });
+
+    const userId = req.scope?.userId || req.user?.id || null;
+    if (!userId) return res.status(401).json({ message: '❌ Missing user (auth)' });
+
+    const type = String(req.body?.type || '').toLowerCase();
+    const comment = (req.body?.comment || '').toString().trim();
+
+    if (!REPORT_TYPES.has(type)) {
+      return res.status(400).json({ message: "❌ Invalid report type. Use 'fake' or 'error'." });
+    }
+
+    // Build embedded report object (with deterministic _id for later updates)
+    const reportId = new mongoose.Types.ObjectId();
+    const report = {
+      _id: reportId,
+      type,
+      comment,
+      status: 'new',
+      createdBy: userId,
+      createdAt: new Date()
+    };
+
+    const updated = await Certificate.updateOne(
+      { _id: oid },
+      { $push: { reports: report } }
+    );
+
+    if (updated.matchedCount === 0) {
+      return res.status(404).json({ message: '❌ Certificate not found' });
+    }
+
+    return res.json({ message: '✅ Report added', certificateId: String(oid), report });
+  } catch (e) {
+    console.error('❌ addReport error:', e?.message || e);
+    return res.status(500).json({ message: '❌ Failed to add report' });
+  }
+};
+
+/**
+ * GET /api/certificates/:id/reports?status=new|resolved
+ * Lists reports for a certificate (optionally filter by status).
+ */
+exports.listReports = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const oid = tryObjectId(id);
+    if (!oid) return res.status(400).json({ message: '❌ Invalid certificate id' });
+
+    const status = (req.query?.status || '').toString().toLowerCase();
+    const projection = { reports: 1, _id: 0 };
+
+    const doc = await Certificate.findById(oid).select(projection).lean();
+    if (!doc) return res.status(404).json({ message: '❌ Certificate not found' });
+
+    let reports = Array.isArray(doc.reports) ? doc.reports : [];
+    if (status && REPORT_STATUSES.has(status)) {
+      reports = reports.filter(r => (r?.status || '').toLowerCase() === status);
+    }
+
+    // Sort newest first
+    reports.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+    return res.json({ certificateId: String(id), reports });
+  } catch (e) {
+    console.error('❌ listReports error:', e?.message || e);
+    return res.status(500).json({ message: '❌ Failed to list reports' });
+  }
+};
+
+// === LIST ALL REPORTS (global, optional status filter) ===
+exports.listAllReports = async (req, res) => {
+  try {
+    const { status } = req.query; // 'new' | 'resolved' | undefined
+    const matchStage = [];
+
+    // csak azok a dokumentumok, ahol van reports
+    matchStage.push({ $match: { reports: { $exists: true, $ne: [] } } });
+
+    // szétbontjuk a reports tömböt
+    const pipeline = [
+      ...matchStage,
+      { $unwind: '$reports' },
+    ];
+
+    if (status && /^(new|resolved)$/i.test(status)) {
+      pipeline.push({ $match: { 'reports.status': status.toLowerCase() } });
+    }
+
+    pipeline.push(
+      // hozzánézzük a bejelentőt (createdBy)
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'reports.createdBy',
+          foreignField: '_id',
+          as: 'creator',
+        }
+      },
+      { $unwind: { path: '$creator', preserveNullAndEmptyArrays: true } },
+      // kimeneti forma
+      {
+        $project: {
+          _id: 0,
+          certId: '$_id',
+          certNo: '$certNo',
+          reportId: '$reports._id',
+          type: '$reports.type',
+          comment: '$reports.comment',
+          status: '$reports.status',
+          createdAt: '$reports.createdAt',
+          createdBy: {
+            id: '$creator._id',
+            email: '$creator.email',
+            firstName: '$creator.firstName',
+            lastName: '$creator.lastName'
+          }
+        }
+      },
+      { $sort: { createdAt: -1 } }
+    );
+
+    const rows = await Certificate.aggregate(pipeline);
+
+    return res.json({ items: rows });
+  } catch (e) {
+    console.error('listAllReports error:', e?.message || e);
+    return res.status(500).json({ error: 'Failed to list reports' });
+  }
+};
+
+/**
+ * PATCH /api/certificates/:id/reports/:reportId
+ * Body: { status: 'new'|'resolved' }
+ * Updates the status of a specific report. When resolving, sets resolvedBy/At.
+ */
+exports.updateReportStatus = async (req, res) => {
+  try {
+    const { id, reportId } = req.params;
+    const oid = tryObjectId(id);
+    const rid = tryObjectId(reportId);
+    if (!oid || !rid) {
+      return res.status(400).json({ message: '❌ Invalid certificate id or report id' });
+    }
+
+    const userId = req.scope?.userId || req.user?.id || null;
+    if (!userId) return res.status(401).json({ message: '❌ Missing user (auth)' });
+
+    const nextStatus = String(req.body?.status || '').toLowerCase();
+    if (!REPORT_STATUSES.has(nextStatus)) {
+      return res.status(400).json({ message: "❌ Invalid status. Use 'new' or 'resolved'." });
+    }
+
+    // Build update with arrayFilters to hit the right report item
+    const now = new Date();
+    const update =
+      nextStatus === 'resolved'
+        ? {
+            $set: {
+              'reports.$[r].status': 'resolved',
+              'reports.$[r].resolvedBy': userId,
+              'reports.$[r].resolvedAt': now
+            }
+          }
+        : {
+            $set: {
+              'reports.$[r].status': 'new'
+            },
+            $unset: {
+              'reports.$[r].resolvedBy': '',
+              'reports.$[r].resolvedAt': ''
+            }
+          };
+
+    const result = await Certificate.updateOne(
+      { _id: oid },
+      update,
+      { arrayFilters: [{ 'r._id': rid }] }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ message: '❌ Certificate not found' });
+    }
+    if (result.modifiedCount === 0) {
+      return res.status(404).json({ message: '❌ Report not found on certificate' });
+    }
+
+    return res.json({ message: '✅ Report status updated', certificateId: String(oid), reportId: String(rid), status: nextStatus });
+  } catch (e) {
+    console.error('❌ updateReportStatus error:', e?.message || e);
+    return res.status(500).json({ message: '❌ Failed to update report status' });
   }
 };
