@@ -531,17 +531,24 @@ function sendDuplicateResponse(res, conflicts) {
 exports.updateDraftExtractedById = async (req, res) => {
   const { id } = req.params;
   const userId = req.userId;
+  // SuperAdmin role parsing – allow cross-tenant edits for SuperAdmin only
+  const roleRaw = (req.scope?.role || req.scope?.userRole || req.role || '').toString();
+  const isSuperAdmin = /superadmin/i.test(roleRaw);
   try {
     const draft = await DraftCertificate.findById(id);
     if (!draft) {
       return res.status(404).json({ message: '❌ Draft not found' });
     }
     const tenantId = req.scope?.tenantId;
-    if (!tenantId) {
+    if (!isSuperAdmin && !tenantId) {
       return res.status(403).json({ message: '❌ Missing tenantId' });
     }
-    if (draft.tenantId && String(draft.tenantId) !== String(tenantId)) {
-      return res.status(403).json({ message: '❌ Forbidden (wrong tenant)' });
+
+    // Enforce tenant match only for non‑SuperAdmin
+    if (!isSuperAdmin) {
+      if (draft.tenantId && tenantId && String(draft.tenantId) !== String(tenantId)) {
+        return res.status(403).json({ message: '❌ Forbidden (wrong tenant)' });
+      }
     }
 
     const overrides = sanitizeOverrides(req.body?.extractedData || req.body || {});
