@@ -9,16 +9,15 @@ const { uploadPdfWithFormRecognizerInternal } = require('../helpers/ocrHelper');
 const { generateDocxFile, generateDocxBuffer } = require('../helpers/docx');
 const azureBlobService = require('../services/azureBlobService');
 const { notifyAndStore } = require('../lib/notifications/notifier');
-
 const { extractCertFieldsFromOCR } = require('../helpers/openaiCertExtractor');
-
 const mongoose = require('mongoose');
-
-const User = require('../models/user'); // ha még nincs bent
+const User = require('../models/user');
 const upload = multer({ dest: 'uploads/' });
 const DraftCertificate = require('../models/draftCertificate.js');
-
 const CompanyCertificateLink = require('../models/companyCertificateLink');
+const UploadBatch = require('../models/uploadBatch');
+const mailService = require('../services/mailService');
+const mailTemplates = require('../services/mailTemplates');
 
 async function ensureLinkForTenant(tenantId, certId, userId, session) {
   if (!tenantId || !certId) return;
@@ -92,13 +91,13 @@ function shouldRetryOpenAI(err) {
   const msg = (err && (err.message || err.toString())) || '';
   // common transient markers: 429/5xx/upstream/connect/timeouts/resets
   return /\b(429|5\d\d|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND)\b/i.test(msg)
-      || /upstream connect error/i.test(msg)
-      || /connection (timeout|terminated|reset)/i.test(msg)
-      || /temporarily unavailable/i.test(msg)
-      || /timeout of \d+ms exceeded/i.test(msg)
-      || /\brequest timed out\b/i.test(msg)
-      || /\bdeadline exceeded\b/i.test(msg)
-      || /\btimeout\b/i.test(msg);
+    || /upstream connect error/i.test(msg)
+    || /connection (timeout|terminated|reset)/i.test(msg)
+    || /temporarily unavailable/i.test(msg)
+    || /timeout of \d+ms exceeded/i.test(msg)
+    || /\brequest timed out\b/i.test(msg)
+    || /\bdeadline exceeded\b/i.test(msg)
+    || /\btimeout\b/i.test(msg);
 }
 
 async function retryWithBackoff(fn, opts = {}) {
@@ -111,7 +110,7 @@ async function retryWithBackoff(fn, opts = {}) {
     label = 'openai-call',
     isRetryable = shouldRetryOpenAI,
     onRetry = (e, attempt, delay) => {
-      try { console.warn(`[retry:${label}] attempt ${attempt} failed:`, e?.message || e); } catch {}
+      try { console.warn(`[retry:${label}] attempt ${attempt} failed:`, e?.message || e); } catch { }
     }
   } = opts;
 
@@ -137,7 +136,7 @@ async function retryWithBackoff(fn, opts = {}) {
 
 // ---- blob move with incrementing version suffix (_2, _3, ...) ----
 async function moveBlobWithVersioning(srcPath, baseName, ext) {
-  try { if (!srcPath) return null; } catch {}
+  try { if (!srcPath) return null; } catch { }
   const cleanBase = String(baseName || '').trim().replace(/\.pdf$/i, '').replace(/\.docx$/i, '');
   const cleanExt = String(ext || '').replace(/^\./, '').toLowerCase();
   const makeDest = (b) => `certificates/${b}/${b}.${cleanExt}`;
@@ -178,7 +177,7 @@ async function moveBlobWithVersioning(srcPath, baseName, ext) {
 
 // ---- local FS cleanup helpers ----
 function safeUnlink(p) {
-  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch { }
 }
 function removeDraftFolderIfEmpty(uploadId) {
   const dir = path.join('storage', 'certificates', 'draft', uploadId);
@@ -187,7 +186,78 @@ function removeDraftFolderIfEmpty(uploadId) {
       const files = fs.readdirSync(dir);
       if (files.length === 0) fs.rmSync(dir, { recursive: true, force: true });
     }
-  } catch {}
+  } catch { }
+}
+
+async function finishCheckAndNotify(uploadId) {
+  try {
+    if (!uploadId) return;
+
+    const pendingCount = await DraftCertificate.countDocuments({
+      uploadId,
+      status: { $in: ['draft', 'ready', 'error'] }
+    });
+    if (pendingCount > 0) return;
+
+    const batch = await UploadBatch.findOne({ uploadId }).lean();
+    if (!batch || batch.notified) return;
+
+    const total = Number(batch.total || 0);
+    const saved = Number(batch.saved || 0);
+    const discarded = Number(
+      typeof batch.discarded === 'number'
+        ? batch.discarded
+        : Math.max(0, total - saved)
+    );
+
+    let to = '';
+    let firstName = '';
+    let lastName = '';
+
+    if (batch.createdBy) {
+      const createdById = String(batch.createdBy);
+      let user = null;
+      try {
+        user = await User.findById(createdById).lean();
+      } catch (_) { /* ignore */ }
+
+      if (user) {
+        to = (user.email || '').toString();
+        firstName = (user.firstName || '').toString();
+        lastName = (user.lastName || '').toString();
+      }
+    }
+
+    if (!to) return;
+
+    const emailLocal = to.includes('@') ? to.split('@')[0] : '';
+    const safeFirst = firstName || '';
+    const safeLast = lastName || '';
+    const displayName =
+      (safeFirst || safeLast) ? `${safeFirst} ${safeLast}`.trim()
+      : (emailLocal || 'there');
+
+    const subject = `Your upload ${uploadId} has been completed`;
+
+    const html = mailTemplates.uploadCompletedEmail(
+      { firstName: displayName, lastName: '' },
+      { uploadId, total, saved, discarded }
+    );
+
+    try {
+      await mailService.sendMail({ to, subject, html });
+      console.log(`✅ Email sent successfully to ${to}`);
+    } catch (e) {
+      console.warn('❌ finishCheckAndNotify: sendMail failed:', e?.message || e);
+    }
+
+    await UploadBatch.updateOne(
+      { uploadId },
+      { $set: { notified: true, completedAt: new Date() } }
+    );
+  } catch (e) {
+    console.warn('❌ finishCheckAndNotify error:', e?.message || e);
+  }
 }
 
 // ---- blob download via SAS (no SDK dependency here) ----
@@ -230,9 +300,27 @@ exports.bulkUpload = [
       }
       const createdBy = ownerUserId;
 
+      // Initialize/Upsert batch meta document for this uploadId
+      await UploadBatch.updateOne(
+        { uploadId },
+        {
+          $setOnInsert: {
+            uploadId,
+            tenantId,
+            createdBy,
+            createdAt: new Date(),
+            notified: false,
+            total: 0,
+            saved: 0,
+            discarded: 0
+          }
+        },
+        { upsert: true }
+      );
+
       // 🔹 2. Közvetlen blob-feltöltés (nincs lokális storage)
       for (const file of req.files) {
-        // 🔹 2. Közvetlen blob-feltöltés (nincs lokális storage)
+
         const blobFolder = `certificates/uploads/${uploadId}`;
         const blobPdfPath = `${blobFolder}/${file.originalname}`;
         try {
@@ -241,7 +329,7 @@ exports.bulkUpload = [
           console.warn(`⚠️ Blob upload failed for ${file.originalname}:`, e.message);
         } finally {
           // töröljük a multer ideiglenes fájlt
-          try { if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path); } catch {}
+          try { if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path); } catch { }
         }
 
         // 🔹 3. Mentés az ideiglenes DB-be (lokális elérési útvonalak nélkül)
@@ -254,6 +342,15 @@ exports.bulkUpload = [
           createdBy,
           blobPdfPath               // elmentjük a blob útvonalat
         });
+      }
+
+      try {
+        await UploadBatch.updateOne(
+          { uploadId },
+          { $inc: { total: req.files.length } }
+        );
+      } catch (e) {
+        try { console.warn('bulkUpload: failed to bump UploadBatch.total:', e?.message || e); } catch { }
       }
 
       res.status(200).json({ message: 'Files uploaded successfully', uploadId });
@@ -459,7 +556,7 @@ const Certificate = require('../models/certificate');
 
 // Allowed keys we accept from the UI for inline edits
 const ALLOWED_EXTRACTED_KEYS = new Set([
-  'certNo','scheme','issueDate','applicant','protection','exmarking','equipment','manufacturer','xcondition','ucondition','specCondition','status','description','docType'
+  'certNo', 'scheme', 'issueDate', 'applicant', 'protection', 'exmarking', 'equipment', 'manufacturer', 'xcondition', 'ucondition', 'specCondition', 'status', 'description', 'docType'
 ]);
 
 function sanitizeOverrides(src = {}) {
@@ -608,7 +705,7 @@ exports.finalizeDrafts = async (req, res) => {
         const srcPdf = draft.blobPdfPath || null;
         const srcDocx = draft.blobDocxPath || null;
 
-        const uploadedPdf  = await moveBlobWithVersioning(srcPdf,  baseName, 'pdf');
+        const uploadedPdf = await moveBlobWithVersioning(srcPdf, baseName, 'pdf');
         const uploadedDocx = await moveBlobWithVersioning(srcDocx, baseName, 'docx');
 
         const targetTenantId = isSuperAdmin ? draft.tenantId : tenantId;
@@ -706,6 +803,21 @@ exports.finalizeDrafts = async (req, res) => {
       removeDraftFolderIfEmpty(uploadId);
     }
 
+    // Update batch counters (saved) and check for final notification
+    try {
+      if (resultsSaved.length > 0) {
+        await UploadBatch.updateOne(
+          { uploadId },
+          { $inc: { saved: resultsSaved.length } }
+        );
+      }
+    } catch (e) {
+      try { console.warn('finalizeDrafts: failed to bump UploadBatch.saved:', e?.message || e); } catch { }
+    }
+
+    // If the whole upload has no more pending drafts, send one-off email
+    finishCheckAndNotify(uploadId).catch(() => { });
+
     // Build response
     const payload = {
       message: conflicts.length
@@ -778,7 +890,7 @@ exports.finalizeSingleDraftById = async (req, res) => {
     const srcPdf = draft.blobPdfPath || null;
     const srcDocx = draft.blobDocxPath || null;
 
-    const uploadedPdf  = await moveBlobWithVersioning(srcPdf,  baseName, 'pdf');
+    const uploadedPdf = await moveBlobWithVersioning(srcPdf, baseName, 'pdf');
     const uploadedDocx = await moveBlobWithVersioning(srcDocx, baseName, 'docx');
 
     const targetTenantId = isSuperAdmin ? draft.tenantId : tenantId;
@@ -875,6 +987,19 @@ exports.finalizeSingleDraftById = async (req, res) => {
     const remaining = await DraftCertificate.countDocuments({ uploadId: draft.uploadId });
     if (remaining === 0) removeDraftFolderIfEmpty(draft.uploadId);
 
+    // Batch accounting for single finalize and possible final notification
+    try {
+      if (draft && draft.uploadId) {
+        await UploadBatch.updateOne(
+          { uploadId: draft.uploadId },
+          { $inc: { saved: 1 } }
+        );
+        finishCheckAndNotify(draft.uploadId).catch(() => { });
+      }
+    } catch (e) {
+      try { console.warn('finalizeSingle: failed to bump UploadBatch.saved:', e?.message || e); } catch { }
+    }
+
     return res.json({
       message: '✅ Certificate finalized',
       certificate: doc,
@@ -901,7 +1026,7 @@ exports.getPendingUploads = async (req, res) => {
     const limit = req.query.limit ? parseInt(req.query.limit, 10) : null;
 
     const matchTenantStage = isSuperAdmin
-      ? { $match: { } } // no tenant filter for SuperAdmin
+      ? { $match: {} } // no tenant filter for SuperAdmin
       : { $match: { tenantId: new mongoose.Types.ObjectId(tenantId) } };
 
     const pipeline = [
@@ -1078,8 +1203,8 @@ exports.deletePendingUpload = async (req, res) => {
     for (const d of drafts) {
       safeUnlink(d.originalPdfPath);
       safeUnlink(d.docxPath);
-      try { if (d.blobPdfPath)  await azureBlobService.deleteFile(d.blobPdfPath); } catch (e) {}
-      try { if (d.blobDocxPath) await azureBlobService.deleteFile(d.blobDocxPath); } catch (e) {}
+      try { if (d.blobPdfPath) await azureBlobService.deleteFile(d.blobPdfPath); } catch (e) { }
+      try { if (d.blobDocxPath) await azureBlobService.deleteFile(d.blobDocxPath); } catch (e) { }
     }
 
     // Remove draft folder if empty
@@ -1087,6 +1212,17 @@ exports.deletePendingUpload = async (req, res) => {
 
     // Delete using the same filter
     const del = await DraftCertificate.deleteMany(findFilter);
+
+    // Batch accounting for bulk discard and possible final notification
+    try {
+      await UploadBatch.updateOne(
+        { uploadId },
+        { $inc: { discarded: del.deletedCount || 0 } }
+      );
+    } catch (e) {
+      try { console.warn('deletePendingUpload: failed to bump UploadBatch.discarded:', e?.message || e); } catch { }
+    }
+    finishCheckAndNotify(uploadId).catch(() => { });
 
     return res.json({
       message: '✅ Pending upload deleted',
@@ -1180,12 +1316,12 @@ exports.deleteDraftById = async (req, res) => {
       return res.status(403).json({ message: '❌ Forbidden (wrong tenant)' });
     }
     // ideiglenes fájlok törlése
-    
+
     safeUnlink(draft.originalPdfPath);
     safeUnlink(draft.docxPath);
     // 🔹 blob fájlok törlése
-    try { if (draft.blobPdfPath)  await azureBlobService.deleteFile(draft.blobPdfPath); } catch(e){}
-    try { if (draft.blobDocxPath) await azureBlobService.deleteFile(draft.blobDocxPath); } catch(e){}
+    try { if (draft.blobPdfPath) await azureBlobService.deleteFile(draft.blobPdfPath); } catch (e) { }
+    try { if (draft.blobDocxPath) await azureBlobService.deleteFile(draft.blobDocxPath); } catch (e) { }
 
     // draft rekord törlés
     await DraftCertificate.deleteOne({ _id: id });
@@ -1194,6 +1330,19 @@ exports.deleteDraftById = async (req, res) => {
     const remaining = await DraftCertificate.countDocuments({ uploadId: draft.uploadId });
     if (remaining === 0) {
       removeDraftFolderIfEmpty(draft.uploadId);
+    }
+
+    // Batch accounting for manual discard and possible final notification
+    try {
+      if (draft && draft.uploadId) {
+        await UploadBatch.updateOne(
+          { uploadId: draft.uploadId },
+          { $inc: { discarded: 1 } }
+        );
+        finishCheckAndNotify(draft.uploadId).catch(() => { });
+      }
+    } catch (e) {
+      try { console.warn('deleteDraftById: failed to bump UploadBatch.discarded:', e?.message || e); } catch { }
     }
 
     return res.json({

@@ -117,8 +117,49 @@ function forgotPasswordEmailHtml({ firstName, lastName, loginUrl, tempPassword }
   });
 }
 
+/**
+ * Upload completion email (HTML only)
+ */
+function uploadCompletedEmail(user = {}, stats = {}) {
+  const { firstName = '', lastName = '' } = user;
+  const { uploadId = '', total = 0, saved = 0, discarded = 0 } = stats;
+
+  const fullName = `${firstName || ''} ${lastName || ''}`.trim() || 'there';
+
+  return baseTemplate({
+    title: 'Upload processing completed',
+    bodyHtml: `
+      <h2 style="color:#131313;">Dear ${escapeHtml(fullName)},</h2>
+      <p>Your certificate upload with ID <strong>${escapeHtml(uploadId)}</strong> has been fully processed.</p>
+
+      <table style="width:100%; max-width:400px; margin:12px 0; border-collapse:collapse;">
+        <tr><td style="padding:6px 0;">📄 <strong>Total files:</strong></td><td style="text-align:right;">${Number(total) || 0}</td></tr>
+        <tr><td style="padding:6px 0;">✅ <strong>Finalized:</strong></td><td style="text-align:right;">${Number(saved) || 0}</td></tr>
+        <tr><td style="padding:6px 0;">🚫 <strong>Discarded:</strong></td><td style="text-align:right;">${Number(discarded) || 0}</td></tr>
+      </table>
+
+      <p>You can review the results in the web application.</p>
+
+      <p>Some of the uploaded certificates might have been discarded during verification, either because their content did not meet validation requirements or because an identical record already exists in our database.</p>
+
+      <p style="margin-top:16px;">Thank you for using <strong>ATEXdb Certs</strong>.</p>
+    `
+  });
+}
+
+/** Simple HTML escape for safety */
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 module.exports = {
   registrationEmailHtml,
   tenantInviteEmailHtml,
-  forgotPasswordEmailHtml
+  forgotPasswordEmailHtml,
+  uploadCompletedEmail,
 };
