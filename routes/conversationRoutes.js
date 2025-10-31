@@ -48,7 +48,7 @@ function safeUploadArray(fieldName, maxCount) {
 
 // Define conversation routes
 router.post('/new-conversation', authMiddleware(), startNewConversation);
-router.post('/chat', authMiddleware(), sendMessage);
+router.post('/chat', authMiddleware(), ...sendMessage);
 router.post('/chat/stream', authMiddleware(), sendMessageStream);
 router.post('/rate-message', authMiddleware(), rateMessage);
 router.post('/save-feedback', authMiddleware(), saveFeedback);
