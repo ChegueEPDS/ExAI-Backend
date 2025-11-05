@@ -18,6 +18,7 @@ const CompanyCertificateLink = require('../models/companyCertificateLink');
 const UploadBatch = require('../models/uploadBatch');
 const mailService = require('../services/mailService');
 const mailTemplates = require('../services/mailTemplates');
+const CertificateRequest = require('../models/certificateRequest');
 
 async function ensureLinkForTenant(tenantId, certId, userId, session) {
   if (!tenantId || !certId) return;
@@ -290,6 +291,20 @@ exports.bulkUpload = [
         return res.status(400).json({ error: 'No files uploaded.' });
       }
 
+      // Optional: linking this upload to a specific certificate request
+      const requestIdRaw = (req.body && req.body.requestId) || (req.query && req.query.requestId) || '';
+      let requestId = null;
+      if (requestIdRaw) {
+        if (!mongoose.Types.ObjectId.isValid(String(requestIdRaw))) {
+          return res.status(400).json({ error: 'Invalid requestId format.' });
+        }
+        // When responding to a specific request, enforce exactly one file
+        if (req.files.length !== 1) {
+          return res.status(400).json({ error: 'Exactly one file must be uploaded when responding to a request.' });
+        }
+        requestId = new mongoose.Types.ObjectId(String(requestIdRaw));
+      }
+
       // 🔹 1. Létrehozzuk az uploadId-t
       const uploadId = `${Date.now()}-${uuidv4().slice(0, 6)}`;
       // tenant/user scope from auth
@@ -333,15 +348,28 @@ exports.bulkUpload = [
         }
 
         // 🔹 3. Mentés az ideiglenes DB-be (lokális elérési útvonalak nélkül)
-        await DraftCertificate.create({
+        const createdDraft = await DraftCertificate.create({
           tenantId,
           uploadId,
           fileName: file.originalname,
           originalPdfPath: null,     // nincs lokális storage
           status: 'draft',
           createdBy,
-          blobPdfPath               // elmentjük a blob útvonalat
+          blobPdfPath,               // elmentjük a blob útvonalat
+          ...(requestId ? { requestId } : {})
         });
+        
+        // If this upload is a response to a request, mark the request as PENDING
+        if (requestId && createdDraft && createdDraft._id) {
+          try {
+            await CertificateRequest.updateOne(
+              { _id: requestId, status: 'open' },
+              { $set: { status: 'pending', pendingAt: new Date(), pendingBy: createdBy, pendingDraftId: createdDraft._id } }
+            );
+          } catch (e) {
+            try { console.warn('bulkUpload: failed to mark request pending:', e?.message || e); } catch {}
+          }
+        }
       }
 
       try {
@@ -758,6 +786,21 @@ exports.finalizeDrafts = async (req, res) => {
             }
           }
 
+          // If this draft was created in response to a request, mark that request as fulfilled
+          if (draft.requestId) {
+            try {
+              await CertificateRequest.updateOne(
+                { _id: draft.requestId, status: { $in: ['open', 'pending'] } },
+                { 
+                  $set: { status: 'fulfilled', fulfilledAt: new Date(), fulfilledBy: userId },
+                  $unset: { pendingAt: '', pendingBy: '', pendingDraftId: '' }
+                }
+              );
+            } catch (e) {
+              console.warn('⚠️ finalizeDrafts: could not fulfill CertificateRequest:', e?.message || e);
+            }
+          }
+
           resultsSaved.push(draft._id.toString());
           cleanupItems.push({
             pdfPath: draft.originalPdfPath,
@@ -981,6 +1024,21 @@ exports.finalizeSingleDraftById = async (req, res) => {
       }
     }
 
+    // Fulfill linked request (if any)
+if (draft.requestId) {
+  try {
+    await CertificateRequest.updateOne(
+      { _id: draft.requestId, status: { $in: ['open', 'pending'] } },
+      { 
+        $set: { status: 'fulfilled', fulfilledAt: new Date(), fulfilledBy: userId },
+        $unset: { pendingAt: '', pendingBy: '', pendingDraftId: '' }
+      }
+    );
+  } catch (e) {
+    console.warn('⚠️ finalizeSingle: could not fulfill CertificateRequest:', e?.message || e);
+  }
+}
+
     // FS cleanup after successful DB operations
     safeUnlink(draft.originalPdfPath);
     safeUnlink(draft.docxPath);
@@ -1195,6 +1253,11 @@ exports.deletePendingUpload = async (req, res) => {
     const findFilter = isSuperAdmin ? { uploadId } : { uploadId, tenantId };
 
     const drafts = await DraftCertificate.find(findFilter);
+    const affectedRequestIds = Array.from(new Set(
+      drafts
+        .map(d => (d.requestId ? String(d.requestId) : null))
+        .filter(Boolean)
+    ));
     if (!drafts.length) {
       return res.status(404).json({ message: 'No drafts found for this uploadId' });
     }
@@ -1212,6 +1275,28 @@ exports.deletePendingUpload = async (req, res) => {
 
     // Delete using the same filter
     const del = await DraftCertificate.deleteMany(findFilter);
+    // For each affected request, if no drafts remain, revert to OPEN and clear pending fields
+if (affectedRequestIds.length) {
+  for (const reqId of affectedRequestIds) {
+    try {
+      const remainForRequest = await DraftCertificate.countDocuments({
+        requestId: reqId,
+        status: { $in: ['draft', 'ready', 'error'] }
+      });
+      if (remainForRequest === 0) {
+        await CertificateRequest.updateOne(
+          { _id: reqId, status: 'pending' },
+          { 
+            $set: { status: 'open' },
+            $unset: { pendingAt: '', pendingBy: '', pendingDraftId: '' }
+          }
+        );
+      }
+    } catch (e) {
+      try { console.warn('deletePendingUpload: revert request open failed:', e?.message || e); } catch {}
+    }
+  }
+}
 
     // Batch accounting for bulk discard and possible final notification
     try {
@@ -1325,6 +1410,27 @@ exports.deleteDraftById = async (req, res) => {
 
     // draft rekord törlés
     await DraftCertificate.deleteOne({ _id: id });
+
+    // If this draft was linked to a request and no more drafts remain, revert request to OPEN
+if (draft.requestId) {
+  try {
+    const remainForRequest = await DraftCertificate.countDocuments({
+      requestId: draft.requestId,
+      status: { $in: ['draft', 'ready', 'error'] }
+    });
+    if (remainForRequest === 0) {
+      await CertificateRequest.updateOne(
+        { _id: draft.requestId, status: 'pending' },
+        { 
+          $set: { status: 'open' },
+          $unset: { pendingAt: '', pendingBy: '', pendingDraftId: '' }
+        }
+      );
+    }
+  } catch (e) {
+    try { console.warn('deleteDraftById: failed to revert request to open:', e?.message || e); } catch {}
+  }
+}
 
     // ha az upload alatt nincs több draft, mappa takarítás
     const remaining = await DraftCertificate.countDocuments({ uploadId: draft.uploadId });

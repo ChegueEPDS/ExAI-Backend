@@ -36,6 +36,8 @@ const upgradeRoutes = require('./routes/upgrade');
 const tenantRoutes = require('./routes/tenantRoutes');
 const inviteRoutes = require('./routes/inviteRoutes');
 const mailRoutes = require('./routes/mailRoutes');
+const certificateRequestRoutes = require('./routes/certificateRequestRoutes');
+
 
 
 const app = express();
@@ -187,6 +189,8 @@ app.use('/api/vision', visionRoutes);
 app.use('/api/fire', fireRoutes);
 app.use('/api', exRegisterRoutes);
 app.use('/api', certificateRoutes);
+app.use('/api', certificateDraftRoutes);
+app.use('/api/cert-requests', certificateRequestRoutes);
 app.use('/api/questions', questionsRoutes);
 app.use('/api/zones', zoneRoutes);
 app.use('/api/sites', siteRoutes);
@@ -194,7 +198,6 @@ app.use('/api/xls', xlsCompareRoutes);
 app.use('/api/graph', graphRoutes);
 app.use('/api', injectionRoutes);
 app.use('/api/dxf', dxfRoute);
-app.use('/api', certificateDraftRoutes);
 app.use('/api', notificationsRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api', upgradeRoutes);

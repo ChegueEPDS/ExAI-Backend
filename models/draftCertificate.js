@@ -19,6 +19,9 @@ const DraftCertificateSchema = new mongoose.Schema({
   blobPdfPath: { type: String },   // pl. "certificates/uploads/<uploadId>/<fileName>.pdf"
   blobDocxPath: { type: String },  // pl. "certificates/uploads/<uploadId>/<fileName>.docx"
 
+  // 🔗 Request binding (optional): when a draft is an answer to a specific request
+  requestId: { type: mongoose.Schema.Types.ObjectId, ref: 'CertificateRequest', index: true },
+
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
@@ -37,6 +40,19 @@ DraftCertificateSchema.index(
     unique: true,
     name: 'uniq_tenant_draft_upload_file',
     partialFilterExpression: { tenantId: { $exists: true, $type: 'objectId' } }
+  }
+);
+
+// Ensure a request has at most one active (non-finalized) draft attached
+DraftCertificateSchema.index(
+  { requestId: 1, status: 1 },
+  {
+    unique: true,
+    name: 'uniq_active_draft_per_request',
+    partialFilterExpression: {
+      requestId: { $exists: true, $ne: null },
+      status: { $in: ['draft', 'ready', 'error'] }
+    }
   }
 );
 
