@@ -582,6 +582,164 @@ exports.createTenant = async (req, res) => {
   }
 }; */
 
+const jwt = require('jsonwebtoken');
+
+// Helper: egyszerű slugify + ensure unique tenant name (local)
+async function makeUniqueTenantName(base) {
+  const raw = String(base || `tenant-${Math.random().toString(36).slice(2,8)}`).trim();
+  const slug = () => raw.toLowerCase().replace(/[^a-z0-9\-_.]+/g, '-').replace(/^-+|-+$/g, '').substring(0,64);
+  let candidate = slug();
+  let i = 1;
+  while (await Tenant.findOne({ name: candidate })) {
+    i += 1;
+    candidate = (slug().substring(0, 56) + '-' + i).substring(0,64);
+  }
+  return candidate;
+}
+
+/**
+ * POST /api/admin/create-paid-tenant-user
+ * Body: { email, firstName?, lastName?, password?, tenantName?, plan?: 'pro'|'team', seats?: number, role?: 'User'|'Admin' }
+ * Guard: authMiddleware(['Admin','SuperAdmin']) — csak Admin / SuperAdmin hívja
+ */
+exports.createPaidTenantUser = async (req, res) => {
+  try {
+    const callerRole = (req.role || '').toString();
+    if (!['Admin','SuperAdmin'].includes(callerRole)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const {
+      email,
+      firstName = '',
+      lastName = '',
+      password = null,
+      tenantName = null,
+      plan = 'pro',   // 'pro' vagy 'team'
+      seats = (plan === 'team' ? 5 : 1),
+      role = 'User'
+    } = req.body || {};
+
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    if (!['pro','team'].includes(plan)) return res.status(400).json({ error: 'Invalid plan' });
+    if (plan === 'team' && (!Number.isInteger(seats) || seats < 5)) {
+      return res.status(400).json({ error: 'Team plan needs at least 5 seats' });
+    }
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const existing = await User.findOne({ email: normalizedEmail });
+    if (existing) return res.status(409).json({ error: 'User already exists' });
+
+    // 1) Tenant létrehozása (manual seats management)
+    const tenantUniqueName = await makeUniqueTenantName(tenantName || (plan === 'team' ? 'company' : `u-${normalizedEmail.split('@')[0]}`));
+    const tenant = await Tenant.create({
+      name: tenantUniqueName,
+      type: plan === 'team' ? 'company' : 'personal',
+      plan: plan,
+      ownerUserId: undefined,
+      seats: { max: seats, used: 1 },
+      seatsManaged: 'manual', // fontos: stripe nélkül manuális kezelés
+    });
+
+    // 2) User létrehozása
+    const pwd = password || Math.random().toString(36).slice(2,10) + 'A1'; // ha nincs pw: ideiglenes
+    const hashed = await bcrypt.hash(String(pwd), 10);
+
+    const user = await User.create({
+      firstName,
+      lastName,
+      email: normalizedEmail,
+      password: hashed,
+      role: plan === 'team' ? 'Admin' : role,
+      tenantId: tenant._id,
+      nickname: firstName || normalizedEmail.split('@')[0]
+    });
+    await Tenant.findByIdAndUpdate(tenant._id, { ownerUserId: user._id });
+
+    // 3) Subscription dokument létrehozása (manuálisan, active)
+    const expires = new Date();
+    expires.setFullYear(expires.getFullYear() + 1); // 1 év
+    const sub = await Subscription.create({
+      tenantId: tenant._id,
+      tier: plan,                 // 'pro' | 'team'
+      status: 'active',
+      seatsPurchased: seats,
+      expiresAt: expires,
+      // egyéb mezők: customerId / stripeSubscriptionId --> üresen hagyjuk
+    });
+
+    // 4) (Biztonsági) tenant cache/frissítés: állítsuk be a tenant.plan is ha szükséges
+    await Tenant.findByIdAndUpdate(tenant._id, { plan, 'seats.used': 1, seatsManaged: 'manual' });
+
+    // 5) Token generálás (rövid életű access token)
+    // A payload tükrözi a signAccessTokenWithSubscription logikáját:
+    const payload = {
+      sub: String(user._id),
+      userId: String(user._id),
+      role: user.role,
+      tenantId: String(tenant._id),
+      tenantName: tenant.name,
+      tenantType: tenant.type,
+      nickname: user.nickname || null,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      azureId: user.azureId || null,
+      subscription: {
+        tenantName: tenant.name,
+        tenantType: tenant.type,
+        plan: tenant.plan,
+        seats: { max: tenant.seats.max, used: tenant.seats.used },
+        seatsManaged: tenant.seatsManaged,
+        tier: sub.tier,
+        status: sub.status,
+        seatsPurchased: sub.seatsPurchased,
+        lastUpdate: sub.updatedAt || sub.createdAt || null,
+        flags: {
+          isFree: sub.tier === 'free',
+          isPro: sub.tier === 'pro',
+          isTeam: sub.tier === 'team',
+        }
+      },
+      type: 'access',
+      v: 2,
+    };
+    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '1h' });
+
+    // 6) (Opcionális) e-mail küldés: tenantInviteEmailHtml használatával (fire-and-forget)
+    (async () => {
+      try {
+        const html = tenantInviteEmailHtml({
+          firstName: user.firstName || '',
+          lastName: user.lastName || '',
+          tenantName: tenant.name,
+          loginUrl: process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu',
+          password: pwd
+        });
+        await mailService.sendMail({
+          to: user.email,
+          subject: `You're added to ${tenant.name}`,
+          html,
+          from: process.env.MAIL_SENDER_UPN
+        });
+      } catch (err) {
+        console.warn('[mail] tenant invite mail failed', err?.message || err);
+      }
+    })();
+
+    return res.status(201).json({
+      message: 'Paid tenant + user created (manual).',
+      user: { id: user._id, email: user.email, tenantId: tenant._id, role: user.role },
+      tenant: { id: tenant._id, name: tenant.name, plan: tenant.plan, seats: tenant.seats },
+      subscription: { id: sub._id, tier: sub.tier, status: sub.status, expiresAt: sub.expiresAt },
+      token
+    });
+
+  } catch (e) {
+    console.error('createPaidTenantUser error', e);
+    return res.status(500).json({ error: e.message || 'Internal server error' });
+  }
+};
+
 // ---------------------------
 // GET /api/users/me/quota
 // Returns today's remaining download quota (e.g., Free users: 3/day)
