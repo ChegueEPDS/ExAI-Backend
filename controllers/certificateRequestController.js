@@ -21,6 +21,21 @@ function normalizeCertNo(raw) {
   return s;
 }
 
+function normalizeModel(raw) {
+  if (!raw) return undefined;
+  let s = String(raw).trim();
+  s = s.replace(/\s+/g, ' ');
+  return s || undefined;
+}
+
+function normalizeManufacturer(raw) {
+  if (!raw) return undefined;
+  let s = String(raw).trim();
+  s = s.replace(/\s+/g, ' ');
+  // opcionális: nagy kezdőbetűk (Title Case) helyett maradjon az eredeti casing
+  return s || undefined;
+}
+
 /**
  * POST /api/cert-requests
  * Body: { certNo: string }
@@ -32,7 +47,7 @@ function normalizeCertNo(raw) {
  */
 exports.createRequest = async (req, res) => {
   try {
-    const { certNo, comment } = req.body || {};
+    const { certNo, comment, model, manufacturer } = req.body || {};
     const userId = req.userId;
     const tenantId = req.scope?.tenantId || null;
 
@@ -61,7 +76,7 @@ exports.createRequest = async (req, res) => {
 
     // 2) Van-e már OPEN request erre a certNo-ra?
     const openExisting = await CertificateRequest.findOne({ certNo: norm, status: 'open' })
-      .select('_id certNo status createdBy createdAt');
+      .select('_id certNo status createdBy createdAt model comment');
     if (openExisting) {
       // Idempotens válasz: 200 és visszaadjuk a meglévőt (nem duplikálunk)
       return res.status(200).json({
@@ -73,7 +88,9 @@ exports.createRequest = async (req, res) => {
     // 3) Létrehozás
     const doc = await CertificateRequest.create({
       certNo: norm,
-      comment: comment || null,
+      manufacturer: normalizeManufacturer(manufacturer),
+      model: normalizeModel(model),
+      comment: (typeof comment === 'string' ? comment.trim() : undefined),
       status: 'open',
       createdBy: userId,
       tenantId: tenantId || undefined
@@ -113,6 +130,7 @@ exports.listRequests = async (req, res) => {
     statuses = statuses.map(s => s.trim()).filter(Boolean);
     const mine = String(req.query.mine || 'false').toLowerCase() === 'true';
     const q = (req.query.q || '').toString().trim();
+    const qModel = (req.query.qModel || '').toString().trim();
 
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit || '20', 10), 1), 100);
@@ -127,14 +145,17 @@ exports.listRequests = async (req, res) => {
       filter.status = 'open';
     }
     if (mine) filter.createdBy = userId;
-    if (q) filter.certNo = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    if (q) {
+      const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      filter.$or = [{ certNo: rx }, { manufacturer: rx }, { model: rx }];
+    }
 
     const [items, total] = await Promise.all([
       CertificateRequest.find(filter)
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
-        .select('_id certNo status createdBy tenantId createdAt updatedAt fulfilledByDraftId fulfilledCertId')
+        .select('_id certNo manufacturer model comment status createdBy tenantId createdAt updatedAt fulfilledByDraftId fulfilledCertId')
         .lean(),
       CertificateRequest.countDocuments(filter)
     ]);

@@ -5,6 +5,8 @@ const CertificateRequestSchema = new mongoose.Schema(
   {
     // ⚠️ Mindig NORMALIZÁLT cert számot tárolj (pl. "CML 21ATEX1234" → "CML 21-ATEX-1234" / felsőbetű / stb.)
     certNo: { type: String, required: true, index: true },
+    manufacturer: { type: String },
+    model: { type: String },
     comment: { type: String },
 
     // Három státusz: open / pending / fulfilled
