@@ -406,29 +406,40 @@ exports.getPublicCertificatesPaged = async (req, res) => {
 
     const project = buildProjectFromFields(req.query.fields);
 
+    // --- NEW: prefetch adopted ids for this tenant (no large lookup in pipeline) ---
+    let adoptedIds = [];
+    if (tenantObjectId) {
+      const links = await CompanyCertificateLink
+        .find({ tenantId: tenantObjectId })
+        .select('certId')
+        .lean();
+      adoptedIds = links.map(l => l.certId);
+    }
+
+    // Build an index hint to make the {visibility, key} sort/filter cheap when possible
+    // Falls back gracefully if the hint is not applicable.
+    const hint = (() => {
+      const h = { visibility: 1 };
+      // Only add the secondary key if it's not _id and not createdAt (createdAt_-1 exists separately)
+      if (key && key !== '_id') {
+        h[key] = dir;
+      }
+      return h;
+    })();
+
+    // Aggregate with pagination first; then compute adoptedByMe on the N page items.
     const pipeline = [
       { $match: match },
       { $sort: sort },
-      ...(tenantObjectId ? [{
-        $lookup: {
-          from: 'companycertificatelinks',
-          let: { certId: '$_id' },
-          pipeline: [
-            { $match: { $expr: { $and: [
-              { $eq: ['$certId', '$$certId'] },
-              { $eq: ['$tenantId', tenantObjectId] }
-            ]}}},
-            { $limit: 1 }
-          ],
-          as: 'myLink'
-        }
-      }, { $addFields: { adoptedByMe: { $gt: [{ $size: '$myLink' }, 0] } } },
-         { $project: { myLink: 0 } }] : []),
       {
         $facet: {
           items: [
             { $skip: (page - 1) * pageSize },
             { $limit: pageSize },
+            // adoptedByMe computed without $lookup
+            ...(tenantObjectId
+              ? [{ $addFields: { adoptedByMe: { $in: ['$_id', adoptedIds] } } }]
+              : [{ $addFields: { adoptedByMe: false } }]),
             { $project: project }
           ],
           total: [{ $count: 'count' }]
@@ -436,7 +447,14 @@ exports.getPublicCertificatesPaged = async (req, res) => {
       }
     ];
 
-    const [agg] = await Certificate.aggregate(pipeline);
+    let aggCursor = Certificate.aggregate(pipeline);
+    try {
+      aggCursor = aggCursor.hint(hint);
+    } catch (_) {
+      // If the hint isn't valid on this server/index set, ignore it.
+    }
+
+    const [agg] = await aggCursor.exec();
     const items = agg?.items || [];
     const total = agg?.total?.[0]?.count || 0;
 
