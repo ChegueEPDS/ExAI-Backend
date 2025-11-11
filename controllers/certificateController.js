@@ -86,6 +86,43 @@ function buildProjectFromFields(fieldsParam) {
   return out;
 }
 
+// ==== Index helpers for safe hinting ====
+async function listIndexes(collectionName) {
+  const col = mongoose.connection.db.collection(collectionName);
+  const idx = await col.indexes();
+  return idx; // [{ name, key: { a:1, b:-1 }, ...}, ...]
+}
+
+function sameKeySpec(a, b) {
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (let i = 0; i < aKeys.length; i++) {
+    const k = aKeys[i];
+    if (!(k in b)) return false;
+    if (a[k] !== b[k]) return false;
+  }
+  return true;
+}
+
+async function hasExactIndex(collectionName, keySpec) {
+  try {
+    const idx = await listIndexes(collectionName);
+    return idx.some(i => sameKeySpec(i.key || {}, keySpec));
+  } catch {
+    return false;
+  }
+}
+
+// Map requested sort key -> exact compound index spec created in the model
+const SORT_HINTS = Object.freeze({
+  certNo:       { visibility: 1, certNo: 1, _id: 1 },
+  manufacturer: { visibility: 1, manufacturer: 1, _id: 1 },
+  equipment:    { visibility: 1, equipment: 1, _id: 1 },
+  issueDate:    { visibility: 1, issueDate: -1, _id: 1 }, // index built descending on date
+  createdAt:    { visibility: 1, createdAt: -1, _id: 1 }  // index built descending on createdAt
+});
+
 // Safely handle incoming id parameters (skip CastError)
 function tryObjectId(id) {
   try {
@@ -416,17 +453,6 @@ exports.getPublicCertificatesPaged = async (req, res) => {
       adoptedIds = links.map(l => l.certId);
     }
 
-    // Build an index hint to make the {visibility, key} sort/filter cheap when possible
-    // Falls back gracefully if the hint is not applicable.
-    const hint = (() => {
-      const h = { visibility: 1 };
-      // Only add the secondary key if it's not _id and not createdAt (createdAt_-1 exists separately)
-      if (key && key !== '_id') {
-        h[key] = dir;
-      }
-      return h;
-    })();
-
     // Aggregate with pagination first; then compute adoptedByMe on the N page items.
     const pipeline = [
       { $match: match },
@@ -447,11 +473,13 @@ exports.getPublicCertificatesPaged = async (req, res) => {
       }
     ];
 
-    let aggCursor = Certificate.aggregate(pipeline);
-    try {
-      aggCursor = aggCursor.hint(hint);
-    } catch (_) {
-      // If the hint isn't valid on this server/index set, ignore it.
+    // Create aggregate cursor with disk spill enabled for big sorts if needed
+    let aggCursor = Certificate.aggregate(pipeline).allowDiskUse(true);
+
+    // Apply an index hint only if the exact compound index exists (prevents runtime "hint not found")
+    const hintSpec = SORT_HINTS[key] || SORT_HINTS.certNo;
+    if (await hasExactIndex('certificates', hintSpec)) {
+      aggCursor = aggCursor.hint(hintSpec);
     }
 
     const [agg] = await aggCursor.exec();

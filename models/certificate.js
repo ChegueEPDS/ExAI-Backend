@@ -122,6 +122,13 @@ CertificateSchema.index({ tenantId: 1, manufacturer: 1 });
 CertificateSchema.index({ tenantId: 1, equipment: 1 });
 CertificateSchema.index({ createdAt: -1 }); // ha idő szerinti listázás lesz
 
+// --- Stable, index-backed sort indexes for public lists (with _id tie-breaker) ---
+CertificateSchema.index({ visibility: 1, certNo: 1, _id: 1 }, { name: 'vis_certNo__id' });
+CertificateSchema.index({ visibility: 1, manufacturer: 1, _id: 1 }, { name: 'vis_manufacturer__id' });
+CertificateSchema.index({ visibility: 1, equipment: 1, _id: 1 }, { name: 'vis_equipment__id' });
+CertificateSchema.index({ visibility: 1, issueDate: -1, _id: 1 }, { name: 'vis_issueDate_desc__id' });
+CertificateSchema.index({ visibility: 1, createdAt: -1, _id: 1 }, { name: 'vis_createdAt_desc__id' });
+
 // ---- Indexes to query reports quickly ----
 CertificateSchema.index({ 'reports.status': 1, visibility: 1 });
 CertificateSchema.index({ 'reports.createdBy': 1, createdAt: -1 });
