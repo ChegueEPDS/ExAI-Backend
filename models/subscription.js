@@ -18,7 +18,8 @@ const SubscriptionSchema = new mongoose.Schema({
   },
 
   // 🔹 Manuális licencekhez / ideiglenes hosszabbításhoz
-  expiresAt: { type: Date }
+  expiresAt: { type: Date },
+  billingPeriod: { type: String, enum: ['month', 'year'], default: 'month' },
 }, { timestamps: true });
 
 // Hasznos indexek

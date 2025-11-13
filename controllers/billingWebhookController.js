@@ -7,6 +7,8 @@ const { migrateDeleteCompanyDataButKeepPublic } = require('../services/tenantCle
 
 const PRO_PRICE_ID  = process.env.STRIPE_PRICE_PRO;
 const TEAM_PRICE_ID = process.env.STRIPE_PRICE_TEAM;
+const PRO_PRICE_ID_YEARLY  = process.env.STRIPE_PRICE_PRO_YEARLY;
+const TEAM_PRICE_ID_YEARLY = process.env.STRIPE_PRICE_TEAM_YEARLY;
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
@@ -37,11 +39,36 @@ async function ensureUniqueTenantName(base) {
   return uniqueName;
 }
 
+function str(v) { return (v || '').toString().toLowerCase(); }
+
 function resolveTierFromItem(item, subMeta) {
   const price = item?.price;
-  if (price && (price.id === TEAM_PRICE_ID || price.lookup_key === 'team')) return 'team';
-  if (subMeta?.plan === 'team' || subMeta?.intent === 'team') return 'team';
+  const lookup = str(price?.lookup_key);
+  const pid = price?.id;
+
+  // Price ID or lookup_key based routing
+  if (pid === TEAM_PRICE_ID || pid === TEAM_PRICE_ID_YEARLY || lookup === 'team' || lookup === 'team_yearly') {
+    return 'team';
+  }
+  if (pid === PRO_PRICE_ID || pid === PRO_PRICE_ID_YEARLY || lookup === 'pro' || lookup === 'pro_yearly') {
+    return 'pro';
+  }
+
+  // Metadata fallback (keeps legacy behavior)
+  const metaPlan = str(subMeta?.plan || subMeta?.intent);
+  if (metaPlan.includes('team')) return 'team';
   return 'pro';
+}
+
+function resolveBillingPeriod(item, subMeta) {
+  // Prefer Stripe price recurring interval if present
+  const interval = item?.price?.recurring?.interval;
+  if (interval === 'year' || interval === 'month') return interval;
+
+  // Fallback from metadata plan name
+  const metaPlan = str(subMeta?.plan || subMeta?.intent);
+  if (metaPlan.endsWith('_yearly')) return 'year';
+  return 'month';
 }
 
 async function resolveTierWithStripeFallback(item, subMeta) {
@@ -70,11 +97,13 @@ async function upsertSubscriptionSnapshot(
     item,
     priceOverride,
     tier,
+    billingPeriod,
   }
 ) {
   const price = priceOverride || item?.price || null;
   const qty = Number(item?.quantity ?? 0) || 0;
   const currentPeriodEnd = current_period_end ? new Date(current_period_end * 1000) : undefined;
+  const bp = billingPeriod || (price?.recurring?.interval === 'year' ? 'year' : (price?.recurring?.interval === 'month' ? 'month' : 'month'));
   const payload = {
     tenantId,
     stripeCustomerId: stripeCustomerId || undefined,
@@ -86,6 +115,7 @@ async function upsertSubscriptionSnapshot(
     tier: tier || undefined,
     priceId: price?.id,
     productId: price?.product,
+    billingPeriod: bp,
   };
   await Subscription.findOneAndUpdate({ tenantId }, payload, { upsert: true, new: true });
 }
@@ -115,6 +145,7 @@ exports.handleStripeWebhook = async (req, res) => {
         let quantity = item.quantity || 1;
 
         let tier = await resolveTierWithStripeFallback(item, m);
+        const billingPeriod = resolveBillingPeriod(item, m);
 
         let tenant = null;
         const isValidObjectId = ref && /^[a-fA-F0-9]{24}$/.test(ref);
@@ -135,6 +166,7 @@ exports.handleStripeWebhook = async (req, res) => {
             }
             tenant.stripeCustomerId = customerId;
             tenant.stripeSubscriptionId = subId;
+            tenant.billingPeriod = billingPeriod; // cache billing period ('month' | 'year')
             await tenant.save();
 
             const buyerUserId = m.userId || null;
@@ -183,7 +215,8 @@ exports.handleStripeWebhook = async (req, res) => {
               cancel_at_period_end: sub.cancel_at_period_end,
               item,
               priceOverride: price,
-              tier
+              tier,
+              billingPeriod
             });
             break;
           }
@@ -211,6 +244,7 @@ exports.handleStripeWebhook = async (req, res) => {
             seatsManaged: 'stripe',
             stripeCustomerId: customerId,
             stripeSubscriptionId: subId,
+            billingPeriod, // 'month' | 'year'
           });
 
           if (buyer) {
@@ -243,7 +277,8 @@ exports.handleStripeWebhook = async (req, res) => {
             cancel_at_period_end: sub.cancel_at_period_end,
             item,
             priceOverride: price,
-            tier
+            tier,
+            billingPeriod
           });
         }
 
@@ -260,6 +295,7 @@ exports.handleStripeWebhook = async (req, res) => {
           const item = sub.items?.data?.[0];
           const price = item?.price;
           const tier = await resolveTierWithStripeFallback(item, sub?.metadata);
+          const billingPeriod = resolveBillingPeriod(item, sub?.metadata);
 
           if (tier === 'team') {
             const q = Math.max(Number(item?.quantity || 0), 5);
@@ -274,6 +310,7 @@ exports.handleStripeWebhook = async (req, res) => {
           tenant.stripeCustomerId = sub.customer || tenant.stripeCustomerId;
           tenant.stripeSubscriptionId = sub.id || tenant.stripeSubscriptionId;
           tenant.seatsManaged = 'stripe';
+          tenant.billingPeriod = billingPeriod;
           await tenant.save();
 
           // normalize once more
@@ -294,7 +331,8 @@ exports.handleStripeWebhook = async (req, res) => {
             cancel_at_period_end: sub.cancel_at_period_end,
             item,
             priceOverride: price,
-            tier
+            tier,
+            billingPeriod
           });
         }
         break;
@@ -319,6 +357,7 @@ exports.handleStripeWebhook = async (req, res) => {
         const item = sub.items?.data?.[0];
         const price = item?.price;
         const tier = await resolveTierWithStripeFallback(item, sub?.metadata);
+        const billingPeriod = resolveBillingPeriod(item, sub?.metadata);
 
         // 3) Identify the actor user who initiated the portal change (if any)
         // Prefer subscription metadata.userId, otherwise read Stripe Customer.metadata.lastPortalUserId
@@ -337,6 +376,7 @@ exports.handleStripeWebhook = async (req, res) => {
         t.stripeCustomerId = sub.customer || t.stripeCustomerId;
         t.stripeSubscriptionId = sub.id || t.stripeSubscriptionId;
         t.seatsManaged = 'stripe';
+        t.billingPeriod = billingPeriod;
 
         if (tier === 'team') {
           const q = Math.max(Number(item?.quantity || 0), 5);
@@ -361,11 +401,12 @@ exports.handleStripeWebhook = async (req, res) => {
           cancel_at_period_end: sub.cancel_at_period_end,
           item,
           priceOverride: price,
-          tier
+          tier,
+          billingPeriod
         });
         await Subscription.findOneAndUpdate(
           { tenantId: t._id },
-          { seatsPurchased: (tier === 'team') ? Math.max(Number(item?.quantity || 0), 5) : 1, tier, status: sub.status },
+          { seatsPurchased: (tier === 'team') ? Math.max(Number(item?.quantity || 0), 5) : 1, tier, status: sub.status, billingPeriod },
           { upsert: true }
         );
 
@@ -427,6 +468,7 @@ exports.handleStripeWebhook = async (req, res) => {
           tenant.seats.used = Math.min(tenant.seats.used || 0, 1);
           tenant.seatsManaged = tenant.seatsManaged || 'stripe';
           tenant.stripeSubscriptionId = undefined;
+          tenant.billingPeriod = undefined;
           await tenant.save();
 
           const ownerId = tenant.ownerUserId;
@@ -446,7 +488,8 @@ exports.handleStripeWebhook = async (req, res) => {
             cancel_at_period_end: sub.cancel_at_period_end,
             item: sub.items?.data?.[0],
             priceOverride: sub.items?.data?.[0]?.price,
-            tier: undefined
+            tier: undefined,
+            billingPeriod: sub.items?.data?.[0]?.price?.recurring?.interval === 'year' ? 'year' : 'month'
           });
 
           await Subscription.findOneAndUpdate(

@@ -24,7 +24,7 @@ const Tenant = require('../models/tenant');
 
 /**
  * Route-szintű normalizáló/validáló middleware a Checkout-hoz
- * - plan: 'pro' | 'team' (kötelező)
+ * - plan: 'pro' | 'team' | 'pro_yearly' | 'team_yearly' (kötelező)
  * - tenantId: kötelező (nálatok mindig van)
  * - team: seats kötelező és min. 5, tenant.type='company'
  * - pro: seats = 1, tenant.type='personal'
@@ -38,8 +38,8 @@ async function validateCheckoutBody(req, res, next) {
     const companyName = body.companyName != null ? String(body.companyName).trim() : '';
 
     // 1) Plan validation
-    if (!['pro', 'team'].includes(plan)) {
-      return res.status(400).json({ message: 'Invalid plan. Use "pro" or "team".' });
+    if (!['pro', 'team', 'pro_yearly', 'team_yearly'].includes(plan)) {
+      return res.status(400).json({ message: 'Invalid plan. Use "pro", "team", "pro_yearly", "team_yearly".' });
     }
 
     // 2) If tenantId is provided => strict validation against DB (legacy / advanced flows)
@@ -49,7 +49,7 @@ async function validateCheckoutBody(req, res, next) {
         return res.status(404).json({ message: 'Tenant not found.' });
       }
 
-      if (plan === 'team') {
+      if (plan.startsWith('team')) {
         // company + min. 5 seat
         const seats = Number.isInteger(rawSeats) ? rawSeats : 5;
         if (seats < 5) {
@@ -58,7 +58,7 @@ async function validateCheckoutBody(req, res, next) {
         if (tenant.type !== 'company') {
           return res.status(400).json({ message: 'Team plan requires a company tenant.' });
         }
-        req.body.plan = 'team';
+        req.body.plan = plan;
         req.body.seats = seats;
         req.body.tenantId = rawTenantId;
         return next();
@@ -68,14 +68,14 @@ async function validateCheckoutBody(req, res, next) {
       if (tenant.type !== 'personal') {
         return res.status(400).json({ message: 'Pro plan requires a personal tenant.' });
       }
-      req.body.plan = 'pro';
+      req.body.plan = plan;
       req.body.seats = 1; // fixed for pro
       req.body.tenantId = rawTenantId;
       return next();
     }
 
     // 3) Free-first mode (NO tenantId yet)
-    if (plan === 'team') {
+    if (plan.startsWith('team')) {
       // For team we need at least a desired seats count and a companyName to create later at webhook.
       const seats = Number.isInteger(rawSeats) ? rawSeats : NaN;
       if (!Number.isInteger(seats) || seats < 5) {
@@ -85,14 +85,14 @@ async function validateCheckoutBody(req, res, next) {
         return res.status(400).json({ message: 'Team plan requires a companyName when tenantId is not provided.' });
       }
       // normalize body for controller
-      req.body.plan = 'team';
+      req.body.plan = plan;
       req.body.seats = seats;
       // tenantId intentionally omitted (free-first)
       return next();
     }
 
     // PRO free-first: allow without tenantId; seats fixed to 1
-    req.body.plan = 'pro';
+    req.body.plan = plan;
     req.body.seats = 1;
     // tenantId intentionally omitted
     return next();

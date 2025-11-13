@@ -128,18 +128,93 @@ exports.createCheckoutSession = async (req, res) => {
 
     try {
         const { tenantId, plan, seats, priceId, successUrl, cancelUrl, companyName, userId } = req.body;
+        console.log('[billing] /checkout body:', JSON.stringify({
+            tenantId,
+            plan,
+            seats,
+            priceId,
+            successUrl,
+            cancelUrl,
+            companyName,
+            userId
+        }, null, 2));
 
-        const normalizedPlan = String(plan);
-        const qty = normalizedPlan === 'team' ? Math.max(5, Number(seats) || 5) : 1;
+        // --- Support monthly + yearly variants; keep legacy behavior otherwise ---
+        // Frontend küldi: plan (pl. "pro" | "team" | "pro_yearly" | "team_yearly")
+        // + product ("pro"|"team") + billingPeriod ("month"|"year").
+        // A normalizedPlan-t mindig ezek alapján határozzuk meg, de kompatibilisek maradunk a régi hívásokkal.
 
-        // Ár kiválasztása: body.priceId vagy ENV mappolás
+        // Nyers értékek a body-ból
+        const rawPlan = (plan || '').toString().toLowerCase();
+        const rawProduct = (req.body.product || '').toString().toLowerCase();
+        const rawPeriod = (req.body.billingPeriod || '').toString().toLowerCase();
+
+        // Termék: pro vagy team (alapértelmezés: pro)
+        const product = rawProduct === 'team' ? 'team' : 'pro';
+        // Periódus: month vagy year (alapértelmezés: month, ha nincs megadva)
+        const period = rawPeriod === 'year' ? 'year' : 'month';
+
+        // Támogatott plan stringek
+        const allowedPlans = ['pro', 'team', 'pro_yearly', 'team_yearly'];
+
+        // Ha a rawPlan már egy ismert string, használjuk azt, különben derive product+period alapján.
+        let normalizedPlan = rawPlan;
+        if (!allowedPlans.includes(normalizedPlan)) {
+            if (product === 'team') {
+                normalizedPlan = period === 'year' ? 'team_yearly' : 'team';
+            } else {
+                normalizedPlan = period === 'year' ? 'pro_yearly' : 'pro';
+            }
+        }
+
+        const isTeam = normalizedPlan === 'team' || normalizedPlan === 'team_yearly';
+        const isPro = normalizedPlan === 'pro' || normalizedPlan === 'pro_yearly';
+        const isYearly = normalizedPlan === 'pro_yearly' || normalizedPlan === 'team_yearly';
+
+        // Base plan és billing period a Stripe metadatához
+        const basePlan = isTeam ? 'team' : 'pro';
+        const billingPeriod = isYearly ? 'year' : 'month';
+
+        // Debug: plan flags and billing period
+        console.log('[billing] normalized plan flags:', JSON.stringify({
+            rawPlan,
+            rawProduct,
+            rawPeriod,
+            product,
+            period,
+            normalizedPlan,
+            isTeam,
+            isPro,
+            isYearly,
+            basePlan,
+            billingPeriod
+        }, null, 2));
+
+        // Quantity: TEAM → min 5, PRO → always 1
+        const qty = isTeam ? Math.max(5, Number(seats) || 5) : 1;
+
+        // Price selection: explicit priceId overrides everything; otherwise env mapping
         const PRICE_BY_PLAN = {
-            pro: process.env.STRIPE_PRICE_PRO,
-            team: process.env.STRIPE_PRICE_TEAM,
+            pro:          process.env.STRIPE_PRICE_PRO,                                        // monthly PRO
+            team:         process.env.STRIPE_PRICE_TEAM,                                       // monthly TEAM
+            pro_yearly:   process.env.STRIPE_PRICE_PRO_YEARLY, 
+            team_yearly:  process.env.STRIPE_PRICE_TEAM_YEARLY || process.env.STRIPE_PRICE_TEAM,
         };
-        const chosenPriceId = priceId || PRICE_BY_PLAN[plan];
+        console.log('[billing] PRICE_BY_PLAN mapping:', JSON.stringify({
+            STRIPE_PRICE_PRO: process.env.STRIPE_PRICE_PRO,
+            STRIPE_PRICE_TEAM: process.env.STRIPE_PRICE_TEAM,
+            STRIPE_PRICE_PRO_YEARLY: process.env.STRIPE_PRICE_PRO_YEARLY,
+            STRIPE_PRICE_TEAM_YEARLY: process.env.STRIPE_PRICE_TEAM_YEARLY
+        }, null, 2));
+        const chosenPriceId = priceId || PRICE_BY_PLAN[normalizedPlan];
+        console.log('[billing] chosen price:', JSON.stringify({
+            normalizedPlan,
+            explicitPriceId: priceId || null,
+            chosenPriceId,
+            qty,
+        }, null, 2));
         if (!chosenPriceId) {
-            return res.status(500).json({ message: `Stripe price is not configured for plan "${plan}".` });
+            return res.status(500).json({ message: `Stripe price is not configured for plan "${normalizedPlan}".` });
         }
 
         // Success / Cancel URL fallback and normalization
@@ -149,7 +224,7 @@ exports.createCheckoutSession = async (req, res) => {
         const CANCEL_URL  = ensureAbsUrl(RAW_CANCEL,  'http://localhost:4200/billing/cancel');
 
         // Branch by plan
-        if (normalizedPlan === 'pro') {
+        if (normalizedPlan === 'pro' || normalizedPlan === 'pro_yearly') {
             // Require tenantId for pro plan
             if (!tenantId) {
                 return res.status(400).json({ message: 'tenantId is required for pro plan' });
@@ -169,6 +244,15 @@ exports.createCheckoutSession = async (req, res) => {
                 await tenant.save();
             }
 
+            console.log('[billing] creating PRO checkout session with:', JSON.stringify({
+                mode: 'subscription',
+                customerId,
+                price: chosenPriceId,
+                qty,
+                basePlan,
+                billingPeriod,
+                metadataPlan: normalizedPlan
+            }, null, 2));
             const session = await stripe.checkout.sessions.create({
                 mode: 'subscription',
                 customer: customerId,
@@ -191,14 +275,18 @@ exports.createCheckoutSession = async (req, res) => {
                 cancel_url: CANCEL_URL,
                 subscription_data: {
                     metadata: {
-                        plan: 'pro',
+                        plan: normalizedPlan,
+                        basePlan,
+                        billingPeriod,
                         seats: String(qty),
                         tenantId: String(tenant._id),
                         userId: (req.user?.id || req.user?._id || userId || '').toString()
                     }
                 },
                 metadata: {
-                    plan: 'pro',
+                    plan: normalizedPlan,
+                    basePlan,
+                    billingPeriod,
                     seats: String(qty),
                     tenantId: String(tenant._id),
                     userId: (req.user?.id || req.user?._id || userId || '').toString()
@@ -206,7 +294,7 @@ exports.createCheckoutSession = async (req, res) => {
             });
 
             return res.json({ url: session.url });
-        } else if (normalizedPlan === 'team') {
+        } else if (normalizedPlan === 'team' || normalizedPlan === 'team_yearly') {
             if (!tenantId) {
                 // TEAM: free-first flow (no tenant yet)
                 const newCustomer = await stripe.customers.create({
@@ -221,11 +309,23 @@ exports.createCheckoutSession = async (req, res) => {
                 const clientRef = `team|${(req.user?.id || req.user?._id || userId || '').toString()}`;
                 const meta = {
                     intent: 'team',
-                    plan: 'team',
+                    plan: normalizedPlan,
+                    basePlan,
+                    billingPeriod,
                     seats: String(qty),
                     userId: (req.user?.id || req.user?._id || userId || '').toString(),
                     companyName: (companyName || '').toString()
                 };
+                console.log('[billing] creating TEAM checkout session (no tenantId) with:', JSON.stringify({
+                    mode: 'subscription',
+                    customerId,
+                    price: chosenPriceId,
+                    qty,
+                    basePlan,
+                    billingPeriod,
+                    metadataPlan: normalizedPlan,
+                    meta
+                }, null, 2));
                 const session = await stripe.checkout.sessions.create({
                     mode: 'subscription',
                     customer: customerId,
@@ -268,12 +368,24 @@ exports.createCheckoutSession = async (req, res) => {
                     await tenant.save();
                 }
                 const meta = {
-                    plan: 'team',
+                    plan: normalizedPlan,
+                    basePlan,
+                    billingPeriod,
                     seats: String(qty),
                     tenantId: String(tenant._id),
                     userId: (req.user?.id || req.user?._id || userId || '').toString(),
                     companyName: (companyName || '').toString()
                 };
+                console.log('[billing] creating TEAM checkout session (with tenantId) with:', JSON.stringify({
+                    mode: 'subscription',
+                    customerId,
+                    price: chosenPriceId,
+                    qty,
+                    basePlan,
+                    billingPeriod,
+                    metadataPlan: normalizedPlan,
+                    meta
+                }, null, 2));
                 const session = await stripe.checkout.sessions.create({
                     mode: 'subscription',
                     customer: customerId,
