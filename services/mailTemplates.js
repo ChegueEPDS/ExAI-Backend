@@ -147,6 +147,70 @@ function uploadCompletedEmail(user = {}, stats = {}) {
   });
 }
 
+function certificateRequestFulfilledEmail({ firstName, lastName, certNo, request = {} }) {
+  const {
+    certNo: requestedCertNo = '',
+    manufacturer = '',
+    model = '',
+    status = 'fulfilled',
+  } = request || {};
+
+  const fullName = `${firstName || ''} ${lastName || ''}`.trim() || 'there';
+  const safeUploadedCertNo = escapeHtml(certNo || '');
+  const safeRequestedCertNo = escapeHtml(requestedCertNo || '');
+  const safeManufacturer = escapeHtml(manufacturer || '');
+  const safeModel = escapeHtml(model || '');
+  const safeStatus = escapeHtml(status || 'fulfilled');
+
+  const appUrl = 'https://certs.atexdb.eu/cert?tab=db';
+
+  return baseTemplate({
+    title: 'Your requested certificate is available',
+    bodyHtml: `
+      <h2 style="color:#131313;">Dear ${escapeHtml(fullName)},</h2>
+      <p>The certificate you requested is now available in <strong>ATEXdb Certs</strong>.</p>
+
+      <p style="margin:16px 0 8px 0;"><strong>Uploaded certificate:</strong></p>
+      <div style="background:#ebebeb; padding:10px 12px; border-radius:6px; font-family:monospace; font-size:15px;">
+        ${safeUploadedCertNo || 'N/A'}
+      </div>
+
+      <p style="margin:20px 0 6px 0;"><strong>Request details</strong></p>
+      <table style="width:100%; max-width:480px; margin:0 0 16px 0; border-collapse:collapse;">
+        <tr>
+          <td style="padding:6px 0; font-weight:bold;">Requested cert number:</td>
+          <td style="padding:6px 0; text-align:right;">${safeRequestedCertNo || '—'}</td>
+        </tr>
+        <tr>
+          <td style="padding:6px 0; font-weight:bold;">Manufacturer:</td>
+          <td style="padding:6px 0; text-align:right;">${safeManufacturer || '—'}</td>
+        </tr>
+        <tr>
+          <td style="padding:6px 0; font-weight:bold;">Model:</td>
+          <td style="padding:6px 0; text-align:right;">${safeModel || '—'}</td>
+        </tr>
+        <tr>
+          <td style="padding:6px 0; font-weight:bold;">Status:</td>
+          <td style="padding:6px 0; text-align:right;">${safeStatus}</td>
+        </tr>
+      </table>
+
+      <p>You can view this certificate and related records in the database.</p>
+
+      <p style="margin:24px 0; text-align:center;">
+        <a href="${appUrl}" target="_blank" rel="noopener noreferrer"
+           style="background:#f8d201; color:#131313; text-decoration:none; padding:12px 24px; border-radius:6px; font-size:16px; display:inline-block;">
+          Go to ATEXdb Certs
+        </a>
+      </p>
+
+      <p>Best regards,<br/>The ATEXdb Team<br/>
+         <a href="https://certs.atexdb.eu" target="_blank" rel="noopener noreferrer">certs.atexdb.eu</a>
+      </p>
+    `,
+  });
+}
+
 /** Simple HTML escape for safety */
 function escapeHtml(s) {
   return String(s)
@@ -162,4 +226,5 @@ module.exports = {
   tenantInviteEmailHtml,
   forgotPasswordEmailHtml,
   uploadCompletedEmail,
+  certificateRequestFulfilledEmail,
 };

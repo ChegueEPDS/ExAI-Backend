@@ -786,16 +786,48 @@ exports.finalizeDrafts = async (req, res) => {
             }
           }
 
-          // If this draft was created in response to a request, mark that request as fulfilled
+          // If this draft was created in response to a request, mark that request as fulfilled + notify requester
           if (draft.requestId) {
             try {
-              await CertificateRequest.updateOne(
+              const request = await CertificateRequest.findOneAndUpdate(
                 { _id: draft.requestId, status: { $in: ['open', 'pending'] } },
                 { 
                   $set: { status: 'fulfilled', fulfilledAt: new Date(), fulfilledBy: userId },
                   $unset: { pendingAt: '', pendingBy: '', pendingDraftId: '' }
+                },
+                { new: true }
+              ).lean();
+
+              if (request && request.createdBy) {
+                const requester = await User.findById(request.createdBy).lean();
+                if (requester && requester.email) {
+                  const to = requester.email;
+                  const subject = 'Your certificate request has been fulfilled';
+                  const html = mailTemplates.certificateRequestFulfilledEmail({
+                    firstName: requester.firstName || '',
+                    lastName: requester.lastName || '',
+                    certNo: merged.certNo || draft.fileName,
+                    request: {
+                      certNo: request.certNo || '',
+                      manufacturer: request.manufacturer || '',
+                      model: request.model || '',
+                      status: 'fulfilled',
+                    },
+                  });
+
+                  try {
+                    await mailService.sendMail({
+                      to,
+                      subject,
+                      html,
+                      from: process.env.MAIL_SENDER_UPN,
+                    });
+                    console.log('[mail] Request-fulfilled e-mail sent to', to);
+                  } catch (mailErr) {
+                    console.warn('⚠️ finalizeDrafts: request-fulfilled e-mail failed:', mailErr?.message || mailErr);
+                  }
                 }
-              );
+              }
             } catch (e) {
               console.warn('⚠️ finalizeDrafts: could not fulfill CertificateRequest:', e?.message || e);
             }
@@ -1024,20 +1056,52 @@ exports.finalizeSingleDraftById = async (req, res) => {
       }
     }
 
-    // Fulfill linked request (if any)
-if (draft.requestId) {
-  try {
-    await CertificateRequest.updateOne(
-      { _id: draft.requestId, status: { $in: ['open', 'pending'] } },
-      { 
-        $set: { status: 'fulfilled', fulfilledAt: new Date(), fulfilledBy: userId },
-        $unset: { pendingAt: '', pendingBy: '', pendingDraftId: '' }
+    // Fulfill linked request (if any) + notify requester
+    if (draft.requestId) {
+      try {
+        const request = await CertificateRequest.findOneAndUpdate(
+          { _id: draft.requestId, status: { $in: ['open', 'pending'] } },
+          { 
+            $set: { status: 'fulfilled', fulfilledAt: new Date(), fulfilledBy: userId },
+            $unset: { pendingAt: '', pendingBy: '', pendingDraftId: '' }
+          },
+          { new: true }
+        ).lean();
+
+        if (request && request.createdBy) {
+          const requester = await User.findById(request.createdBy).lean();
+          if (requester && requester.email) {
+            const to = requester.email;
+            const subject = 'Your certificate request has been fulfilled';
+            const html = mailTemplates.certificateRequestFulfilledEmail({
+              firstName: requester.firstName || '',
+              lastName: requester.lastName || '',
+              certNo: merged.certNo || draft.fileName,
+              request: {
+                certNo: request.certNo || '',
+                manufacturer: request.manufacturer || '',
+                model: request.model || '',
+                status: 'fulfilled',
+              },
+            });
+
+            try {
+              await mailService.sendMail({
+                to,
+                subject,
+                html,
+                from: process.env.MAIL_SENDER_UPN,
+              });
+              console.log('[mail] Request-fulfilled e-mail sent to', to);
+            } catch (mailErr) {
+              console.warn('⚠️ finalizeSingle: request-fulfilled e-mail failed:', mailErr?.message || mailErr);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('⚠️ finalizeSingle: could not fulfill CertificateRequest:', e?.message || e);
       }
-    );
-  } catch (e) {
-    console.warn('⚠️ finalizeSingle: could not fulfill CertificateRequest:', e?.message || e);
-  }
-}
+    }
 
     // FS cleanup after successful DB operations
     safeUnlink(draft.originalPdfPath);
