@@ -14,6 +14,26 @@ router.post('/exreg/import', authMiddleware(), express.json(), exRegisterControl
 
 router.post('/exreg/:id/upload-images', authMiddleware(), upload.array('pictures'), exRegisterController.uploadImagesToEquipment);
 
+// Equipment documents (images + files) upload / list / delete
+router.post(
+  '/exreg/:id/upload-documents',
+  authMiddleware(),
+  upload.array('files'),
+  exRegisterController.uploadDocumentsToEquipment
+);
+
+router.get(
+  '/exreg/:id/documents',
+  authMiddleware(),
+  exRegisterController.getDocumentsOfEquipment
+);
+
+router.delete(
+  '/exreg/:id/documents/:docId',
+  authMiddleware(),
+  exRegisterController.deleteDocumentFromEquipment
+);
+
 // Listázás
 router.get('/exreg', authMiddleware(), exRegisterController.listEquipment);
 

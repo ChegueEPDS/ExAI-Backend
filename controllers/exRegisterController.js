@@ -255,6 +255,154 @@ exports.uploadImagesToEquipment = async (req, res) => {
   }
 };
 
+// 📎 Dokumentumok / képek feltöltése equipment szintre (POST /exreg/:id/upload-documents)
+exports.uploadDocumentsToEquipment = async (req, res) => {
+  try {
+    const equipmentId = req.params.id;
+    const files = Array.isArray(req.files) ? req.files : [];
+    const aliasFromForm = req.body.alias;
+    const tenantId = req.scope?.tenantId;
+
+    if (!tenantId) {
+      return res.status(401).json({ message: 'Missing tenantId' });
+    }
+
+    const equipment = await Equipment.findOne({ _id: equipmentId, tenantId });
+    if (!equipment) {
+      return res.status(404).json({ message: 'Equipment not found' });
+    }
+
+    const tenantName = req.scope?.tenantName || '';
+
+    let zoneDoc = null;
+    let siteDoc = null;
+    if (equipment.Zone && equipment.Site) {
+      zoneDoc = await Zone.findById(equipment.Zone);
+      siteDoc = await Site.findById(equipment.Site);
+    }
+    const zoneName = zoneDoc?.Name || (equipment.Zone ? `Zone_${equipment.Zone}` : null);
+    const siteName = siteDoc?.Name || (equipment.Site ? `Site_${equipment.Site}` : null);
+    const eqPrefix = buildEquipmentPrefix(
+      tenantName,
+      tenantId,
+      siteName,
+      zoneName,
+      equipment.EqID || equipment._id.toString()
+    );
+
+    if (!files.length) {
+      return res.status(400).json({ message: 'No files provided' });
+    }
+
+    console.log('📥 Dokumentum feltöltés equipmenthez:', {
+      equipmentId,
+      tenantId,
+      filesCount: files.length
+    });
+
+    const docs = [];
+
+    for (const file of files) {
+      const cleanName = cleanFileName(file.originalname);
+      const blobPath = `${eqPrefix}/${cleanName}`;
+      const guessedType = file.mimetype || mime.lookup(cleanName) || 'application/octet-stream';
+
+      await azureBlob.uploadFile(file.path, blobPath, guessedType);
+
+      docs.push({
+        name: cleanName,
+        alias: aliasFromForm || cleanName,
+        type: String(guessedType).startsWith('image') ? 'image' : 'document',
+        blobPath,
+        blobUrl: azureBlob.getBlobUrl(blobPath),
+        contentType: guessedType,
+        size: file.size,
+        uploadedAt: new Date()
+      });
+
+      try { fs.unlinkSync(file.path); } catch {}
+    }
+
+    equipment.documents = [...(equipment.documents || []), ...docs];
+    await equipment.save();
+
+    const savedDocs = equipment.documents.slice(-docs.length);
+
+    return res.status(200).json({
+      message: 'Documents uploaded',
+      documents: savedDocs
+    });
+  } catch (error) {
+    console.error('❌ uploadDocumentsToEquipment error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to upload documents for equipment.' });
+  }
+};
+
+// 📄 Equipment dokumentumok listázása (GET /exreg/:id/documents)
+exports.getDocumentsOfEquipment = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const tenantId = req.scope?.tenantId;
+
+    if (!tenantId) {
+      return res.status(401).json({ message: 'Missing tenantId' });
+    }
+
+    const equipment = await Equipment.findOne({ _id: id, tenantId }).lean();
+    if (!equipment) {
+      return res.status(404).json({ message: 'Equipment not found' });
+    }
+
+    return res.status(200).json(equipment.documents || []);
+  } catch (error) {
+    console.error('❌ getDocumentsOfEquipment error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to fetch documents for equipment.' });
+  }
+};
+
+// 🗑️ Equipment dokumentum törlése (DELETE /exreg/:id/documents/:docId)
+exports.deleteDocumentFromEquipment = async (req, res) => {
+  try {
+    const { id, docId } = req.params;
+    const tenantId = req.scope?.tenantId;
+
+    if (!tenantId) {
+      return res.status(401).json({ message: 'Missing tenantId' });
+    }
+
+    const equipment = await Equipment.findOne({ _id: id, tenantId });
+    if (!equipment) {
+      return res.status(404).json({ message: 'Equipment not found' });
+    }
+
+    const docs = equipment.documents || [];
+    const docToDelete = docs.find(doc =>
+      doc._id?.toString() === docId || doc.blobPath === docId
+    );
+
+    if (!docToDelete) {
+      return res.status(404).json({ message: 'Document not found' });
+    }
+
+    const targetPath = docToDelete.blobPath;
+    if (targetPath) {
+      try {
+        await azureBlob.deleteFile(targetPath);
+      } catch (e) {
+        console.warn('⚠️ Equipment document blob delete failed:', e?.message || e);
+      }
+    }
+
+    equipment.documents = docs.filter(doc => doc._id.toString() !== docToDelete._id.toString());
+    await equipment.save();
+
+    return res.status(200).json({ message: 'Document deleted' });
+  } catch (error) {
+    console.error('❌ deleteDocumentFromEquipment error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to delete document from equipment.' });
+  }
+};
+
 // GET /exreg/:id
 exports.getEquipmentById = async (req, res) => {
   try {

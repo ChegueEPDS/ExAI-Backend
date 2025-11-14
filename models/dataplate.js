@@ -47,6 +47,18 @@ const EquipmentSchema = new mongoose.Schema({
       size: { type: Number },            // bytes
       uploadedAt: { type: Date, default: Date.now }
     }
+  ],
+  "documents": [
+    {
+      name: { type: String },            // original filename (cleaned)
+      alias: { type: String },           // optional display name shown in UI
+      type: { type: String, enum: ['document', 'image'], default: 'document' },
+      blobPath: { type: String },        // container-relative path in Blob (e.g. Equipment/EqID/file.pdf)
+      blobUrl: { type: String },         // direct HTTPS URL (no SAS)
+      contentType: { type: String },     // MIME type, e.g. application/pdf, image/jpeg
+      size: { type: Number },            // bytes
+      uploadedAt: { type: Date, default: Date.now }
+    }
   ]
 }, { timestamps: true }); // ⏳ Timestamps (createdAt, updatedAt)
 
