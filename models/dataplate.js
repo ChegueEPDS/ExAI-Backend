@@ -59,7 +59,17 @@ const EquipmentSchema = new mongoose.Schema({
       size: { type: Number },            // bytes
       uploadedAt: { type: Date, default: Date.now }
     }
-  ]
+  ],
+
+  // ---- Inspection summary (denormalized from Inspection collection) ----
+  lastInspectionDate: { type: Date, default: null },
+  lastInspectionValidUntil: { type: Date, default: null },
+  lastInspectionStatus: {
+    type: String,
+    enum: ['Passed', 'Failed', 'NA', null],
+    default: null
+  },
+  lastInspectionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Inspection', default: null }
 }, { timestamps: true }); // ⏳ Timestamps (createdAt, updatedAt)
 
 // 🔹 Pre-save middleware: kezeli a tenantId és Company mezőket mentéskor

@@ -37,8 +37,7 @@ const tenantRoutes = require('./routes/tenantRoutes');
 const inviteRoutes = require('./routes/inviteRoutes');
 const mailRoutes = require('./routes/mailRoutes');
 const certificateRequestRoutes = require('./routes/certificateRequestRoutes');
-
-
+const inspectionRoutes = require('./routes/inspectionRoutes');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -204,6 +203,7 @@ app.use('/api', upgradeRoutes);
 app.use('/api', tenantRoutes);
 app.use('/api', inviteRoutes);
 app.use('/api', mailRoutes);
+app.use('/api', inspectionRoutes);
 
 
 /**
