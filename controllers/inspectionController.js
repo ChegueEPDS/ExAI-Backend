@@ -79,6 +79,7 @@ exports.createInspection = async (req, res) => {
       eqId,
       inspectionDate,
       validUntil,
+      inspectionType,
       results = [],
       attachments = []
     } = req.body || {};
@@ -151,6 +152,7 @@ exports.createInspection = async (req, res) => {
       zoneId: equipment.Zone || null,
       inspectionDate: new Date(inspectionDate),
       validUntil: new Date(validUntil),
+      inspectionType,
       inspectorId,
       results: normalizedResults,
       attachments: normalizedAttachments,
@@ -275,6 +277,7 @@ exports.listInspections = async (req, res) => {
     }
 
     const inspections = await Inspection.find(filter)
+      .populate('inspectorId', 'firstName lastName email')
       .sort({ inspectionDate: -1, createdAt: -1 })
       .lean();
 

@@ -70,6 +70,12 @@ const InspectionSchema = new Schema(
     inspectionDate: { type: Date, required: true },  // mikor végezték (user adja meg)
     validUntil: { type: Date, required: true },      // meddig érvényes (user adja meg)
     inspectorId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+    // Type of inspection: Detailed / Close / Visual
+    inspectionType: {
+      type: String,
+      enum: ['Detailed', 'Close', 'Visual'],
+      required: true,
+    },
 
     // 2. Eredmények (MINDEN kérdés, nem csak Failed/NA)
     results: {
