@@ -58,6 +58,7 @@ exports.createSite = async (req, res) => {
     const newSite = new Site({
       Name: req.body.Name,
       Client: req.body.Client,
+      Note: req.body.Note,
       CreatedBy: CreatedBy,
       tenantId: tenantObjectId,
     });
@@ -158,7 +159,7 @@ exports.getSiteById = async (req, res) => {
 // 🔹 Site módosítása
 exports.updateSite = async (req, res) => {
   try {
-    const { Name, Client, CreatedBy } = req.body;
+    const { Name, Client, Note, CreatedBy } = req.body;
 
     const tenantIdStr = req.scope?.tenantId;
     const tenantName = req.scope?.tenantName || '';
@@ -209,6 +210,9 @@ exports.updateSite = async (req, res) => {
 
     site.Name = newName || site.Name;
     site.Client = Client || site.Client;
+    if (Note !== undefined) {
+      site.Note = Note;
+    }
 
     if (CreatedBy && CreatedBy !== String(site.CreatedBy)) {
       const u = await User.findById(CreatedBy);

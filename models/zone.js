@@ -24,6 +24,14 @@ const ZoneSchema = new mongoose.Schema(
             enum: ['T1', 'T2', 'T3', 'T4', 'T5', 'T6'] 
         },
         MaxTemp: { type: Number },
+        IpRating: { type: String },
+        EPL: {
+            type: [String],
+            enum: ['Ga', 'Gb', 'Gc', 'Da', 'Db', 'Dc'],
+            default: []
+        },
+        AmbientTempMin: { type: Number },
+        AmbientTempMax: { type: Number },
         CreatedBy: { 
             type: mongoose.Schema.Types.ObjectId, 
             ref: 'User', 

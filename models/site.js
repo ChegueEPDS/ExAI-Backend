@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const SiteSchema = new mongoose.Schema({
   Name: { type: String, required: true },
   Client: { type: String, required: true },
+  Note: { type: String },
 
   CreatedBy: {
     type: mongoose.Schema.Types.ObjectId,

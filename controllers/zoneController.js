@@ -45,8 +45,24 @@ exports.createZone = async (req, res) => {
     const createdBy = req.user.id;
     const modifiedBy = req.user.id;
 
+    const {
+      IpRating,
+      EPL,
+      AmbientTempMin,
+      AmbientTempMax,
+      ...rest
+    } = req.body || {};
+
     const zone = new Zone({
-      ...req.body,
+      ...rest,
+      IpRating: typeof IpRating === 'string' ? IpRating : '',
+      EPL: Array.isArray(EPL) ? EPL : (EPL ? [EPL] : []),
+      AmbientTempMin: AmbientTempMin !== undefined && AmbientTempMin !== null
+        ? Number(AmbientTempMin)
+        : undefined,
+      AmbientTempMax: AmbientTempMax !== undefined && AmbientTempMax !== null
+        ? Number(AmbientTempMax)
+        : undefined,
       CreatedBy: createdBy,
       ModifiedBy: modifiedBy,
       tenantId: tenantObjectId,
@@ -163,7 +179,31 @@ exports.updateZone = async (req, res) => {
       }
     }
 
-    Object.assign(zone, req.body);
+    const {
+      IpRating,
+      EPL,
+      AmbientTempMin,
+      AmbientTempMax,
+      ...restBody
+    } = req.body || {};
+
+    Object.assign(zone, restBody);
+
+    if (IpRating !== undefined) {
+      zone.IpRating = IpRating;
+    }
+
+    if (EPL !== undefined) {
+      zone.EPL = Array.isArray(EPL) ? EPL : (EPL ? [EPL] : []);
+    }
+
+    if (AmbientTempMin !== undefined) {
+      zone.AmbientTempMin = AmbientTempMin !== null ? Number(AmbientTempMin) : undefined;
+    }
+
+    if (AmbientTempMax !== undefined) {
+      zone.AmbientTempMax = AmbientTempMax !== null ? Number(AmbientTempMax) : undefined;
+    }
     zone.ModifiedBy = req.userId;
     await zone.save();
     return res.status(200).json({ message: 'Zone updated successfully', zone });

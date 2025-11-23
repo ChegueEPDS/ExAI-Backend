@@ -2,6 +2,10 @@
 const Inspection = require('../models/inspection');
 const Equipment = require('../models/dataplate');
 const mongoose = require('mongoose');
+const multer = require('multer');
+const azureBlob = require('../services/azureBlobService');
+
+const upload = multer({ dest: 'uploads/' });
 
 /**
  * Segédfüggvény: összefoglaló statisztika számítása
@@ -285,5 +289,97 @@ exports.listInspections = async (req, res) => {
   } catch (error) {
     console.error('❌ Hiba az inspectionök listázása közben:', error);
     return res.status(500).json({ message: 'Belső szerverhiba az inspectionök listázásakor.' });
+  }
+};
+
+/**
+ * POST /api/inspections/upload-attachment
+ * Form fields:
+ *  - file (multipart)
+ *  - eqId (required) – Equipment EqID string (used for blob path)
+ *  - questionId (optional)
+ *  - questionKey (optional) e.g. "T1-G2-3" or "SC1"
+ *  - note (optional)
+ */
+exports.uploadInspectionAttachment = (req, res) => {
+  upload.single('file')(req, res, async (err) => {
+    if (err) {
+      console.error('❌ Attachment upload failed:', err);
+      return res.status(500).json({ message: 'Attachment upload failed' });
+    }
+
+    const file = req.file;
+    const { eqId, questionId, questionKey, note } = req.body || {};
+    const tenantId = req.scope?.tenantId;
+
+    if (!tenantId) {
+      return res.status(400).json({ message: 'tenantId is missing from auth' });
+    }
+
+    if (!file) {
+      return res.status(400).json({ message: 'Missing file' });
+    }
+
+    if (!eqId) {
+      return res.status(400).json({ message: 'eqId is required' });
+    }
+
+    try {
+      const safeEq = String(eqId).replace(/[^\w\-.]+/g, '_');
+      const blobPath = `Equipment/${safeEq}/inspections/${Date.now()}_${file.originalname.replace(/[^\w.\-]+/g, '_')}`;
+      const guessedType = file.mimetype || 'application/octet-stream';
+
+      await azureBlob.uploadFile(file.path, blobPath, guessedType);
+
+      const blobUrl = azureBlob.getBlobUrl(blobPath);
+
+      try { require('fs').unlinkSync(file.path); } catch (_) {}
+
+      return res.status(200).json({
+        blobPath,
+        blobUrl,
+        type: guessedType.startsWith('image') ? 'image' : 'document',
+        questionId: questionId || undefined,
+        questionKey: questionKey || undefined,
+        note: note || ''
+      });
+    } catch (uploadErr) {
+      console.error('❌ Attachment upload error:', uploadErr);
+      return res.status(500).json({ message: 'Failed to upload attachment', error: uploadErr.message });
+    }
+  });
+};
+
+/**
+ * DELETE /api/inspections/attachment
+ * Body: { blobPath: string }
+ * Best-effort: if blobPath missing or delete fails, respond with 400/500.
+ */
+exports.deleteInspectionAttachment = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) {
+      return res.status(400).json({ message: 'tenantId is missing from auth' });
+    }
+
+    const blobPath = req.body?.blobPath;
+    if (!blobPath || typeof blobPath !== 'string') {
+      return res.status(400).json({ message: 'blobPath is required' });
+    }
+
+    // Opció: biztosítsuk, hogy csak Equipment mappán belül törlünk
+    if (!blobPath.startsWith('Equipment/')) {
+      return res.status(400).json({ message: 'Invalid blobPath' });
+    }
+
+    if (typeof azureBlob.deleteFile !== 'function') {
+      return res.status(500).json({ message: 'Blob delete not available' });
+    }
+
+    await azureBlob.deleteFile(blobPath);
+    return res.status(200).json({ message: 'Attachment deleted', blobPath });
+  } catch (error) {
+    console.error('❌ Failed to delete inspection attachment:', error);
+    return res.status(500).json({ message: 'Failed to delete attachment', error: error.message });
   }
 };
