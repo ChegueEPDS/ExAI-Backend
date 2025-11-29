@@ -13,6 +13,7 @@ const ExMarkingSchema = new mongoose.Schema({
 
 const EquipmentSchema = new mongoose.Schema({
   "EqID": { type: String },
+  "TagNo": { type: String },
   "Manufacturer": { type: String },
   "Model/Type": { type: String },
   "Serial Number": { type: String },
@@ -45,7 +46,8 @@ const EquipmentSchema = new mongoose.Schema({
       blobUrl: { type: String },         // direct HTTPS (no SAS)
       contentType: { type: String },     // MIME type, e.g. image/jpeg
       size: { type: Number },            // bytes
-      uploadedAt: { type: Date, default: Date.now }
+      uploadedAt: { type: Date, default: Date.now },
+      tag: { type: String, enum: ['dataplate', 'general', 'fault'], default: 'general' }
     }
   ],
   "documents": [
@@ -57,7 +59,8 @@ const EquipmentSchema = new mongoose.Schema({
       blobUrl: { type: String },         // direct HTTPS URL (no SAS)
       contentType: { type: String },     // MIME type, e.g. application/pdf, image/jpeg
       size: { type: Number },            // bytes
-      uploadedAt: { type: Date, default: Date.now }
+      uploadedAt: { type: Date, default: Date.now },
+      tag: { type: String, enum: ['dataplate', 'general', 'fault'], default: undefined }
     }
   ],
 

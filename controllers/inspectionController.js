@@ -138,6 +138,8 @@ exports.createInspection = async (req, res) => {
       blobPath: a.blobPath,
       blobUrl: a.blobUrl,
       type: a.type || 'image',
+      contentType: a.contentType || (a.type === 'image' ? 'image/*' : 'application/octet-stream'),
+      size: a.size ?? null,
       questionId: a.questionId ? new mongoose.Types.ObjectId(a.questionId) : undefined,
       questionKey: a.questionKey || undefined,
       note: a.note || '',
@@ -175,6 +177,34 @@ exports.createInspection = async (req, res) => {
       equipment.lastInspectionValidUntil = inspection.validUntil;
       equipment.lastInspectionStatus = status;
       equipment.lastInspectionId = inspection._id;
+
+      const imageAttachments = normalizedAttachments.filter(att => att.type === 'image' && att.blobPath && att.blobUrl);
+      if (imageAttachments.length) {
+        const existingPaths = new Set(
+          Array.isArray(equipment.documents)
+            ? equipment.documents.map(doc => doc.blobPath)
+            : []
+        );
+        const docsToAppend = [];
+        imageAttachments.forEach(att => {
+          if (existingPaths.has(att.blobPath)) return;
+          docsToAppend.push({
+            name: att.blobPath.split('/').pop() || 'inspection-image',
+            alias: att.note || '',
+            type: 'image',
+            blobPath: att.blobPath,
+            blobUrl: att.blobUrl,
+            contentType: att.contentType || 'image/*',
+            size: att.size ?? null,
+            uploadedAt: new Date(),
+            tag: 'fault'
+          });
+          existingPaths.add(att.blobPath);
+        });
+        if (docsToAppend.length) {
+          equipment.documents = [...(equipment.documents || []), ...docsToAppend];
+        }
+      }
 
       await equipment.save();
     } catch (updateErr) {
@@ -326,7 +356,8 @@ exports.uploadInspectionAttachment = (req, res) => {
 
     try {
       const safeEq = String(eqId).replace(/[^\w\-.]+/g, '_');
-      const blobPath = `Equipment/${safeEq}/inspections/${Date.now()}_${file.originalname.replace(/[^\w.\-]+/g, '_')}`;
+      const cleanName = file.originalname ? file.originalname.replace(/[^\w.\-]+/g, '_') : `inspection_${Date.now()}`;
+      const blobPath = `Equipment/${safeEq}/inspections/${Date.now()}_${cleanName}`;
       const guessedType = file.mimetype || 'application/octet-stream';
 
       await azureBlob.uploadFile(file.path, blobPath, guessedType);
@@ -339,6 +370,8 @@ exports.uploadInspectionAttachment = (req, res) => {
         blobPath,
         blobUrl,
         type: guessedType.startsWith('image') ? 'image' : 'document',
+        contentType: guessedType,
+        size: file.size,
         questionId: questionId || undefined,
         questionKey: questionKey || undefined,
         note: note || ''
@@ -381,5 +414,108 @@ exports.deleteInspectionAttachment = async (req, res) => {
   } catch (error) {
     console.error('❌ Failed to delete inspection attachment:', error);
     return res.status(500).json({ message: 'Failed to delete attachment', error: error.message });
+  }
+};
+
+/**
+ * DELETE /api/inspections/:id
+ * Egy teljes inspection törlése:
+ *  - az Inspection dokumentum törlése
+ *  - az ahhoz tartozó blob képek/dokumentumok törlése
+ *  - az Equipment dokumentumból az ezekre hivatkozó dokumentum-bejegyzések eltávolítása
+ *  - ha ez volt a legutóbbi inspection, az összefoglaló mezők újraszámítása
+ */
+exports.deleteInspection = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const { id } = req.params;
+
+    if (!tenantId) {
+      return res.status(400).json({ message: 'tenantId is missing from auth' });
+    }
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: 'Érvénytelen inspection ID.' });
+    }
+
+    const inspection = await Inspection.findOne({ _id: id, tenantId });
+    if (!inspection) {
+      return res.status(404).json({ message: 'Inspection nem található.' });
+    }
+
+    // 1) Blob képek/dokumentumok törlése (minden egyedi blobPath alapján)
+    const blobPaths = new Set();
+    (inspection.attachments || []).forEach(att => {
+      const raw = att?.blobPath || att?.blobUrl;
+      const normalized = raw ? azureBlob.toBlobPath(raw) : '';
+      if (normalized) {
+        blobPaths.add(normalized);
+      }
+    });
+
+    for (const blobPath of blobPaths) {
+      try {
+        if (typeof azureBlob.deleteFile === 'function') {
+          await azureBlob.deleteFile(blobPath);
+        }
+      } catch (err) {
+        try {
+          console.warn('⚠️ Failed to delete blob for inspection:', { blobPath, error: err?.message || err });
+        } catch {}
+      }
+    }
+
+    // 2) Inspection dokumentum törlése
+    await Inspection.deleteOne({ _id: inspection._id });
+
+    // 3) Equipment dokumentum frissítése (dokumentum-lista + lastInspection mezők)
+    try {
+      if (inspection.equipmentId && mongoose.isValidObjectId(inspection.equipmentId)) {
+        const equipment = await Equipment.findOne({ _id: inspection.equipmentId, tenantId });
+        if (equipment) {
+          // Dokumentumok közül is szedjük ki ezeket a blobPath-okat
+          if (Array.isArray(equipment.documents) && blobPaths.size > 0) {
+            equipment.documents = equipment.documents.filter(doc => {
+              const raw = doc?.blobPath || doc?.blobUrl;
+              const normalized = raw ? azureBlob.toBlobPath(raw) : '';
+              return !normalized || !blobPaths.has(normalized);
+            });
+          }
+
+          // Ha ez volt a lastInspectionId, akkor újraszámoljuk a legfrissebb inspection alapján
+          if (equipment.lastInspectionId && String(equipment.lastInspectionId) === String(inspection._id)) {
+            const latest = await Inspection.findOne({
+              equipmentId: equipment._id,
+              tenantId
+            })
+              .sort({ inspectionDate: -1, createdAt: -1 })
+              .lean();
+
+            if (latest) {
+              equipment.Compliance = latest.status;
+              equipment.lastInspectionDate = latest.inspectionDate;
+              equipment.lastInspectionValidUntil = latest.validUntil;
+              equipment.lastInspectionStatus = latest.status;
+              equipment.lastInspectionId = latest._id;
+            } else {
+              equipment.Compliance = 'NA';
+              equipment.lastInspectionDate = null;
+              equipment.lastInspectionValidUntil = null;
+              equipment.lastInspectionStatus = null;
+              equipment.lastInspectionId = null;
+            }
+          }
+
+          await equipment.save();
+        }
+      }
+    } catch (updateErr) {
+      console.error('⚠️ Warning: Nem sikerült az eszköz frissítése inspection törlés után:', updateErr);
+    }
+
+    return res.json({ message: 'Inspection sikeresen törölve.', id });
+  } catch (error) {
+    console.error('❌ Hiba az inspection törlése közben:', error);
+    return res.status(500).json({ message: 'Belső szerverhiba az inspection törlésekor.' });
   }
 };

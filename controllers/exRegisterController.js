@@ -1,15 +1,69 @@
 // controllers/exRegisterController.js
 const Equipment = require('../models/dataplate');
-const Zone = require('../models/zone')
+const Zone = require('../models/zone');
 const Site = require('../models/site');
+const Inspection = require('../models/inspection');
+const Certificate = require('../models/certificate');
+const Question = require('../models/questions');
 const mongoose = require('mongoose');
 const fs = require('fs');
 const azureBlob = require('../services/azureBlobService');
 const mime = require('mime-types');
+const ExcelJS = require('exceljs');
 
 const { BlobServiceClient } = require('@azure/storage-blob');
 const path = require('path');
 
+const HEADER_ALIASES = {
+  '#': '#',
+  'tag no': 'TagNo',
+  'tag#': 'TagNo',
+  'tagno': 'TagNo',
+  'eq id': 'EqID',
+  'eqid': 'EqID',
+  'description': 'Description',
+  'manufacturer': 'Manufacturer',
+  'model': 'Model',
+  'model/type': 'Model',
+  'serial number': 'Serial Number',
+  'serial no': 'Serial Number',
+  'serial#': 'Serial Number',
+  'ip rating': 'IP rating',
+  'temp range': 'Temp. Range',
+  'temp. range': 'Temp. Range',
+  'temperature range': 'Temp. Range',
+  'epl': 'EPL',
+  'subgroup': 'SubGroup',
+  'sub group': 'SubGroup',
+  'temperature class': 'Temperature Class',
+  'protection concept': 'Protection Concept',
+  'certificate no': 'Certificate No',
+  'certificate number': 'Certificate No',
+  'inspection date': 'Inspection Date',
+  'inspection status': 'Status',
+  'status': 'Status',
+  'remarks': 'Remarks',
+  'comments': 'Remarks',
+  'comment': 'Remarks'
+};
+
+const EXCEL_SERIAL_DATE_OFFSET = 25569;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const GAS_SUBGROUPS = new Set(['IIA', 'IIB', 'IIC']);
+const DUST_SUBGROUPS = new Set(['IIIA', 'IIIB', 'IIIC']);
+
+function escapeRegex(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function toObjectId(value) {
+  if (!value) return null;
+  try {
+    return new mongoose.Types.ObjectId(value);
+  } catch {
+    return null;
+  }
+}
 
 // Létrehozás (POST /exreg)
 // 🔧 Segédfüggvény a fájlnév tisztítására
@@ -31,6 +85,12 @@ function buildTenantRoot(tenantName, tenantId) {
   const tn = slug(tenantName) || `TENANT_${tenantId}`;
   return `${tn}`;
 }
+
+function normalizeImageTag(tag, fallback = 'general') {
+  const allowed = ['dataplate', 'general', 'fault'];
+  const value = typeof tag === 'string' ? tag.trim().toLowerCase() : '';
+  return allowed.includes(value) ? value : fallback;
+}
 function buildEquipmentPrefix(tenantName, tenantId, siteName, zoneName, eqId) {
   const root = buildTenantRoot(tenantName, tenantId);
   if (siteName && zoneName) {
@@ -38,6 +98,8 @@ function buildEquipmentPrefix(tenantName, tenantId, siteName, zoneName, eqId) {
   }
   return `${root}/equipment/${slug(eqId)}`;
 }
+
+const EXCEL_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
 // Move (copy+delete) all blobs under a prefix to a new prefix
 async function moveAllUnderPrefix(oldPrefix, newPrefix) {
@@ -61,6 +123,290 @@ async function moveAllUnderPrefix(oldPrefix, newPrefix) {
       try { console.warn('[exreg] moveAllUnderPrefix failed', { srcPath, dstPath, err: e?.message }); } catch {}
     }
   }
+}
+
+function normalizeHeaderLabel(value) {
+  if (value == null) return '';
+  let raw = value;
+  if (typeof value === 'object') {
+    if (value.text) {
+      raw = value.text;
+    } else if (Array.isArray(value.richText)) {
+      raw = value.richText.map(part => part.text).join('');
+    } else if (value.result != null) {
+      raw = value.result;
+    } else {
+      raw = value.toString();
+    }
+  }
+  const asString = String(raw || '').trim();
+  if (!asString) return '';
+  const alias = HEADER_ALIASES[asString.toLowerCase()];
+  return alias || asString;
+}
+
+function buildHeaderMap(row) {
+  const map = {};
+  row?.eachCell?.({ includeEmpty: true }, (cell, columnNumber) => {
+    const label = normalizeHeaderLabel(cell?.value);
+    if (label && !map[label]) {
+      map[label] = columnNumber;
+    }
+  });
+  return map;
+}
+
+function detectHeaderRow(worksheet) {
+  const limit = Math.min(worksheet?.rowCount || 0, 10);
+  for (let i = 1; i <= limit; i += 1) {
+    const row = worksheet.getRow(i);
+    const headerMap = buildHeaderMap(row);
+    if (headerMap['EqID'] || headerMap['TagNo'] || headerMap['Description']) {
+      return { headerRowNumber: i, headerMap };
+    }
+  }
+  return null;
+}
+
+function cellValueToPrimitive(cellValue) {
+  if (cellValue == null) return null;
+  if (cellValue instanceof Date) return cellValue;
+  if (typeof cellValue === 'object') {
+    if (cellValue.text) return cellValue.text;
+    if (Array.isArray(cellValue.richText)) {
+      return cellValue.richText.map(part => part.text).join('');
+    }
+    if (cellValue.result != null) return cellValue.result;
+    if (typeof cellValue.hyperlink === 'string' && cellValue.text) {
+      return cellValue.text;
+    }
+  }
+  return cellValue;
+}
+
+function getCellString(row, headerMap, label) {
+  const column = headerMap[label];
+  if (!column) return '';
+  const primitive = cellValueToPrimitive(row.getCell(column)?.value);
+  if (primitive == null) return '';
+  if (primitive instanceof Date) {
+    return primitive.toISOString().split('T')[0];
+  }
+  return String(primitive).trim();
+}
+
+function normalizeExcelDateValue(value) {
+  if (value == null && value !== 0) return null;
+  if (value instanceof Date) return value;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const millis = Math.round((value - EXCEL_SERIAL_DATE_OFFSET) * MS_PER_DAY);
+    return new Date(millis);
+  }
+  const text = String(value || '').trim();
+  if (!text) return null;
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
+}
+
+function getCellDate(row, headerMap, label) {
+  const column = headerMap[label];
+  if (!column) return null;
+  const primitive = cellValueToPrimitive(row.getCell(column)?.value);
+  return normalizeExcelDateValue(primitive);
+}
+
+function normalizeComplianceStatus(status) {
+  if (!status) return 'NA';
+  const lower = String(status).trim().toLowerCase();
+  if (!lower) return 'NA';
+  if (lower.startsWith('pass')) return 'Passed';
+  if (lower.startsWith('fail')) return 'Failed';
+  if (lower === 'na' || lower === 'n/a' || lower === 'n.a.') return 'NA';
+  if (lower === 'passed') return 'Passed';
+  if (lower === 'failed') return 'Failed';
+  return 'NA';
+}
+
+function determineEnvironmentFromSubGroup(value) {
+  if (!value) return '';
+  const entries = String(value)
+    .split(/[,\s/]+/)
+    .map(v => v.trim().toUpperCase())
+    .filter(Boolean);
+
+  let hasGas = false;
+  let hasDust = false;
+
+  for (const entry of entries) {
+    if (GAS_SUBGROUPS.has(entry)) hasGas = true;
+    if (DUST_SUBGROUPS.has(entry)) hasDust = true;
+  }
+
+  if (hasGas && hasDust) return 'GD';
+  if (hasGas) return 'G';
+  if (hasDust) return 'D';
+  return '';
+}
+
+function buildMarkingString(protectionConcept, subGroup, tempClass) {
+  const parts = ['Ex'];
+  const trimmedProtection = protectionConcept ? String(protectionConcept).trim() : '';
+  const trimmedSubGroup = subGroup ? String(subGroup).trim() : '';
+  const trimmedTempClass = tempClass ? String(tempClass).trim() : '';
+
+  if (trimmedProtection) parts.push(trimmedProtection);
+  if (trimmedSubGroup) parts.push(trimmedSubGroup);
+  if (trimmedTempClass) parts.push(trimmedTempClass);
+
+  if (parts.length <= 1) return '';
+  return parts.join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function extractProtectionTypesFromEquipment(equipmentDoc) {
+  const protection = equipmentDoc?.['Ex Marking']?.[0]?.['Type of Protection'] || '';
+  if (!protection) return [];
+
+  return String(protection)
+    .split(/[;,|/ ]+/)
+    .map(token => token.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+async function loadAutoInspectionQuestions(equipmentDoc, tenantId) {
+  try {
+    const protections = extractProtectionTypesFromEquipment(equipmentDoc);
+    const filter = {};
+    const tenantObjectId = toObjectId(tenantId);
+    if (tenantObjectId) {
+      filter.tenantId = tenantObjectId;
+    }
+
+    if (protections.length) {
+      filter.protectionTypes = {
+        $in: protections.map(token => new RegExp(`^${escapeRegex(token)}$`, 'i'))
+      };
+    }
+
+    let questions = await Question.find(filter).lean();
+
+    if ((!questions || !questions.length) && tenantObjectId) {
+      const fallbackFilter = { ...filter };
+      delete fallbackFilter.tenantId;
+      questions = await Question.find(fallbackFilter).lean();
+    }
+
+    if (!Array.isArray(questions)) {
+      return [];
+    }
+
+    return questions.filter(q => {
+      const types = Array.isArray(q.inspectionTypes) ? q.inspectionTypes : [];
+      return !types.length || types.includes('Detailed');
+    });
+  } catch (err) {
+    console.error('⚠️ Failed to load auto inspection questions:', err);
+    return [];
+  }
+}
+
+async function findCertificateByCertNoForTenant(certNoRaw, tenantId) {
+  if (!certNoRaw || !certNoRaw.trim()) return null;
+
+  const parts = certNoRaw
+    .split(/[/,]/)
+    .map(part => part.trim())
+    .filter(Boolean);
+
+  if (!parts.length) return null;
+
+  const regexConditions = parts.map(part => {
+    const normalized = part.replace(/\s+/g, '').toLowerCase();
+    const pattern = normalized
+      .split('')
+      .map(ch => escapeRegex(ch))
+      .join('.*');
+    return {
+      certNo: {
+        $regex: new RegExp(pattern, 'i')
+      }
+    };
+  });
+
+  const tenantObjectId = toObjectId(tenantId);
+  const visibilityFilter = tenantObjectId
+    ? {
+        $or: [
+          { visibility: 'public' },
+          { tenantId: tenantObjectId }
+        ]
+      }
+    : { visibility: 'public' };
+
+  try {
+    return await Certificate.findOne({
+      ...visibilityFilter,
+      $or: regexConditions
+    })
+      .select('specCondition certNo')
+      .lean();
+  } catch (err) {
+    console.error('⚠️ Failed to resolve certificate for auto inspection:', err);
+    return null;
+  }
+}
+
+async function buildSpecialConditionResult(equipmentDoc, tenantId) {
+  const equipmentSpecific =
+    (equipmentDoc &&
+      typeof equipmentDoc === 'object' &&
+      equipmentDoc['X condition'] &&
+      typeof equipmentDoc['X condition'].Specific === 'string'
+      ? equipmentDoc['X condition'].Specific
+      : ''
+    ).trim();
+
+  let text = equipmentSpecific;
+
+  if (!text) {
+    const certNo = equipmentDoc?.['Certificate No'] || equipmentDoc?.CertificateNo;
+    if (certNo) {
+      const certificate = await findCertificateByCertNoForTenant(certNo, tenantId);
+      text = certificate?.specCondition?.trim() || '';
+    }
+  }
+
+  if (!text) return null;
+
+  return {
+    questionId: undefined,
+    table: 'SC',
+    group: 'SC',
+    number: 1,
+    equipmentType: 'Special Condition',
+    protectionTypes: [],
+    status: 'Passed',
+    note: '',
+    questionText: {
+      eng: text,
+      hun: ''
+    }
+  };
+}
+
+function summarizeAutoInspectionResults(results) {
+  const summary = { failedCount: 0, naCount: 0, passedCount: 0 };
+
+  results.forEach(result => {
+    if (result.status === 'Failed') summary.failedCount += 1;
+    else if (result.status === 'NA') summary.naCount += 1;
+    else summary.passedCount += 1;
+  });
+
+  return {
+    summary,
+    status: summary.failedCount > 0 ? 'Failed' : 'Passed'
+  };
 }
 
 // 📥 Létrehozás (POST /exreg)
@@ -156,7 +502,8 @@ exports.createEquipment = async (req, res) => {
           blobUrl: azureBlob.getBlobUrl(blobPath),
           contentType: guessedType,
           size: file.size,
-          uploadedAt: new Date()
+          uploadedAt: new Date(),
+          tag: 'dataplate'
         });
         try { fs.unlinkSync(file.path); } catch {}
       }
@@ -241,7 +588,8 @@ exports.uploadImagesToEquipment = async (req, res) => {
         blobUrl: azureBlob.getBlobUrl(blobPath),
         contentType: guessedType,
         size: file.size,
-        uploadedAt: new Date()
+        uploadedAt: new Date(),
+        tag: 'general'
       });
       try { fs.unlinkSync(file.path); } catch {}
     }
@@ -301,6 +649,7 @@ exports.uploadDocumentsToEquipment = async (req, res) => {
     });
 
     const docs = [];
+    const requestedTag = req.body?.tag;
 
     for (const file of files) {
       const cleanName = cleanFileName(file.originalname);
@@ -309,15 +658,17 @@ exports.uploadDocumentsToEquipment = async (req, res) => {
 
       await azureBlob.uploadFile(file.path, blobPath, guessedType);
 
+      const typeValue = String(guessedType).startsWith('image') ? 'image' : 'document';
       docs.push({
         name: cleanName,
         alias: aliasFromForm || cleanName,
-        type: String(guessedType).startsWith('image') ? 'image' : 'document',
+        type: typeValue,
         blobPath,
         blobUrl: azureBlob.getBlobUrl(blobPath),
         contentType: guessedType,
         size: file.size,
-        uploadedAt: new Date()
+        uploadedAt: new Date(),
+        tag: typeValue === 'image' ? normalizeImageTag(requestedTag, 'general') : null
       });
 
       try { fs.unlinkSync(file.path); } catch {}
@@ -403,6 +754,865 @@ exports.deleteDocumentFromEquipment = async (req, res) => {
   }
 };
 
+exports.importEquipmentXLSX = async (req, res) => {
+  const tenantId = req.scope?.tenantId;
+  const userId = req.userId;
+  const uploadedFile = req.file;
+  const zoneId = (req.body?.zoneId || req.query?.zoneId || '').trim();
+
+  if (!tenantId) {
+    return res.status(401).json({ message: 'Missing tenantId from auth.' });
+  }
+  if (!userId) {
+    return res.status(401).json({ message: 'Missing user context.' });
+  }
+  if (!uploadedFile) {
+    return res.status(400).json({ message: 'Missing XLSX file (field name: file).' });
+  }
+  if (!zoneId || !mongoose.Types.ObjectId.isValid(zoneId)) {
+    return res.status(400).json({ message: 'Valid zoneId must be provided in the form data.' });
+  }
+
+  try {
+    const zone = await Zone.findOne({ _id: zoneId, tenantId }).lean();
+    if (!zone) {
+      return res.status(404).json({ message: 'Zone not found for this tenant.' });
+    }
+
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.readFile(uploadedFile.path);
+    const worksheet = workbook.worksheets?.[0];
+    if (!worksheet) {
+      return res.status(400).json({ message: 'The uploaded workbook does not contain any worksheet.' });
+    }
+
+    const headerInfo = detectHeaderRow(worksheet);
+    if (!headerInfo) {
+      return res.status(400).json({ message: 'Unable to detect header row. Please use the provided export template.' });
+    }
+
+    const equipmentMap = new Map();
+    const parseErrors = [];
+
+    worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+      if (rowNumber <= headerInfo.headerRowNumber) return;
+
+      const eqIdRaw = getCellString(row, headerInfo.headerMap, 'EqID');
+      const eqId = eqIdRaw ? eqIdRaw.trim() : '';
+      const tagNo = getCellString(row, headerInfo.headerMap, 'TagNo');
+      const description = getCellString(row, headerInfo.headerMap, 'Description');
+      const manufacturer = getCellString(row, headerInfo.headerMap, 'Manufacturer');
+      const model = getCellString(row, headerInfo.headerMap, 'Model');
+      const serialNumber = getCellString(row, headerInfo.headerMap, 'Serial Number');
+      const ipRating = getCellString(row, headerInfo.headerMap, 'IP rating');
+      const tempRange = getCellString(row, headerInfo.headerMap, 'Temp. Range');
+      const certificateNo = getCellString(row, headerInfo.headerMap, 'Certificate No');
+      const remarks = getCellString(row, headerInfo.headerMap, 'Remarks');
+      const epl = getCellString(row, headerInfo.headerMap, 'EPL');
+      const subGroup = getCellString(row, headerInfo.headerMap, 'SubGroup');
+      const tempClass = getCellString(row, headerInfo.headerMap, 'Temperature Class');
+      const protectionConcept = getCellString(row, headerInfo.headerMap, 'Protection Concept');
+      const inspectionStatus = normalizeComplianceStatus(getCellString(row, headerInfo.headerMap, 'Status'));
+      const inspectionDate = getCellDate(row, headerInfo.headerMap, 'Inspection Date');
+
+      const rowHasData = [
+        eqId,
+        tagNo,
+        description,
+        manufacturer,
+        model,
+        serialNumber,
+        ipRating,
+        tempRange,
+        certificateNo,
+        remarks
+      ].some(Boolean);
+
+      const rowHasExData = [epl, subGroup, tempClass, protectionConcept].some(Boolean);
+
+      if (!rowHasData && !rowHasExData) {
+        return;
+      }
+
+      if (!eqId) {
+        parseErrors.push({
+          rows: [rowNumber],
+          eqId: '',
+          message: 'EqID is required for every row.'
+        });
+        return;
+      }
+
+      const entryKey = eqId;
+      if (!equipmentMap.has(entryKey)) {
+        equipmentMap.set(entryKey, {
+          rows: [],
+          eqId,
+          base: {
+            EqID: eqId,
+            TagNo: tagNo || '',
+            'Equipment Type': description || '',
+            Manufacturer: manufacturer || '',
+            'Model/Type': model || '',
+            'Serial Number': serialNumber || '',
+            'IP rating': ipRating || '',
+            'Max Ambient Temp': tempRange || '',
+            'Certificate No': certificateNo || '',
+            'Other Info': remarks || '',
+            Compliance: inspectionStatus || 'NA',
+            'Ex Marking': [],
+            'X condition': { X: false, Specific: '' }
+          },
+          inspectionDate: inspectionDate || null,
+          inspectionStatus
+        });
+      }
+
+      const entry = equipmentMap.get(entryKey);
+      entry.rows.push(rowNumber);
+
+      if (tagNo && !entry.base.TagNo) entry.base.TagNo = tagNo;
+      if (description) entry.base['Equipment Type'] = description;
+      if (manufacturer) entry.base.Manufacturer = manufacturer;
+      if (model) entry.base['Model/Type'] = model;
+      if (serialNumber) entry.base['Serial Number'] = serialNumber;
+      if (ipRating) entry.base['IP rating'] = ipRating;
+      if (tempRange) entry.base['Max Ambient Temp'] = tempRange;
+      if (certificateNo) entry.base['Certificate No'] = certificateNo;
+      if (remarks) entry.base['Other Info'] = remarks;
+      if (inspectionStatus && inspectionStatus !== 'NA') entry.base.Compliance = inspectionStatus;
+      if (!entry.inspectionDate && inspectionDate) entry.inspectionDate = inspectionDate;
+      if (entry.inspectionStatus === 'NA' && inspectionStatus !== 'NA') {
+        entry.inspectionStatus = inspectionStatus;
+      }
+
+      if (epl || subGroup || tempClass || protectionConcept) {
+        const autoMarking = buildMarkingString(protectionConcept, subGroup, tempClass);
+        const inferredEnvironment = determineEnvironmentFromSubGroup(subGroup);
+
+        if (autoMarking && !entry.base.Marking) {
+          entry.base.Marking = autoMarking;
+        }
+
+        const markingEntry = {
+          'Equipment Protection Level': epl || '',
+          'Gas / Dust Group': subGroup || '',
+          'Temperature Class': tempClass || '',
+          'Type of Protection': protectionConcept || ''
+        };
+
+        if (autoMarking) {
+          markingEntry['Marking'] = autoMarking;
+        }
+        if (inferredEnvironment) {
+          markingEntry['Environment'] = inferredEnvironment;
+        }
+
+        entry.base['Ex Marking'].push(markingEntry);
+      }
+    });
+
+    const entries = Array.from(equipmentMap.values());
+    if (!entries.length) {
+      const baseMessage = 'No usable rows detected in the uploaded file.';
+      if (parseErrors.length) {
+        return res.status(400).json({ message: baseMessage, issues: parseErrors });
+      }
+      return res.status(400).json({ message: baseMessage });
+    }
+
+    const stats = { created: 0, updated: 0, inspections: 0, errors: [] };
+
+    for (const entry of entries) {
+      try {
+        const payload = { ...entry.base };
+        payload.Zone = zone._id;
+        payload.Site = zone.Site || null;
+        payload['Ex Marking'] = (payload['Ex Marking'] || []).filter(mark =>
+          Object.values(mark).some(value => !!String(value || '').trim())
+        );
+
+        let equipmentDoc = null;
+        const lookup = await Equipment.findOne({
+          tenantId,
+          Zone: zone._id,
+          EqID: payload.EqID
+        });
+
+        if (lookup) {
+          const updateData = { ...payload, ModifiedBy: userId };
+          delete updateData.CreatedBy;
+          delete updateData.tenantId;
+          equipmentDoc = await Equipment.findByIdAndUpdate(
+            lookup._id,
+            { $set: updateData },
+            { new: true }
+          );
+          stats.updated += 1;
+        } else {
+          const createData = {
+            ...payload,
+            tenantId,
+            CreatedBy: userId
+          };
+          equipmentDoc = await Equipment.create(createData);
+          stats.created += 1;
+        }
+
+        if (
+          equipmentDoc &&
+          entry.inspectionStatus === 'Passed' &&
+          entry.inspectionDate instanceof Date
+        ) {
+          try {
+            await createAutoInspectionForImport(
+              equipmentDoc,
+              entry.inspectionDate,
+              userId,
+              tenantId
+            );
+            stats.inspections += 1;
+          } catch (inspectionError) {
+            stats.errors.push({
+              eqId: equipmentDoc.EqID,
+              rows: entry.rows,
+              message: `Auto inspection creation failed: ${inspectionError.message || inspectionError}`
+            });
+          }
+        }
+      } catch (entryError) {
+        stats.errors.push({
+          eqId: entry.eqId,
+          rows: entry.rows,
+          message: entryError.message || String(entryError)
+        });
+      }
+    }
+
+    return res.json({
+      message: 'Import completed.',
+      createdCount: stats.created,
+      updatedCount: stats.updated,
+      inspectionsCreated: stats.inspections,
+      issues: [...parseErrors, ...stats.errors]
+    });
+  } catch (error) {
+    console.error('❌ importEquipmentXLSX error:', error);
+    return res.status(500).json({ message: 'Failed to import XLSX.', error: error.message || String(error) });
+  } finally {
+    if (uploadedFile?.path) {
+      try { fs.unlinkSync(uploadedFile.path); } catch (cleanupErr) {
+        console.warn('⚠️ Failed to remove uploaded XLSX file:', cleanupErr?.message || cleanupErr);
+      }
+    }
+  }
+};
+
+async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspectorId, tenantId) {
+  const date = new Date(inspectionDate);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error('Invalid inspection date provided.');
+  }
+
+  const validUntil = new Date(date);
+  validUntil.setFullYear(validUntil.getFullYear() + 3);
+
+  const questionDocs = await loadAutoInspectionQuestions(equipmentDoc, tenantId);
+  let results = [];
+
+  if (questionDocs.length) {
+    results = questionDocs.map((q) => ({
+      questionId: q._id ? new mongoose.Types.ObjectId(q._id) : undefined,
+      table: q.table || q.Table || '',
+      group: q.group || q.Group || '',
+      number: q.number ?? q.Number ?? null,
+      equipmentType: q.equipmentType || '',
+      protectionTypes: Array.isArray(q.protectionTypes) ? q.protectionTypes : [],
+      status: 'Passed',
+      note: '',
+      questionText: {
+        eng: q.questionText?.eng || '',
+        hun: q.questionText?.hun || ''
+      }
+    }));
+  }
+
+  if (!results.length) {
+    results = [{
+      status: 'Passed',
+      note: 'Automatically created during XLSX import (all checks passed).',
+      table: 'AUTO',
+      group: 'AUTO',
+      number: 1,
+      equipmentType: equipmentDoc['Equipment Type'] || equipmentDoc.EquipmentType || '',
+      protectionTypes: [],
+      questionText: {
+        eng: 'Auto-generated inspection from XLSX import.',
+        hun: 'Automatikus ellenőrzés XLSX importból.'
+      }
+    }];
+  }
+
+  const specialResult = await buildSpecialConditionResult(equipmentDoc, tenantId);
+  if (specialResult) {
+    results.push(specialResult);
+  }
+
+  const { summary, status } = summarizeAutoInspectionResults(results);
+
+  const inspection = new Inspection({
+    equipmentId: equipmentDoc._id,
+    eqId: equipmentDoc.EqID,
+    tenantId,
+    siteId: equipmentDoc.Site || null,
+    zoneId: equipmentDoc.Zone || null,
+    inspectionDate: date,
+    validUntil,
+    inspectionType: 'Detailed',
+    inspectorId,
+    results,
+    attachments: [],
+    summary,
+    status
+  });
+
+  await inspection.save();
+
+  equipmentDoc.Compliance = status;
+  equipmentDoc.lastInspectionDate = date;
+  equipmentDoc.lastInspectionValidUntil = validUntil;
+  equipmentDoc.lastInspectionStatus = status;
+  equipmentDoc.lastInspectionId = inspection._id;
+  await equipmentDoc.save();
+
+  return inspection;
+}
+
+// GET /exreg/export-xlsx
+// Exportálja a kiválasztott / zónához / projekthez tartozó eszközöket Excel-be
+exports.exportEquipmentXLSX = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) {
+      return res.status(401).json({ message: 'Missing tenantId from auth.' });
+    }
+
+    const { ids, zoneId, siteId } = req.query || {};
+    const filter = { tenantId };
+
+    // 1) Kijelölt eszközök (ids paraméter)
+    if (ids) {
+      const rawIds = String(ids)
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+
+      const objectIds = rawIds
+        .map(id => {
+          try {
+            return new mongoose.Types.ObjectId(id);
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean);
+
+      if (!objectIds.length) {
+        return res.status(400).json({ message: 'Invalid ids parameter.' });
+      }
+      filter._id = { $in: objectIds };
+    } else {
+      // 2) Zóna / projekt alapú szűrés
+      if (zoneId) filter.Zone = zoneId;
+      if (siteId) filter.Site = siteId;
+    }
+
+    const equipments = await Equipment.find(filter)
+      .sort({ createdAt: 1, _id: 1 })
+      .lean();
+
+    if (!equipments || equipments.length === 0) {
+      return res.status(404).json({ message: 'No equipment found for export.' });
+    }
+
+    // ---- Zóna cache ----
+    const zoneIds = [
+      ...new Set(
+        equipments
+          .map(e => (e.Zone ? e.Zone.toString() : null))
+          .filter(Boolean)
+      )
+    ];
+    const zones = zoneIds.length
+      ? await Zone.find({ _id: { $in: zoneIds } }).lean()
+      : [];
+    const zoneMap = new Map(zones.map(z => [z._id.toString(), z]));
+
+    // ---- Inspection cache (utolsó inspection az eszközhöz) ----
+    const lastInspectionIds = [
+      ...new Set(
+        equipments
+          .map(e => (e.lastInspectionId ? e.lastInspectionId.toString() : null))
+          .filter(Boolean)
+      )
+    ];
+
+    let inspections = [];
+    if (lastInspectionIds.length) {
+      inspections = await Inspection.find({
+        _id: { $in: lastInspectionIds },
+        tenantId
+      })
+        .populate('inspectorId', 'firstName lastName name')
+        .lean();
+    }
+    const inspectionMap = new Map(
+      inspections.map(i => [i._id.toString(), i])
+    );
+
+    // ---- Certificate cache (issue date + special condition) ----
+    // Fuzzy matching, like getCertificateByCertNo:
+    // - ignore spaces and non-alphanumeric characters
+    // - case-insensitive
+    // - search among PUBLIC certificates and the current tenant's own certificates
+    const normalizeCertNo = (s = '') =>
+      String(s)
+        .replace(/[^0-9A-Za-z]/g, '') // keep only letters and digits
+        .toLowerCase();
+
+    let certDocs = [];
+    try {
+      certDocs = await Certificate.find({
+        certNo: { $ne: null },
+        $or: [
+          { visibility: 'public' },
+          { tenantId }
+        ]
+      }).lean();
+    } catch (e) {
+      console.warn('⚠️ Certificate cache query failed in exportEquipmentXLSX:', e?.message || e);
+      certDocs = [];
+    }
+
+    const certMap = new Map();
+    certDocs.forEach(c => {
+      const norm = normalizeCertNo(c.certNo || '');
+      if (!norm) return;
+      // first match wins
+      if (!certMap.has(norm)) {
+        certMap.set(norm, c);
+      }
+    });
+
+    const resolveCertificate = (certNoRaw) => {
+      if (!certNoRaw) return null;
+
+      const parts = String(certNoRaw)
+        .split(/[/,;]/)
+        .map(p => p.trim())
+        .filter(Boolean);
+
+      for (const part of parts) {
+        const norm = normalizeCertNo(part);
+        if (!norm) continue;
+        const hit = certMap.get(norm);
+        if (hit) return hit;
+      }
+
+      // Fallback: try the whole raw string normalized as well
+      const wholeNorm = normalizeCertNo(certNoRaw);
+      if (wholeNorm) {
+        const hit = certMap.get(wholeNorm);
+        if (hit) return hit;
+      }
+
+      return null;
+    };
+
+    // ---- Excel workbook ----
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Database');
+
+    const headers = [
+      '#',
+      'TagNo',
+      'EqID',
+      'Description',
+      'Manufacturer',
+      'Model',
+      'Serial Number',
+      'IP rating',
+      'Temp. Range',
+      'EPL',
+      'SubGroup',
+      'Temperature Class',
+      'Protection Concept',
+      //'Equipment Group',
+      //'Equipment Category',
+      //'Environment',
+      'Certificate No',
+      'Certificate Issue Date',
+      'Special Condition',
+      'Zone',
+      'Gas / Dust Group',
+      'Temp Rating',
+      'Ambient Temp',
+      'Req Zone',
+      'Req Gas / Dust Group',
+      'Req Temp Rating',
+      'Req Ambient Temp',
+      'Req IP Rating',
+      'Inspection Date',
+      'Inspector',
+      'Status',
+      'Remarks'
+    ];
+
+    worksheet.columns = headers.map(header => ({
+      header,
+      key: header,
+      width: 2
+    }));
+
+    // ➕ Extra csoportosító sor a fejléc fölé
+    // Beszúrunk egy üres sort az első helyre, így az eredeti fejléc a 2. sorba csúszik.
+    worksheet.spliceRows(1, 0, []);
+
+    const groupRow = worksheet.getRow(1);
+    // Identification (A–C)
+    groupRow.getCell(1).value = 'IDENTIFICATION';
+    worksheet.mergeCells(1, 1, 1, 3);
+    // Equipment data (D–P)
+    groupRow.getCell(4).value = 'EQUIPMENT DATA';
+    worksheet.mergeCells(1, 4, 1, 8);
+    // Ex Data
+    groupRow.getCell(9).value = 'EX DATA';
+    worksheet.mergeCells(1, 9, 1, 13);
+    // Certification (R–T)
+    groupRow.getCell(14).value = 'CERTIFICATION';
+    worksheet.mergeCells(1, 14, 1, 16);
+    // Zone Requirements (Q–T)
+    groupRow.getCell(17).value = 'ZONE REQUIREMENTS';
+    worksheet.mergeCells(1, 17, 1, 20);
+    // User Requirement (U–Y)
+    groupRow.getCell(21).value = 'USER REQUIREMENT';
+    worksheet.mergeCells(1, 21, 1, 25);
+    // Inspection Data (Z–AC)
+    groupRow.getCell(26).value = 'INSPECTION DATA';
+    worksheet.mergeCells(1, 26, 1, 29);
+
+    // Csoportosító sor formázása (1. sor)
+    groupRow.eachCell((cell, colNumber) => {
+      let bg = null;
+
+      if (colNumber >= 1 && colNumber <= 3) {
+        // Identification (A–C) – zöld háttér
+        bg = 'FF00AA00';
+      } else if (colNumber >= 4 && colNumber <= 8) {
+        // Equipment data (D–Q) – narancssárga háttér
+        bg = 'FFFF9900';
+      } else if (colNumber >= 9 && colNumber <= 13) {
+        // Ex Data (R–P) – kék háttér
+        bg = 'FF538DD5';
+      } else if (colNumber >= 14 && colNumber <= 16) {
+        // Certification (R–T) – zöld háttér
+        bg = 'FF00AA00';
+      } else if (colNumber >= 17 && colNumber <= 20) {
+        // Zone Requirements – sárga háttér
+        bg = 'FFFFFF66';
+      } else if (colNumber >= 21 && colNumber <= 25) {
+        // User Requirement – világos lila háttér (megegyezhet a zóna követelményekkel)
+        bg = 'FFB1A0C7';
+      } else if (colNumber >= 26 && colNumber <= 29) {
+        // Inspection Data – szürke háttér
+        bg = 'FFB0B0B0';
+      }
+
+      cell.font = { bold: true, color: { argb: 'FF000000' } };
+      if (bg) {
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: bg }
+        };
+      } else {
+        cell.fill = undefined;
+      }
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      
+    });
+
+    // Fejléc formázása (2. sor – oszlopcímek, halványabb színekkel)
+    const headerRow = worksheet.getRow(2);
+    headerRow.eachCell((cell, colNumber) => {
+      let bg = null;
+
+      if (colNumber >= 1 && colNumber <= 3) {
+        // Identification – világos zöld
+        bg = 'FFCCFFCC';
+      } else if (colNumber >= 4 && colNumber <= 8) {
+        // Equipment data – világos narancssárga
+        bg = 'FFFFE0B2';
+      } else if (colNumber >= 9 && colNumber <= 13) {
+        // Ex Data – világos narancssárga
+        bg = 'FFDCE6F1';
+      } 
+      else if (colNumber >= 14 && colNumber <= 16) {
+        // Certification – világos zöld
+        bg = 'FFCCFFCC';
+      } else if (colNumber >= 17 && colNumber <= 20) {
+        // Zone Requirements – világos sárga
+        bg = 'FFFFFFCC';
+      } else if (colNumber >= 21 && colNumber <= 25) {
+        // User Requirement – világos lila
+        bg = 'FFE4DFEC';
+      } else if (colNumber >= 26 && colNumber <= 29) {
+        // Inspection Data – világos szürke
+        bg = 'FFE0E0E0';
+      }
+
+      cell.font = { bold: true, color: { argb: 'FF000000' } };
+      if (bg) {
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: bg }
+        };
+      } else {
+        cell.fill = undefined;
+      }
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+    });
+
+    const centerAlignedColumns = new Set([
+      'Temp. Range',
+      'Equipment Group',
+      'Equipment Category',
+      'Environment',
+      'Type of Protection',
+      'SubGroup',
+      'Temperature Class',
+      'Equipment Protection Level',
+      'IP rating',
+      'Zone',
+      'Gas / Dust Group',
+      'Temp. Rating',
+      'Ambient Temp',
+      'Req Zone',
+      'Req Gas / Dust Group',
+      'Req Temp Rating',
+      'Req Ambient Temp',
+      'Req IP Rating',
+      'Status'
+    ]);
+
+    // Sorok generálása – eszközök létrehozási sorrendjében
+    let equipmentIndex = 0;
+
+    for (const eq of equipments) {
+      equipmentIndex += 1;
+
+      const zone = eq.Zone ? zoneMap.get(eq.Zone.toString()) : null;
+
+      const inspection = eq.lastInspectionId
+        ? inspectionMap.get(eq.lastInspectionId.toString())
+        : null;
+
+      const inspectorName = inspection?.inspectorId
+        ? `${inspection.inspectorId.firstName || inspection.inspectorId.name || ''} ${inspection.inspectorId.lastName || ''}`.trim()
+        : '';
+
+      const inspectionDate =
+        inspection?.inspectionDate ||
+        eq.lastInspectionDate ||
+        null;
+
+      const zoneNumber = Array.isArray(zone?.Zone)
+        ? zone.Zone.join(', ')
+        : (zone?.Zone != null ? String(zone.Zone) : '');
+
+      const zoneSubGroup = Array.isArray(zone?.SubGroup)
+        ? zone.SubGroup.join(', ')
+        : (zone?.SubGroup != null ? String(zone.SubGroup) : '');
+
+      const zoneTempParts = [];
+      if (zone?.TempClass) zoneTempParts.push(zone.TempClass);
+      if (typeof zone?.MaxTemp === 'number') {
+        zoneTempParts.push(`${zone.MaxTemp}°C`);
+      }
+      const zoneTempDisplay = zoneTempParts.join(' / ');
+
+      const ambientParts = [];
+      if (zone?.AmbientTempMin != null) {
+        ambientParts.push(`${zone.AmbientTempMin}°C`);
+      }
+      if (zone?.AmbientTempMax != null) {
+        ambientParts.push(`+${zone.AmbientTempMax}°C`);
+      }
+      const ambientDisplay = ambientParts.join(' / ');
+
+      // ---- Client requirement (user requirement) derived from zone.clientReq[0] ----
+      const clientReq = Array.isArray(zone?.clientReq) && zone.clientReq.length
+        ? zone.clientReq[0]
+        : null;
+
+      const clientReqZoneNumber = Array.isArray(clientReq?.Zone)
+        ? clientReq.Zone.join(', ')
+        : (clientReq?.Zone != null ? String(clientReq.Zone) : '');
+
+      const clientReqGasDustGroup = Array.isArray(clientReq?.SubGroup)
+        ? clientReq.SubGroup.join(', ')
+        : (clientReq?.SubGroup != null ? String(clientReq.SubGroup) : '');
+
+      // User requirement temp rating: same logic as zone (TempClass + MaxTemp)
+      const clientReqTempParts = [];
+      if (clientReq?.TempClass) {
+        clientReqTempParts.push(clientReq.TempClass);
+      }
+      if (typeof clientReq?.MaxTemp === 'number') {
+        clientReqTempParts.push(`${clientReq.MaxTemp}°C`);
+      }
+      const clientReqTempDisplay = clientReqTempParts.join(' / ');
+
+      const clientReqAmbientParts = [];
+      if (clientReq?.AmbientTempMin != null) {
+        clientReqAmbientParts.push(`${clientReq.AmbientTempMin}°C`);
+      }
+      if (clientReq?.AmbientTempMax != null) {
+        clientReqAmbientParts.push(`+${clientReq.AmbientTempMax}°C`);
+      }
+      const clientReqAmbientDisplay = clientReqAmbientParts.join(' / ');
+
+      const clientReqIpRating = clientReq?.IpRating || '';
+
+      const cert = resolveCertificate(eq['Certificate No']);
+      const hasSpecialCondition =
+        !!(cert && (cert.specCondition || cert.xcondition));
+
+      const exMarkings = Array.isArray(eq['Ex Marking']) && eq['Ex Marking'].length
+        ? eq['Ex Marking']
+        : [null];
+
+      for (const marking of exMarkings) {
+        const rowData = {
+          '#': equipmentIndex,
+          'TagNo': eq['TagNo'] || '',
+          'EqID': eq['EqID'] || '',
+          'Description': eq['Equipment Type'] || '',
+          'Manufacturer': eq.Manufacturer || '',
+          'Model': eq['Model/Type'] || '',
+          'Serial Number': eq['Serial Number'] || '',
+          'IP rating': eq['IP rating'] || '',
+          'Temp. Range': eq['Max Ambient Temp'] || '',
+          'EPL': marking ? marking['Equipment Protection Level'] || '' : '',
+          'SubGroup': marking ? marking['Gas / Dust Group'] || '' : '',
+          'Temperature Class': marking ? marking['Temperature Class'] || '' : '',
+          'Protection Concept': marking ? marking['Type of Protection'] || '' : '',
+          //'Equipment Group': marking ? marking['Equipment Group'] || '' : '',
+         // 'Equipment Category': marking ? marking['Equipment Category'] || '' : '',
+         // 'Environment': marking ? marking.Environment || '' : '',
+          'Certificate No': eq['Certificate No'] || '',
+          'Certificate Issue Date': cert?.issueDate || '',
+          'Special Condition': hasSpecialCondition ? 'Yes' : 'No',
+          'Zone': zoneNumber,
+          'Gas / Dust Group': zoneSubGroup,
+          'Temp Rating': zoneTempDisplay,
+          'Ambient Temp': ambientDisplay,
+          'Req Zone': clientReqZoneNumber,
+          'Req Gas / Dust Group': clientReqGasDustGroup,
+          'Req Temp Rating': clientReqTempDisplay,
+          'Req Ambient Temp': clientReqAmbientDisplay,
+          'Req IP Rating': clientReqIpRating,
+          'Status': eq['Compliance'] || '',
+          'Inspection Date': inspectionDate
+            ? new Date(inspectionDate)
+            : '',
+          'Inspector': inspectorName,
+          'Remarks': eq['Other Info'] || ''
+        };
+
+        const row = worksheet.addRow(rowData);
+
+        row.eachCell((cell, colNumber) => {
+          const header = headers[colNumber - 1];
+
+          if (header === 'Status') {
+            const complianceValue = rowData[header];
+            const complianceColor =
+              complianceValue === 'Passed'
+                ? 'FF008000'
+                : complianceValue === 'Failed'
+                  ? 'FFFF0000'
+                  : 'FF000000';
+            cell.font = { color: { argb: complianceColor } , bold: true };
+          }
+
+          if (centerAlignedColumns.has(header)) {
+            cell.alignment = { horizontal: 'center', vertical: 'middle' };
+          } else {
+            cell.alignment = { horizontal: 'left', vertical: 'middle' };
+          }
+        });
+
+        // Váltakozó háttérszín az adatsorokhoz (3. sortól lefelé)
+        if (row.number > 2) {
+          const isEven = row.number % 2 === 0;
+          row.eachCell(cell => {
+            if (isEven) {
+              // páros sor – halvány szürke háttér
+              cell.fill = {
+                type: 'pattern',
+                pattern: 'solid',
+                fgColor: { argb: 'FFF5F5F5' }
+              };
+            } else {
+              // páratlan sor – üres háttér
+              cell.fill = undefined;
+            }
+          });
+        }
+      }
+    }
+
+    // Dinamikus oszlopszélesség
+    if (worksheet.columns) {
+      worksheet.columns.forEach(column => {
+        if (!column || !column.eachCell) return;
+        let maxLength = 5;
+        column.eachCell({ includeEmpty: true }, cell => {
+          if (cell.value) {
+            const cellLength = cell.value.toString().length;
+            if (cellLength > maxLength) {
+              maxLength = cellLength;
+            }
+          }
+        });
+        column.width = maxLength + 2;
+      });
+    }
+
+    const fileNameParts = ['exregister'];
+    if (siteId) fileNameParts.push(`site_${siteId}`);
+    if (zoneId) fileNameParts.push(`zone_${zoneId}`);
+    const fileName = `${fileNameParts.join('_')}.xlsx`;
+
+    res.setHeader('Content-Type', EXCEL_CONTENT_TYPE);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename=\"${fileName}\"`
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error('❌ exportEquipmentXLSX error:', error);
+    return res.status(500).json({
+      message: 'Failed to export equipment register',
+      error: error.message || String(error)
+    });
+  }
+};
+
 // GET /exreg/:id
 exports.getEquipmentById = async (req, res) => {
   try {
@@ -452,8 +1662,8 @@ exports.listEquipment = async (req, res) => {
       filter["Serial Number"] = req.query.SerialNumber;
     }
 
-    if (req.query.Qualitycheck) {
-      filter["Qualitycheck"] = req.query.Qualitycheck === 'true';
+    if (req.query.TagNo) {
+      filter["TagNo"] = req.query.TagNo;
     }
 
     const equipments = await Equipment.find(filter).lean();
@@ -614,7 +1824,6 @@ exports.updateEquipment = async (req, res) => {
 exports.deleteEquipment = async (req, res) => {
   const { id } = req.params;
   try {
-    const user = req.user;
     const tenantId = req.scope?.tenantId;
     if (!tenantId) {
       return res.status(401).json({ error: 'Nincs bejelentkezett felhasználó vagy hiányzó tenant.' });
@@ -634,8 +1843,44 @@ exports.deleteEquipment = async (req, res) => {
     const siteName = siteDoc?.Name || (equipment.Site ? `Site_${equipment.Site}` : null);
     const eqPrefix = buildEquipmentPrefix(tenantName, tenantId, siteName, zoneName, equipment.EqID);
     try { await azureBlob.deletePrefix(`${eqPrefix}/`); } catch (e) { console.warn('⚠️ deletePrefix failed:', e?.message); }
+    // Kapcsolódó inspectionök és azok blob képeinek törlése
+    try {
+      const inspections = await Inspection.find({ equipmentId: equipment._id, tenantId });
+      const blobPaths = new Set();
+      inspections.forEach(insp => {
+        (insp.attachments || []).forEach(att => {
+          const raw = att?.blobPath || att?.blobUrl;
+          const normalized = raw ? azureBlob.toBlobPath(raw) : '';
+          if (normalized) {
+            blobPaths.add(normalized);
+          }
+        });
+      });
+
+      for (const blobPath of blobPaths) {
+        try {
+          if (typeof azureBlob.deleteFile === 'function') {
+            await azureBlob.deleteFile(blobPath);
+          }
+        } catch (e) {
+          try {
+            console.warn('⚠️ Failed to delete inspection blob while deleting equipment:', {
+              blobPath,
+              error: e?.message || e
+            });
+          } catch {}
+        }
+      }
+
+      if (inspections.length) {
+        await Inspection.deleteMany({ equipmentId: equipment._id, tenantId });
+      }
+    } catch (inspErr) {
+      console.error('⚠️ Warning: Nem sikerült a kapcsolódó inspectionök teljes törlése equipment törléskor:', inspErr);
+    }
+
     await Equipment.deleteOne({ _id: id });
-    return res.json({ message: 'Az eszköz sikeresen törölve.' });
+    return res.json({ message: 'Az eszköz és a hozzá tartozó inspectionök sikeresen törölve.' });
   } catch (error) {
     console.error('❌ Hiba az eszköz törlésekor:', error);
     return res.status(500).json({ error: 'Nem sikerült törölni az eszközt.' });

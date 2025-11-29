@@ -4,24 +4,29 @@ const ZoneSchema = new mongoose.Schema(
     {
         Name: { type: String, required: true },
         Description: { type: String },
-        Environment: { 
-            type: String, 
-            required: true, 
-            enum: ['Gas', 'Dust', 'Hybrid', 'NonEx'] 
+        Environment: {
+            type: String,
+            required: true,
+            enum: ['Gas', 'Dust', 'Hybrid', 'NonEx']
         },
-        Zone: { 
-            type: [Number], 
+        Scheme: {
+            type: String,
+            enum: ['ATEX', 'IECEx', 'NA'],
+            default: 'ATEX'
+        },
+        Zone: {
+            type: [Number],
             enum: [0, 1, 2, 20, 21, 22],
             default: []
         },
-        SubGroup: { 
-            type: [String], 
+        SubGroup: {
+            type: [String],
             enum: ['IIA', 'IIB', 'IIC', 'IIIA', 'IIIB', 'IIIC'],
             default: []
         },
-        TempClass: { 
-            type: String, 
-            enum: ['T1', 'T2', 'T3', 'T4', 'T5', 'T6'] 
+        TempClass: {
+            type: String,
+            enum: ['T1', 'T2', 'T3', 'T4', 'T5', 'T6']
         },
         MaxTemp: { type: Number },
         IpRating: { type: String },
@@ -32,12 +37,12 @@ const ZoneSchema = new mongoose.Schema(
         },
         AmbientTempMin: { type: Number },
         AmbientTempMax: { type: Number },
-        CreatedBy: { 
-            type: mongoose.Schema.Types.ObjectId, 
-            ref: 'User', 
+        CreatedBy: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'User',
         },
         ModifiedBy: {  // Új mező a módosító felhasználónak
-            type: mongoose.Schema.Types.ObjectId, 
+            type: mongoose.Schema.Types.ObjectId,
             ref: 'User'
         },
         tenantId: {
@@ -52,17 +57,44 @@ const ZoneSchema = new mongoose.Schema(
         },
         documents: [
             {
-              name: { type: String },
-              alias: { type: String },
-              type: { type: String, enum: ['document', 'image'], default: 'document' },
-              uploadedAt: { type: Date, default: Date.now },
-              blobPath: { type: String },
-              blobUrl: { type: String },
-              contentType: { type: String },
-              size: { type: Number }
+                name: { type: String },
+                alias: { type: String },
+                type: { type: String, enum: ['document', 'image'], default: 'document' },
+                uploadedAt: { type: Date, default: Date.now },
+                blobPath: { type: String },
+                blobUrl: { type: String },
+                contentType: { type: String },
+                size: { type: Number }
             }
-          ]
-    }, 
+        ],
+        clientReq: [
+            {
+                Zone: {
+                    type: [Number],
+                    enum: [0, 1, 2, 20, 21, 22],
+                    default: []
+                },
+                SubGroup: {
+                    type: [String],
+                    enum: ['IIA', 'IIB', 'IIC', 'IIIA', 'IIIB', 'IIIC'],
+                    default: []
+                },
+                TempClass: {
+                    type: String,
+                    enum: ['T1', 'T2', 'T3', 'T4', 'T5', 'T6']
+                },
+                MaxTemp: { type: Number },
+                IpRating: { type: String },
+                EPL: {
+                    type: [String],
+                    enum: ['Ga', 'Gb', 'Gc', 'Da', 'Db', 'Dc'],
+                    default: []
+                },
+                AmbientTempMin: { type: Number },
+                AmbientTempMax: { type: Number },
+            }
+        ]
+    },
     { timestamps: true }
 );
 
@@ -70,7 +102,7 @@ ZoneSchema.pre('save', async function (next) {
     try {
         const user = await mongoose.model('User').findById(this.CreatedBy).select('tenantId');
         if (!user) return next(new Error('Érvénytelen CreatedBy felhasználó.'));
-        
+
         if (!this.tenantId && user.tenantId) {
             this.tenantId = user.tenantId;
         }

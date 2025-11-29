@@ -42,6 +42,8 @@ const InspectionAttachmentSchema = new Schema(
       enum: ['image', 'document'],
       default: 'image',
     },
+    contentType: { type: String },
+    size: { type: Number },
 
     // Opcionális kapcsolódás konkrét kérdéshez
     questionId: { type: Schema.Types.ObjectId, ref: 'Question', required: false },

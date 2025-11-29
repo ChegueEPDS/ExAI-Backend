@@ -22,6 +22,20 @@ router.post(
   exRegisterController.uploadDocumentsToEquipment
 );
 
+router.post(
+  '/exreg/import-xlsx',
+  authMiddleware(),
+  upload.single('file'),
+  exRegisterController.importEquipmentXLSX
+);
+
+// Export XLSX a kiválasztott / zónához / projekthez tartozó eszközökhöz
+router.get(
+  '/exreg/export-xlsx',
+  authMiddleware(),
+  exRegisterController.exportEquipmentXLSX
+);
+
 router.get(
   '/exreg/:id/documents',
   authMiddleware(),

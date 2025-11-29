@@ -227,6 +227,24 @@ module.exports = {
     return blobPath; // return relative path for DB storage
   },
 
+  async downloadToBuffer(blobNameOrPath) {
+    const blobPath = toBlobPath(blobNameOrPath);
+    if (!blobPath) throw new Error('downloadToBuffer: missing blob name/path');
+    const blockBlobClient = containerClient.getBlockBlobClient(blobPath);
+    const response = await blockBlobClient.download();
+    const stream = response.readableStreamBody;
+    if (!stream) {
+      return Buffer.alloc(0);
+    }
+    const chunks = [];
+    await new Promise((resolve, reject) => {
+      stream.on('data', data => chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data)));
+      stream.on('end', resolve);
+      stream.on('error', reject);
+    });
+    return Buffer.concat(chunks);
+  },
+
   
 
   getReadSasUrl,

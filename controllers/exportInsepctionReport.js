@@ -2,11 +2,13 @@
 
 const ExcelJS = require('exceljs');
 const archiver = require('archiver');
+const path = require('path');
 const Inspection = require('../models/inspection');
 const Dataplate = require('../models/dataplate');
 const Site = require('../models/site');
 const Zone = require('../models/zone');
 const Certificate = require('../models/certificate');
+const azureBlob = require('../services/azureBlobService');
 
 const EXCEL_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const DEFAULT_COLUMNS = [
@@ -154,10 +156,146 @@ async function resolveInspectionContext(inspection, options = {}) {
   return { equipment, site, zone, scheme };
 }
 
-function buildInspectionWorkbook(inspection, equipment, site, zone, scheme) {
+function sanitizeFileNameSegment(value, fallback = 'item') {
+  const safe = String(value || fallback)
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9._-]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return safe || fallback;
+}
+
+function deriveQuestionReference(result) {
+  if (!result) return '';
+  const tableVal = (result.table || result.Table || '').toString();
+  const groupVal = (result.group || result.Group || '').toString();
+  const numRaw = result.number ?? result.Number;
+  if (tableVal === 'SC' || result.equipmentType === 'Special Condition') {
+    const num = typeof numRaw === 'number' ? numRaw : 1;
+    return `SC${num}`;
+  }
+  if (tableVal && groupVal && (numRaw || numRaw === 0)) {
+    return `${tableVal}-${groupVal}-${numRaw}`;
+  }
+  return result.reference || '';
+}
+
+function deriveQuestionKey(result) {
+  if (!result) return null;
+  if (result.questionKey) return result.questionKey;
+  const ref = deriveQuestionReference(result);
+  return ref || null;
+}
+
+function buildResultKeys(result) {
+  const keys = [];
+  if (result?.questionId) {
+    keys.push(`id:${result.questionId.toString()}`);
+  }
+  const derivedKey = deriveQuestionKey(result);
+  if (derivedKey) {
+    keys.push(`key:${derivedKey}`);
+  }
+  if (!keys.length) {
+    keys.push('general');
+  }
+  return keys;
+}
+
+function buildInspectionAttachmentLookup(inspection, eqId) {
+  const eqFolder = sanitizeFileNameSegment(eqId || inspection?.eqId || inspection?.equipmentId || 'equipment');
+  const attachments = Array.isArray(inspection?.attachments) ? inspection.attachments : [];
+  const imageAttachments = attachments.filter(att => att && att.blobPath && (att.type === 'image' || !att.type));
+  const byKey = new Map();
+  const counterMap = new Map();
+  const metas = [];
+
+  imageAttachments.forEach((att, index) => {
+    const keys = [];
+    if (att.questionId) keys.push(`id:${att.questionId.toString()}`);
+    if (att.questionKey) keys.push(`key:${att.questionKey}`);
+    if (!keys.length) keys.push('general');
+
+    const preferredKey = att.questionKey || (keys.find(k => k.startsWith('key:'))?.slice(4)) || `IMG${index + 1}`;
+    const sanitizedKey = sanitizeFileNameSegment(preferredKey, 'img');
+    const counterKey = `${sanitizedKey}`;
+    const seq = (counterMap.get(counterKey) || 0) + 1;
+    counterMap.set(counterKey, seq);
+    const ext = path.extname(att.blobPath) || '.jpg';
+    const padded = seq.toString().padStart(2, '0');
+    const fileName = `${eqFolder}_${sanitizedKey}_${padded}${ext}`;
+    const meta = { ...att, fileName, keys, eqFolder };
+    metas.push(meta);
+    keys.forEach(key => {
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push(meta);
+    });
+  });
+
+  const getForResult = (result) => {
+    if (!result) return [];
+    const keys = buildResultKeys(result);
+    const seen = new Set();
+    const list = [];
+    keys.forEach(key => {
+      const arr = byKey.get(key);
+      if (arr) {
+        arr.forEach(meta => {
+          if (seen.has(meta.fileName)) return;
+          seen.add(meta.fileName);
+          list.push(meta);
+        });
+      }
+    });
+    return list;
+  };
+
+  return {
+    all: metas,
+    eqFolder,
+    getForResult,
+    getFileNamesForResult: (result) => getForResult(result).map(meta => meta.fileName)
+  };
+}
+
+async function appendImagesToArchive(archive, attachments, imagesRoot = 'images') {
+  if (!Array.isArray(attachments) || !attachments.length) return;
+  for (const meta of attachments) {
+    if (!meta?.blobPath) continue;
+    try {
+      const buffer = await azureBlob.downloadToBuffer(meta.blobPath);
+      const folder = sanitizeFileNameSegment(meta.eqFolder || 'equipment');
+      const zipPath = path.posix.join(imagesRoot, folder, meta.fileName);
+      archive.append(buffer, { name: zipPath });
+    } catch (err) {
+      console.error('⚠️ Failed to append inspection image to archive:', err?.message || err);
+    }
+  }
+}
+
+function buildInspectionWorkbook(inspection, equipment, site, zone, scheme, attachmentLookup = null) {
   // -------- Excel workbook + sheet --------
   const workbook = new ExcelJS.Workbook();
   const ws = workbook.addWorksheet('Inspection Report');
+
+  const setHeaderCell = (range, text) => {
+    ws.mergeCells(range);
+    const cell = ws.getCell(range.split(':')[0]);
+    cell.value = text;
+    cell.font = { bold: true };
+    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+    cell.fill = HEADER_FILL;
+    return cell;
+  };
+
+  const setValueCell = (range, value) => {
+    ws.mergeCells(range);
+    const cell = ws.getCell(range.split(':')[0]);
+    cell.value = value || '';
+    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+    return cell;
+  };
 
   // Oszlopszélességek – kb. a tervhez igazítva
   ws.columns = DEFAULT_COLUMNS;
@@ -195,105 +333,70 @@ function buildInspectionWorkbook(inspection, equipment, site, zone, scheme) {
   const emptyRow3 = ws.addRow([]);
   emptyRow3.height = 7;
 
-  // ========= 3. sor – Client / Project / Zone =========
-  ws.mergeCells('A4:B4');
-  ws.getCell('A4').value = 'Client name';
-  ws.getCell('A4').font = { bold: true };
-  ws.getCell('A4').alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getCell('A4').fill= HEADER_FILL;
+  let currentRow = 4;
+  const topRowHeight = 30;
+  const spacerHeight = 5;
 
-  ws.mergeCells('C4:E4');
-  ws.getCell('C4').value = site?.Client || '';
-  ws.getCell('C4').alignment = { horizontal: 'center', vertical: 'middle' };
+  // Client / Project / Zone
+  const clientRow = currentRow;
+  setHeaderCell(`A${clientRow}:B${clientRow}`, 'Client name');
+  setValueCell(`C${clientRow}:E${clientRow}`, site?.Client || '');
+  setHeaderCell(`F${clientRow}:G${clientRow}`, 'Project');
+  setValueCell(`H${clientRow}:J${clientRow}`, site?.Name || '');
+  setHeaderCell(`K${clientRow}:L${clientRow}`, 'Zone');
+  setValueCell(`M${clientRow}:N${clientRow}`, zone?.Name || zone?.ZoneName || '');
+  ws.getRow(clientRow).height = topRowHeight;
+  currentRow += 1;
 
-  ws.mergeCells('F4:G4');
-  ws.getCell('F4').value = 'Project';
-  ws.getCell('F4').font = { bold: true };
-  ws.getCell('F4').alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getCell('F4').fill= HEADER_FILL;
+  const tagIdValue = equipment?.TagNo || equipment?.['TagNo'] || equipment?.['Tag No'] || equipment?.tagId || '';
+  const hasTagId = !!tagIdValue;
+  let tagRowIndex = null;
 
-  ws.mergeCells('H4:J4');
-  ws.getCell('H4').value = site?.Name || '';
-  ws.getCell('H4').alignment = { horizontal: 'center', vertical: 'middle' };
+  if (hasTagId) {
+    tagRowIndex = currentRow;
+    setHeaderCell(`A${tagRowIndex}:B${tagRowIndex}`, 'Tag ID');
+    setValueCell(`C${tagRowIndex}:E${tagRowIndex}`, tagIdValue);
 
-  ws.mergeCells('K4:L4');
-  ws.getCell('K4').value = 'Zone';
-  ws.getCell('K4').font = { bold: true };
-  ws.getCell('K4').alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getCell('K4').fill= HEADER_FILL;
+    setHeaderCell(`F${tagRowIndex}:G${tagRowIndex}`, 'Equipment ID');
+    setValueCell(`H${tagRowIndex}:J${tagRowIndex}`, equipment.EqID || '');
 
-  ws.mergeCells('M4:N4');
-  ws.getCell('M4').value = zone?.Name || zone?.ZoneName || '';
-  ws.getCell('M4').alignment = { horizontal: 'center', vertical: 'middle' };
+    setHeaderCell(`K${tagRowIndex}:L${tagRowIndex}`, 'Equipment Description');
+    setValueCell(`M${tagRowIndex}:N${tagRowIndex}`, equipment['Equipment Type'] || equipment.EquipmentType || '');
+    ws.getRow(tagRowIndex).height = topRowHeight;
+    currentRow += 1;
+  }
 
-  // ========= 5. sor – Equipment ID / Manufacturer / Model =========
-  ws.mergeCells('A5:B5');
-  ws.getCell('A5').value = 'Equipment ID';
-  ws.getCell('A5').font = { bold: true };
-  ws.getCell('A5').alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getCell('A5').fill= HEADER_FILL;
+  const equipmentRow = currentRow;
+  if (hasTagId) {
+    setHeaderCell(`A${equipmentRow}:B${equipmentRow}`, 'Manufacturer');
+    setValueCell(`C${equipmentRow}:E${equipmentRow}`, equipment.Manufacturer || '');
+    setHeaderCell(`F${equipmentRow}:G${equipmentRow}`, 'Model');
+    setValueCell(`H${equipmentRow}:J${equipmentRow}`, equipment['Model/Type'] || '');
+    setHeaderCell(`K${equipmentRow}:L${equipmentRow}`, 'Serial No');
+    setValueCell(`M${equipmentRow}:N${equipmentRow}`, equipment['Serial Number'] || equipment.SerialNumber || '');
+  } else {
+    setHeaderCell(`A${equipmentRow}:B${equipmentRow}`, 'Equipment ID');
+    setValueCell(`C${equipmentRow}:E${equipmentRow}`, equipment.EqID || '');
+    setHeaderCell(`F${equipmentRow}:G${equipmentRow}`, 'Manufacturer');
+    setValueCell(`H${equipmentRow}:J${equipmentRow}`, equipment.Manufacturer || '');
+    setHeaderCell(`K${equipmentRow}:L${equipmentRow}`, 'Model');
+    setValueCell(`M${equipmentRow}:N${equipmentRow}`, equipment['Model/Type'] || '');
+  }
+  ws.getRow(equipmentRow).height = topRowHeight;
+  currentRow += 1;
 
-  ws.mergeCells('C5:E5');
-  ws.getCell('C5').value = equipment.EqID || '';
-  ws.getCell('C5').alignment = { horizontal: 'center', vertical: 'middle' };
-
-  ws.mergeCells('F5:G5');
-  ws.getCell('F5').value = 'Manufacturer';
-  ws.getCell('F5').font = { bold: true };
-  ws.getCell('F5').alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getCell('F5').fill= HEADER_FILL;
-
-  ws.mergeCells('H5:J5');
-  ws.getCell('H5').value = equipment.Manufacturer || '';
-  ws.getCell('H5').alignment = { horizontal: 'center', vertical: 'middle' };
-
-  ws.mergeCells('K5:L5');
-  ws.getCell('K5').value = 'Model';
-  ws.getCell('K5').font = { bold: true };
-  ws.getCell('K5').alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getCell('K5').fill= HEADER_FILL;
-
-  ws.mergeCells('M5:N5');
-  ws.getCell('M5').value = equipment['Model/Type'] || '';
-  ws.getCell('M5').alignment = { horizontal: 'center', vertical: 'middle' };
-
-  // ========= 6. sor – Certificate / Ex scheme =========
-  ws.mergeCells('A6:B6');
-  ws.getCell('A6').value = 'Certificate no';
-  ws.getCell('A6').font = { bold: true };
-  ws.getCell('A6').alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getCell('A6').fill= HEADER_FILL;
-
-  ws.mergeCells('C6:E6');
-  ws.getCell('C6').value = equipment['Certificate No'] || '';
-  ws.getCell('C6').alignment = { horizontal: 'center', vertical: 'middle' };
-
-  ws.mergeCells('F6:G6');
-  ws.getCell('F6').value = 'Ex scheme';
-  ws.getCell('F6').font = { bold: true };
-  ws.getCell('F6').alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getCell('F6').fill= HEADER_FILL;
-
-  ws.mergeCells('H6:J6');
-  ws.getCell('H6').value = scheme || '';
-  ws.getCell('H6').alignment = { horizontal: 'center', vertical: 'middle' };
-
-  ws.mergeCells('K6:L6');
-  ws.getCell('K6').value = 'Status'
-  ws.getCell('K6').font = { bold: true };
-  ws.getCell('K6').alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getCell('K6').fill= HEADER_FILL;
-
+  // ========= Certificate / Ex scheme =========
+  const certificateRow = currentRow;
+  setHeaderCell(`A${certificateRow}:B${certificateRow}`, 'Certificate no');
+  setValueCell(`C${certificateRow}:E${certificateRow}`, equipment['Certificate No'] || '');
+  setHeaderCell(`F${certificateRow}:G${certificateRow}`, 'Ex scheme');
+  setValueCell(`H${certificateRow}:J${certificateRow}`, scheme || '');
+  setHeaderCell(`K${certificateRow}:L${certificateRow}`, 'Status');
   const statusValue = inspection.status || '';
   const isPassed = statusValue === 'Passed';
   const isFailed = statusValue === 'Failed';
-  
-  ws.mergeCells('M6:N6');
-  ws.getCell('M6').value = statusValue
-  ws.getCell('M6').alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getCell(`M6`).font = { bold: true };
-
-  const statusCell = ws.getCell(`M6`);
+  setValueCell(`M${certificateRow}:N${certificateRow}`, statusValue);
+  const statusCell = ws.getCell(`M${certificateRow}`);
   statusCell.value = statusValue;
   statusCell.font = {
     bold: true,
@@ -303,14 +406,16 @@ function buildInspectionWorkbook(inspection, equipment, site, zone, scheme) {
         ? { argb: 'FFFF0000' } // red
         : undefined
   };
+  ws.getRow(certificateRow).height = topRowHeight;
+  currentRow += 1;
 
-  // üres sor (4)
-  const emptyRow4 = ws.addRow([]);
-  emptyRow4.height = 7;
+  // üres sor
+  const spacerRowIndex = currentRow;
+  const spacerRow = ws.getRow(spacerRowIndex);
+  spacerRow.height = spacerHeight;
+  currentRow += 1;
 
-
-
-  // ========= 8–9. sor – Area vs Equipment (új layout) =========
+  // ========= Area vs Equipment =========
 
   // Segéd: Area sorhoz Temp Class mező (TempClass + MaxTemp, ha van)
   const zoneNumber =
@@ -360,85 +465,90 @@ function buildInspectionWorkbook(inspection, equipment, site, zone, scheme) {
     fgColor: { argb: 'FFCCFFFF' } // halvány kék
   };
 
-  // ----- 8. sor – Area -----
-  ws.getCell('A8').value = 'Area';
-  ws.mergeCells('A8:B8');
-  ws.getCell('A8').font = { bold: true };
-  ws.getCell('A8').fill = areaLabelFill;
+  const areaRow = currentRow;
+  ws.mergeCells(`A${areaRow}:B${areaRow}`);
+  ws.getCell(`A${areaRow}`).value = 'Area';
+  ws.getCell(`A${areaRow}`).font = { bold: true };
+  ws.getCell(`A${areaRow}`).fill = areaLabelFill;
 
-  ws.getCell('C8').value = 'Zone';
-  ws.getCell('C8').font = { bold: true };
-  ws.getCell('C8').fill = HEADER_FILL
-  ws.getCell('D8').value = zoneNumber || '';
+  ws.getCell(`C${areaRow}`).value = 'Zone';
+  ws.getCell(`C${areaRow}`).font = { bold: true };
+  ws.getCell(`C${areaRow}`).fill = HEADER_FILL;
+  ws.getCell(`D${areaRow}`).value = zoneNumber || '';
 
-  ws.getCell('E8').value = 'Group';
-  ws.getCell('E8').font = { bold: true };
-  ws.getCell('E8').fill = HEADER_FILL;
-  ws.getCell('F8').value = zoneSubGroup || '';
+  ws.getCell(`E${areaRow}`).value = 'Group';
+  ws.getCell(`E${areaRow}`).font = { bold: true };
+  ws.getCell(`E${areaRow}`).fill = HEADER_FILL;
+  ws.getCell(`F${areaRow}`).value = zoneSubGroup || '';
 
-  ws.getCell('G8').value = 'Temp Class';
-  ws.getCell('G8').font = { bold: true };
-  ws.getCell('G8').fill = HEADER_FILL;
-  ws.getCell('H8').value = zoneTempDisplay || '';
+  ws.getCell(`G${areaRow}`).value = 'Temp Class';
+  ws.getCell(`G${areaRow}`).font = { bold: true };
+  ws.getCell(`G${areaRow}`).fill = HEADER_FILL;
+  ws.getCell(`H${areaRow}`).value = zoneTempDisplay || '';
 
-  ws.getCell('I8').value = 'Tamb';
-  ws.getCell('I8').font = { bold: true };
-  ws.getCell('I8').fill = HEADER_FILL;
-  ws.getCell('J8').value = ambientDisplay || '';
+  ws.getCell(`I${areaRow}`).value = 'Tamb';
+  ws.getCell(`I${areaRow}`).font = { bold: true };
+  ws.getCell(`I${areaRow}`).fill = HEADER_FILL;
+  ws.getCell(`J${areaRow}`).value = ambientDisplay || '';
 
-  ws.getCell('K8').value = 'IP Rating';
-  ws.getCell('K8').font = { bold: true };
-  ws.getCell('K8').fill = HEADER_FILL;
-  ws.getCell('L8').value = zoneIpRating;
+  ws.getCell(`K${areaRow}`).value = 'IP Rating';
+  ws.getCell(`K${areaRow}`).font = { bold: true };
+  ws.getCell(`K${areaRow}`).fill = HEADER_FILL;
+  ws.getCell(`L${areaRow}`).value = zoneIpRating;
 
-  ws.getCell('M8').value = 'EPL';
-  ws.getCell('M8').font = { bold: true };
-  ws.getCell('M8').fill = HEADER_FILL;
-  ws.getCell('N8').value = zoneEpl;
+  ws.getCell(`M${areaRow}`).value = 'EPL';
+  ws.getCell(`M${areaRow}`).font = { bold: true };
+  ws.getCell(`M${areaRow}`).fill = HEADER_FILL;
+  ws.getCell(`N${areaRow}`).value = zoneEpl;
 
-  // ----- 9. sor – Equipment -----
+  const equipmentInfoRow = areaRow + 1;
   const exMarking = Array.isArray(equipment['Ex Marking'])
     ? equipment['Ex Marking'][0] || {}
     : {};
 
-  ws.getCell('A9').value = 'Equipment';
-  ws.mergeCells('A9:B9');
-  ws.getCell('A9').font = { bold: true };
-  ws.getCell('A9').fill = equipmentLabelFill;
+  ws.mergeCells(`A${equipmentInfoRow}:B${equipmentInfoRow}`);
+  ws.getCell(`A${equipmentInfoRow}`).value = 'Equipment';
+  ws.getCell(`A${equipmentInfoRow}`).font = { bold: true };
+  ws.getCell(`A${equipmentInfoRow}`).fill = equipmentLabelFill;
 
-  ws.getCell('C9').value = 'Ex Type';
-  ws.getCell('C9').font = { bold: true };
-  ws.getCell('C9').fill = HEADER_FILL;
-  ws.getCell('D9').value = exMarking['Type of Protection'] || '';
+  ws.getCell(`C${equipmentInfoRow}`).value = 'Ex Type';
+  ws.getCell(`C${equipmentInfoRow}`).font = { bold: true };
+  ws.getCell(`C${equipmentInfoRow}`).fill = HEADER_FILL;
+  ws.getCell(`D${equipmentInfoRow}`).value = exMarking['Type of Protection'] || '';
 
-  ws.getCell('E9').value = 'Group';
-  ws.getCell('E9').font = { bold: true };
-  ws.getCell('E9').fill = HEADER_FILL;
-  ws.getCell('F9').value = exMarking['Gas / Dust Group'] || '';
+  ws.getCell(`E${equipmentInfoRow}`).value = 'Group';
+  ws.getCell(`E${equipmentInfoRow}`).font = { bold: true };
+  ws.getCell(`E${equipmentInfoRow}`).fill = HEADER_FILL;
+  ws.getCell(`F${equipmentInfoRow}`).value = exMarking['Gas / Dust Group'] || '';
 
-  ws.getCell('G9').value = 'Temp Rating';
-  ws.getCell('G9').font = { bold: true };
-  ws.getCell('G9').fill = HEADER_FILL;
-  ws.getCell('H9').value = exMarking['Temperature Class'] || '';
+  ws.getCell(`G${equipmentInfoRow}`).value = 'Temp Rating';
+  ws.getCell(`G${equipmentInfoRow}`).font = { bold: true };
+  ws.getCell(`G${equipmentInfoRow}`).fill = HEADER_FILL;
+  ws.getCell(`H${equipmentInfoRow}`).value = exMarking['Temperature Class'] || '';
 
-  ws.getCell('I9').value = 'Tamb';
-  ws.getCell('I9').font = { bold: true };
-  ws.getCell('I9').fill = HEADER_FILL;
-  ws.getCell('J9').value = equipment['Max Ambient Temp'] || '';
+  ws.getCell(`I${equipmentInfoRow}`).value = 'Tamb';
+  ws.getCell(`I${equipmentInfoRow}`).font = { bold: true };
+  ws.getCell(`I${equipmentInfoRow}`).fill = HEADER_FILL;
+  ws.getCell(`J${equipmentInfoRow}`).value = equipment['Max Ambient Temp'] || '';
 
-  ws.getCell('K9').value = 'IP Rating';
-  ws.getCell('K9').font = { bold: true };
-  ws.getCell('K9').fill = HEADER_FILL;
-  ws.getCell('L9').value = equipment['IP rating'] || '';
+  ws.getCell(`K${equipmentInfoRow}`).value = 'IP Rating';
+  ws.getCell(`K${equipmentInfoRow}`).font = { bold: true };
+  ws.getCell(`K${equipmentInfoRow}`).fill = HEADER_FILL;
+  ws.getCell(`L${equipmentInfoRow}`).value = equipment['IP rating'] || '';
 
-  ws.getCell('M9').value = 'EPL';
-  ws.getCell('M9').font = { bold: true };
-  ws.getCell('M9').fill = HEADER_FILL;
-  ws.getCell('N9').value = exMarking['Equipment Protection Level'] || '';
+  ws.getCell(`M${equipmentInfoRow}`).value = 'EPL';
+  ws.getCell(`M${equipmentInfoRow}`).font = { bold: true };
+  ws.getCell(`M${equipmentInfoRow}`).fill = HEADER_FILL;
+  ws.getCell(`N${equipmentInfoRow}`).value = exMarking['Equipment Protection Level'] || '';
+  ws.getRow(areaRow).height = topRowHeight;
+  ws.getRow(equipmentInfoRow).height = topRowHeight;
 
-  // Keret + igazítás a 8–9. sorra (A–N oszlop)
+  const borderRows = [clientRow, equipmentRow, certificateRow, areaRow, equipmentInfoRow];
+  if (hasTagId && tagRowIndex) borderRows.splice(1, 0, tagRowIndex);
+
+  // Keret + igazítás
   ['A','B','C','D','E','F','G','H','I','J','K','L','M','N'].forEach(col => {
-    [4, 5, 6, 8, 9].forEach(rn => {
+    borderRows.forEach(rn => {
       const cell = ws.getCell(`${col}${rn}`);
       cell.border = BORDER_THIN;
       cell.alignment = {
@@ -449,9 +559,19 @@ function buildInspectionWorkbook(inspection, equipment, site, zone, scheme) {
     });
   });
 
-  // Üres sor a blokk után
-  const emptyRowAfterBlock = ws.addRow([]);
-  emptyRowAfterBlock.height = 7;
+  const spacerAfterBlockIndex = equipmentInfoRow + 1;
+  const spacerAfterBlock = ws.getRow(spacerAfterBlockIndex);
+  spacerAfterBlock.height = spacerHeight;
+
+  // enforce heights again (some cells wrap)
+  const enforceHeights = [clientRow, equipmentRow, certificateRow, areaRow, equipmentInfoRow];
+  if (hasTagId && tagRowIndex) enforceHeights.splice(1, 0, tagRowIndex);
+  enforceHeights.forEach(rn => {
+    const row = ws.getRow(rn);
+    row.height = topRowHeight;
+  });
+  ws.getRow(spacerRowIndex).height = spacerHeight;
+  ws.getRow(spacerAfterBlockIndex).height = spacerHeight;
 
   // ========= INSPECTION RESULT BLOKKOK =========
 
@@ -561,22 +681,7 @@ function buildInspectionWorkbook(inspection, equipment, site, zone, scheme) {
 
     // Kérdések
     grouped[groupName].forEach(r => {
-      let ref =
-        r.reference ||
-        (r.table && r.group && r.number
-          ? `${r.table}-${r.group}-${r.number}`
-          : '');
-
-      // Special Condition kérdések: Ref = SC1, SC2, ...
-      const tableVal = r.table || r.Table;
-      if (tableVal === 'SC' || r.equipmentType === 'Special Condition') {
-        const num =
-          typeof r.number === 'number'
-            ? r.number
-            : (typeof r.Number === 'number' ? r.Number : 1);
-        ref = `SC${num}`;
-      }
-
+      const ref = deriveQuestionReference(r);
       const status = r.status || r.result || ''; // Passed / Failed / NA
 
       const passedMark = status === 'Passed' ? 'X' : '';
@@ -588,6 +693,12 @@ function buildInspectionWorkbook(inspection, equipment, site, zone, scheme) {
         r.question ||
         '';
 
+      const imageNames = attachmentLookup ? attachmentLookup.getFileNamesForResult(r) : [];
+      const baseComment = r.note || '';
+      const commentWithImages = imageNames.length
+        ? (baseComment ? `${baseComment}\nImages: ${imageNames.join(', ')}` : `Images: ${imageNames.join(', ')}`)
+        : baseComment;
+
       const row = ws.addRow([
         ref,
         questionText,
@@ -598,7 +709,7 @@ function buildInspectionWorkbook(inspection, equipment, site, zone, scheme) {
         passedMark,
         failedMark,
         naMark,
-        r.note || ''
+        commentWithImages
       ]);
 
       const rn = row.number;
@@ -636,7 +747,7 @@ function buildInspectionWorkbook(inspection, equipment, site, zone, scheme) {
       // Sor magasság becslése a kérdés hossza alapján,
       // hogy a teljes szöveg látható legyen több sorban is.
       const approxCharsPerLine = 65; // kb. ennyi karakter fér el egy sorban
-      const textLength = (questionText && questionText.length) ? questionText.length : 1;
+      const textLength = (questionText?.length || 0) + (commentWithImages?.length || 0) || 1;
       const lineCount = Math.max(1, Math.ceil(textLength / approxCharsPerLine));
       ws.getRow(rn).height = lineCount * 15; // 15 pont / sor, szükség esetén növelhető
     });
@@ -669,10 +780,10 @@ function buildInspectionWorkbook(inspection, equipment, site, zone, scheme) {
   signatureCell.border = BORDER_THIN;
 
   // Végső finomhangolás: magasság a felső sorokra
-  [1,2,4,5,6,8,9].forEach(rn => {
+  /*[1,2,4,5,6,8,9].forEach(rn => {
     const row = ws.getRow(rn);
     row.height = 30;
-  });
+  });*/
 
   const fileName = `Inspection_EQ_${equipment.EqID || 'unknown'}_${Date.now()}.xlsx`;
   return { workbook, fileName };
@@ -867,7 +978,7 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
   headerValues[3] = 'Ref';       // C
   headerValues[4] = 'Check';     // D
   headerValues[9] = 'Note';      // I
-  headerValues[13] = 'Priority'; // M
+  headerValues[13] = 'Images';   // M
 
   const headerRow = ws.addRow(headerValues);
   const hr = headerRow.number;
@@ -899,7 +1010,9 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
     rowValues[3] = item.ref || '';       // C
     rowValues[4] = item.check || '';     // D (merged D-H)
     rowValues[9] = item.note || '';      // I (merged I-L)
-    rowValues[13] = item.priority || ''; // M (merged M-N)
+    rowValues[13] = Array.isArray(item.imageNames) && item.imageNames.length
+      ? item.imageNames.join(', ')
+      : ''; // M (merged M-N)
 
     const row = ws.addRow(rowValues);
     const rn = row.number;
@@ -924,7 +1037,8 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
 
     const checkText = item.check || '';
     const noteText = item.note || '';
-    const textLength = Math.max(checkText.length, noteText.length, 1);
+    const imageText = Array.isArray(item.imageNames) ? item.imageNames.join(', ') : '';
+    const textLength = Math.max(checkText.length, noteText.length, imageText.length, 1);
     const lineCount = Math.max(1, Math.ceil(textLength / 60));
     ws.getRow(rn).height = lineCount * 15;
   });
@@ -936,6 +1050,7 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
 exports.exportInspectionXLSX = async (req, res) => {
   try {
     const { id } = req.params;
+    const includeImages = req.query?.includeImages === 'true';
 
     const inspection = await Inspection.findById(id)
       .populate('inspectorId', 'firstName lastName email')
@@ -951,19 +1066,50 @@ exports.exportInspectionXLSX = async (req, res) => {
       return res.status(404).json({ message: context.error });
     }
 
+    const eqIdentifier = context.equipment?.EqID || inspection.eqId || inspection.equipmentId;
+    const attachmentLookup = includeImages
+      ? buildInspectionAttachmentLookup(inspection, eqIdentifier)
+      : null;
+
     const { workbook, fileName } = buildInspectionWorkbook(
       inspection,
       context.equipment,
       context.site,
       context.zone,
-      context.scheme
+      context.scheme,
+      attachmentLookup
     );
 
-    res.setHeader('Content-Type', EXCEL_CONTENT_TYPE);
-    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    if (!includeImages) {
+      res.setHeader('Content-Type', EXCEL_CONTENT_TYPE);
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      await workbook.xlsx.write(res);
+      res.end();
+      return;
+    }
 
-    await workbook.xlsx.write(res);
-    res.end();
+    const workbookBuffer = await workbook.xlsx.writeBuffer();
+    const zipName = fileName.replace(/\.xlsx$/i, '') + '.zip';
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
+
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    archive.on('error', err => {
+      console.error('Error creating inspection ZIP:', err);
+      if (!res.headersSent) {
+        res.status(500).end();
+      } else {
+        res.end();
+      }
+    });
+
+    archive.pipe(res);
+    archive.append(workbookBuffer, { name: fileName });
+    if (attachmentLookup?.all?.length) {
+      await appendImagesToArchive(archive, attachmentLookup.all);
+    }
+    await archive.finalize();
   } catch (err) {
     console.error('Error exporting inspection XLSX:', err);
     return res.status(500).json({ message: 'Failed to export inspection report', error: err.message });
@@ -974,6 +1120,7 @@ exports.exportPunchlistXLSX = async (req, res) => {
   try {
     const tenantId = req.scope?.tenantId;
     const { siteId, zoneId } = req.query || {};
+    const includeImages = (req.query?.includeImages ?? 'true') !== 'false';
 
     if (!tenantId) {
       return res.status(400).json({ message: 'tenantId is missing from auth' });
@@ -996,6 +1143,7 @@ exports.exportPunchlistXLSX = async (req, res) => {
     const zoneCache = new Map();
     const certificateCache = new Map();
     const failures = [];
+    const punchlistImages = [];
 
     let headerSite = siteId ? await getSiteCached(siteId, siteCache) : null;
     let headerZone = zoneId ? await getZoneCached(zoneId, zoneCache) : null;
@@ -1032,39 +1180,37 @@ exports.exportPunchlistXLSX = async (req, res) => {
       if (!headerSite && context.site) headerSite = context.site;
       if (!headerZone && zoneId && context.zone) headerZone = context.zone;
 
+      const attachmentLookup = includeImages
+        ? buildInspectionAttachmentLookup(
+            inspection,
+            context.equipment?.EqID || inspection.eqId
+          )
+        : null;
+      if (includeImages && attachmentLookup?.all?.length) {
+        punchlistImages.push(...attachmentLookup.all);
+      }
+
       const failedResults = Array.isArray(inspection.results)
         ? inspection.results.filter(r => r.status === 'Failed')
         : [];
 
       failedResults.forEach(r => {
-        let ref =
-          r.reference ||
-          (r.table && r.group && r.number
-            ? `${r.table}-${r.group}-${r.number}`
-            : '');
-
-        const tableVal = r.table || r.Table;
-        if (tableVal === 'SC' || r.equipmentType === 'Special Condition') {
-          const num =
-            typeof r.number === 'number'
-              ? r.number
-              : (typeof r.Number === 'number' ? r.Number : 1);
-          ref = `SC${num}`;
-        }
-
+        const ref = deriveQuestionReference(r);
         const checkText =
+        r.questionText?.eng ||
           r.questionText?.hun ||
           r.questionText?.hu ||
-          r.questionText?.eng ||
           r.question ||
           '';
+
+        const imageNames = attachmentLookup.getFileNamesForResult(r);
 
         failures.push({
           eqId: context.equipment?.EqID || equipment.EqID || inspection.eqId,
           ref,
           check: checkText,
           note: r.note || '',
-          priority: r.priority || r.Priority || ''
+          imageNames: includeImages ? imageNames : []
         });
       });
     }
@@ -1085,11 +1231,34 @@ exports.exportPunchlistXLSX = async (req, res) => {
       scopeLabel
     });
 
-    res.setHeader('Content-Type', EXCEL_CONTENT_TYPE);
-    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    if (!includeImages) {
+      res.setHeader('Content-Type', EXCEL_CONTENT_TYPE);
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      await workbook.xlsx.write(res);
+      res.end();
+      return;
+    }
 
-    await workbook.xlsx.write(res);
-    res.end();
+    const workbookBuffer = await workbook.xlsx.writeBuffer();
+    const zipName = fileName.replace(/\.xlsx$/i, '') + '.zip';
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
+
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    archive.on('error', err => {
+      console.error('Error exporting punchlist ZIP:', err);
+      if (!res.headersSent) {
+        res.status(500).end();
+      } else {
+        res.end();
+      }
+    });
+
+    archive.pipe(res);
+    archive.append(workbookBuffer, { name: fileName });
+    await appendImagesToArchive(archive, punchlistImages);
+    await archive.finalize();
   } catch (err) {
     console.error('Error exporting punchlist XLSX:', err);
     return res.status(500).json({ message: 'Failed to export punchlist report', error: err.message });
@@ -1100,6 +1269,7 @@ exports.exportLatestInspectionReportsZip = async (req, res) => {
   try {
     const tenantId = req.scope?.tenantId;
     const { zoneId, siteId } = req.query || {};
+    const includeImages = (req.query?.includeImages ?? 'true') !== 'false';
 
     if (!tenantId) {
       return res.status(400).json({ message: 'tenantId is missing from auth' });
@@ -1123,6 +1293,7 @@ exports.exportLatestInspectionReportsZip = async (req, res) => {
     const zoneCache = new Map();
     const certificateCache = new Map();
     const files = [];
+    const allImages = [];
 
     for (const equipment of equipments) {
       let inspection = null;
@@ -1153,15 +1324,26 @@ exports.exportLatestInspectionReportsZip = async (req, res) => {
 
       if (context.error) continue;
 
+      const attachmentLookup = includeImages
+        ? buildInspectionAttachmentLookup(
+            inspection,
+            context.equipment?.EqID || inspection.eqId
+          )
+        : null;
+
       const { workbook, fileName } = buildInspectionWorkbook(
         inspection,
         context.equipment,
         context.site,
         context.zone,
-        context.scheme
+        context.scheme,
+        attachmentLookup
       );
       const buffer = await workbook.xlsx.writeBuffer();
       files.push({ buffer, fileName });
+      if (includeImages && attachmentLookup?.all?.length) {
+        allImages.push(...attachmentLookup.all);
+      }
     }
 
     if (files.length === 0) {
@@ -1186,7 +1368,9 @@ exports.exportLatestInspectionReportsZip = async (req, res) => {
     files.forEach(({ buffer, fileName }) => {
       archive.append(buffer, { name: fileName });
     });
-
+    if (includeImages) {
+      await appendImagesToArchive(archive, allImages);
+    }
     await archive.finalize();
   } catch (err) {
     console.error('Error exporting inspection ZIP:', err);

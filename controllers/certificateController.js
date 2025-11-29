@@ -137,6 +137,16 @@ function escapeRegex(s = '') {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function buildLooseCertNoRegex(value = '') {
+  const source = (value || '').toString().trim();
+  if (!source) return null;
+  const pattern = source
+    .split('')
+    .map(ch => escapeRegex(ch))
+    .join('\\s*');
+  return new RegExp('^' + pattern, 'i');
+}
+
 // --- Helper: standardized duplicate (unique index) error response ---
 function sendDuplicateError(res, err) {
   // MongoServerError E11000 handler
@@ -437,7 +447,8 @@ exports.getPublicCertificatesPaged = async (req, res) => {
     };
 
     const match = { visibility: 'public' };
-    if (f.certNo)       match.certNo       = { $regex: '^' + escapeRegex(f.certNo), $options: 'i' };
+    const certRegex = buildLooseCertNoRegex(f.certNo);
+    if (certRegex) match.certNo = certRegex;
     if (f.manufacturer) match.manufacturer = { $regex: '^' + escapeRegex(f.manufacturer), $options: 'i' };
     if (f.equipment)    match.equipment    = { $regex: '^' + escapeRegex(f.equipment), $options: 'i' };
 
@@ -525,7 +536,8 @@ exports.getMyCertificatesPaged = async (req, res) => {
     }
 
     const match = { _id: { $in: allIds } };
-    if (f.certNo)       match.certNo       = { $regex: '^' + escapeRegex(f.certNo), $options: 'i' };
+    const certRegex = buildLooseCertNoRegex(f.certNo);
+    if (certRegex) match.certNo = certRegex;
     if (f.manufacturer) match.manufacturer = { $regex: '^' + escapeRegex(f.manufacturer), $options: 'i' };
     if (f.equipment)    match.equipment    = { $regex: '^' + escapeRegex(f.equipment), $options: 'i' };
 
@@ -612,40 +624,71 @@ exports.getCertificatesSamples = async (req, res) => {
 };
 
 exports.getCertificateByCertNo = async (req, res) => {
-    try {
-      const rawCertNo = req.params.certNo;
+  try {
+    const rawCertNo = req.params.certNo;
+    const tenantId = req.scope?.tenantId || null;
 
-      const certParts = rawCertNo
-        .split(/[/,]/) // Splitelés '/' vagy ',' mentén
-        .map(part => part.trim()) // Szóközök eltávolítása
-        .filter(part => part.length > 0);
-
-      console.log('Keresett Certificate részek:', certParts);
-
-      const regexConditions = certParts.map(part => {
-        const normalizedPart = part.replace(/\s+/g, '').toLowerCase();
-        console.log('Regex keresés részletre:', normalizedPart);
-        return { certNo: { $regex: new RegExp(normalizedPart.split('').join('.*'), 'i') } };
-      });
-
-      console.log('Keresési feltételek:', regexConditions);
-
-      const certificate = await Certificate.findOne({
-        $or: regexConditions
-      }).lean();
-
-      if (!certificate) {
-        console.log('Certificate not found');
-        return res.status(404).json({ message: 'Certificate not found' });
-      }
-
-      console.log('Certificate found:', certificate);
-      res.json(certificate);
-    } catch (error) {
-      console.error('Error fetching certificate:', error);
-      res.status(500).send('Error fetching certificate');
+    if (!rawCertNo || !rawCertNo.trim()) {
+      return res.status(400).json({ message: '❌ Missing certNo parameter' });
     }
-  };
+
+    // Split certNo on "/" or "," and normalize parts
+    const certParts = rawCertNo
+      .split(/[/,]/)
+      .map(part => part.trim())
+      .filter(part => part.length > 0);
+
+    console.log('Keresett Certificate részek:', certParts);
+
+    if (!certParts.length) {
+      return res.status(400).json({ message: '❌ Invalid certNo parameter' });
+    }
+
+    const regexConditions = certParts.map(part => {
+      const normalizedPart = part.replace(/\s+/g, '').toLowerCase();
+      console.log('Regex keresés részletre:', normalizedPart);
+      // Build a fuzzy regex: each character separated by ".*"
+      return {
+        certNo: {
+          $regex: new RegExp(normalizedPart.split('').join('.*'), 'i')
+        }
+      };
+    });
+
+    console.log('Keresési feltételek:', regexConditions);
+
+    // Scope: all PUBLIC certs + current tenant's own certs
+    let visibilityFilter;
+    if (tenantId) {
+      const tenantObjectId = new mongoose.Types.ObjectId(tenantId);
+      visibilityFilter = {
+        $or: [
+          { visibility: 'public' },
+          { tenantId: tenantObjectId }
+        ]
+      };
+    } else {
+      // Ha nincs tenant az auth-ból, akkor csak public cert-ek között keresünk
+      visibilityFilter = { visibility: 'public' };
+    }
+
+    const certificate = await Certificate.findOne({
+      ...visibilityFilter,
+      $or: regexConditions
+    }).lean();
+
+    if (!certificate) {
+      console.log('Certificate not found (public + own scope)');
+      return res.status(404).json({ message: 'Certificate not found' });
+    }
+
+    console.log('Certificate found:', certificate);
+    return res.json(certificate);
+  } catch (error) {
+    console.error('Error fetching certificate:', error);
+    return res.status(500).send('Error fetching certificate');
+  }
+};
 
 
 exports.deleteCertificate = async (req, res) => {

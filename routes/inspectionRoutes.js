@@ -23,4 +23,8 @@ router.get('/inspections/:id/export-xlsx', exportInspectioReport.exportInspectio
 // GET /api/inspections/:id
 router.get('/inspections/:id', authMiddleware(), inspectionController.getInspectionById);
 
+// Inspection törlése
+// DELETE /api/inspections/:id
+router.delete('/inspections/:id', authMiddleware(), inspectionController.deleteInspection);
+
 module.exports = router;
