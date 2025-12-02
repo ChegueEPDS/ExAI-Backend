@@ -192,11 +192,16 @@ exports.listUsers = async (req, res) => {
           from: 'certificates',
           let: { uid: '$_id' },
           pipeline: [
-            { $addFields: { _createdByStr: { $toString: '$createdBy' }, _vis: { $toLower: '$visibility' } } },
-            { $match: { $expr: { $and: [
-              { $eq: ['$_createdByStr', { $toString: '$$uid' }] },
-              { $eq: ['$_vis', 'public'] }
-            ] } } },
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ['$createdBy', '$$uid'] },
+                    { $eq: ['$visibility', 'public'] }
+                  ]
+                }
+              }
+            },
             { $count: 'count' }
           ],
           as: 'publicContributionAgg'
@@ -214,9 +219,9 @@ exports.listUsers = async (req, res) => {
               $match: {
                 $expr: {
                   $and: [
-                    { $eq: [ { $toString: '$createdBy' }, { $toString: '$$uid' } ] },
-                    { $eq: [ { $toString: '$tenantId' }, { $toString: '$$tId' } ] },
-                    { $in: [ '$status', ['draft', 'ready', 'error'] ] }
+                    { $eq: ['$createdBy', '$$uid'] },
+                    { $eq: ['$tenantId', '$$tId'] },
+                    { $in: ['$status', ['draft', 'ready', 'error']] }
                   ]
                 }
               }
@@ -250,11 +255,29 @@ exports.listUsers = async (req, res) => {
       }
     );
 
-    const rows = await User.aggregate(pipeline);
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const pageSizeRaw = parseInt(req.query.pageSize, 10) || 25;
+    const allowedPageSizes = [10, 25, 50];
+    const pageSize = allowedPageSizes.includes(pageSizeRaw) ? pageSizeRaw : 25;
+    const skip = (page - 1) * pageSize;
+
+    const [rows, total] = await Promise.all([
+      User.aggregate([
+        ...pipeline,
+        { $skip: skip },
+        { $limit: pageSize }
+      ]),
+      User.aggregate([
+        ...(Object.keys(preLookupMatch).length > 0 ? [{ $match: preLookupMatch }] : []),
+        { $count: 'count' }
+      ]).then(countArr => (countArr[0]?.count || 0))
+    ]);
 
     return res.json({
       items: rows,
-      total: rows.length
+      total,
+      page,
+      pageSize
     });
   } catch (error) {
     console.error('listUsers error:', error);

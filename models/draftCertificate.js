@@ -34,6 +34,8 @@ const DraftCertificateSchema = new mongoose.Schema({
   }
 });
 
+DraftCertificateSchema.index({ tenantId: 1, createdBy: 1, status: 1, createdAt: -1 });
+
 DraftCertificateSchema.index(
   { tenantId: 1, uploadId: 1, fileName: 1 },
   {

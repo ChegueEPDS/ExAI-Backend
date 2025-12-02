@@ -68,6 +68,8 @@ const CertificateSchema = new mongoose.Schema({
   reports: { type: [ReportSchema], default: [] }
 }, { timestamps: true });
 
+CertificateSchema.index({ createdBy: 1, visibility: 1, tenantId: 1, createdAt: -1 });
+
 // 🔹 Automatikus tenant kitöltés CreatedBy alapján (company mező kivezetve)
 CertificateSchema.pre('save', async function (next) {
   try {
