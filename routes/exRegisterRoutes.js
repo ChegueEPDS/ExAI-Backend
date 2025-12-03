@@ -60,6 +60,9 @@ router.put('/exreg/:id', authMiddleware(), upload.array('pictures'), exRegisterC
 // Törlés
 router.delete('/exreg/:id', authMiddleware(), exRegisterController.deleteEquipment);
 
+// Tömeges törlés
+router.post('/exreg/bulk-delete', authMiddleware(), express.json(), exRegisterController.bulkDeleteEquipment);
+
 // Gyártók lekérdezése
 router.get('/manufacturers', authMiddleware(), exRegisterController.getManufacturers);
 

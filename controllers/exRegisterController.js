@@ -5,6 +5,7 @@ const Site = require('../models/site');
 const Inspection = require('../models/inspection');
 const Certificate = require('../models/certificate');
 const Question = require('../models/questions');
+const QuestionTypeMapping = require('../models/questionTypeMapping');
 const mongoose = require('mongoose');
 const fs = require('fs');
 const azureBlob = require('../services/azureBlobService');
@@ -349,6 +350,52 @@ async function loadAutoInspectionQuestions(equipmentDoc, tenantId, inspectionTyp
   }
 }
 
+async function getRelevantEquipmentTypesForDevice(equipmentDoc, tenantId) {
+  const rawType =
+    (equipmentDoc && typeof equipmentDoc === 'object'
+      ? equipmentDoc['Equipment Type'] || equipmentDoc.EquipmentType || ''
+      : '') || '';
+
+  const normalized = String(rawType).toLowerCase().trim();
+  const result = new Set();
+
+  if (!normalized) {
+    return result;
+  }
+
+  const tenantObjectId = toObjectId(tenantId);
+  if (!tenantObjectId) {
+    return result;
+  }
+
+  try {
+    const mappings = await QuestionTypeMapping.find({
+      tenantId: tenantObjectId,
+      active: true
+    })
+      .select('equipmentPattern equipmentTypes')
+      .lean();
+
+    mappings.forEach((m) => {
+      const pattern = String(m.equipmentPattern || '').toLowerCase().trim();
+      if (!pattern) return;
+      if (!normalized.includes(pattern)) return;
+
+      (m.equipmentTypes || []).forEach((t) => {
+        if (!t) return;
+        result.add(String(t).toLowerCase());
+      });
+    });
+  } catch (err) {
+    console.warn(
+      '⚠️ getRelevantEquipmentTypesForDevice failed:',
+      err?.message || err
+    );
+  }
+
+  return result;
+}
+
 async function findCertificateByCertNoForTenant(certNoRaw, tenantId) {
   if (!certNoRaw || !certNoRaw.trim()) return null;
 
@@ -493,19 +540,19 @@ exports.createEquipment = async (req, res) => {
       }
 
       const _id = equipment._id || null;
-      const eqId = equipment.EqID || new mongoose.Types.ObjectId().toString();
+      const rawEqId =
+        typeof equipment.EqID === 'string'
+          ? equipment.EqID.trim()
+          : (equipment.EqID || '');
 
+      // Blob elérési útvonalhoz kell egy azonosító, de az EqID mezőt nem töltjük ki automatikusan,
+      // ha üresen jött (így a DB-ben az EqID üres maradhat).
+      const eqIdForBlob = rawEqId || new mongoose.Types.ObjectId().toString();
+
+      // ⚙️ EqID már NEM egyedi kulcs: csak _id alapján frissítünk
       let existingEquipment = null;
       if (_id) {
-        existingEquipment = await Equipment.findById(_id);
-      }
-      if (!existingEquipment && eqId) {
-        existingEquipment = await Equipment.findOne({
-          EqID: eqId,
-          tenantId,
-          Site: equipment.Site || null,
-          Zone: equipment.Zone || null
-        });
+        existingEquipment = await Equipment.findOne({ _id, tenantId });
       }
 
       let zoneDoc = null;
@@ -516,7 +563,7 @@ exports.createEquipment = async (req, res) => {
       }
       const zoneName = zoneDoc?.Name || (equipment.Zone ? `Zone_${equipment.Zone}` : null);
       const siteName = siteDoc?.Name || (equipment.Site ? `Site_${equipment.Site}` : null);
-      const eqPrefix = buildEquipmentPrefix(tenantName, tenantId, siteName, zoneName, eqId);
+      const eqPrefix = buildEquipmentPrefix(tenantName, tenantId, siteName, zoneName, eqIdForBlob);
 
       const equipmentFiles = files.filter(file => {
         const eqIdInName = file.originalname.split('__')[0];
@@ -548,7 +595,7 @@ exports.createEquipment = async (req, res) => {
       }
 
       console.log('💾 Equipment mentésre készül:', {
-        EqID: eqId,
+        EqID: rawEqId,
         Site: equipment.Site,
         Zone: equipment.Zone,
         PictureCount: pictures.length,
@@ -843,8 +890,10 @@ exports.importEquipmentXLSX = async (req, res) => {
     worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
       if (rowNumber <= headerInfo.headerRowNumber) return;
 
+      const idRaw = getCellString(row, headerInfo.headerMap, '_id');
       const eqIdRaw = getCellString(row, headerInfo.headerMap, 'EqID');
       const eqId = eqIdRaw ? eqIdRaw.trim() : '';
+      const mongoId = idRaw ? idRaw.trim() : '';
       const tagNo = getCellString(row, headerInfo.headerMap, 'TagNo');
       const description = getCellString(row, headerInfo.headerMap, 'Description');
       const manufacturer = getCellString(row, headerInfo.headerMap, 'Manufacturer');
@@ -884,23 +933,17 @@ exports.importEquipmentXLSX = async (req, res) => {
       const rowHasExData = [epl, subGroup, tempClass, protectionConcept].some(Boolean);
 
       if (!rowHasData && !rowHasExData) {
+        // teljesen üres sor – kihagyjuk
         return;
       }
 
-      if (!eqId) {
-        parseErrors.push({
-          rows: [rowNumber],
-          eqId: '',
-          message: 'EqID is required for every row.'
-        });
-        return;
-      }
-
-      const entryKey = eqId;
+      // EqID nem egyedi: minden sor önálló "entry" (akkor is, ha EqID üres)
+      const entryKey = `${eqId || 'NO_EQID'}__row_${rowNumber}`;
       if (!equipmentMap.has(entryKey)) {
         equipmentMap.set(entryKey, {
           rows: [],
           eqId,
+          mongoId,
           orderIndex: orderIndex,
           base: {
             EqID: eqId,
@@ -999,27 +1042,55 @@ exports.importEquipmentXLSX = async (req, res) => {
         );
 
         let equipmentDoc = null;
-        const lookup = await Equipment.findOne({
-          tenantId,
-          Zone: zone._id,
-          EqID: payload.EqID
-        });
 
-        if (lookup) {
-          const updateData = { ...payload, ModifiedBy: userId };
-          delete updateData.CreatedBy;
-          delete updateData.tenantId;
-          // Ha importban nincs megadva sorszám, ne nullázzuk le a meglévőt
-          if (entry.orderIndex == null) {
-            delete updateData.orderIndex;
+        // 1) Első próbálkozás: explicit _id alapján frissítés (ha az exportból visszatöltötték)
+        if (entry.mongoId && mongoose.Types.ObjectId.isValid(entry.mongoId)) {
+          equipmentDoc = await Equipment.findOne({
+            _id: entry.mongoId,
+            tenantId,
+            Zone: zone._id
+          });
+          if (equipmentDoc) {
+            const updateData = { ...payload, ModifiedBy: userId };
+            delete updateData.CreatedBy;
+            delete updateData.tenantId;
+            if (entry.orderIndex == null) {
+              delete updateData.orderIndex;
+            }
+            equipmentDoc = await Equipment.findByIdAndUpdate(
+              equipmentDoc._id,
+              { $set: updateData },
+              { new: true }
+            );
+            stats.updated += 1;
           }
-          equipmentDoc = await Equipment.findByIdAndUpdate(
-            lookup._id,
-            { $set: updateData },
-            { new: true }
-          );
-          stats.updated += 1;
-        } else {
+        }
+
+        // 2) Ha nincs vagy nem érvényes _id, EqID + Zone alapján próbálunk frissíteni
+        if (!equipmentDoc && payload.EqID) {
+          const lookup = await Equipment.findOne({
+            tenantId,
+            Zone: zone._id,
+            EqID: payload.EqID
+          });
+          if (lookup) {
+            const updateData = { ...payload, ModifiedBy: userId };
+            delete updateData.CreatedBy;
+            delete updateData.tenantId;
+            if (entry.orderIndex == null) {
+              delete updateData.orderIndex;
+            }
+            equipmentDoc = await Equipment.findByIdAndUpdate(
+              lookup._id,
+              { $set: updateData },
+              { new: true }
+            );
+            stats.updated += 1;
+          }
+        }
+
+        // 3) Ha így sem találtunk, új eszközt hozunk létre
+        if (!equipmentDoc) {
           const createData = {
             ...payload,
             tenantId,
@@ -1061,18 +1132,91 @@ exports.importEquipmentXLSX = async (req, res) => {
       } catch (entryError) {
         stats.errors.push({
           eqId: entry.eqId,
+          id: entry.mongoId || null,
           rows: entry.rows,
           message: entryError.message || String(entryError)
         });
       }
     }
 
+    const issues = [...parseErrors, ...stats.errors];
+
+    // Ha volt bármilyen hiba, generáljunk egy válasz XLSX-et a hibás sorokkal
+    if (issues.length > 0) {
+      try {
+        const workbookOut = new ExcelJS.Workbook();
+        await workbookOut.xlsx.readFile(uploadedFile.path);
+        const worksheet = workbookOut.worksheets[0];
+
+        const summarySheet = workbookOut.addWorksheet('Import summary');
+        summarySheet.addRow(['Created', stats.created]);
+        summarySheet.addRow(['Updated', stats.updated]);
+        summarySheet.addRow(['Inspections', stats.inspections]);
+        summarySheet.addRow(['Error items', issues.length]);
+        summarySheet.getColumn(1).width = 15;
+        summarySheet.getColumn(2).width = 12;
+
+        const errorFill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FFFFC0C0' } // halvány piros
+        };
+
+        issues.forEach((issue) => {
+          const rows = Array.isArray(issue.rows)
+            ? issue.rows
+            : (typeof issue.row === 'number' ? [issue.row] : []);
+
+          rows.forEach((rowNumber) => {
+            if (!rowNumber || !worksheet) return;
+            const row = worksheet.getRow(rowNumber);
+            row.eachCell((cell) => {
+              cell.fill = errorFill;
+            });
+
+            // Megjegyzés hozzáadása az első oszlophoz
+            const noteCell = worksheet.getCell(`A${rowNumber}`);
+            const existingNote =
+              typeof noteCell.note === 'string' && noteCell.note.length
+                ? `${noteCell.note}\n`
+                : '';
+            noteCell.note = `${existingNote}${issue.message || 'Invalid data in this row.'}`;
+          });
+        });
+
+        const buffer = await workbookOut.xlsx.writeBuffer();
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        res.setHeader(
+          'Content-Disposition',
+          'attachment; filename=\"equipment-import-errors.xlsx\"'
+        );
+        return res.status(200).send(Buffer.from(buffer));
+      } catch (excelErr) {
+        console.warn(
+          '⚠️ Failed to generate error XLSX for equipment import:',
+          excelErr?.message || excelErr
+        );
+        // Ha az XLSX generálás is elhasal, essünk vissza JSON-re
+        return res.status(200).json({
+          message: 'Import completed with errors.',
+          createdCount: stats.created,
+          updatedCount: stats.updated,
+          inspectionsCreated: stats.inspections,
+          issues
+        });
+      }
+    }
+
+    // Ha nem volt hiba, marad a JSON válasz
     return res.json({
       message: 'Import completed.',
       createdCount: stats.created,
       updatedCount: stats.updated,
       inspectionsCreated: stats.inspections,
-      issues: [...parseErrors, ...stats.errors]
+      issues: []
     });
   } catch (error) {
     console.error('❌ importEquipmentXLSX error:', error);
@@ -1096,25 +1240,41 @@ async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspe
   validUntil.setFullYear(validUntil.getFullYear() + 3);
 
   const normalizedInspectionType = normalizeInspectionType(inspectionType);
-  const questionDocs = await loadAutoInspectionQuestions(equipmentDoc, tenantId, normalizedInspectionType);
-  const passedByDefault = new Set(['general', 'environment']);
+  const questionDocs = await loadAutoInspectionQuestions(
+    equipmentDoc,
+    tenantId,
+    normalizedInspectionType
+  );
+  const basePassedTypes = new Set(['general', 'environment']);
+  const relevantTypes = await getRelevantEquipmentTypesForDevice(
+    equipmentDoc,
+    tenantId
+  ); // lowercased equipmentType-ok
   let results = [];
 
   if (questionDocs.length) {
-    results = questionDocs.map((q) => ({
-      questionId: q._id ? new mongoose.Types.ObjectId(q._id) : undefined,
-      table: q.table || q.Table || '',
-      group: q.group || q.Group || '',
-      number: q.number ?? q.Number ?? null,
-      equipmentType: q.equipmentType || '',
-      protectionTypes: Array.isArray(q.protectionTypes) ? q.protectionTypes : [],
-      status: passedByDefault.has((q.equipmentType || '').toLowerCase()) ? 'Passed' : 'NA',
-      note: '',
-      questionText: {
-        eng: q.questionText?.eng || '',
-        hun: q.questionText?.hun || ''
-      }
-    }));
+    results = questionDocs.map((q) => {
+      const eqType = (q.equipmentType || '').toLowerCase();
+      const isAlwaysPassed = basePassedTypes.has(eqType);
+      const isRelevantByDevice = relevantTypes.has(eqType);
+
+      return {
+        questionId: q._id ? new mongoose.Types.ObjectId(q._id) : undefined,
+        table: q.table || q.Table || '',
+        group: q.group || q.Group || '',
+        number: q.number ?? q.Number ?? null,
+        equipmentType: q.equipmentType || '',
+        protectionTypes: Array.isArray(q.protectionTypes)
+          ? q.protectionTypes
+          : [],
+        status: isAlwaysPassed || isRelevantByDevice ? 'Passed' : 'NA',
+        note: '',
+        questionText: {
+          eng: q.questionText?.eng || '',
+          hun: q.questionText?.hun || ''
+        }
+      };
+    });
   }
 
   if (!results.length) {
@@ -1263,6 +1423,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
     const worksheet = workbook.addWorksheet('Database');
 
     const headers = [
+      '_id',
       '#',
       'TagNo',
       'EqID',
@@ -1310,52 +1471,52 @@ exports.exportEquipmentXLSX = async (req, res) => {
     worksheet.spliceRows(1, 0, []);
 
     const groupRow = worksheet.getRow(1);
-    // Identification (A–C)
+    // Identification (A–D): _id, #, TagNo, EqID
     groupRow.getCell(1).value = 'IDENTIFICATION';
-    worksheet.mergeCells(1, 1, 1, 3);
-    // Equipment data (D–H)
-    groupRow.getCell(4).value = 'EQUIPMENT DATA';
-    worksheet.mergeCells(1, 4, 1, 8);
-    // Ex Data (I–M)
-    groupRow.getCell(9).value = 'EX DATA';
-    worksheet.mergeCells(1, 9, 1, 13);
-    // Certification (N–Q)
-    groupRow.getCell(14).value = 'CERTIFICATION';
-    worksheet.mergeCells(1, 14, 1, 17);
-    // Zone Requirements (R–U)
-    groupRow.getCell(18).value = 'ZONE REQUIREMENTS';
-    worksheet.mergeCells(1, 18, 1, 21);
-    // User Requirement (V–Z)
-    groupRow.getCell(22).value = 'USER REQUIREMENT';
-    worksheet.mergeCells(1, 22, 1, 26);
-    // Inspection Data (AA–AE)
-    groupRow.getCell(27).value = 'INSPECTION DATA';
-    worksheet.mergeCells(1, 27, 1, 31);
+    worksheet.mergeCells(1, 1, 1, 4);
+    // Equipment data (E–I)
+    groupRow.getCell(5).value = 'EQUIPMENT DATA';
+    worksheet.mergeCells(1, 5, 1, 9);
+    // Ex Data (J–N)
+    groupRow.getCell(10).value = 'EX DATA';
+    worksheet.mergeCells(1, 10, 1, 14);
+    // Certification (O–R)
+    groupRow.getCell(15).value = 'CERTIFICATION';
+    worksheet.mergeCells(1, 15, 1, 18);
+    // Zone Requirements (S–V)
+    groupRow.getCell(19).value = 'ZONE REQUIREMENTS';
+    worksheet.mergeCells(1, 19, 1, 22);
+    // User Requirement (W–AA)
+    groupRow.getCell(23).value = 'USER REQUIREMENT';
+    worksheet.mergeCells(1, 23, 1, 27);
+    // Inspection Data (AB–AF)
+    groupRow.getCell(28).value = 'INSPECTION DATA';
+    worksheet.mergeCells(1, 28, 1, 32);
 
     // Csoportosító sor formázása (1. sor)
     groupRow.eachCell((cell, colNumber) => {
       let bg = null;
 
-      if (colNumber >= 1 && colNumber <= 3) {
-        // Identification (A–C) – zöld háttér
+      if (colNumber >= 1 && colNumber <= 4) {
+        // Identification (A–D) – zöld háttér
         bg = 'FF00AA00';
-      } else if (colNumber >= 4 && colNumber <= 8) {
-        // Equipment data (D–H) – narancssárga háttér
+      } else if (colNumber >= 5 && colNumber <= 9) {
+        // Equipment data (E–I) – narancssárga háttér
         bg = 'FFFF9900';
-      } else if (colNumber >= 9 && colNumber <= 13) {
-        // Ex Data (I–M) – kék háttér
+      } else if (colNumber >= 10 && colNumber <= 14) {
+        // Ex Data (J–N) – kék háttér
         bg = 'FF538DD5';
-      } else if (colNumber >= 14 && colNumber <= 17) {
-        // Certification (N–Q) – zöld háttér
+      } else if (colNumber >= 15 && colNumber <= 18) {
+        // Certification (O–R) – zöld háttér
         bg = 'FF00AA00';
-      } else if (colNumber >= 18 && colNumber <= 21) {
-        // Zone Requirements (R–U) – sárga háttér
+      } else if (colNumber >= 19 && colNumber <= 22) {
+        // Zone Requirements (S–V) – sárga háttér
         bg = 'FFFFFF66';
-      } else if (colNumber >= 22 && colNumber <= 26) {
-        // User Requirement (V–Z) – világos lila háttér
+      } else if (colNumber >= 23 && colNumber <= 27) {
+        // User Requirement (W–AA) – világos lila háttér
         bg = 'FFB1A0C7';
-      } else if (colNumber >= 27 && colNumber <= 31) {
-        // Inspection Data (AA–AE) – szürke háttér
+      } else if (colNumber >= 28 && colNumber <= 32) {
+        // Inspection Data (AB–AF) – szürke háttér
         bg = 'FFB0B0B0';
       }
 
@@ -1378,26 +1539,25 @@ exports.exportEquipmentXLSX = async (req, res) => {
     headerRow.eachCell((cell, colNumber) => {
       let bg = null;
 
-      if (colNumber >= 1 && colNumber <= 3) {
+      if (colNumber >= 1 && colNumber <= 4) {
         // Identification – világos zöld
         bg = 'FFCCFFCC';
-      } else if (colNumber >= 4 && colNumber <= 8) {
+      } else if (colNumber >= 5 && colNumber <= 9) {
         // Equipment data – világos narancssárga
         bg = 'FFFFE0B2';
-      } else if (colNumber >= 9 && colNumber <= 13) {
+      } else if (colNumber >= 10 && colNumber <= 14) {
         // Ex Data – világos narancssárga
         bg = 'FFDCE6F1';
-      } 
-      else if (colNumber >= 14 && colNumber <= 17) {
+      } else if (colNumber >= 15 && colNumber <= 18) {
         // Certification – világos zöld
         bg = 'FFCCFFCC';
-      } else if (colNumber >= 18 && colNumber <= 21) {
+      } else if (colNumber >= 19 && colNumber <= 22) {
         // Zone Requirements – világos sárga
         bg = 'FFFFFFCC';
-      } else if (colNumber >= 22 && colNumber <= 26) {
+      } else if (colNumber >= 23 && colNumber <= 27) {
         // User Requirement – világos lila
         bg = 'FFE4DFEC';
-      } else if (colNumber >= 27 && colNumber <= 31) {
+      } else if (colNumber >= 28 && colNumber <= 32) {
         // Inspection Data – világos szürke
         bg = 'FFE0E0E0';
       }
@@ -1536,6 +1696,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
 
       for (const marking of exMarkings) {
         const rowData = {
+          '_id': eq._id ? eq._id.toString() : '',
           '#': typeof eq.orderIndex === 'number' && eq.orderIndex > 0
             ? eq.orderIndex
             : equipmentIndex,
@@ -1911,6 +2072,70 @@ exports.updateEquipment = async (req, res) => {
 };
 
 // Törlés (DELETE /exreg/:id)
+async function deleteEquipmentInternal(equipment, tenantId, tenantName) {
+  let zoneDoc = null;
+  let siteDoc = null;
+  if (equipment.Zone && equipment.Site) {
+    zoneDoc = await Zone.findById(equipment.Zone).lean();
+    siteDoc = await Site.findById(equipment.Site).lean();
+  }
+  const zoneName = zoneDoc?.Name || (equipment.Zone ? `Zone_${equipment.Zone}` : null);
+  const siteName = siteDoc?.Name || (equipment.Site ? `Site_${equipment.Site}` : null);
+  const eqPrefix = buildEquipmentPrefix(tenantName, tenantId, siteName, zoneName, equipment.EqID);
+  try { await azureBlob.deletePrefix(`${eqPrefix}/`); } catch (e) { console.warn('⚠️ deletePrefix failed:', e?.message); }
+  // Kapcsolódó inspectionök és azok blob képeinek törlése
+  try {
+    const inspections = await Inspection.find({ equipmentId: equipment._id, tenantId });
+    const blobPaths = new Set();
+    inspections.forEach(insp => {
+      (insp.attachments || []).forEach(att => {
+        const raw = att?.blobPath || att?.blobUrl;
+        const normalized = raw ? azureBlob.toBlobPath(raw) : '';
+        if (normalized) {
+          blobPaths.add(normalized);
+        }
+      });
+    });
+
+    for (const blobPath of blobPaths) {
+      try {
+        if (typeof azureBlob.deleteFile === 'function') {
+          await azureBlob.deleteFile(blobPath);
+        }
+      } catch (e) {
+        try {
+          console.warn('⚠️ Failed to delete inspection blob while deleting equipment:', {
+            blobPath,
+            error: e?.message || e
+          });
+        } catch {}
+      }
+    }
+
+    if (inspections.length) {
+      await Inspection.deleteMany({ equipmentId: equipment._id, tenantId });
+    }
+  } catch (inspErr) {
+    console.error('⚠️ Warning: Nem sikerült a kapcsolódó inspectionök teljes törlése equipment törléskor:', inspErr);
+  }
+
+  const deletedOrderIndex =
+    typeof equipment.orderIndex === 'number' && equipment.orderIndex > 0
+      ? equipment.orderIndex
+      : null;
+
+  await Equipment.deleteOne({ _id: equipment._id });
+
+  // 🧹 Sorszámok újraszámozása az adott zónán/projekten belül
+  if (deletedOrderIndex != null) {
+    const scopeFilter = { tenantId, orderIndex: { $gt: deletedOrderIndex } };
+    if (equipment.Zone) scopeFilter.Zone = equipment.Zone;
+    if (equipment.Site) scopeFilter.Site = equipment.Site;
+
+    await Equipment.updateMany(scopeFilter, { $inc: { orderIndex: -1 } });
+  }
+}
+
 exports.deleteEquipment = async (req, res) => {
   const { id } = req.params;
   try {
@@ -1923,71 +2148,96 @@ exports.deleteEquipment = async (req, res) => {
     if (!equipment) {
       return res.status(404).json({ error: 'Az eszköz nem található vagy nem tartozik a vállalatához.' });
     }
-    let zoneDoc = null;
-    let siteDoc = null;
-    if (equipment.Zone && equipment.Site) {
-      zoneDoc = await Zone.findById(equipment.Zone).lean();
-      siteDoc = await Site.findById(equipment.Site).lean();
-    }
-    const zoneName = zoneDoc?.Name || (equipment.Zone ? `Zone_${equipment.Zone}` : null);
-    const siteName = siteDoc?.Name || (equipment.Site ? `Site_${equipment.Site}` : null);
-    const eqPrefix = buildEquipmentPrefix(tenantName, tenantId, siteName, zoneName, equipment.EqID);
-    try { await azureBlob.deletePrefix(`${eqPrefix}/`); } catch (e) { console.warn('⚠️ deletePrefix failed:', e?.message); }
-    // Kapcsolódó inspectionök és azok blob képeinek törlése
-    try {
-      const inspections = await Inspection.find({ equipmentId: equipment._id, tenantId });
-      const blobPaths = new Set();
-      inspections.forEach(insp => {
-        (insp.attachments || []).forEach(att => {
-          const raw = att?.blobPath || att?.blobUrl;
-          const normalized = raw ? azureBlob.toBlobPath(raw) : '';
-          if (normalized) {
-            blobPaths.add(normalized);
-          }
-        });
-      });
 
-      for (const blobPath of blobPaths) {
-        try {
-          if (typeof azureBlob.deleteFile === 'function') {
-            await azureBlob.deleteFile(blobPath);
-          }
-        } catch (e) {
-          try {
-            console.warn('⚠️ Failed to delete inspection blob while deleting equipment:', {
-              blobPath,
-              error: e?.message || e
-            });
-          } catch {}
-        }
-      }
+    await deleteEquipmentInternal(equipment, tenantId, tenantName);
 
-      if (inspections.length) {
-        await Inspection.deleteMany({ equipmentId: equipment._id, tenantId });
-      }
-    } catch (inspErr) {
-      console.error('⚠️ Warning: Nem sikerült a kapcsolódó inspectionök teljes törlése equipment törléskor:', inspErr);
-    }
-
-    const deletedOrderIndex =
-      typeof equipment.orderIndex === 'number' && equipment.orderIndex > 0
-        ? equipment.orderIndex
-        : null;
-
-    await Equipment.deleteOne({ _id: id });
-
-    // 🧹 Sorszámok újraszámozása az adott zónán/projekten belül
-    if (deletedOrderIndex != null) {
-      const scopeFilter = { tenantId, orderIndex: { $gt: deletedOrderIndex } };
-      if (equipment.Zone) scopeFilter.Zone = equipment.Zone;
-      if (equipment.Site) scopeFilter.Site = equipment.Site;
-
-      await Equipment.updateMany(scopeFilter, { $inc: { orderIndex: -1 } });
-    }
     return res.json({ message: 'Az eszköz és a hozzá tartozó inspectionök sikeresen törölve.' });
   } catch (error) {
     console.error('❌ Hiba az eszköz törlésekor:', error);
     return res.status(500).json({ error: 'Nem sikerült törölni az eszközt.' });
+  }
+};
+
+// Tömeges eszköz törlés (pl. 100+ egyszerre)
+exports.bulkDeleteEquipment = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) {
+      return res.status(401).json({ error: 'Nincs bejelentkezett felhasználó vagy hiányzó tenant.' });
+    }
+    const tenantName = req.scope?.tenantName || '';
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    if (!ids.length) {
+      return res.status(400).json({ error: 'Nincs megadva törlendő eszköz lista (ids).' });
+    }
+
+    const objectIds = ids
+      .map(id => {
+        try {
+          return new mongoose.Types.ObjectId(id);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+
+    if (!objectIds.length) {
+      return res.status(400).json({ error: 'Érvénytelen eszköz azonosítók.' });
+    }
+
+    const equipments = await Equipment.find({ _id: { $in: objectIds }, tenantId });
+    if (!equipments.length) {
+      return res.status(404).json({ error: 'Egyik megadott eszköz sem található vagy nem tartozik a vállalatához.' });
+    }
+
+    const results = [];
+    // Limitált párhuzamosság: egyszerre max 5 törlés fusson
+    const concurrency = 5;
+    let index = 0;
+
+    async function runNextBatch() {
+      const batch = equipments.slice(index, index + concurrency);
+      if (!batch.length) return;
+      index += concurrency;
+
+      await Promise.all(
+        batch.map(async eq => {
+          try {
+            await deleteEquipmentInternal(eq, tenantId, tenantName);
+            results.push({ id: String(eq._id), status: 'deleted' });
+          } catch (err) {
+            console.error('❌ Hiba az eszköz tömeges törlésekor:', err);
+            results.push({
+              id: String(eq._id),
+              status: 'error',
+              error: err?.message || 'Ismeretlen hiba a törlés során.'
+            });
+          }
+        })
+      );
+
+      return runNextBatch();
+    }
+
+    await runNextBatch();
+
+    const deletedCount = results.filter(r => r.status === 'deleted').length;
+    const failed = results.filter(r => r.status === 'error');
+
+    const message =
+      failed.length === 0
+        ? 'Minden kijelölt eszköz és kapcsolódó inspection sikeresen törölve.'
+        : 'A legtöbb eszköz törlése sikeres volt, de néhánynál hiba történt.';
+
+    return res.status(failed.length ? 207 : 200).json({
+      message,
+      deletedCount,
+      failedCount: failed.length,
+      results
+    });
+  } catch (error) {
+    console.error('❌ Hiba a tömeges eszköz törlésekor:', error);
+    return res.status(500).json({ error: 'Nem sikerült a tömeges eszköz törlés.' });
   }
 };
 
