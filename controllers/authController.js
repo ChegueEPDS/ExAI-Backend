@@ -250,7 +250,8 @@ exports.register = async (req, res) => {
       const html = registrationEmailHtml({
         firstName: user.firstName || '',
         lastName: user.lastName || '',
-        loginUrl
+        loginUrl,
+        tenantName: personalTenant.name
       });
       mailService.sendMail({
         to: user.email,
@@ -456,13 +457,25 @@ exports.forgotPassword = async (req, res) => {
     user.password = hashed;
     await user.save();
 
+    // Resolve tenant name (if any) for branding
+    let tenantName = null;
+    if (user.tenantId) {
+      try {
+        const t = await Tenant.findById(user.tenantId).select('name').lean();
+        tenantName = t?.name || null;
+      } catch (_) {
+        tenantName = null;
+      }
+    }
+
     // Send email with the new temporary password
     const loginUrl = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
     const html = forgotPasswordEmailHtml({
       firstName: user.firstName || '',
       lastName: user.lastName || '',
       loginUrl,
-      tempPassword
+      tempPassword,
+      tenantName: tenantName || undefined
     });
 
     // fire-and-forget

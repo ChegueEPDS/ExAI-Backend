@@ -12,6 +12,7 @@ const { notifyAndStore } = require('../lib/notifications/notifier');
 const { extractCertFieldsFromOCR } = require('../helpers/openaiCertExtractor');
 const mongoose = require('mongoose');
 const User = require('../models/user');
+const Tenant = require('../models/tenant');
 const upload = multer({ dest: 'uploads/' });
 const DraftCertificate = require('../models/draftCertificate.js');
 const CompanyCertificateLink = require('../models/companyCertificateLink');
@@ -214,6 +215,7 @@ async function finishCheckAndNotify(uploadId) {
     let to = '';
     let firstName = '';
     let lastName = '';
+    let tenantName = '';
 
     if (batch.createdBy) {
       const createdById = String(batch.createdBy);
@@ -226,6 +228,15 @@ async function finishCheckAndNotify(uploadId) {
         to = (user.email || '').toString();
         firstName = (user.firstName || '').toString();
         lastName = (user.lastName || '').toString();
+
+        if (user.tenantId) {
+          try {
+            const t = await Tenant.findById(user.tenantId).select('name').lean();
+            tenantName = t?.name || '';
+          } catch (_) {
+            tenantName = '';
+          }
+        }
       }
     }
 
@@ -242,7 +253,8 @@ async function finishCheckAndNotify(uploadId) {
 
     const html = mailTemplates.uploadCompletedEmail(
       { firstName: displayName, lastName: '' },
-      { uploadId, total, saved, discarded }
+      { uploadId, total, saved, discarded },
+      tenantName || undefined
     );
 
     try {
@@ -801,6 +813,16 @@ exports.finalizeDrafts = async (req, res) => {
               if (request && request.createdBy) {
                 const requester = await User.findById(request.createdBy).lean();
                 if (requester && requester.email) {
+                  let tenantName = '';
+                  if (requester.tenantId) {
+                    try {
+                      const t = await Tenant.findById(requester.tenantId).select('name').lean();
+                      tenantName = t?.name || '';
+                    } catch (_) {
+                      tenantName = '';
+                    }
+                  }
+
                   const to = requester.email;
                   const subject = 'Your certificate request has been fulfilled';
                   const html = mailTemplates.certificateRequestFulfilledEmail({
@@ -813,6 +835,7 @@ exports.finalizeDrafts = async (req, res) => {
                       model: request.model || '',
                       status: 'fulfilled',
                     },
+                    tenantName: tenantName || undefined
                   });
 
                   try {
@@ -1071,6 +1094,16 @@ exports.finalizeSingleDraftById = async (req, res) => {
         if (request && request.createdBy) {
           const requester = await User.findById(request.createdBy).lean();
           if (requester && requester.email) {
+            let tenantName = '';
+            if (requester.tenantId) {
+              try {
+                const t = await Tenant.findById(requester.tenantId).select('name').lean();
+                tenantName = t?.name || '';
+              } catch (_) {
+                tenantName = '';
+              }
+            }
+
             const to = requester.email;
             const subject = 'Your certificate request has been fulfilled';
             const html = mailTemplates.certificateRequestFulfilledEmail({
@@ -1083,6 +1116,7 @@ exports.finalizeSingleDraftById = async (req, res) => {
                 model: request.model || '',
                 status: 'fulfilled',
               },
+              tenantName: tenantName || undefined
             });
 
             try {

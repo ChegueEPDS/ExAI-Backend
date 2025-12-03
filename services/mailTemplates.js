@@ -1,6 +1,11 @@
 // services/mailTemplates.js
 
-function baseTemplate({ title, bodyHtml }) {
+function baseTemplate({ title, bodyHtml, tenantName }) {
+  const isIndex = (tenantName || '').toLowerCase() === 'index';
+  const logoUrl = isIndex ? 'https://certs.atexdb.eu/public/index_logo.png' : 'https://certs.atexdb.eu/public/ATEXdb.png';
+  const logoAlt = isIndex ? 'ExAI IndEx Logo' : 'ATEXdb Certs Logo';
+  const footerName = isIndex ? 'ExAI IndEx' : 'ATEXdb Certs';
+
   return `
   <!DOCTYPE html>
   <html lang="en">
@@ -17,8 +22,8 @@ function baseTemplate({ title, bodyHtml }) {
             <tr>
               <td align="center" style="padding:20px; background:#ebebeb;">
                 <!-- ⚠️ SVG helyett PNG + e-mail safe inline stílusok -->
-                <img src="https://certs.atexdb.eu/public/ATEXdb.png"
-                     alt="ATEXdb Logo"
+                <img src="${logoUrl}"
+                     alt="${logoAlt}"
                      width="220" height="auto"
                      style="display:block; outline:none; border:0; text-decoration:none; -ms-interpolation-mode:bicubic; max-width:220px; height:auto;" />
               </td>
@@ -30,7 +35,7 @@ function baseTemplate({ title, bodyHtml }) {
             </tr>
             <tr>
               <td align="center" style="padding:20px; background:#ebebeb; font-size:12px; color:#777;">
-                © ${new Date().getFullYear()} ATEXdb Certs. All rights reserved.
+                © ${new Date().getFullYear()} ${footerName}. All rights reserved.
               </td>
             </tr>
           </table>
@@ -42,22 +47,23 @@ function baseTemplate({ title, bodyHtml }) {
   `;
 }
 
-function registrationEmailHtml({ firstName, lastName, loginUrl }) {
+function registrationEmailHtml({ firstName, lastName, loginUrl, tenantName }) {
   // loginUrl legyen teljes https URL
   const safeLoginUrl = loginUrl?.startsWith('http') ? loginUrl : `https://${loginUrl}`;
   return baseTemplate({
     title: 'Welcome to ATEXdb Certs',
+    tenantName,
     bodyHtml: `
       <h2 style="color:#131313;">Dear ${firstName} ${lastName},</h2>
-      <p>Thank you for registering on the <strong>ATEXdb Certs</strong> platform.</p>
+      <p>Thank you for registering on the <strong>${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb Certs'}</strong> platform.</p>
       <p>You can now log in and start managing your certificates and compliance documents.</p>
       <p style="margin:30px 0; text-align:center;">
         <a href="${safeLoginUrl}" target="_blank" rel="noopener noreferrer"
            style="background:#f8d201; color:#131313; text-decoration:none; padding:12px 24px; border-radius:4px; font-size:16px; display:inline-block;">
-          Go to ATEXdb Certs
+          Go to ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb Certs'}
         </a>
       </p>
-      <p>Best regards,<br/>The ATEXdb Team<br/>
+      <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team<br/>
          <a href="https://certs.atexdb.eu" target="_blank" rel="noopener noreferrer">certs.atexdb.eu</a>
       </p>
     `,
@@ -68,9 +74,10 @@ function tenantInviteEmailHtml({ firstName, lastName, tenantName, loginUrl, pass
   const safeLoginUrl = loginUrl?.startsWith('http') ? loginUrl : `https://${loginUrl}`;
   return baseTemplate({
     title: 'You have been added to a tenant',
+    tenantName,
     bodyHtml: `
       <h2 style="color:#131313;">Dear ${firstName} ${lastName},</h2>
-      <p>You have been added to the tenant <strong>${tenantName}</strong> on the <strong>ATEXdb Certs</strong> platform.</p>
+      <p>You have been added to the tenant <strong>${tenantName}</strong> on the <strong>${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb Certs'}</strong> platform.</p>
       <p>You can log in using your email address${password ? ` and the password below` : ''}:</p>
       ${
         password
@@ -80,23 +87,24 @@ function tenantInviteEmailHtml({ firstName, lastName, tenantName, loginUrl, pass
       <p style="margin:30px 0; text-align:center;">
         <a href="${safeLoginUrl}" target="_blank" rel="noopener noreferrer"
            style="background:#f8d201; color:#131313; text-decoration:none; padding:12px 24px; border-radius:4px; font-size:16px; display:inline-block;">
-          Log in to ATEXdb Certs
+          Log in to ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb Certs'}
         </a>
       </p>
-      <p>Best regards,<br/>The ATEXdb Team<br/>
+      <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team<br/>
          <a href="https://certs.atexdb.eu" target="_blank" rel="noopener noreferrer">certs.atexdb.eu</a>
       </p>
     `,
   });
 }
 
-function forgotPasswordEmailHtml({ firstName, lastName, loginUrl, tempPassword }) {
+function forgotPasswordEmailHtml({ firstName, lastName, loginUrl, tempPassword, tenantName }) {
   const safeLoginUrl = loginUrl?.startsWith('http') ? loginUrl : `https://${loginUrl}`;
   return baseTemplate({
     title: 'Your temporary password',
+    tenantName,
     bodyHtml: `
       <h2 style="color:#131313;">Dear ${firstName || ''} ${lastName || ''},</h2>
-      <p>We received a request to reset your password for <strong>ATEXdb Certs</strong>.</p>
+      <p>We received a request to reset your password for <strong>${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb Certs'}</strong>.</p>
       <p>Here is your temporary password:</p>
       <div style="background:#ebebeb; padding:12px 14px; border-radius:6px; font-family:monospace; font-size:16px; text-align:center;">
         <span style="word-break:break-all;">${tempPassword}</span>
@@ -107,10 +115,10 @@ function forgotPasswordEmailHtml({ firstName, lastName, loginUrl, tempPassword }
       <p style="margin:28px 0; text-align:center;">
         <a href="${safeLoginUrl}" target="_blank" rel="noopener noreferrer"
            style="background:#f8d201; color:#131313; text-decoration:none; padding:12px 24px; border-radius:6px; font-size:16px; display:inline-block;">
-          Go to ATEXdb Certs
+          Go to ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb Certs'}
         </a>
       </p>
-      <p>Best regards,<br/>The ATEXdb Team<br/>
+      <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team<br/>
          <a href="https://certs.atexdb.eu" target="_blank" rel="noopener noreferrer">certs.atexdb.eu</a>
       </p>
     `,
@@ -120,7 +128,7 @@ function forgotPasswordEmailHtml({ firstName, lastName, loginUrl, tempPassword }
 /**
  * Upload completion email (HTML only)
  */
-function uploadCompletedEmail(user = {}, stats = {}) {
+function uploadCompletedEmail(user = {}, stats = {}, tenantName) {
   const { firstName = '', lastName = '' } = user;
   const { uploadId = '', total = 0, saved = 0, discarded = 0 } = stats;
 
@@ -128,6 +136,7 @@ function uploadCompletedEmail(user = {}, stats = {}) {
 
   return baseTemplate({
     title: 'Upload processing completed',
+    tenantName,
     bodyHtml: `
       <h2 style="color:#131313;">Dear ${escapeHtml(fullName)},</h2>
       <p>Your certificate upload with ID <strong>${escapeHtml(uploadId)}</strong> has been fully processed.</p>
@@ -142,12 +151,12 @@ function uploadCompletedEmail(user = {}, stats = {}) {
 
       <p>Some of the uploaded certificates might have been discarded during verification, either because their content did not meet validation requirements or because an identical record already exists in our database.</p>
 
-      <p style="margin-top:16px;">Thank you for using <strong>ATEXdb Certs</strong>.</p>
+      <p style="margin-top:16px;">Thank you for using <strong>${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb Certs'}</strong>.</p>
     `
   });
 }
 
-function certificateRequestFulfilledEmail({ firstName, lastName, certNo, request = {} }) {
+function certificateRequestFulfilledEmail({ firstName, lastName, certNo, request = {}, tenantName }) {
   const {
     certNo: requestedCertNo = '',
     manufacturer = '',
@@ -166,9 +175,10 @@ function certificateRequestFulfilledEmail({ firstName, lastName, certNo, request
 
   return baseTemplate({
     title: 'Your requested certificate is available',
+    tenantName,
     bodyHtml: `
       <h2 style="color:#131313;">Dear ${escapeHtml(fullName)},</h2>
-      <p>The certificate you requested is now available in <strong>ATEXdb Certs</strong>.</p>
+      <p>The certificate you requested is now available in <strong>${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb Certs'}</strong>.</p>
 
       <p style="margin:16px 0 8px 0;"><strong>Uploaded certificate:</strong></p>
       <div style="background:#ebebeb; padding:10px 12px; border-radius:6px; font-family:monospace; font-size:15px;">
@@ -200,11 +210,11 @@ function certificateRequestFulfilledEmail({ firstName, lastName, certNo, request
       <p style="margin:24px 0; text-align:center;">
         <a href="${appUrl}" target="_blank" rel="noopener noreferrer"
            style="background:#f8d201; color:#131313; text-decoration:none; padding:12px 24px; border-radius:6px; font-size:16px; display:inline-block;">
-          Go to ATEXdb Certs
+          Go to ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb Certs'}
         </a>
       </p>
 
-      <p>Best regards,<br/>The ATEXdb Team<br/>
+      <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team<br/>
          <a href="https://certs.atexdb.eu" target="_blank" rel="noopener noreferrer">certs.atexdb.eu</a>
       </p>
     `,

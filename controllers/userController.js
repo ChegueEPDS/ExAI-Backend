@@ -528,7 +528,8 @@ async function createTenantForRegistration({ plan, companyName, ownerUserId }) {
         const html = registrationEmailHtml({
           firstName: user.firstName || '',
           lastName:  user.lastName  || '',
-          loginUrl
+          loginUrl,
+          tenantName: tenant.name
         });
         await mailService.sendMail({
           to: user.email,

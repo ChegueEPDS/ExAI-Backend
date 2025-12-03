@@ -26,6 +26,14 @@ router.post(
     upload.array('files'),
     zoneController.uploadFileToZone
   );
+
+// XLSX import zónákhoz (egy adott site alá)
+router.post(
+  '/import-xlsx',
+  authMiddleware(),
+  upload.single('file'),
+  zoneController.importZonesFromXlsx
+);
   
   router.get(
     '/:id/files',
