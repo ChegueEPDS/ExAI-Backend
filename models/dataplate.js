@@ -14,6 +14,8 @@ const ExMarkingSchema = new mongoose.Schema({
 const EquipmentSchema = new mongoose.Schema({
   "EqID": { type: String },
   "TagNo": { type: String },
+  // Sorszám / index az adott zónán (vagy projekten) belül
+  orderIndex: { type: Number, default: null, index: true },
   "Manufacturer": { type: String },
   "Model/Type": { type: String },
   "Serial Number": { type: String },

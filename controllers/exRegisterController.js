@@ -10,6 +10,10 @@ const fs = require('fs');
 const azureBlob = require('../services/azureBlobService');
 const mime = require('mime-types');
 const ExcelJS = require('exceljs');
+const {
+  buildCertificateCacheForTenant,
+  resolveCertificateFromCache
+} = require('../helpers/certificateMatchHelper');
 
 const { BlobServiceClient } = require('@azure/storage-blob');
 const path = require('path');
@@ -39,6 +43,11 @@ const HEADER_ALIASES = {
   'protection concept': 'Protection Concept',
   'certificate no': 'Certificate No',
   'certificate number': 'Certificate No',
+  'declaration of conformity': 'Declaration of conformity',
+  'declaration of comformity': 'Declaration of conformity',
+  'type': 'Type',
+  'inspection type': 'Type',
+  'inspectiontype': 'Type',
   'inspection date': 'Inspection Date',
   'inspection status': 'Status',
   'status': 'Status',
@@ -84,6 +93,26 @@ function slug(s) {
 function buildTenantRoot(tenantName, tenantId) {
   const tn = slug(tenantName) || `TENANT_${tenantId}`;
   return `${tn}`;
+}
+
+// 🔢 Következő sorszám kiszámítása az adott zónán/projekten belül
+async function getNextOrderIndex(tenantId, siteId, zoneId) {
+  const filter = { tenantId };
+  if (zoneId) filter.Zone = zoneId;
+  if (siteId) filter.Site = siteId;
+
+  const maxDoc = await Equipment.find(filter)
+    .sort({ orderIndex: -1 })
+    .limit(1)
+    .select('orderIndex')
+    .lean();
+
+  const currentMax =
+    Array.isArray(maxDoc) && maxDoc.length
+      ? (typeof maxDoc[0].orderIndex === 'number' ? maxDoc[0].orderIndex : 0)
+      : (maxDoc && typeof maxDoc.orderIndex === 'number' ? maxDoc.orderIndex : 0);
+
+  return (currentMax || 0) + 1;
 }
 
 function normalizeImageTag(tag, fallback = 'general') {
@@ -228,6 +257,16 @@ function normalizeComplianceStatus(status) {
   return 'NA';
 }
 
+function normalizeInspectionType(rawType) {
+  if (!rawType) return 'Detailed';
+  const value = String(rawType).trim().toLowerCase();
+  if (!value) return 'Detailed';
+  if (value.includes('visual')) return 'Visual';
+  if (value.startsWith('close') || value.startsWith('closed')) return 'Close';
+  if (value.startsWith('detailed')) return 'Detailed';
+  return 'Detailed';
+}
+
 function determineEnvironmentFromSubGroup(value) {
   if (!value) return '';
   const entries = String(value)
@@ -273,7 +312,7 @@ function extractProtectionTypesFromEquipment(equipmentDoc) {
     .filter(Boolean);
 }
 
-async function loadAutoInspectionQuestions(equipmentDoc, tenantId) {
+async function loadAutoInspectionQuestions(equipmentDoc, tenantId, inspectionType = 'Detailed') {
   try {
     const protections = extractProtectionTypesFromEquipment(equipmentDoc);
     const filter = {};
@@ -302,7 +341,7 @@ async function loadAutoInspectionQuestions(equipmentDoc, tenantId) {
 
     return questions.filter(q => {
       const types = Array.isArray(q.inspectionTypes) ? q.inspectionTypes : [];
-      return !types.length || types.includes('Detailed');
+      return !types.length || types.includes(inspectionType);
     });
   } catch (err) {
     console.error('⚠️ Failed to load auto inspection questions:', err);
@@ -522,6 +561,13 @@ exports.createEquipment = async (req, res) => {
         tenantId,
         Pictures: [...(existingEquipment?.Pictures || []), ...pictures]
       };
+
+      // Ha az UI nem ad meg orderIndex-et, automatikusan kiosztjuk a következő szabad sorszámot
+      if (updateFields.orderIndex == null) {
+        const siteIdForIndex = equipment.Site || null;
+        const zoneIdForIndex = equipment.Zone || null;
+        updateFields.orderIndex = await getNextOrderIndex(tenantId, siteIdForIndex, zoneIdForIndex);
+      }
 
       if (existingEquipment) {
         updateFields.ModifiedBy = CreatedBy;
@@ -807,12 +853,18 @@ exports.importEquipmentXLSX = async (req, res) => {
       const ipRating = getCellString(row, headerInfo.headerMap, 'IP rating');
       const tempRange = getCellString(row, headerInfo.headerMap, 'Temp. Range');
       const certificateNo = getCellString(row, headerInfo.headerMap, 'Certificate No');
+      const declarationNo = getCellString(row, headerInfo.headerMap, 'Declaration of conformity');
       const remarks = getCellString(row, headerInfo.headerMap, 'Remarks');
       const epl = getCellString(row, headerInfo.headerMap, 'EPL');
       const subGroup = getCellString(row, headerInfo.headerMap, 'SubGroup');
       const tempClass = getCellString(row, headerInfo.headerMap, 'Temperature Class');
       const protectionConcept = getCellString(row, headerInfo.headerMap, 'Protection Concept');
+      const indexRaw = getCellString(row, headerInfo.headerMap, '#');
+      const parsedIndex = indexRaw ? parseInt(indexRaw, 10) : null;
+      const orderIndex = Number.isFinite(parsedIndex) && parsedIndex > 0 ? parsedIndex : null;
       const inspectionStatus = normalizeComplianceStatus(getCellString(row, headerInfo.headerMap, 'Status'));
+      const inspectionTypeRaw = getCellString(row, headerInfo.headerMap, 'Type');
+      const inspectionType = inspectionTypeRaw ? normalizeInspectionType(inspectionTypeRaw) : null;
       const inspectionDate = getCellDate(row, headerInfo.headerMap, 'Inspection Date');
 
       const rowHasData = [
@@ -825,6 +877,7 @@ exports.importEquipmentXLSX = async (req, res) => {
         ipRating,
         tempRange,
         certificateNo,
+        declarationNo,
         remarks
       ].some(Boolean);
 
@@ -848,6 +901,7 @@ exports.importEquipmentXLSX = async (req, res) => {
         equipmentMap.set(entryKey, {
           rows: [],
           eqId,
+          orderIndex: orderIndex,
           base: {
             EqID: eqId,
             TagNo: tagNo || '',
@@ -857,19 +911,25 @@ exports.importEquipmentXLSX = async (req, res) => {
             'Serial Number': serialNumber || '',
             'IP rating': ipRating || '',
             'Max Ambient Temp': tempRange || '',
-            'Certificate No': certificateNo || '',
+            'Certificate No': certificateNo || declarationNo || '',
             'Other Info': remarks || '',
             Compliance: inspectionStatus || 'NA',
             'Ex Marking': [],
             'X condition': { X: false, Specific: '' }
           },
           inspectionDate: inspectionDate || null,
-          inspectionStatus
+          inspectionStatus,
+          inspectionType: inspectionType || null
         });
       }
 
       const entry = equipmentMap.get(entryKey);
       entry.rows.push(rowNumber);
+
+       // Ha több soron keresztül jön ugyanahhoz az EqID-hez index, az első nem üres érték nyer
+      if (orderIndex != null && entry.orderIndex == null) {
+        entry.orderIndex = orderIndex;
+      }
 
       if (tagNo && !entry.base.TagNo) entry.base.TagNo = tagNo;
       if (description) entry.base['Equipment Type'] = description;
@@ -884,6 +944,9 @@ exports.importEquipmentXLSX = async (req, res) => {
       if (!entry.inspectionDate && inspectionDate) entry.inspectionDate = inspectionDate;
       if (entry.inspectionStatus === 'NA' && inspectionStatus !== 'NA') {
         entry.inspectionStatus = inspectionStatus;
+      }
+      if (inspectionType && (!entry.inspectionType || entry.inspectionType === 'Detailed')) {
+        entry.inspectionType = inspectionType;
       }
 
       if (epl || subGroup || tempClass || protectionConcept) {
@@ -928,6 +991,9 @@ exports.importEquipmentXLSX = async (req, res) => {
         const payload = { ...entry.base };
         payload.Zone = zone._id;
         payload.Site = zone.Site || null;
+        if (entry.orderIndex != null) {
+          payload.orderIndex = entry.orderIndex;
+        }
         payload['Ex Marking'] = (payload['Ex Marking'] || []).filter(mark =>
           Object.values(mark).some(value => !!String(value || '').trim())
         );
@@ -943,6 +1009,10 @@ exports.importEquipmentXLSX = async (req, res) => {
           const updateData = { ...payload, ModifiedBy: userId };
           delete updateData.CreatedBy;
           delete updateData.tenantId;
+          // Ha importban nincs megadva sorszám, ne nullázzuk le a meglévőt
+          if (entry.orderIndex == null) {
+            delete updateData.orderIndex;
+          }
           equipmentDoc = await Equipment.findByIdAndUpdate(
             lookup._id,
             { $set: updateData },
@@ -955,6 +1025,13 @@ exports.importEquipmentXLSX = async (req, res) => {
             tenantId,
             CreatedBy: userId
           };
+          if (createData.orderIndex == null) {
+            createData.orderIndex = await getNextOrderIndex(
+              tenantId,
+              createData.Site || null,
+              createData.Zone || null
+            );
+          }
           equipmentDoc = await Equipment.create(createData);
           stats.created += 1;
         }
@@ -969,7 +1046,8 @@ exports.importEquipmentXLSX = async (req, res) => {
               equipmentDoc,
               entry.inspectionDate,
               userId,
-              tenantId
+              tenantId,
+              entry.inspectionType || 'Detailed'
             );
             stats.inspections += 1;
           } catch (inspectionError) {
@@ -1008,7 +1086,7 @@ exports.importEquipmentXLSX = async (req, res) => {
   }
 };
 
-async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspectorId, tenantId) {
+async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspectorId, tenantId, inspectionType = 'Detailed') {
   const date = new Date(inspectionDate);
   if (Number.isNaN(date.getTime())) {
     throw new Error('Invalid inspection date provided.');
@@ -1017,7 +1095,9 @@ async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspe
   const validUntil = new Date(date);
   validUntil.setFullYear(validUntil.getFullYear() + 3);
 
-  const questionDocs = await loadAutoInspectionQuestions(equipmentDoc, tenantId);
+  const normalizedInspectionType = normalizeInspectionType(inspectionType);
+  const questionDocs = await loadAutoInspectionQuestions(equipmentDoc, tenantId, normalizedInspectionType);
+  const passedByDefault = new Set(['general', 'environment']);
   let results = [];
 
   if (questionDocs.length) {
@@ -1028,7 +1108,7 @@ async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspe
       number: q.number ?? q.Number ?? null,
       equipmentType: q.equipmentType || '',
       protectionTypes: Array.isArray(q.protectionTypes) ? q.protectionTypes : [],
-      status: 'Passed',
+      status: passedByDefault.has((q.equipmentType || '').toLowerCase()) ? 'Passed' : 'NA',
       note: '',
       questionText: {
         eng: q.questionText?.eng || '',
@@ -1039,7 +1119,7 @@ async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspe
 
   if (!results.length) {
     results = [{
-      status: 'Passed',
+      status: 'NA',
       note: 'Automatically created during XLSX import (all checks passed).',
       table: 'AUTO',
       group: 'AUTO',
@@ -1068,7 +1148,7 @@ async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspe
     zoneId: equipmentDoc.Zone || null,
     inspectionDate: date,
     validUntil,
-    inspectionType: 'Detailed',
+    inspectionType: normalizedInspectionType,
     inspectorId,
     results,
     attachments: [],
@@ -1128,7 +1208,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
     }
 
     const equipments = await Equipment.find(filter)
-      .sort({ createdAt: 1, _id: 1 })
+      .sort({ orderIndex: 1, createdAt: 1, _id: 1 })
       .lean();
 
     if (!equipments || equipments.length === 0) {
@@ -1170,64 +1250,13 @@ exports.exportEquipmentXLSX = async (req, res) => {
       inspections.map(i => [i._id.toString(), i])
     );
 
-    // ---- Certificate cache (issue date + special condition) ----
-    // Fuzzy matching, like getCertificateByCertNo:
-    // - ignore spaces and non-alphanumeric characters
-    // - case-insensitive
-    // - search among PUBLIC certificates and the current tenant's own certificates
-    const normalizeCertNo = (s = '') =>
-      String(s)
-        .replace(/[^0-9A-Za-z]/g, '') // keep only letters and digits
-        .toLowerCase();
-
-    let certDocs = [];
+    let certMap = new Map();
     try {
-      certDocs = await Certificate.find({
-        certNo: { $ne: null },
-        $or: [
-          { visibility: 'public' },
-          { tenantId }
-        ]
-      }).lean();
+      certMap = await buildCertificateCacheForTenant(tenantId);
     } catch (e) {
-      console.warn('⚠️ Certificate cache query failed in exportEquipmentXLSX:', e?.message || e);
-      certDocs = [];
+      console.warn('⚠️ Certificate cache build failed for exportEquipmentXLSX:', e?.message || e);
+      certMap = new Map();
     }
-
-    const certMap = new Map();
-    certDocs.forEach(c => {
-      const norm = normalizeCertNo(c.certNo || '');
-      if (!norm) return;
-      // first match wins
-      if (!certMap.has(norm)) {
-        certMap.set(norm, c);
-      }
-    });
-
-    const resolveCertificate = (certNoRaw) => {
-      if (!certNoRaw) return null;
-
-      const parts = String(certNoRaw)
-        .split(/[/,;]/)
-        .map(p => p.trim())
-        .filter(Boolean);
-
-      for (const part of parts) {
-        const norm = normalizeCertNo(part);
-        if (!norm) continue;
-        const hit = certMap.get(norm);
-        if (hit) return hit;
-      }
-
-      // Fallback: try the whole raw string normalized as well
-      const wholeNorm = normalizeCertNo(certNoRaw);
-      if (wholeNorm) {
-        const hit = certMap.get(wholeNorm);
-        if (hit) return hit;
-      }
-
-      return null;
-    };
 
     // ---- Excel workbook ----
     const workbook = new ExcelJS.Workbook();
@@ -1253,6 +1282,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
       'Certificate No',
       'Certificate Issue Date',
       'Special Condition',
+      'Declaration of conformity',
       'Zone',
       'Gas / Dust Group',
       'Temp Rating',
@@ -1264,6 +1294,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
       'Req IP Rating',
       'Inspection Date',
       'Inspector',
+      'Type',
       'Status',
       'Remarks'
     ];
@@ -1282,24 +1313,24 @@ exports.exportEquipmentXLSX = async (req, res) => {
     // Identification (A–C)
     groupRow.getCell(1).value = 'IDENTIFICATION';
     worksheet.mergeCells(1, 1, 1, 3);
-    // Equipment data (D–P)
+    // Equipment data (D–H)
     groupRow.getCell(4).value = 'EQUIPMENT DATA';
     worksheet.mergeCells(1, 4, 1, 8);
-    // Ex Data
+    // Ex Data (I–M)
     groupRow.getCell(9).value = 'EX DATA';
     worksheet.mergeCells(1, 9, 1, 13);
-    // Certification (R–T)
+    // Certification (N–Q)
     groupRow.getCell(14).value = 'CERTIFICATION';
-    worksheet.mergeCells(1, 14, 1, 16);
-    // Zone Requirements (Q–T)
-    groupRow.getCell(17).value = 'ZONE REQUIREMENTS';
-    worksheet.mergeCells(1, 17, 1, 20);
-    // User Requirement (U–Y)
-    groupRow.getCell(21).value = 'USER REQUIREMENT';
-    worksheet.mergeCells(1, 21, 1, 25);
-    // Inspection Data (Z–AC)
-    groupRow.getCell(26).value = 'INSPECTION DATA';
-    worksheet.mergeCells(1, 26, 1, 29);
+    worksheet.mergeCells(1, 14, 1, 17);
+    // Zone Requirements (R–U)
+    groupRow.getCell(18).value = 'ZONE REQUIREMENTS';
+    worksheet.mergeCells(1, 18, 1, 21);
+    // User Requirement (V–Z)
+    groupRow.getCell(22).value = 'USER REQUIREMENT';
+    worksheet.mergeCells(1, 22, 1, 26);
+    // Inspection Data (AA–AE)
+    groupRow.getCell(27).value = 'INSPECTION DATA';
+    worksheet.mergeCells(1, 27, 1, 31);
 
     // Csoportosító sor formázása (1. sor)
     groupRow.eachCell((cell, colNumber) => {
@@ -1309,22 +1340,22 @@ exports.exportEquipmentXLSX = async (req, res) => {
         // Identification (A–C) – zöld háttér
         bg = 'FF00AA00';
       } else if (colNumber >= 4 && colNumber <= 8) {
-        // Equipment data (D–Q) – narancssárga háttér
+        // Equipment data (D–H) – narancssárga háttér
         bg = 'FFFF9900';
       } else if (colNumber >= 9 && colNumber <= 13) {
-        // Ex Data (R–P) – kék háttér
+        // Ex Data (I–M) – kék háttér
         bg = 'FF538DD5';
-      } else if (colNumber >= 14 && colNumber <= 16) {
-        // Certification (R–T) – zöld háttér
+      } else if (colNumber >= 14 && colNumber <= 17) {
+        // Certification (N–Q) – zöld háttér
         bg = 'FF00AA00';
-      } else if (colNumber >= 17 && colNumber <= 20) {
-        // Zone Requirements – sárga háttér
+      } else if (colNumber >= 18 && colNumber <= 21) {
+        // Zone Requirements (R–U) – sárga háttér
         bg = 'FFFFFF66';
-      } else if (colNumber >= 21 && colNumber <= 25) {
-        // User Requirement – világos lila háttér (megegyezhet a zóna követelményekkel)
+      } else if (colNumber >= 22 && colNumber <= 26) {
+        // User Requirement (V–Z) – világos lila háttér
         bg = 'FFB1A0C7';
-      } else if (colNumber >= 26 && colNumber <= 29) {
-        // Inspection Data – szürke háttér
+      } else if (colNumber >= 27 && colNumber <= 31) {
+        // Inspection Data (AA–AE) – szürke háttér
         bg = 'FFB0B0B0';
       }
 
@@ -1357,16 +1388,16 @@ exports.exportEquipmentXLSX = async (req, res) => {
         // Ex Data – világos narancssárga
         bg = 'FFDCE6F1';
       } 
-      else if (colNumber >= 14 && colNumber <= 16) {
+      else if (colNumber >= 14 && colNumber <= 17) {
         // Certification – világos zöld
         bg = 'FFCCFFCC';
-      } else if (colNumber >= 17 && colNumber <= 20) {
+      } else if (colNumber >= 18 && colNumber <= 21) {
         // Zone Requirements – világos sárga
         bg = 'FFFFFFCC';
-      } else if (colNumber >= 21 && colNumber <= 25) {
+      } else if (colNumber >= 22 && colNumber <= 26) {
         // User Requirement – világos lila
         bg = 'FFE4DFEC';
-      } else if (colNumber >= 26 && colNumber <= 29) {
+      } else if (colNumber >= 27 && colNumber <= 31) {
         // Inspection Data – világos szürke
         bg = 'FFE0E0E0';
       }
@@ -1406,7 +1437,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
       'Status'
     ]);
 
-    // Sorok generálása – eszközök létrehozási sorrendjében
+    // Sorok generálása – eszközök sorszáma (orderIndex) szerint
     let equipmentIndex = 0;
 
     for (const eq of equipments) {
@@ -1485,9 +1516,19 @@ exports.exportEquipmentXLSX = async (req, res) => {
 
       const clientReqIpRating = clientReq?.IpRating || '';
 
-      const cert = resolveCertificate(eq['Certificate No']);
+      const cert = resolveCertificateFromCache(certMap, eq['Certificate No']);
       const hasSpecialCondition =
         !!(cert && (cert.specCondition || cert.xcondition));
+
+      // Certificate vs Declaration of conformity megjelenítés
+      const rawCertNo = eq['Certificate No'] || '';
+      let exportCertNo = rawCertNo;
+      let exportDocNo = '';
+
+      if (cert && cert.docType === 'manufacturer_declaration') {
+        exportCertNo = '';
+        exportDocNo = rawCertNo;
+      }
 
       const exMarkings = Array.isArray(eq['Ex Marking']) && eq['Ex Marking'].length
         ? eq['Ex Marking']
@@ -1495,7 +1536,9 @@ exports.exportEquipmentXLSX = async (req, res) => {
 
       for (const marking of exMarkings) {
         const rowData = {
-          '#': equipmentIndex,
+          '#': typeof eq.orderIndex === 'number' && eq.orderIndex > 0
+            ? eq.orderIndex
+            : equipmentIndex,
           'TagNo': eq['TagNo'] || '',
           'EqID': eq['EqID'] || '',
           'Description': eq['Equipment Type'] || '',
@@ -1511,9 +1554,10 @@ exports.exportEquipmentXLSX = async (req, res) => {
           //'Equipment Group': marking ? marking['Equipment Group'] || '' : '',
          // 'Equipment Category': marking ? marking['Equipment Category'] || '' : '',
          // 'Environment': marking ? marking.Environment || '' : '',
-          'Certificate No': eq['Certificate No'] || '',
+          'Certificate No': exportCertNo,
           'Certificate Issue Date': cert?.issueDate || '',
           'Special Condition': hasSpecialCondition ? 'Yes' : 'No',
+          'Declaration of conformity': exportDocNo,
           'Zone': zoneNumber,
           'Gas / Dust Group': zoneSubGroup,
           'Temp Rating': zoneTempDisplay,
@@ -1528,6 +1572,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
             ? new Date(inspectionDate)
             : '',
           'Inspector': inspectorName,
+          'Type': inspection?.inspectionType || '',
           'Remarks': eq['Other Info'] || ''
         };
 
@@ -1667,10 +1712,55 @@ exports.listEquipment = async (req, res) => {
     }
 
     const equipments = await Equipment.find(filter).lean();
+    let certMap = new Map();
+    try {
+      certMap = await buildCertificateCacheForTenant(tenantId);
+    } catch (e) {
+      console.warn('⚠️ Certificate cache build failed for listEquipment:', e?.message || e);
+      certMap = new Map();
+    }
 
     const withPaths = equipments.map(eq => {
       const firstBlobUrl = eq.Pictures?.find?.(p => p.blobUrl)?.blobUrl || null;
-      return { ...eq, BlobPreviewUrl: firstBlobUrl };
+      const certDoc = resolveCertificateFromCache(certMap, eq['Certificate No']);
+
+      let xCondition = eq['X condition'];
+      if (!xCondition || typeof xCondition !== 'object') {
+        xCondition = { X: false, Specific: '' };
+      } else {
+        xCondition = {
+          X: !!xCondition.X,
+          Specific: xCondition.Specific || ''
+        };
+      }
+
+      if ((!xCondition.Specific || !xCondition.Specific.trim()) && certDoc?.specCondition) {
+        xCondition = {
+          X: true,
+          Specific: certDoc.specCondition
+        };
+      }
+
+      const linkedCertificate = certDoc
+        ? {
+            _id: certDoc._id,
+            certNo: certDoc.certNo,
+            docType: certDoc.docType || 'unknown',
+            specCondition: certDoc.specCondition || '',
+            issueDate: certDoc.issueDate || '',
+            visibility: certDoc.visibility || 'private',
+            manufacturer: certDoc.manufacturer || '',
+            equipment: certDoc.equipment || ''
+          }
+        : null;
+
+      return {
+        ...eq,
+        BlobPreviewUrl: firstBlobUrl,
+        'X condition': xCondition,
+        _linkedCertificate: linkedCertificate,
+        certificateDocType: linkedCertificate?.docType || 'unknown'
+      };
     });
 
     return res.json(withPaths);
@@ -1879,7 +1969,21 @@ exports.deleteEquipment = async (req, res) => {
       console.error('⚠️ Warning: Nem sikerült a kapcsolódó inspectionök teljes törlése equipment törléskor:', inspErr);
     }
 
+    const deletedOrderIndex =
+      typeof equipment.orderIndex === 'number' && equipment.orderIndex > 0
+        ? equipment.orderIndex
+        : null;
+
     await Equipment.deleteOne({ _id: id });
+
+    // 🧹 Sorszámok újraszámozása az adott zónán/projekten belül
+    if (deletedOrderIndex != null) {
+      const scopeFilter = { tenantId, orderIndex: { $gt: deletedOrderIndex } };
+      if (equipment.Zone) scopeFilter.Zone = equipment.Zone;
+      if (equipment.Site) scopeFilter.Site = equipment.Site;
+
+      await Equipment.updateMany(scopeFilter, { $inc: { orderIndex: -1 } });
+    }
     return res.json({ message: 'Az eszköz és a hozzá tartozó inspectionök sikeresen törölve.' });
   } catch (error) {
     console.error('❌ Hiba az eszköz törlésekor:', error);

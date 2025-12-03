@@ -11,6 +11,10 @@ const { getReadSasUrl, toBlobPath } = azureBlobService;
 const { uploadPdfWithFormRecognizerInternal } = require('../helpers/ocrHelper');
 const { extractCertFieldsFromOCR } = require('../helpers/openaiCertExtractor');
 const mongoose = require('mongoose');
+const {
+  buildCertificateCacheForTenant,
+  resolveCertificateFromCache
+} = require('../helpers/certificateMatchHelper');
 
 const upload = multer({ dest: 'uploads/' });
 
@@ -687,6 +691,58 @@ exports.getCertificateByCertNo = async (req, res) => {
   } catch (error) {
     console.error('Error fetching certificate:', error);
     return res.status(500).send('Error fetching certificate');
+  }
+};
+
+exports.resolveCertificatesBulk = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) {
+      return res.status(401).json({ message: 'Missing tenantId' });
+    }
+
+    const incoming = Array.isArray(req.body?.certNos)
+      ? req.body.certNos
+      : [];
+
+    const normalizedInput = Array.from(
+      new Set(
+        incoming
+          .map(value => (typeof value === 'string' ? value.trim() : ''))
+          .filter(Boolean)
+      )
+    );
+
+    if (!normalizedInput.length) {
+      return res.json({});
+    }
+
+    const certMap = await buildCertificateCacheForTenant(tenantId);
+    const response = {};
+
+    normalizedInput.forEach(original => {
+      const certDoc = resolveCertificateFromCache(certMap, original);
+      if (certDoc) {
+        response[original] = {
+          _id: certDoc._id,
+          certNo: certDoc.certNo,
+          docType: certDoc.docType || 'unknown',
+          specCondition: certDoc.specCondition || '',
+          issueDate: certDoc.issueDate || '',
+          visibility: certDoc.visibility || 'private',
+          manufacturer: certDoc.manufacturer || '',
+          equipment: certDoc.equipment || ''
+        };
+      }
+    });
+
+    return res.json(response);
+  } catch (error) {
+    console.error('❌ resolveCertificatesBulk error:', error);
+    return res.status(500).json({
+      message: 'Failed to resolve certificates.',
+      error: error.message || String(error)
+    });
   }
 };
 

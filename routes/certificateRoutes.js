@@ -21,6 +21,7 @@ router.get('/certificates/public/contribution', authMiddleware(), certificateCon
 // Adopt / Unadopt
 router.post('/certificates/:id/adopt', authMiddleware(), certificateController.adoptPublic);
 router.delete('/certificates/:id/adopt', authMiddleware(), certificateController.unadoptPublic);
+router.post('/certificates/resolve-bulk', authMiddleware(), certificateController.resolveCertificatesBulk);
 
 // SAS link generálás tanúsítvány letöltéséhez
 router.post(
