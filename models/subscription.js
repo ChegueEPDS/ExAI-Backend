@@ -2,7 +2,7 @@
 const mongoose = require('mongoose');
 
 const SubscriptionSchema = new mongoose.Schema({
-  tenantId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', required: true, index: true },
+  tenantId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', required: true },
   stripeCustomerId: { type: String, index: true },
   stripeSubscriptionId: { type: String, index: true },
   productId: { type: String },

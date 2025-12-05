@@ -75,7 +75,6 @@ TenantSchema.virtual('isPersonal').get(function () {
 });
 
 // Hasznos indexek
-TenantSchema.index({ name: 1 }, { unique: true });
 TenantSchema.index({ type: 1, plan: 1 });
 
 // JSON kimenet tisztítás

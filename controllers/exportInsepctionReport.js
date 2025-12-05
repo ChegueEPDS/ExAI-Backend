@@ -183,6 +183,49 @@ function sanitizeFileNameSegment(value, fallback = 'item') {
   return safe || fallback;
 }
 
+function buildEquipmentIdentifier(equipment) {
+  if (!equipment) return null;
+
+  const rawOrder =
+    equipment.orderIndex ??
+    equipment.OrderIndex ??
+    equipment['orderIndex'] ??
+    equipment['OrderIndex'];
+  const orderIndex =
+    typeof rawOrder === 'number' && /^\d+$/.test(rawOrder.toString())
+      ? rawOrder.toString()
+      : null;
+
+  const rawTag =
+    equipment.TagNo ||
+    equipment['TagNo'] ||
+    equipment['Tag No'] ||
+    equipment.tagNo ||
+    equipment.tag ||
+    equipment.Tag ||
+    equipment.TagID ||
+    equipment.tagID ||
+    equipment.tagId ||
+    equipment.TagId ||
+    null;
+  const tag =
+    typeof rawTag === 'string' && rawTag.trim().length ? rawTag.trim() : null;
+
+  const eqId =
+    equipment.EqID ||
+    equipment.eqId ||
+    equipment.EqId ||
+    (typeof equipment['EqID'] === 'string' ? equipment['EqID'] : null) ||
+    null;
+
+  const parts = [orderIndex, tag, eqId]
+    .map(part => (typeof part === 'string' ? part.trim() : part))
+    .filter(part => !!part && part.toString().length > 0);
+
+  if (!parts.length) return null;
+  return parts.join('-');
+}
+
 function deriveQuestionReference(result) {
   if (!result) return '';
   const tableVal = (result.table || result.Table || '').toString();
@@ -220,8 +263,10 @@ function buildResultKeys(result) {
   return keys;
 }
 
-function buildInspectionAttachmentLookup(inspection, eqId) {
-  const eqFolder = sanitizeFileNameSegment(eqId || inspection?.eqId || inspection?.equipmentId || 'equipment');
+function buildInspectionAttachmentLookup(inspection, eqId, identifier = null) {
+  const eqFolder = sanitizeFileNameSegment(
+    identifier || eqId || inspection?.eqId || inspection?.equipmentId || 'equipment'
+  );
   const attachments = Array.isArray(inspection?.attachments) ? inspection.attachments : [];
   const imageAttachments = attachments.filter(att => att && att.blobPath && (att.type === 'image' || !att.type));
   const byKey = new Map();
@@ -971,7 +1016,12 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
     row.height = 30;
   });*/
 
-  const fileName = `Inspection_EQ_${equipment.EqID || 'unknown'}_${Date.now()}.xlsx`;
+  const identifier =
+    buildEquipmentIdentifier(equipment) ||
+    equipment.EqID ||
+    inspection.eqId ||
+    'unknown';
+  const fileName = `Inspection_${sanitizeFileNameSegment(identifier)}_${Date.now()}.xlsx`;
   return { workbook, fileName };
 }
 
@@ -1258,9 +1308,17 @@ exports.exportInspectionXLSX = async (req, res) => {
       return res.status(404).json({ message: context.error });
     }
 
-    const eqIdentifier = context.equipment?.EqID || inspection.eqId || inspection.equipmentId;
+    const eqIdentifier =
+      buildEquipmentIdentifier(context.equipment) ||
+      context.equipment?.EqID ||
+      inspection.eqId ||
+      inspection.equipmentId;
     const attachmentLookup = includeImages
-      ? buildInspectionAttachmentLookup(inspection, eqIdentifier)
+      ? buildInspectionAttachmentLookup(
+          inspection,
+          context.equipment?.EqID || inspection.eqId,
+          eqIdentifier
+        )
       : null;
 
     const { workbook, fileName } = await buildInspectionWorkbook(
@@ -1282,7 +1340,8 @@ exports.exportInspectionXLSX = async (req, res) => {
     }
 
     const workbookBuffer = await workbook.xlsx.writeBuffer();
-    const zipName = fileName.replace(/\.xlsx$/i, '') + '.zip';
+    const zipIdentifier = sanitizeFileNameSegment(eqIdentifier);
+    const zipName = `Inspection_${zipIdentifier}_${Date.now()}.zip`;
 
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
@@ -1373,10 +1432,15 @@ exports.exportPunchlistXLSX = async (req, res) => {
       if (!headerSite && context.site) headerSite = context.site;
       if (!headerZone && zoneId && context.zone) headerZone = context.zone;
 
+      const identifier =
+        buildEquipmentIdentifier(context.equipment) ||
+        context.equipment?.EqID ||
+        inspection.eqId;
       const attachmentLookup = includeImages
         ? buildInspectionAttachmentLookup(
             inspection,
-            context.equipment?.EqID || inspection.eqId
+            context.equipment?.EqID || inspection.eqId,
+            identifier
           )
         : null;
       if (includeImages && attachmentLookup?.all?.length) {
@@ -1517,10 +1581,15 @@ exports.exportLatestInspectionReportsZip = async (req, res) => {
 
       if (context.error) continue;
 
+      const identifier =
+        buildEquipmentIdentifier(context.equipment) ||
+        context.equipment?.EqID ||
+        inspection.eqId;
       const attachmentLookup = includeImages
         ? buildInspectionAttachmentLookup(
             inspection,
-            context.equipment?.EqID || inspection.eqId
+            context.equipment?.EqID || inspection.eqId,
+            identifier
           )
         : null;
 
