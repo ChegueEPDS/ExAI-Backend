@@ -17,7 +17,7 @@ router.get('/inspections', authMiddleware(), inspectionController.listInspection
 
 router.get('/inspections/punchlist', authMiddleware(), exportInspectioReport.exportPunchlistXLSX);
 router.get('/inspections/export-zip', authMiddleware(), exportInspectioReport.exportLatestInspectionReportsZip);
-router.get('/inspections/:id/export-xlsx', exportInspectioReport.exportInspectionXLSX);
+router.get('/inspections/:id/export-xlsx', authMiddleware(), exportInspectioReport.exportInspectionXLSX);
 
 // Konkrét inspection lekérése ID alapján
 // GET /api/inspections/:id

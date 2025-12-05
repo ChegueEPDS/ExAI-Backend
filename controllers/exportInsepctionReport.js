@@ -9,6 +9,7 @@ const Site = require('../models/site');
 const Zone = require('../models/zone');
 const Certificate = require('../models/certificate');
 const azureBlob = require('../services/azureBlobService');
+const https = require('https');
 
 const EXCEL_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const DEFAULT_COLUMNS = [
@@ -47,6 +48,22 @@ const BORDER_THIN = {
   bottom: { style: 'thin' },
   right: { style: 'thin' }
 };
+
+const INDEX_LOGO_URL = 'https://certs.atexdb.eu/public/index_logo.png';
+
+function fetchImageBuffer(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, res => {
+      if (res.statusCode !== 200) {
+        res.resume(); // drain
+        return reject(new Error(`Failed to fetch image: ${res.statusCode}`));
+      }
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+    }).on('error', reject);
+  });
+}
 
 async function findEquipmentForInspection(inspection) {
   let equipment = null;
@@ -274,7 +291,7 @@ async function appendImagesToArchive(archive, attachments, imagesRoot = 'images'
   }
 }
 
-function buildInspectionWorkbook(inspection, equipment, site, zone, scheme, attachmentLookup = null) {
+async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme, attachmentLookup = null, options = {}) {
   // -------- Excel workbook + sheet --------
   const workbook = new ExcelJS.Workbook();
   const ws = workbook.addWorksheet('Inspection Report');
@@ -308,13 +325,59 @@ function buildInspectionWorkbook(inspection, equipment, site, zone, scheme, atta
     ? `${inspection.inspectorId.firstName || ''} ${inspection.inspectorId.lastName || ''}`.trim()
     : '';
 
-  // ========= 1. sor – cím + dátum =========
-  ws.mergeCells('A1:K2');
-  const titleCell = ws.getCell('A1');
-  titleCell.value = 'Inspection Test Report';
-  titleCell.font = { bold: true, size: 16 };
-  titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
-  titleCell.fill = TITLE_FILL;
+  const tenantName = (options.tenantName || '').toLowerCase();
+  const isIndexTenant = tenantName === 'index' || tenantName === 'ind-ex';
+
+  // Oldalbeállítás: 1 oldal szélesre igazítás
+  ws.pageSetup = ws.pageSetup || {};
+  ws.pageSetup.fitToPage = true;
+  ws.pageSetup.fitToWidth = 1;   // Szélesség: 1 lap
+  ws.pageSetup.fitToHeight = 0;  // Magasság: Automatikus
+
+  // ========= 1. sor – logo (Index) + cím + dátum =========
+  if (isIndexTenant) {
+    // Logo bal oldalt A1:B2
+    try {
+      const logoBuffer = await fetchImageBuffer(INDEX_LOGO_URL);
+      const imageId = workbook.addImage({
+        buffer: logoBuffer,
+        extension: 'png'
+      });
+      // Rögzített méretű logó, hogy az arányai ne torzuljanak
+      ws.addImage(imageId, {
+        tl: { col: 0, row: 0 },      // A1
+        ext: { width: 117.5, height: 53.5 } // px
+      });
+      ws.mergeCells('A1:B2');
+    } catch (e) {
+      // ha nem sikerül, csak simán üresen hagyjuk a logó helyét
+      ws.mergeCells('A1:B2');
+    }
+
+    // Szürke háttér a logo mögötti teljes blokkra (A1:B2)
+    ['A','B'].forEach(col => {
+      [1,2].forEach(rn => {
+        const cell = ws.getCell(`${col}${rn}`);
+        cell.fill = HEADER_FILL;
+      });
+    });
+
+    ws.mergeCells('C1:K2');
+    const titleCell = ws.getCell('C1');
+    titleCell.value = 'Inspection Test Report';
+    titleCell.font = { bold: true, size: 16 };
+    titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+    // háttér azonos a dátum cellával
+    titleCell.fill = HEADER_FILL;
+  } else {
+    ws.mergeCells('A1:K2');
+    const titleCell = ws.getCell('A1');
+    titleCell.value = 'Inspection Test Report';
+    titleCell.font = { bold: true, size: 16 };
+    titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+    // háttér azonos a dátum cellával
+    titleCell.fill = HEADER_FILL;
+  }
 
   ws.mergeCells('L1:L2');
   ws.getCell('L1').value = 'Date:';
@@ -328,6 +391,11 @@ function buildInspectionWorkbook(inspection, equipment, site, zone, scheme, atta
   ws.getCell('M1').numFmt = 'yyyy-mm-dd';
   ws.getCell('M1').alignment = { horizontal: 'center', vertical: 'middle' };
   ws.getCell('M1').fill= HEADER_FILL;
+
+  // Címsorok magassága – kb. 75%-kal nagyobb a defaultnál
+  const headerRowHeight = 15;
+  ws.getRow(1).height = headerRowHeight;
+  ws.getRow(2).height = headerRowHeight;
 
   // üres sor (3)
   const emptyRow3 = ws.addRow([]);
@@ -573,6 +641,124 @@ function buildInspectionWorkbook(inspection, equipment, site, zone, scheme, atta
   ws.getRow(spacerRowIndex).height = spacerHeight;
   ws.getRow(spacerAfterBlockIndex).height = spacerHeight;
 
+  // ========= Tenant-specific drawing block (Index) =========
+  if (isIndexTenant && Array.isArray(zone?.documents) && zone.documents.length) {
+    const docs = zone.documents || [];
+    const usedIds = new Set();
+    let hacDoc = null;
+    const otherDrawingDocs = [];
+
+    for (const doc of docs) {
+      const aliasRaw = doc?.alias || '';
+      const alias = String(aliasRaw || '').trim();
+      const lowerAlias = alias.toLowerCase();
+      if (!lowerAlias.includes('drawing')) continue;
+
+      const idStr = doc?._id ? String(doc._id) : `${alias}::${doc.name || ''}`;
+      if (usedIds.has(idStr)) continue;
+      usedIds.add(idStr);
+
+      if (!hacDoc && lowerAlias === 'hac drawing') {
+        hacDoc = doc;
+      } else {
+        otherDrawingDocs.push(doc);
+      }
+    }
+
+    const hasAnyDrawing = hacDoc || otherDrawingDocs.length;
+    if (hasAnyDrawing) {
+      const totalRows = Math.max(1, otherDrawingDocs.length || (hacDoc ? 1 : 0));
+      // If we render the Index-specific drawing block, reuse the spacer row directly
+      // below the equipment info block as the first drawing row (no extra empty row above).
+      const drawingStartRow = spacerAfterBlockIndex;
+      const drawingEndRow = drawingStartRow + totalRows - 1;
+
+      // HAC Drawing label (merged, grey)
+      ws.mergeCells(`A${drawingStartRow}:B${drawingEndRow}`);
+      const hacLabelCell = ws.getCell(`A${drawingStartRow}`);
+      hacLabelCell.value = 'HAC Drawing';
+      hacLabelCell.font = { bold: true };
+      hacLabelCell.fill = HEADER_FILL;
+      hacLabelCell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+
+      // HAC Drawing value (merged similarly in height)
+      ws.mergeCells(`C${drawingStartRow}:F${drawingEndRow}`);
+      const hacValueCell = ws.getCell(`C${drawingStartRow}`);
+      if (hacDoc) {
+        hacValueCell.value = hacDoc.alias || hacDoc.name || '';
+      } else {
+        hacValueCell.value = '';
+      }
+      hacValueCell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: true };
+
+      // Other Drawings label (merged)
+      ws.mergeCells(`G${drawingStartRow}:H${drawingEndRow}`);
+      const otherLabelCell = ws.getCell(`G${drawingStartRow}`);
+      otherLabelCell.value = 'Other Drawings:';
+      otherLabelCell.font = { bold: true };
+      otherLabelCell.fill = HEADER_FILL;
+      otherLabelCell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+
+      // Rows for other drawings (alias + filename)
+      for (let i = 0; i < totalRows; i += 1) {
+        const rowIndex = drawingStartRow + i;
+        const doc = otherDrawingDocs[i] || null;
+
+        const aliasCell = ws.getCell(`I${rowIndex}`);
+        const aliasMergeRange = `I${rowIndex}:J${rowIndex}`;
+        ws.mergeCells(aliasMergeRange);
+        const fileCellRange = `K${rowIndex}:N${rowIndex}`;
+        ws.mergeCells(fileCellRange);
+        const fileCell = ws.getCell(`K${rowIndex}`);
+
+        if (doc) {
+          aliasCell.value = doc.alias || '';
+          fileCell.value = doc.name || '';
+        } else {
+          aliasCell.value = '';
+          fileCell.value = '';
+        }
+
+        aliasCell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: true };
+        fileCell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: true };
+
+        // Borders for drawing row
+        ['A','B','C','D','E','F','G','H','I','J','K','L','M','N'].forEach(col => {
+          const cell = ws.getCell(`${col}${rowIndex}`);
+          cell.border = BORDER_THIN;
+        });
+      }
+
+      // Match HAC / drawing block row heights so all text is visible
+      // (override previous spacer height if needed).
+      let maxTextLen = 0;
+      if (hacDoc) {
+        const hacText = `${hacDoc.alias || ''} ${hacDoc.name || ''}`.trim();
+        maxTextLen = Math.max(maxTextLen, hacText.length);
+      }
+      otherDrawingDocs.forEach(d => {
+        if (!d) return;
+        const txt = `${d.alias || ''} ${d.name || ''}`.trim();
+        maxTextLen = Math.max(maxTextLen, txt.length);
+      });
+      if (maxTextLen === 0) {
+        maxTextLen = 10;
+      }
+      const approxCharsPerLine = 25;
+      const lineCount = Math.max(1, Math.ceil(maxTextLen / approxCharsPerLine));
+      const rowHeight = lineCount * 5 + 4; // 15 pt / line + kis ráhagyás
+
+      for (let rn = drawingStartRow; rn <= drawingEndRow; rn += 1) {
+        const row = ws.getRow(rn);
+        row.height = rowHeight;
+      }
+
+      // Spacer after drawing block
+      const afterDrawingSpacer = ws.getRow(drawingEndRow + 1);
+      afterDrawingSpacer.height = spacerHeight;
+    }
+  }
+
   // ========= INSPECTION RESULT BLOKKOK =========
 
   const grouped = {};
@@ -794,6 +980,12 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
   const ws = workbook.addWorksheet('Punchlist');
 
   ws.columns = DEFAULT_COLUMNS;
+
+  // Oldalbeállítás: 1 oldal szélesre igazítás
+  ws.pageSetup = ws.pageSetup || {};
+  ws.pageSetup.fitToPage = true;
+  ws.pageSetup.fitToWidth = 1;   // Szélesség: 1 lap
+  ws.pageSetup.fitToHeight = 0;  // Magasság: Automatikus
 
   const dateValue = reportDate ? new Date(reportDate) : new Date();
 
@@ -1071,13 +1263,14 @@ exports.exportInspectionXLSX = async (req, res) => {
       ? buildInspectionAttachmentLookup(inspection, eqIdentifier)
       : null;
 
-    const { workbook, fileName } = buildInspectionWorkbook(
+    const { workbook, fileName } = await buildInspectionWorkbook(
       inspection,
       context.equipment,
       context.site,
       context.zone,
       context.scheme,
-      attachmentLookup
+      attachmentLookup,
+      { tenantName: req.scope?.tenantName || '' }
     );
 
     if (!includeImages) {
@@ -1331,13 +1524,14 @@ exports.exportLatestInspectionReportsZip = async (req, res) => {
           )
         : null;
 
-      const { workbook, fileName } = buildInspectionWorkbook(
+      const { workbook, fileName } = await buildInspectionWorkbook(
         inspection,
         context.equipment,
         context.site,
         context.zone,
         context.scheme,
-        attachmentLookup
+        attachmentLookup,
+        { tenantName: req.scope?.tenantName || '' }
       );
       const buffer = await workbook.xlsx.writeBuffer();
       files.push({ buffer, fileName });

@@ -1245,7 +1245,7 @@ async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspe
     tenantId,
     normalizedInspectionType
   );
-  const basePassedTypes = new Set(['general', 'environment']);
+  const basePassedTypes = new Set(['general', 'environment', 'additional checks']);
   const relevantTypes = await getRelevantEquipmentTypesForDevice(
     equipmentDoc,
     tenantId

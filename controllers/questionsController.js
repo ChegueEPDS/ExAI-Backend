@@ -27,7 +27,8 @@ const EQUIPMENT_TYPES = [
   "Installation Heating System",
   "Installation Motors",
   "Environment",
-  "Equipment"
+  "Equipment",
+  "Additional Checks"
 ];
 const EQUIPMENT_TYPE_SET = new Set(EQUIPMENT_TYPES.map(v => v.toLowerCase()));
 
@@ -414,8 +415,9 @@ const importQuestionsXLSX = async (req, res) => {
   let updatedCount = 0;
 
   try {
+    const originalFileBuffer = await fs.promises.readFile(file.path);
     const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.readFile(file.path);
+    await workbook.xlsx.load(originalFileBuffer);
     const worksheet = workbook.worksheets[0];
     if (!worksheet) {
       return res.status(400).json({ message: 'The uploaded workbook does not contain any worksheet.' });
@@ -589,6 +591,55 @@ const importQuestionsXLSX = async (req, res) => {
           tenantId: tenantObjectId
         });
         createdCount += 1;
+      }
+    }
+
+    if (errors.length > 0) {
+      try {
+        const workbookOut = new ExcelJS.Workbook();
+        await workbookOut.xlsx.load(originalFileBuffer);
+        const worksheet = workbookOut.worksheets[0];
+
+        const summarySheet = workbookOut.addWorksheet('Import summary');
+        summarySheet.addRow(['Created', createdCount]);
+        summarySheet.addRow(['Updated', updatedCount]);
+        summarySheet.addRow(['Error rows', errors.length]);
+        summarySheet.getColumn(1).width = 15;
+        summarySheet.getColumn(2).width = 12;
+
+        const errorFill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FFFFC0C0' }
+        };
+
+        errors.forEach(err => {
+          const rowNumber = err?.row;
+          if (!rowNumber || !worksheet) return;
+          const row = worksheet.getRow(rowNumber);
+          row.eachCell(cell => {
+            cell.fill = errorFill;
+          });
+          const noteCell = worksheet.getCell(`A${rowNumber}`);
+          const existingNote = typeof noteCell.note === 'string' && noteCell.note.length
+            ? `${noteCell.note}\n`
+            : '';
+          noteCell.note = `${existingNote}${err.message || 'Invalid data in this row.'}`;
+        });
+
+        const buffer = await workbookOut.xlsx.writeBuffer();
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        res.setHeader(
+          'Content-Disposition',
+          'attachment; filename="questions-import-errors.xlsx"'
+        );
+        return res.status(200).send(Buffer.from(buffer));
+      } catch (excelErr) {
+        console.warn('⚠️ Failed to generate error XLSX for questions import:', excelErr?.message || excelErr);
+        // fall through to JSON response below
       }
     }
 
