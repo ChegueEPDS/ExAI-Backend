@@ -156,6 +156,92 @@ exports.getSiteById = async (req, res) => {
     }
 };
 
+// 🔹 Rövid összesítő (zónák, eszközök, státuszok)
+exports.getSiteSummary = async (req, res) => {
+  try {
+    const siteId = req.params.id;
+    const tenantIdStr = req.scope?.tenantId;
+    const tenantObjectId = toObjectId(tenantIdStr);
+    const siteObjectId = toObjectId(siteId);
+
+    if (!tenantObjectId || !siteObjectId) {
+      return res.status(400).json({ message: 'Invalid site or tenant ID.' });
+    }
+
+    const [zoneCount, zoneStats] = await Promise.all([
+      Zone.countDocuments({ Site: siteObjectId, tenantId: tenantObjectId }),
+      Equipment.aggregate([
+        {
+          $match: {
+            tenantId: tenantObjectId,
+            Site: siteObjectId
+          }
+        },
+        {
+          $group: {
+            _id: '$Zone',
+            total: { $sum: 1 },
+            passed: {
+              $sum: {
+                $cond: [{ $eq: ['$Compliance', 'Passed'] }, 1, 0]
+              }
+            },
+            failed: {
+              $sum: {
+                $cond: [{ $eq: ['$Compliance', 'Failed'] }, 1, 0]
+              }
+            },
+            na: {
+              $sum: {
+                $cond: [{ $eq: ['$Compliance', 'NA'] }, 1, 0]
+              }
+            }
+          }
+        }
+      ])
+    ]);
+
+    const zoneStatsFormatted = zoneStats.map(stat => ({
+      zoneId: stat._id ? stat._id.toString() : 'unassigned',
+      equipmentCount: stat.total,
+      statusCounts: {
+        Passed: stat.passed,
+        Failed: stat.failed,
+        NA: stat.na
+      }
+    }));
+
+    const statusCounts = zoneStatsFormatted.reduce(
+      (acc, stat) => {
+        acc.Passed += stat.statusCounts.Passed;
+        acc.Failed += stat.statusCounts.Failed;
+        acc.NA += stat.statusCounts.NA;
+        return acc;
+      },
+      { Passed: 0, Failed: 0, NA: 0 }
+    );
+
+    const deviceCount = zoneStatsFormatted.reduce(
+      (sum, stat) => sum + stat.equipmentCount,
+      0
+    );
+
+    return res.json({
+      siteId: siteObjectId.toString(),
+      zoneCount,
+      deviceCount,
+      statusCounts,
+      zoneStats: zoneStatsFormatted
+    });
+  } catch (error) {
+    console.error('❌ getSiteSummary error:', error);
+    return res.status(500).json({
+      message: 'Failed to fetch site summary.',
+      error: error.message || String(error)
+    });
+  }
+};
+
 // 🔹 Site módosítása
 exports.updateSite = async (req, res) => {
   try {

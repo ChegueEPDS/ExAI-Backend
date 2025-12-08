@@ -9,6 +9,7 @@ const upload = multer({ dest: 'uploads/' }); // ideiglenes mappa
 
 router.post('/', authMiddleware(), siteController.createSite);        // Új site létrehozása
 router.get('/', authMiddleware(), siteController.getAllSites);        // Összes site listázása
+router.get('/:id/summary', authMiddleware(), siteController.getSiteSummary); // Site összefoglaló
 router.get('/:id', authMiddleware(), siteController.getSiteById);     // Egyedi site lekérése
 router.put('/:id', authMiddleware(), siteController.updateSite);      // Site módosítása
 router.delete('/:id', authMiddleware(), siteController.deleteSite);   // Site törlése
