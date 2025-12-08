@@ -1,5 +1,6 @@
 const bus = require('../lib/notifications/bus');
 const Notification = require('../models/notification');
+const ReportExportJob = require('../models/reportExportJob');
 
 exports.notificationsStream = (req, res) => {
   const userId = req.userId;
@@ -53,23 +54,54 @@ exports.notificationsStream = (req, res) => {
 exports.listNotifications = async (req, res) => {
   const userId = req.userId;
   const tenantId = req.scope?.tenantId;
-  const unreadOnly = String(req.query.unreadOnly || 'true') === 'true';
   const includeTenant = String(req.query.includeTenant || 'true') === 'true';
-  const limit = Math.min(parseInt(req.query.limit || '50', 10), 200);
+  const limit = Math.min(parseInt(req.query.limit || '100', 10), 200);
+  const status = String(req.query.status || 'all').toLowerCase();
 
   const or = [{ userId }];
   if (includeTenant && tenantId) or.push({ tenantId });
 
   const q = { $or: or };
-  if (unreadOnly) q.status = 'unread';
+  if (status === 'unread') q.status = 'unread';
+  if (status === 'read') q.status = 'read';
 
   const items = await Notification.find(q).sort({ createdAt: -1 }).limit(limit).lean();
-  const enriched = (items || []).map(it => ({
-    ...it,
-    audience: it.userId ? 'user' : 'tenant',
-    meta: it?.data?.meta || undefined
-  }));
+  const jobIds = Array.from(
+    new Set(
+      (items || [])
+        .map(it => it?.data?.jobId)
+        .filter(Boolean)
+    )
+  );
+  let jobMap = new Map();
+  if (jobIds.length) {
+    const jobs = await ReportExportJob.find({ jobId: { $in: jobIds } })
+      .select('jobId status meta finishedAt createdAt')
+      .lean();
+    jobMap = new Map(jobs.map(j => [j.jobId, j]));
+  }
+  const enriched = (items || []).map(it => {
+    const jobId = it?.data?.jobId;
+    const job = jobId ? jobMap.get(jobId) : null;
+    return {
+      ...it,
+      audience: it.userId ? 'user' : 'tenant',
+      data: it?.data || {},
+      meta: it?.data?.meta || undefined,
+      jobStatus: job?.status || null,
+      jobFinishedAt: job?.finishedAt || null
+    };
+  });
   res.json({ items: enriched });
+};
+
+exports.deleteNotification = async (req, res) => {
+  const userId = req.userId;
+  const { id } = req.params;
+  const doc = await Notification.findOne({ _id: id, userId });
+  if (!doc) return res.status(404).json({ error: 'Not found' });
+  await Notification.deleteOne({ _id: id });
+  res.json({ deleted: true });
 };
 
 exports.markRead = async (req, res) => {

@@ -3,13 +3,24 @@
 const ExcelJS = require('exceljs');
 const archiver = require('archiver');
 const path = require('path');
+const { PassThrough } = require('stream');
+const { v4: uuidv4 } = require('uuid');
 const Inspection = require('../models/inspection');
 const Dataplate = require('../models/dataplate');
 const Site = require('../models/site');
 const Zone = require('../models/zone');
 const Certificate = require('../models/certificate');
+const User = require('../models/user');
+const ReportExportJob = require('../models/reportExportJob');
 const azureBlob = require('../services/azureBlobService');
 const https = require('https');
+const mailService = require('../services/mailService');
+const mailTemplates = require('../services/mailTemplates');
+const { notifyAndStore } = require('../lib/notifications/notifier');
+const {
+  buildCertificateCacheForTenant,
+  resolveCertificateFromCache
+} = require('../helpers/certificateMatchHelper');
 
 const EXCEL_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const DEFAULT_COLUMNS = [
@@ -50,6 +61,107 @@ const BORDER_THIN = {
 };
 
 const INDEX_LOGO_URL = 'https://certs.atexdb.eu/public/index_logo.png';
+const REPORT_JOB_TYPES = {
+  PROJECT_FULL: 'project_full',
+  LATEST_INSPECTIONS: 'latest_inspections'
+};
+const REPORT_BLOB_PREFIX = 'report-exports';
+const REPORT_EXPORT_RETENTION_DAYS =
+  Number(process.env.REPORT_EXPORT_RETENTION_DAYS) > 0
+    ? Number(process.env.REPORT_EXPORT_RETENTION_DAYS)
+    : 90;
+const PROJECT_REPORT_DIRS = {
+  INSPECTIONS: 'Inspection Reports',
+  IMAGES: 'Images',
+  DOCUMENTS: 'Documents',
+  CERTIFICATES: 'Certificates'
+};
+const REPORT_PROGRESS_STEP_COUNT = 10;
+
+function buildExportJobContext(job = {}) {
+  return (
+    job?.meta?.siteName ||
+    job?.meta?.zoneName ||
+    job?.meta?.downloadName ||
+    job?.params?.siteId ||
+    job?.params?.zoneId ||
+    'Inspection export'
+  );
+}
+
+function createProgressCallback(job) {
+  const label = `[report-job ${job?.jobId || 'unknown'}]`;
+  let lastNotified = -1;
+  return ({ processed = 0, total = 0 } = {}) => {
+    if (!(typeof processed === 'number' && typeof total === 'number' && total > 0)) {
+      console.info(`${label} progress update`);
+      return;
+    }
+    const step = Math.max(1, Math.floor(total / REPORT_PROGRESS_STEP_COUNT));
+    const shouldNotify =
+      processed === 0 ||
+      processed === total ||
+      processed - lastNotified >= step;
+    if (!shouldNotify) return;
+    lastNotified = processed;
+    console.info(`${label} progress ${processed}/${total}`);
+    if (job?.userId) {
+      notifyExportJobStatus(job, { status: 'running', processed, total }).catch(err => {
+        console.warn('⚠️ Failed to push running status notification', err?.message || err);
+      });
+    }
+  };
+}
+
+async function notifyExportJobStatus(job, { status, processed = null, total = null, downloadUrl = null } = {}) {
+  if (!job?.userId) return;
+  const messageContext = buildExportJobContext(job);
+  let message;
+  switch ((status || '').toLowerCase()) {
+    case 'queued':
+      message = `${messageContext} export queued.`;
+      break;
+    case 'running': {
+      if (typeof processed === 'number' && typeof total === 'number' && total > 0) {
+        message = `Processing ${messageContext}: ${processed}/${total} equipment...`;
+      } else {
+        message = `${messageContext} export is running...`;
+      }
+      break;
+    }
+    case 'succeeded':
+      message = `${messageContext} export is ready to download.`;
+      break;
+    case 'failed':
+      message = `${messageContext} export failed.`;
+      break;
+    default:
+      message = `${messageContext} export status: ${status || 'unknown'}.`;
+  }
+
+  const data = {
+    jobId: job.jobId,
+    jobType: job.type,
+    fileName: job.meta?.downloadName || messageContext,
+    status,
+  };
+  if (downloadUrl) data.downloadUrl = downloadUrl;
+  if (typeof processed === 'number' && typeof total === 'number') {
+    data.progress = { processed, total };
+  }
+
+  try {
+    await notifyAndStore(job.userId.toString(), {
+      type: 'inspection-export-status',
+      title: job.type === REPORT_JOB_TYPES.PROJECT_FULL ? 'Project export' : 'Inspection export',
+      message,
+      data,
+      meta: { route: '/inspections/exports', jobId: job.jobId }
+    });
+  } catch (err) {
+    console.warn('⚠️ Failed to push export job status notification', err?.message || err);
+  }
+}
 
 function fetchImageBuffer(url) {
   return new Promise((resolve, reject) => {
@@ -334,6 +446,84 @@ async function appendImagesToArchive(archive, attachments, imagesRoot = 'images'
       console.error('⚠️ Failed to append inspection image to archive:', err?.message || err);
     }
   }
+}
+
+function normalizeDocumentMeta(doc = {}, eqFolder, fallbackPrefix, defaultExt = '.bin') {
+  if (!doc?.blobPath) return null;
+  const originalName = doc.name || doc.alias || doc.fileName || fallbackPrefix;
+  const ext =
+    path.extname(originalName || '') ||
+    path.extname(doc.blobPath || '') ||
+    defaultExt;
+  const base = path.basename(originalName || fallbackPrefix, ext);
+  const safeBase = sanitizeFileNameSegment(base, fallbackPrefix);
+  return {
+    blobPath: doc.blobPath,
+    eqFolder,
+    fileName: `${safeBase}${ext}`
+  };
+}
+
+function collectEquipmentDocuments(equipment, eqFolder) {
+  const docs = Array.isArray(equipment?.documents) ? equipment.documents : [];
+  const documentMetas = [];
+  const imageMetas = [];
+  docs.forEach((doc, idx) => {
+    if (!doc?.blobPath) return;
+    const fallback = `doc_${idx + 1}`;
+    const meta = normalizeDocumentMeta(doc, eqFolder, fallback, '.bin');
+    if (!meta) return;
+    if (String(doc.type || '').toLowerCase() === 'image') {
+      imageMetas.push(meta);
+    } else {
+      documentMetas.push(meta);
+    }
+  });
+  return { documentMetas, imageMetas };
+}
+
+function collectInspectionDocumentAttachments(inspection, eqFolder) {
+  const attachments = Array.isArray(inspection?.attachments) ? inspection.attachments : [];
+  const docs = [];
+  attachments.forEach((att, idx) => {
+    if (!att?.blobPath) return;
+    if (att.type && att.type !== 'document') return;
+    const fallback = `inspection_doc_${idx + 1}`;
+    const meta = normalizeDocumentMeta(att, eqFolder, fallback, '.pdf');
+    if (meta) docs.push(meta);
+  });
+  return docs;
+}
+
+async function appendDocumentsToArchive(archive, docs, documentsRoot = 'documents') {
+  if (!Array.isArray(docs) || !docs.length) return;
+  for (const doc of docs) {
+    if (!doc?.blobPath) continue;
+    try {
+      const buffer = await azureBlob.downloadToBuffer(doc.blobPath);
+      const folder = sanitizeFileNameSegment(doc.eqFolder || 'equipment');
+      const zipPath = path.posix.join(documentsRoot, folder, doc.fileName);
+      archive.append(buffer, { name: zipPath });
+    } catch (err) {
+      console.error('⚠️ Failed to append document to archive:', err?.message || err);
+    }
+  }
+}
+
+function setupArchiveStream(targetStream) {
+  const archive = archiver('zip', { zlib: { level: 9 } });
+  let byteCount = 0;
+  archive.on('data', chunk => {
+    if (chunk) {
+      byteCount += chunk.length;
+    }
+  });
+  const finalized = new Promise((resolve, reject) => {
+    archive.on('end', resolve);
+    archive.on('error', reject);
+  });
+  archive.pipe(targetStream);
+  return { archive, finalized, getByteCount: () => byteCount };
 }
 
 async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme, attachmentLookup = null, options = {}) {
@@ -1025,6 +1215,291 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   return { workbook, fileName };
 }
 
+function buildProjectExRegisterWorkbook(equipments, {
+  zoneMap,
+  inspectionById,
+  inspectionByEquipment,
+  certMap
+}) {
+  const workbook = new ExcelJS.Workbook();
+  const worksheet = workbook.addWorksheet('Database');
+
+  const headers = [
+    '_id',
+    '#',
+    'TagNo',
+    'EqID',
+    'Description',
+    'Manufacturer',
+    'Model',
+    'Serial Number',
+    'IP rating',
+    'Temp. Range',
+    'EPL',
+    'SubGroup',
+    'Temperature Class',
+    'Protection Concept',
+    'Certificate No',
+    'Certificate Issue Date',
+    'Special Condition',
+    'Declaration of conformity',
+    'Zone',
+    'Gas / Dust Group',
+    'Temp Rating',
+    'Ambient Temp',
+    'Req Zone',
+    'Req Gas / Dust Group',
+    'Req Temp Rating',
+    'Req Ambient Temp',
+    'Req IP Rating',
+    'Inspection Date',
+    'Inspector',
+    'Type',
+    'Status',
+    'Remarks'
+  ];
+
+  worksheet.columns = headers.map(header => ({
+    header,
+    key: header,
+    width: 2
+  }));
+
+  worksheet.spliceRows(1, 0, []);
+  const groupRow = worksheet.getRow(1);
+  const mergeDefs = [
+    { start: 1, end: 4, label: 'IDENTIFICATION', color: 'FF00AA00' },
+    { start: 5, end: 9, label: 'EQUIPMENT DATA', color: 'FFFF9900' },
+    { start: 10, end: 14, label: 'EX DATA', color: 'FF538DD5' },
+    { start: 15, end: 18, label: 'CERTIFICATION', color: 'FF00AA00' },
+    { start: 19, end: 22, label: 'ZONE REQUIREMENTS', color: 'FFFFFF66' },
+    { start: 23, end: 27, label: 'USER REQUIREMENT', color: 'FFB1A0C7' },
+    { start: 28, end: 32, label: 'INSPECTION DATA', color: 'FFB0B0B0' }
+  ];
+
+  mergeDefs.forEach(def => {
+    worksheet.mergeCells(1, def.start, 1, def.end);
+    const cell = groupRow.getCell(def.start);
+    cell.value = def.label;
+    cell.font = { bold: true, color: { argb: 'FF000000' } };
+    cell.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: def.color }
+    };
+    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+  });
+
+  const headerRow = worksheet.getRow(2);
+  headerRow.eachCell((cell, colNumber) => {
+    let bg = null;
+    if (colNumber >= 1 && colNumber <= 4) bg = 'FFCCFFCC';
+    else if (colNumber >= 5 && colNumber <= 9) bg = 'FFFFE0B2';
+    else if (colNumber >= 10 && colNumber <= 14) bg = 'FFDCE6F1';
+    else if (colNumber >= 15 && colNumber <= 18) bg = 'FFCCFFCC';
+    else if (colNumber >= 19 && colNumber <= 22) bg = 'FFFFFFCC';
+    else if (colNumber >= 23 && colNumber <= 27) bg = 'FFE4DFEC';
+    else if (colNumber >= 28 && colNumber <= 32) bg = 'FFE0E0E0';
+
+    cell.font = { bold: true, color: { argb: 'FF000000' } };
+    if (bg) {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: bg } };
+    } else {
+      cell.fill = undefined;
+    }
+    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+  });
+
+  const centerAlignedColumns = new Set([
+    'Temp. Range',
+    'Equipment Group',
+    'Equipment Category',
+    'Environment',
+    'Type of Protection',
+    'SubGroup',
+    'Temperature Class',
+    'Equipment Protection Level',
+    'IP rating',
+    'Zone',
+    'Gas / Dust Group',
+    'Temp. Rating',
+    'Ambient Temp',
+    'Req Zone',
+    'Req Gas / Dust Group',
+    'Req Temp Rating',
+    'Req Ambient Temp',
+    'Req IP Rating',
+    'Status'
+  ]);
+
+  let equipmentIndex = 0;
+  for (const eq of equipments) {
+    equipmentIndex += 1;
+    const zone = eq.Zone ? zoneMap.get(eq.Zone.toString()) : null;
+
+    let inspection = null;
+    if (eq.lastInspectionId) {
+      inspection = inspectionById?.get(eq.lastInspectionId.toString()) || null;
+    }
+    if (!inspection && inspectionByEquipment) {
+      inspection = inspectionByEquipment.get(eq._id?.toString()) || null;
+    }
+
+    const inspectorName = inspection?.inspectorId
+      ? `${inspection.inspectorId.firstName || inspection.inspectorId.name || ''} ${inspection.inspectorId.lastName || ''}`.trim()
+      : '';
+    const inspectionDate =
+      inspection?.inspectionDate ||
+      eq.lastInspectionDate ||
+      null;
+
+    const zoneNumber = Array.isArray(zone?.Zone)
+      ? zone.Zone.join(', ')
+      : (zone?.Zone != null ? String(zone.Zone) : '');
+    const zoneSubGroup = Array.isArray(zone?.SubGroup)
+      ? zone.SubGroup.join(', ')
+      : (zone?.SubGroup != null ? String(zone.SubGroup) : '');
+
+    const zoneTempParts = [];
+    if (zone?.TempClass) zoneTempParts.push(zone.TempClass);
+    if (typeof zone?.MaxTemp === 'number') zoneTempParts.push(`${zone.MaxTemp}°C`);
+    const zoneTempDisplay = zoneTempParts.join(' / ');
+
+    const ambientParts = [];
+    if (zone?.AmbientTempMin != null) ambientParts.push(`${zone.AmbientTempMin}°C`);
+    if (zone?.AmbientTempMax != null) ambientParts.push(`+${zone.AmbientTempMax}°C`);
+    const ambientDisplay = ambientParts.join(' / ');
+
+    const clientReq = Array.isArray(zone?.clientReq) && zone.clientReq.length
+      ? zone.clientReq[0]
+      : null;
+    const clientReqZoneNumber = Array.isArray(clientReq?.Zone)
+      ? clientReq.Zone.join(', ')
+      : (clientReq?.Zone != null ? String(clientReq.Zone) : '');
+    const clientReqGasDustGroup = Array.isArray(clientReq?.SubGroup)
+      ? clientReq.SubGroup.join(', ')
+      : (clientReq?.SubGroup != null ? String(clientReq.SubGroup) : '');
+    const clientReqTempParts = [];
+    if (clientReq?.TempClass) clientReqTempParts.push(clientReq.TempClass);
+    if (typeof clientReq?.MaxTemp === 'number') clientReqTempParts.push(`${clientReq.MaxTemp}°C`);
+    const clientReqTempDisplay = clientReqTempParts.join(' / ');
+
+    const clientReqAmbientParts = [];
+    if (clientReq?.AmbientTempMin != null) clientReqAmbientParts.push(`${clientReq.AmbientTempMin}°C`);
+    if (clientReq?.AmbientTempMax != null) clientReqAmbientParts.push(`+${clientReq.AmbientTempMax}°C`);
+    const clientReqAmbientDisplay = clientReqAmbientParts.join(' / ');
+    const clientReqIpRating = clientReq?.IpRating || '';
+
+    const cert = resolveCertificateFromCache(certMap, eq['Certificate No']);
+    const hasSpecialCondition = !!(cert && (cert.specCondition || cert.xcondition));
+
+    const rawCertNo = eq['Certificate No'] || '';
+    let exportCertNo = rawCertNo;
+    let exportDocNo = '';
+    if (cert && cert.docType === 'manufacturer_declaration') {
+      exportCertNo = '';
+      exportDocNo = rawCertNo;
+    }
+
+    const exMarkings = Array.isArray(eq['Ex Marking']) && eq['Ex Marking'].length
+      ? eq['Ex Marking']
+      : [null];
+
+    for (const marking of exMarkings) {
+      const rowData = {
+        '_id': eq._id ? eq._id.toString() : '',
+        '#': typeof eq.orderIndex === 'number' && eq.orderIndex > 0
+          ? eq.orderIndex
+          : equipmentIndex,
+        'TagNo': eq['TagNo'] || '',
+        'EqID': eq['EqID'] || '',
+        'Description': eq['Equipment Type'] || '',
+        'Manufacturer': eq.Manufacturer || '',
+        'Model': eq['Model/Type'] || '',
+        'Serial Number': eq['Serial Number'] || '',
+        'IP rating': eq['IP rating'] || '',
+        'Temp. Range': eq['Max Ambient Temp'] || '',
+        'EPL': marking ? (marking['Equipment Protection Level'] || '') : '',
+        'SubGroup': marking ? (marking['Gas / Dust Group'] || '') : '',
+        'Temperature Class': marking ? (marking['Temperature Class'] || '') : '',
+        'Protection Concept': marking ? (marking['Type of Protection'] || '') : '',
+        'Certificate No': exportCertNo,
+        'Certificate Issue Date': cert?.issueDate || '',
+        'Special Condition': hasSpecialCondition ? 'Yes' : 'No',
+        'Declaration of conformity': exportDocNo,
+        'Zone': zoneNumber,
+        'Gas / Dust Group': zoneSubGroup,
+        'Temp Rating': zoneTempDisplay,
+        'Ambient Temp': ambientDisplay,
+        'Req Zone': clientReqZoneNumber,
+        'Req Gas / Dust Group': clientReqGasDustGroup,
+        'Req Temp Rating': clientReqTempDisplay,
+        'Req Ambient Temp': clientReqAmbientDisplay,
+        'Req IP Rating': clientReqIpRating,
+        'Status': eq['Compliance'] || '',
+        'Inspection Date': inspectionDate ? new Date(inspectionDate) : '',
+        'Inspector': inspectorName,
+        'Type': inspection?.inspectionType || '',
+        'Remarks': eq['Other Info'] || ''
+      };
+
+      const row = worksheet.addRow(rowData);
+      row.eachCell((cell, colNumber) => {
+        const header = headers[colNumber - 1];
+        if (header === 'Status') {
+          const complianceValue = rowData[header];
+          const complianceColor =
+            complianceValue === 'Passed'
+              ? 'FF008000'
+              : complianceValue === 'Failed'
+                ? 'FFFF0000'
+                : 'FF000000';
+          cell.font = { color: { argb: complianceColor }, bold: true };
+        }
+
+        if (centerAlignedColumns.has(header)) {
+          cell.alignment = { horizontal: 'center', vertical: 'middle' };
+        } else {
+          cell.alignment = { horizontal: 'left', vertical: 'middle' };
+        }
+      });
+
+      if (row.number > 2) {
+        const isEven = row.number % 2 === 0;
+        row.eachCell(cell => {
+          if (isEven) {
+            cell.fill = {
+              type: 'pattern',
+              pattern: 'solid',
+              fgColor: { argb: 'FFF5F5F5' }
+            };
+          } else {
+            cell.fill = undefined;
+          }
+        });
+      }
+    }
+  }
+
+  if (worksheet.columns) {
+    worksheet.columns.forEach(column => {
+      if (!column || !column.eachCell) return;
+      let maxLength = 5;
+      column.eachCell({ includeEmpty: true }, cell => {
+        if (cell.value) {
+          const cellLength = cell.value.toString().length;
+          if (cellLength > maxLength) {
+            maxLength = cellLength;
+          }
+        }
+      });
+      column.width = maxLength + 2;
+    });
+  }
+
+  return workbook;
+}
+
 function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }) {
   const workbook = new ExcelJS.Workbook();
   const ws = workbook.addWorksheet('Punchlist');
@@ -1289,6 +1764,579 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
   return { workbook, fileName };
 }
 
+async function generateProjectReportArchive({ tenantId, siteId, tenantName }, targetStream, progressCb = null) {
+  const site = await Site.findOne({ _id: siteId }).lean();
+  if (!site) {
+    throw new Error('Project not found.');
+  }
+
+  const equipments = await Dataplate.find({ tenantId, Site: siteId }).lean();
+  if (!equipments.length) {
+    throw new Error('No equipment found for this project.');
+  }
+  const totalEquipments = equipments.length;
+  if (typeof progressCb === 'function') {
+    progressCb({ processed: 0, total: totalEquipments });
+  }
+
+  const zones = await Zone.find({ tenantId, Site: siteId }).lean();
+  const zoneMap = new Map();
+  zones.forEach(zone => zoneMap.set(zone._id.toString(), zone));
+
+  const lastInspectionIds = [
+    ...new Set(
+      equipments
+        .map(e => (e.lastInspectionId ? e.lastInspectionId.toString() : null))
+        .filter(Boolean)
+    )
+  ];
+
+  let inspections = [];
+  if (lastInspectionIds.length) {
+    inspections = await Inspection.find({
+      _id: { $in: lastInspectionIds },
+      tenantId
+    })
+      .populate('inspectorId', 'firstName lastName name')
+      .lean();
+  }
+  const inspectionById = new Map(inspections.map(i => [i._id.toString(), i]));
+  const inspectionByEquipment = new Map();
+  equipments.forEach(eq => {
+    if (eq.lastInspectionId) {
+      const insp = inspectionById.get(eq.lastInspectionId.toString());
+      if (insp) {
+        inspectionByEquipment.set(eq._id?.toString(), insp);
+      }
+    }
+  });
+
+  const missingEquipments = equipments.filter(
+    eq => !inspectionByEquipment.has(eq._id?.toString())
+  );
+  for (const eq of missingEquipments) {
+    const insp = await Inspection.findOne({ equipmentId: eq._id, tenantId })
+      .sort({ inspectionDate: -1, createdAt: -1 })
+      .populate('inspectorId', 'firstName lastName name')
+      .lean();
+    if (insp) {
+      inspectionByEquipment.set(eq._id.toString(), insp);
+      if (insp._id) {
+        inspectionById.set(insp._id.toString(), insp);
+      }
+    }
+  }
+
+  let certMap = new Map();
+  try {
+    certMap = await buildCertificateCacheForTenant(tenantId);
+  } catch (err) {
+    console.warn('⚠️ Certificate cache build failed for project report:', err?.message || err);
+    certMap = new Map();
+  }
+
+  const exWorkbook = buildProjectExRegisterWorkbook(equipments, {
+    zoneMap,
+    inspectionById,
+    inspectionByEquipment,
+    certMap
+  });
+  const safeSiteName = sanitizeFileNameSegment(site?.Name || site?.SiteName || 'project');
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const projectExFileName = `Project_ExRegister_${safeSiteName}_${timestamp}.xlsx`;
+  const projectExBuffer = await exWorkbook.xlsx.writeBuffer();
+
+  const schemeCache = new Map();
+  const projectFailures = [];
+  const uniqueCertificateKeys = new Set();
+
+  const { archive, finalized, getByteCount } = setupArchiveStream(targetStream);
+  let zipName = `Project_Ex_Report_${safeSiteName}_${timestamp}.zip`;
+
+  archive.append(projectExBuffer, { name: projectExFileName });
+
+  let equipmentIndex = 0;
+  let processedEquipments = 0;
+  for (const eq of equipments) {
+    equipmentIndex++;
+    const eqIdStr = eq._id?.toString();
+    const inspection =
+      (eq.lastInspectionId && inspectionById.get(eq.lastInspectionId.toString())) ||
+      inspectionByEquipment.get(eqIdStr);
+    if (!inspection) continue;
+
+    const zoneId = eq.Zone ? eq.Zone.toString() : null;
+    const zone = zoneId ? zoneMap.get(zoneId) : null;
+
+    const identifier =
+      buildEquipmentIdentifier(eq) ||
+      eq['EqID'] ||
+      inspection.eqId ||
+      eqIdStr ||
+      `equipment_${projectFailures.length + 1}`;
+    const sanitizedIdentifier = sanitizeFileNameSegment(
+      identifier || `equipment_${equipmentIndex}`
+    );
+    const scheme = await resolveSchemeFromEquipment(eq, schemeCache);
+
+    const attachmentLookup = buildInspectionAttachmentLookup(
+      inspection,
+      eq['EqID'] || inspection.eqId,
+      sanitizedIdentifier
+    );
+
+    const { workbook: itrWorkbook, fileName: itrFileName } = await buildInspectionWorkbook(
+      inspection,
+      eq,
+      site,
+      zone,
+      scheme,
+      attachmentLookup,
+      { tenantName: tenantName || '' }
+    );
+    const itrBuffer = await itrWorkbook.xlsx.writeBuffer();
+    archive.append(itrBuffer, {
+      name: path.posix.join(PROJECT_REPORT_DIRS.INSPECTIONS, sanitizedIdentifier, itrFileName)
+    });
+
+    const equipmentDocs = collectEquipmentDocuments(eq, sanitizedIdentifier);
+    const inspectionDocAttachments = collectInspectionDocumentAttachments(
+      inspection,
+      sanitizedIdentifier
+    );
+
+    const combinedImages = [
+      ...(attachmentLookup?.all || []),
+      ...(equipmentDocs.imageMetas || [])
+    ];
+    if (combinedImages.length) {
+      await appendImagesToArchive(archive, combinedImages, PROJECT_REPORT_DIRS.IMAGES);
+    }
+
+    const combinedDocs = [
+      ...(equipmentDocs.documentMetas || []),
+      ...inspectionDocAttachments
+    ];
+    if (combinedDocs.length) {
+      await appendDocumentsToArchive(archive, combinedDocs, PROJECT_REPORT_DIRS.DOCUMENTS);
+    }
+
+    const certDoc = resolveCertificateFromCache(certMap, eq['Certificate No']);
+    const certificateSource =
+      certDoc?.fileUrl ||
+      certDoc?.sharePointFileUrl ||
+      certDoc?.docxUrl ||
+      certDoc?.sharePointDocxUrl;
+    const certNumberRaw =
+      eq['Certificate No'] ||
+      eq['CertNo'] ||
+      eq['certNo'] ||
+      eq['certificateNumber'] ||
+      certDoc?.CertNo ||
+      certDoc?.certNo;
+    const normalizedCertKey = (certNumberRaw || '').toString().trim().toUpperCase();
+    const certKey = normalizedCertKey || certificateSource || certDoc?._id?.toString();
+    if (certificateSource && certKey && !uniqueCertificateKeys.has(certKey)) {
+      try {
+        const certBuffer = await azureBlob.downloadToBuffer(certificateSource);
+        const blobPath = azureBlob.toBlobPath(certificateSource);
+        const ext = path.extname(blobPath || '') || '.pdf';
+        const certBase =
+          normalizedCertKey ||
+          sanitizeFileNameSegment(certDoc?.alias || certDoc?.name || sanitizedIdentifier, 'certificate');
+        const certFileName = `${sanitizeFileNameSegment(certBase, 'certificate')}${ext}`;
+        archive.append(certBuffer, {
+          name: path.posix.join(PROJECT_REPORT_DIRS.CERTIFICATES, certFileName)
+        });
+        uniqueCertificateKeys.add(certKey);
+      } catch (err) {
+        console.warn('⚠️ Failed to append certificate to project ZIP:', err?.message || err);
+      }
+    }
+
+    const failedResults = Array.isArray(inspection.results)
+      ? inspection.results.filter(r => r.status === 'Failed')
+      : [];
+    if (failedResults.length) {
+      failedResults.forEach(r => {
+        const ref = deriveQuestionReference(r);
+        const checkText =
+          r.questionText?.eng ||
+          r.questionText?.hun ||
+          r.questionText?.hu ||
+          r.question ||
+          '';
+        const imageNames = attachmentLookup
+          ? attachmentLookup.getFileNamesForResult(r)
+          : [];
+        const failure = {
+          eqId: eq['EqID'] || inspection.eqId || sanitizedIdentifier,
+          ref,
+          check: checkText,
+          note: r.note || '',
+          imageNames: imageNames || []
+        };
+        projectFailures.push(failure);
+      });
+    }
+    processedEquipments++;
+    if (typeof progressCb === 'function') {
+      progressCb({ processed: processedEquipments, total: totalEquipments });
+    }
+  }
+
+  const { workbook: finalProjectPunchWorkbook } = buildPunchlistWorkbook({
+    site,
+    zone: null,
+    failures: projectFailures,
+    reportDate: new Date(),
+    scopeLabel: 'Project scope'
+  });
+  const finalPunchBuffer = await finalProjectPunchWorkbook.xlsx.writeBuffer();
+  archive.append(finalPunchBuffer, { name: `Project_Punchlist_${safeSiteName}_${timestamp}.xlsx` });
+
+  await archive.finalize();
+  await finalized;
+
+  if (typeof progressCb === 'function') {
+    progressCb({ processed: totalEquipments, total: totalEquipments });
+  }
+
+  return { zipName, byteCount: getByteCount() };
+}
+
+async function generateLatestInspectionArchive(
+  { tenantId, siteId, zoneId, includeImages, tenantName },
+  targetStream,
+  progressCb = null
+) {
+  if (!zoneId && !siteId) {
+    throw new Error('zoneId or siteId is required');
+  }
+
+  const equipmentFilter = { tenantId };
+  if (zoneId) equipmentFilter.Zone = zoneId;
+  if (siteId) equipmentFilter.Site = siteId;
+
+  const equipments = await Dataplate.find(equipmentFilter).lean();
+  if (!equipments || equipments.length === 0) {
+    throw new Error('No equipment found for the provided scope.');
+  }
+  const totalEquipments = equipments.length;
+  if (typeof progressCb === 'function') {
+    progressCb({ processed: 0, total: totalEquipments });
+  }
+
+  const site = siteId ? await Site.findById(siteId).lean() : null;
+  const zone = zoneId ? await Zone.findById(zoneId).lean() : null;
+
+  const siteCache = new Map();
+  const zoneCache = new Map();
+  const certificateCache = new Map();
+
+  const { archive, finalized, getByteCount } = setupArchiveStream(targetStream);
+  let fileCount = 0;
+
+  const safeSite = site ? sanitizeFileNameSegment(site?.Name || site?.SiteName) : null;
+  const safeZone = zone ? sanitizeFileNameSegment(zone?.Name || zone?.ZoneName) : null;
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  let zipName = 'inspection-reports.zip';
+  if (zoneId && safeZone) {
+    zipName = `Zone_${safeZone}_${timestamp}.zip`;
+  } else if (siteId && safeSite) {
+    zipName = `Project_${safeSite}_${timestamp}.zip`;
+  } else {
+    zipName = `Inspection_Reports_${timestamp}.zip`;
+  }
+
+  let processedEquipments = 0;
+  for (const equipment of equipments) {
+    let inspection = null;
+
+    if (equipment.lastInspectionId) {
+      inspection = await Inspection.findOne({ _id: equipment.lastInspectionId, tenantId })
+        .populate('inspectorId', 'firstName lastName email')
+        .lean();
+    }
+
+    if (!inspection) {
+      inspection = await Inspection.findOne({ equipmentId: equipment._id, tenantId })
+        .sort({ inspectionDate: -1, createdAt: -1 })
+        .populate('inspectorId', 'firstName lastName email')
+        .lean();
+    }
+
+    if (!inspection) {
+      continue;
+    }
+
+    const context = await resolveInspectionContext(inspection, {
+      equipment,
+      siteCache,
+      zoneCache,
+      certificateCache
+    });
+
+    if (context.error) continue;
+
+    const identifier =
+      buildEquipmentIdentifier(context.equipment) ||
+      context.equipment?.EqID ||
+      inspection.eqId;
+    const attachmentLookup = includeImages
+      ? buildInspectionAttachmentLookup(
+          inspection,
+          context.equipment?.EqID || inspection.eqId,
+          identifier
+        )
+      : null;
+
+    const { workbook, fileName } = await buildInspectionWorkbook(
+      inspection,
+      context.equipment,
+      context.site,
+      context.zone,
+      context.scheme,
+      attachmentLookup,
+      { tenantName: tenantName || '' }
+    );
+    const buffer = await workbook.xlsx.writeBuffer();
+    archive.append(buffer, { name: fileName });
+    fileCount++;
+
+    if (includeImages && attachmentLookup?.all?.length) {
+      await appendImagesToArchive(archive, attachmentLookup.all);
+    }
+    processedEquipments++;
+    if (typeof progressCb === 'function') {
+      progressCb({ processed: processedEquipments, total: totalEquipments });
+    }
+  }
+
+  if (!fileCount) {
+    throw new Error('No inspections were found for the selected zone/project.');
+  }
+
+  await archive.finalize();
+  await finalized;
+
+  if (typeof progressCb === 'function') {
+    progressCb({ processed: totalEquipments, total: totalEquipments });
+  }
+
+  return { zipName, byteCount: getByteCount() };
+}
+
+function buildReportBlobPath(tenantId, jobId) {
+  return `${REPORT_BLOB_PREFIX}/${String(tenantId)}/${jobId}.zip`;
+}
+
+function scheduleReportJob(job) {
+  setImmediate(() => {
+    runReportExportJob(job.jobId).catch(err => {
+      console.error('Report export job runner error', err);
+    });
+  });
+}
+
+async function runReportExportJob(jobId) {
+  const job = await ReportExportJob.findOneAndUpdate(
+    { jobId, status: 'queued' },
+    { $set: { status: 'running', startedAt: new Date() } },
+    { new: true }
+  );
+
+  if (!job) return;
+
+  const tenantName = job.meta?.tenantName || '';
+  console.info(`[report-job ${job.jobId}] started (${job.type}) for tenant ${job.tenantId}`);
+  const blobPath = buildReportBlobPath(job.tenantId, job.jobId);
+  const uploadStream = new PassThrough();
+  let uploadError = null;
+  const uploadPromise = azureBlob
+    .uploadStream(blobPath, uploadStream, 'application/zip')
+    .catch(err => {
+      uploadError = err;
+      throw err;
+    });
+
+  try {
+    let result;
+    const progressCallback = createProgressCallback(job);
+    if (job.type === REPORT_JOB_TYPES.PROJECT_FULL) {
+      result = await generateProjectReportArchive(
+        { tenantId: job.tenantId, siteId: job.params?.siteId, tenantName },
+        uploadStream,
+        progressCallback
+      );
+    } else if (job.type === REPORT_JOB_TYPES.LATEST_INSPECTIONS) {
+      result = await generateLatestInspectionArchive(
+        {
+          tenantId: job.tenantId,
+          siteId: job.params?.siteId,
+          zoneId: job.params?.zoneId,
+          includeImages: job.params?.includeImages !== false,
+          tenantName
+        },
+        uploadStream,
+        progressCallback
+      );
+    } else {
+      throw new Error(`Unknown report job type: ${job.type}`);
+    }
+
+    await uploadPromise;
+    if (uploadError) throw uploadError;
+
+    job.status = 'succeeded';
+    job.finishedAt = new Date();
+    job.blobPath = blobPath;
+    job.blobSize = result?.byteCount || null;
+    job.meta = { ...(job.meta || {}), downloadName: result?.zipName };
+    await job.save();
+    try {
+      console.info(`[report-job ${job.jobId}] completed successfully.`);
+      await notifyReportExportReady(job);
+    } catch (notifyErr) {
+      console.warn('⚠️ Report export notification failed', notifyErr?.message || notifyErr);
+    }
+  } catch (err) {
+    uploadStream.destroy(err);
+    try {
+      await uploadPromise;
+    } catch (_) {}
+    job.status = 'failed';
+    job.errorMessage = err?.message || 'Report export job failed';
+    job.finishedAt = new Date();
+    await job.save();
+    if (job.userId) {
+      notifyExportJobStatus(job, { status: 'failed' }).catch(notifyErr => {
+        console.warn('⚠️ Failed to notify job failure', notifyErr?.message || notifyErr);
+      });
+    }
+    console.error('Report export job failed', { jobId, error: err?.message || err });
+  }
+}
+
+async function createReportExportJob({ tenantId, userId, type, params = {}, tenantName = '', meta = {} }) {
+  const job = await ReportExportJob.create({
+    jobId: `${type}-${Date.now()}-${uuidv4().slice(0, 8)}`,
+    tenantId,
+    userId,
+    type,
+    params,
+    meta: { tenantName, ...meta }
+  });
+  scheduleReportJob(job);
+  if (job.userId) {
+    notifyExportJobStatus(job, { status: 'queued' }).catch(err => {
+      console.warn('⚠️ Failed to send queued notification for export job', err?.message || err);
+    });
+  }
+  return job;
+}
+
+async function serializeReportJob(job, { includeDownloadUrl = false, downloadUrlTtlSeconds } = {}) {
+  if (!job) return null;
+  const payload = {
+    jobId: job.jobId,
+    tenantId: job.tenantId,
+    userId: job.userId,
+    type: job.type,
+    status: job.status,
+    params: job.params || {},
+    meta: job.meta || {},
+    blobSize: job.blobSize || null,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    errorMessage: job.errorMessage || null
+  };
+
+  if (includeDownloadUrl && job.status === 'succeeded' && job.blobPath) {
+    try {
+      payload.downloadUrl = await azureBlob.getReadSasUrl(job.blobPath, {
+        ttlSeconds: downloadUrlTtlSeconds || Number(process.env.REPORT_EXPORT_DOWNLOAD_URL_TTL) || 600,
+        filename: job.meta?.downloadName || `${job.jobId}.zip`,
+        contentType: 'application/zip'
+      });
+    } catch (err) {
+      console.warn('⚠️ Failed to build SAS URL for report job', {
+        jobId: job.jobId,
+        err: err?.message || err
+      });
+    }
+  }
+  return payload;
+}
+
+async function notifyReportExportReady(job) {
+  if (!job) return;
+  const userId = job.userId ? job.userId.toString() : null;
+  let payload = null;
+  try {
+    payload = await serializeReportJob(job, {
+      includeDownloadUrl: true,
+      downloadUrlTtlSeconds: Number(process.env.REPORT_EXPORT_EMAIL_LINK_TTL) || 24 * 60 * 60
+    });
+  } catch (err) {
+    console.warn('⚠️ Failed to serialize report job for notification', err?.message || err);
+  }
+
+  const title =
+    job.type === REPORT_JOB_TYPES.PROJECT_FULL
+      ? 'Project export ZIP ready'
+      : 'Inspection export ZIP ready';
+  const fileName = job.meta?.downloadName || payload?.meta?.downloadName || job.meta?.siteName || job.meta?.zoneName || 'export.zip';
+
+  if (userId) {
+    notifyExportJobStatus(job, {
+      status: 'succeeded',
+      downloadUrl: payload?.downloadUrl || null
+    }).catch(err => {
+      console.warn('⚠️ Failed to push notification for export job', err?.message || err);
+    });
+  }
+
+  if (payload?.downloadUrl && job.userId) {
+    try {
+      const user = await User.findById(job.userId).select('email firstName lastName').lean();
+      if (user?.email) {
+        const greetingName = [user.firstName, user.lastName].filter(Boolean).join(' ');
+        const tenantName =
+          job.meta?.tenantName ||
+          job.meta?.tenant?.name ||
+          job.meta?.tenant ||
+          job.meta?.tenantSlug ||
+          job.tenantName;
+        const html = mailTemplates.reportExportReadyEmail({
+          firstName: user.firstName || greetingName || '',
+          lastName: user.lastName || '',
+          downloadUrl: payload?.downloadUrl,
+          fileName,
+          jobId: job.jobId,
+          tenantName
+        });
+        await mailService.sendMail({
+          to: user.email,
+          subject: title,
+          html
+        });
+      }
+    } catch (err) {
+      console.warn('⚠️ Failed to send export readiness email', err?.message || err);
+    }
+  }
+}
+
+async function respondJobQueued(_req, res, job) {
+  const payload = await serializeReportJob(job, { includeDownloadUrl: false });
+  return res.status(202).json({
+    message: 'Export job queued',
+    job: payload
+  });
+}
+
 exports.exportInspectionXLSX = async (req, res) => {
   try {
     const { id } = req.params;
@@ -1522,9 +2570,47 @@ exports.exportPunchlistXLSX = async (req, res) => {
   }
 };
 
+exports.exportProjectFullReport = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const userId = req.scope?.userId;
+    const siteId = req.query?.siteId;
+
+    if (!tenantId) {
+      return res.status(401).json({ message: 'Missing tenant context.' });
+    }
+
+    if (!siteId) {
+      return res.status(400).json({ message: 'siteId query param is required.' });
+    }
+
+    const site = await Site.findOne({ _id: siteId, tenantId }).select('Name SiteName').lean();
+    if (!site) {
+      return res.status(404).json({ message: 'Project not found.' });
+    }
+
+    const job = await createReportExportJob({
+      tenantId,
+      userId,
+      type: REPORT_JOB_TYPES.PROJECT_FULL,
+      params: { siteId },
+      tenantName: req.scope?.tenantName || '',
+      meta: {
+        siteName: site?.Name || site?.SiteName || ''
+      }
+    });
+
+    return respondJobQueued(req, res, job, job.meta?.downloadName || 'project_export.zip');
+  } catch (err) {
+    console.error('Error queueing project report job:', err);
+    return res.status(500).json({ message: 'Failed to queue project report', error: err.message });
+  }
+};
+
 exports.exportLatestInspectionReportsZip = async (req, res) => {
   try {
     const tenantId = req.scope?.tenantId;
+    const userId = req.scope?.userId;
     const { zoneId, siteId } = req.query || {};
     const includeImages = (req.query?.includeImages ?? 'true') !== 'false';
 
@@ -1536,107 +2622,135 @@ exports.exportLatestInspectionReportsZip = async (req, res) => {
       return res.status(400).json({ message: 'Kérjük adjon meg zoneId vagy siteId paramétert.' });
     }
 
-    const equipmentFilter = { tenantId };
-    if (zoneId) equipmentFilter.Zone = zoneId;
-    if (siteId) equipmentFilter.Site = siteId;
-
-    const equipments = await Dataplate.find(equipmentFilter).lean();
-
-    if (!equipments || equipments.length === 0) {
-      return res.status(404).json({ message: 'Nem található eszköz a megadott szűrővel.' });
+    const meta = {};
+    if (siteId) {
+      const site = await Site.findOne({ _id: siteId, tenantId }).select('Name SiteName').lean();
+      if (!site) {
+        return res.status(404).json({ message: 'Project not found for the provided siteId.' });
+      }
+      meta.siteName = site?.Name || site?.SiteName || '';
+    }
+    if (zoneId) {
+      const zone = await Zone.findOne({ _id: zoneId, tenantId }).select('Name ZoneName').lean();
+      if (!zone) {
+        return res.status(404).json({ message: 'Zone not found for the provided zoneId.' });
+      }
+      meta.zoneName = zone?.Name || zone?.ZoneName || '';
     }
 
-    const siteCache = new Map();
-    const zoneCache = new Map();
-    const certificateCache = new Map();
-    const files = [];
-    const allImages = [];
-
-    for (const equipment of equipments) {
-      let inspection = null;
-
-      if (equipment.lastInspectionId) {
-        inspection = await Inspection.findOne({ _id: equipment.lastInspectionId, tenantId })
-          .populate('inspectorId', 'firstName lastName email')
-          .lean();
-      }
-
-      if (!inspection) {
-        inspection = await Inspection.findOne({ equipmentId: equipment._id, tenantId })
-          .sort({ inspectionDate: -1, createdAt: -1 })
-          .populate('inspectorId', 'firstName lastName email')
-          .lean();
-      }
-
-      if (!inspection) {
-        continue;
-      }
-
-      const context = await resolveInspectionContext(inspection, {
-        equipment,
-        siteCache,
-        zoneCache,
-        certificateCache
-      });
-
-      if (context.error) continue;
-
-      const identifier =
-        buildEquipmentIdentifier(context.equipment) ||
-        context.equipment?.EqID ||
-        inspection.eqId;
-      const attachmentLookup = includeImages
-        ? buildInspectionAttachmentLookup(
-            inspection,
-            context.equipment?.EqID || inspection.eqId,
-            identifier
-          )
-        : null;
-
-      const { workbook, fileName } = await buildInspectionWorkbook(
-        inspection,
-        context.equipment,
-        context.site,
-        context.zone,
-        context.scheme,
-        attachmentLookup,
-        { tenantName: req.scope?.tenantName || '' }
-      );
-      const buffer = await workbook.xlsx.writeBuffer();
-      files.push({ buffer, fileName });
-      if (includeImages && attachmentLookup?.all?.length) {
-        allImages.push(...attachmentLookup.all);
-      }
-    }
-
-    if (files.length === 0) {
-      return res.status(404).json({ message: 'Nem találtunk inspectiont a megadott zónában/projektben.' });
-    }
-
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', 'attachment; filename="inspection-reports.zip"');
-
-    const archive = archiver('zip', { zlib: { level: 9 } });
-    archive.on('error', err => {
-      console.error('Error while creating inspection ZIP:', err);
-      if (!res.headersSent) {
-        res.status(500).json({ message: 'Hiba a ZIP készítésekor.' });
-      } else {
-        res.end();
-      }
+    const job = await createReportExportJob({
+      tenantId,
+      userId,
+      type: REPORT_JOB_TYPES.LATEST_INSPECTIONS,
+      params: { zoneId, siteId, includeImages },
+      tenantName: req.scope?.tenantName || '',
+      meta
     });
 
-    archive.pipe(res);
-
-    files.forEach(({ buffer, fileName }) => {
-      archive.append(buffer, { name: fileName });
-    });
-    if (includeImages) {
-      await appendImagesToArchive(archive, allImages);
-    }
-    await archive.finalize();
+    return respondJobQueued(req, res, job, job.meta?.downloadName || 'inspection_reports.zip');
   } catch (err) {
-    console.error('Error exporting inspection ZIP:', err);
-    return res.status(500).json({ message: 'Failed to export inspection reports ZIP', error: err.message });
+    console.error('Error queueing inspection ZIP job:', err);
+    return res.status(500).json({ message: 'Failed to queue inspection ZIP job', error: err.message });
+  }
+};
+
+exports.getInspectionExportJob = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) {
+      return res.status(401).json({ message: 'Missing tenant context.' });
+    }
+
+    const job = await ReportExportJob.findOne({ jobId: req.params.jobId, tenantId }).lean();
+    if (!job) {
+      return res.status(404).json({ message: 'Export job not found.' });
+    }
+
+    const payload = await serializeReportJob(job, { includeDownloadUrl: true });
+    return res.json(payload);
+  } catch (err) {
+    console.error('Error fetching export job status:', err);
+    return res.status(500).json({ message: 'Failed to fetch export job status', error: err.message });
+  }
+};
+
+exports.listInspectionExportJobs = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const userId = req.scope?.userId || req.userId;
+    if (!tenantId) {
+      return res.status(401).json({ message: 'Missing tenant context.' });
+    }
+
+    const scope = req.query?.scope === 'tenant' && (req.role === 'Admin' || req.role === 'SuperAdmin')
+      ? 'tenant'
+      : 'user';
+    const includeDownload = req.query?.includeDownloadUrl === 'true';
+    const limit = Math.min(Number(req.query?.limit) || 25, 100);
+    const statusFilter = req.query?.status;
+
+    const filter = { tenantId };
+    if (scope === 'user') {
+      filter.userId = userId;
+    }
+    if (statusFilter) {
+      filter.status = statusFilter;
+    }
+
+    const jobs = await ReportExportJob.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    const payloads = [];
+    for (const job of jobs) {
+      const payload = await serializeReportJob(job, { includeDownloadUrl: includeDownload });
+      if (payload) payloads.push(payload);
+    }
+
+    return res.json({
+      scope,
+      retentionDays: REPORT_EXPORT_RETENTION_DAYS,
+      items: payloads
+    });
+  } catch (err) {
+    console.error('Error listing export jobs:', err);
+    return res.status(500).json({ message: 'Failed to list export jobs', error: err.message });
+  }
+};
+
+exports.deleteInspectionExportJob = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const userId = req.scope?.userId || req.userId;
+    const role = req.role;
+    if (!tenantId) {
+      return res.status(401).json({ message: 'Missing tenant context.' });
+    }
+
+    const job = await ReportExportJob.findOne({ jobId: req.params.jobId, tenantId }).lean();
+    if (!job) {
+      return res.status(404).json({ message: 'Export job not found.' });
+    }
+
+    const isOwner = userId && job.userId && String(job.userId) === String(userId);
+    const canManageTenant = role === 'Admin' || role === 'SuperAdmin';
+    if (!isOwner && !canManageTenant) {
+      return res.status(403).json({ message: 'You are not allowed to delete this export job.' });
+    }
+
+    if (job.blobPath) {
+      try {
+        await azureBlob.deleteFile(job.blobPath);
+      } catch (err) {
+        console.warn('⚠️ Failed to delete export job blob', err?.message || err);
+      }
+    }
+
+    await ReportExportJob.deleteOne({ _id: job._id });
+    return res.json({ deleted: true, jobId: job.jobId });
+  } catch (err) {
+    console.error('Error deleting export job:', err);
+    return res.status(500).json({ message: 'Failed to delete export job', error: err.message });
   }
 };

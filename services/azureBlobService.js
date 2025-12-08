@@ -227,6 +227,27 @@ module.exports = {
     return blobPath; // return relative path for DB storage
   },
 
+  /**
+   * Upload a readable stream directly to Blob Storage.
+   * @param {string} blobNameOrPath
+   * @param {NodeJS.ReadableStream} readable
+   * @param {string} [contentType='application/octet-stream']
+   * @param {{ bufferSize?: number, maxConcurrency?: number, metadata?: Record<string,string> }} [opts]
+   * @returns {Promise<string>} blob path
+   */
+  async uploadStream(blobNameOrPath, readable, contentType = 'application/octet-stream', opts = {}) {
+    const blobPath = toBlobPath(blobNameOrPath);
+    if (!blobPath) throw new Error('uploadStream: missing blob name/path');
+    const blockBlobClient = containerClient.getBlockBlobClient(blobPath);
+    const bufferSize = opts.bufferSize || 4 * 1024 * 1024; // 4MB chunks
+    const maxConcurrency = opts.maxConcurrency || 4;
+    await blockBlobClient.uploadStream(readable, bufferSize, maxConcurrency, {
+      blobHTTPHeaders: { blobContentType: contentType },
+      metadata: opts.metadata || undefined
+    });
+    return blobPath;
+  },
+
   async downloadToBuffer(blobNameOrPath) {
     const blobPath = toBlobPath(blobNameOrPath);
     if (!blobPath) throw new Error('downloadToBuffer: missing blob name/path');

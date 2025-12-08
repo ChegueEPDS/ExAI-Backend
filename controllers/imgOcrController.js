@@ -359,7 +359,13 @@ exports.uploadPdfWithFormRecognizer = [
 
       const client = DocumentIntelligence(endpoint, { key });
 
-      logger.info("🚀 Küldés az Azure AI Document Intelligence API-nak...");
+      logger.info("🚀 Küldés az Azure AI Document Intelligence API-nak...", {
+        certType,
+        tenantId: req.scope?.tenantId || 'n/a',
+        fileName: req.file.originalname,
+        fileSize: req.file.size,
+        endpoint
+      });
       const initialResponse = await client
         .path("/documentModels/{modelId}:analyze", "prebuilt-read")
         .post({
@@ -367,13 +373,96 @@ exports.uploadPdfWithFormRecognizer = [
           body: pdfBuffer
         });
 
+      logger.info('📡 Azure válasz érkezett', {
+        status: initialResponse?.status,
+        headers: initialResponse?.headers,
+        requestId: initialResponse?.headers?.['apim-request-id'] || initialResponse?.headers?.['x-ms-request-id'],
+        operationLocation: initialResponse?.headers?.['operation-location']
+      });
+
       if (isUnexpected(initialResponse)) {
         throw new Error(`❌ Azure API hiba: ${initialResponse.body.error.message}`);
       }
 
-      logger.info("🔄 Azure AI feldolgozás elindítva, várakozás az eredményekre...");
-      const poller = getLongRunningPoller(client, initialResponse);
-      const analyzeResult = (await poller.pollUntilDone()).body.analyzeResult;
+      const operationLocation =
+        initialResponse?.headers?.['operation-location'] ||
+        initialResponse?.headers?.['Operation-Location'];
+      if (!operationLocation) {
+        throw new Error('❌ Azure válaszban hiányzik az operation-location fejléc.');
+      }
+
+      logger.info("🔄 Azure AI manuális polling indul...", {
+        operationLocation
+      });
+
+      const pollIntervalMs =
+        Number(process.env.AZURE_FORM_RECOGNIZER_POLL_INTERVAL_MS) || 2500;
+      const timeoutMs =
+        Number(process.env.AZURE_FORM_RECOGNIZER_TIMEOUT_MS) || 5 * 60 * 1000;
+
+      const pollHeaders = {
+        'Ocp-Apim-Subscription-Key': key,
+        Accept: 'application/json'
+      };
+
+      const pollStart = Date.now();
+      let analyzeResult;
+      // Manuális polling az Operation-Location URL-re axios-szal
+      // így megkerüljük az SDK LRO bugját.
+      // (Azure portal szerint a művelet befejeződik, de az SDK poller nem lép ki.)
+      // Itt explicit a status mezőt figyeljük.
+      /* eslint-disable no-constant-condition */
+      while (true) {
+        const elapsed = Date.now() - pollStart;
+        if (elapsed > timeoutMs) {
+          throw new Error(
+            `❌ Azure OCR timeout: ${Math.round(elapsed / 1000)}s után nincs végállapot`
+          );
+        }
+
+        let pollResp;
+        try {
+          pollResp = await axios.get(operationLocation, { headers: pollHeaders });
+        } catch (err) {
+          logger.error('❌ Azure OCR poll hiba', {
+            message: err?.message,
+            status: err?.response?.status,
+            data: err?.response?.data
+          });
+          throw err;
+        }
+
+        const body = pollResp?.data || {};
+        const status = (body.status || '').toLowerCase();
+
+        logger.info('⏱️ Azure OCR manuális státusz frissítés', {
+          status,
+          httpStatus: pollResp?.status
+        });
+
+        if (status === 'succeeded') {
+          analyzeResult = body.analyzeResult || body;
+          logger.info('✅ Azure OCR succeeded', {
+            totalElapsedMs: elapsed
+          });
+          break;
+        }
+
+        if (status === 'failed' || status === 'cancelled' || status === 'canceled') {
+          logger.error('❌ Azure OCR failed végállapot', {
+            status,
+            errors: body.errors || body.error
+          });
+          throw new Error(
+            `Azure OCR failed with status ${status}: ${JSON.stringify(
+              body.errors || body.error || {}
+            )}`
+          );
+        }
+
+        await wait(pollIntervalMs);
+      }
+      /* eslint-enable no-constant-condition */
 
       if (!analyzeResult) {
         throw new Error("❌ PDF OCR feldolgozás sikertelen.");

@@ -12,5 +12,6 @@ router.get('/notifications/stream', authSse(), notificationsController.notificat
 router.get('/notifications', authMiddleware(), notificationsController.listNotifications);
 router.post('/notifications/:id/read', authMiddleware(), notificationsController.markRead);
 router.post('/notifications/read-all', authMiddleware(), notificationsController.markAllRead);
+router.delete('/notifications/:id', authMiddleware(), notificationsController.deleteNotification);
 
 module.exports = router;

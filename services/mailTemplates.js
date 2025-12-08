@@ -221,6 +221,46 @@ function certificateRequestFulfilledEmail({ firstName, lastName, certNo, request
   });
 }
 
+function reportExportReadyEmail({ firstName, lastName, fileName, downloadUrl, jobId, tenantName }) {
+  const fullName = `${firstName || ''} ${lastName || ''}`.trim() || 'there';
+  const safeFileName = escapeHtml(fileName || 'export.zip');
+  const safeJobId = escapeHtml(jobId || '');
+  const safeDownloadUrl = downloadUrl && downloadUrl.startsWith('http') ? downloadUrl : null;
+  const portalUrl = 'https://certs.atexdb.eu/notifications';
+
+  return baseTemplate({
+    title: 'Your export is ready',
+    tenantName,
+    bodyHtml: `
+      <h2 style="color:#131313;">Dear ${escapeHtml(fullName)},</h2>
+      <p>The ZIP export you requested is now ready.</p>
+      <table style="width:100%; max-width:420px; margin:12px 0; border-collapse:collapse;">
+        <tr>
+          <td style="padding:6px 0; font-weight:bold;">File name:</td>
+          <td style="padding:6px 0; text-align:right;">${safeFileName}</td>
+        </tr>
+        <tr>
+          <td style="padding:6px 0; font-weight:bold;">Job ID:</td>
+          <td style="padding:6px 0; text-align:right;">${safeJobId || '—'}</td>
+        </tr>
+      </table>
+      ${
+        safeDownloadUrl
+          ? `<p style="margin:28px 0; text-align:center;">
+              <a href="${safeDownloadUrl}" target="_blank" rel="noopener noreferrer"
+                 style="background:#f8d201; color:#131313; text-decoration:none; padding:12px 24px; border-radius:6px; font-size:16px; display:inline-block;">
+                Download ZIP
+              </a>
+            </p>`
+          : `<p>You can download the ZIP from the application by opening the Exports section.</p>`
+      }
+      <p>If the download link has expired, please sign in to the platform and navigate to <strong>Notifications → Exports</strong> to regenerate it.</p>
+      <p style="margin-top:20px;">Open the portal: <a href="${portalUrl}" target="_blank" rel="noopener noreferrer">${portalUrl}</a></p>
+      <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team</p>
+    `
+  });
+}
+
 /** Simple HTML escape for safety */
 function escapeHtml(s) {
   return String(s)
@@ -237,4 +277,5 @@ module.exports = {
   forgotPasswordEmailHtml,
   uploadCompletedEmail,
   certificateRequestFulfilledEmail,
+  reportExportReadyEmail,
 };

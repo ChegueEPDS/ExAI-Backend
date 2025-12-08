@@ -1,0 +1,47 @@
+<button mat-icon-button [matMenuTriggerFor]="notificationMenu" aria-label="Értesítések">
+  <span
+    matBadge="{{ unreadCount || '' }}"
+    matBadgeHidden="!unreadCount"
+    matBadgeColor="warn"
+    matBadgeOverlap="false"
+  >
+    <mat-icon>notifications</mat-icon>
+  </span>
+</button>
+
+<mat-menu #notificationMenu="matMenu" class="notifications-menu" (menuOpened)="onMenuOpened()">
+  <div class="menu-container" *ngIf="loading">
+    <mat-progress-spinner mode="indeterminate" diameter="28"></mat-progress-spinner>
+  </div>
+
+  <ng-container *ngIf="!loading && notifications.length; else emptyState">
+    <button mat-menu-item *ngFor="let notification of notifications" (click)="openNotification(notification)">
+      <div class="item">
+        <div class="title">{{ notification.title || 'Értesítés' }}</div>
+        <div class="message">{{ notification.message }}</div>
+        <div class="meta">{{ notification.createdAt | date : 'short' }}</div>
+      </div>
+    </button>
+    <mat-divider></mat-divider>
+    <button mat-menu-item (click)="markAllRead($event)">
+      <mat-icon>done_all</mat-icon>
+      <span>Mark all as read</span>
+    </button>
+    <button mat-menu-item color="primary" (click)="viewAll($event)">
+      <mat-icon>list</mat-icon>
+      <span>Összes értesítés</span>
+    </button>
+  </ng-container>
+
+  <ng-template #emptyState>
+    <div class="menu-container empty">
+      <mat-icon>notifications_off</mat-icon>
+      <p>Nincsenek olvasatlan értesítések.</p>
+    </div>
+    <mat-divider></mat-divider>
+    <button mat-menu-item (click)="viewAll($event)">
+      <mat-icon>list</mat-icon>
+      <span>Összes értesítés</span>
+    </button>
+  </ng-template>
+</mat-menu>

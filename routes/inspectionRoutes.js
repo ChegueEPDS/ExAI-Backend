@@ -16,7 +16,11 @@ router.delete('/inspections/attachment', authMiddleware(), express.json(), inspe
 router.get('/inspections', authMiddleware(), inspectionController.listInspections);
 
 router.get('/inspections/punchlist', authMiddleware(), exportInspectioReport.exportPunchlistXLSX);
+router.get('/inspections/project-report', authMiddleware(), exportInspectioReport.exportProjectFullReport);
 router.get('/inspections/export-zip', authMiddleware(), exportInspectioReport.exportLatestInspectionReportsZip);
+router.get('/inspections/export-jobs', authMiddleware(), exportInspectioReport.listInspectionExportJobs);
+router.get('/inspections/export-jobs/:jobId', authMiddleware(), exportInspectioReport.getInspectionExportJob);
+router.delete('/inspections/export-jobs/:jobId', authMiddleware(), exportInspectioReport.deleteInspectionExportJob);
 router.get('/inspections/:id/export-xlsx', authMiddleware(), exportInspectioReport.exportInspectionXLSX);
 
 // Konkrét inspection lekérése ID alapján

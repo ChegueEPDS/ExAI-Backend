@@ -1018,6 +1018,17 @@ exports.previewAtex = async (req, res) => {
       return res.status(400).json({ message: '❌ Hiányzó fájl a kérésben.' });
     }
 
+    const tenantId = req.scope?.tenantId || 'n/a';
+    const userId = req.scope?.userId || req.user?._id || 'n/a';
+    console.info(JSON.stringify({
+      level: 'info',
+      message: '📥 [ATEX preview] Request received',
+      tenantId,
+      userId,
+      fileName: req.file.originalname,
+      fileSize: req.file.size
+    }));
+
     try {
       const pdfPath = path.resolve(req.file.path);
       const originalPdfName = req.file.originalname;
@@ -1026,9 +1037,20 @@ exports.previewAtex = async (req, res) => {
       const pdfBuffer = fs.readFileSync(pdfPath);
 
       // 1) Azure OCR
-      console.info(JSON.stringify({ level: 'info', message: '🚀 [ATEX preview] Sending PDF to Azure OCR...', name: originalPdfName }));
+      console.info(JSON.stringify({
+        level: 'info',
+        message: '🚀 [ATEX preview] Sending PDF to Azure OCR...',
+        name: originalPdfName,
+        bytes: pdfBuffer?.length || 0
+      }));
+      const ocrStart = Date.now();
       const { recognizedText } = await uploadPdfWithFormRecognizerInternal(pdfBuffer);
-      console.info(JSON.stringify({ level: 'info', message: '✅ [ATEX preview] Azure OCR done.' }));
+      console.info(JSON.stringify({
+        level: 'info',
+        message: '✅ [ATEX preview] Azure OCR done.',
+        elapsedMs: Date.now() - ocrStart,
+        textLength: recognizedText?.length || 0
+      }));
 
       // 2) OpenAI field extraction (ATEX profile inside the helper)
       console.info(JSON.stringify({ level: 'info', message: '🧠 [ATEX preview] Extracting fields with OpenAI...' }));

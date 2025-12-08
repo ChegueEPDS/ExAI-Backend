@@ -6,6 +6,7 @@ const logger = require('./config/logger');
 const limiter = require('./middlewares/rateLimiter');
 const cleanupService = require('./services/cleanupService');
 const subscriptionSweeper = require('./services/subscriptionSweeper');
+const reportExportCleanup = require('./services/reportExportCleanup');
 const path = require('path');
 const fs = require('fs');
 
@@ -204,6 +205,8 @@ app.use('/api', tenantRoutes);
 app.use('/api', inviteRoutes);
 app.use('/api', mailRoutes);
 app.use('/api', inspectionRoutes);
+
+reportExportCleanup.start();
 
 
 /**
