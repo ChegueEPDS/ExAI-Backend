@@ -1211,7 +1211,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
     equipment.EqID ||
     inspection.eqId ||
     'unknown';
-  const fileName = `Inspection_${sanitizeFileNameSegment(identifier)}_${Date.now()}.xlsx`;
+  const fileName = `${sanitizeFileNameSegment(identifier)}_Inspection_${Date.now()}.xlsx`;
   return { workbook, fileName };
 }
 
@@ -1896,7 +1896,7 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName }, ta
     );
     const itrBuffer = await itrWorkbook.xlsx.writeBuffer();
     archive.append(itrBuffer, {
-      name: path.posix.join(PROJECT_REPORT_DIRS.INSPECTIONS, sanitizedIdentifier, itrFileName)
+      name: path.posix.join(PROJECT_REPORT_DIRS.INSPECTIONS, itrFileName)
     });
 
     const equipmentDocs = collectEquipmentDocuments(eq, sanitizedIdentifier);

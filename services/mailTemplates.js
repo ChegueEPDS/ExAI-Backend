@@ -1,10 +1,31 @@
 // services/mailTemplates.js
 
+function isIndexTenant(tenantName) {
+  return (tenantName || '').toLowerCase() === 'index';
+}
+
+function getTenantBaseUrl(tenantName) {
+  return isIndexTenant(tenantName) ? 'https://exai.ind-ex.ae' : 'https://certs.atexdb.eu';
+}
+
+function buildTenantUrl(tenantName, path = '') {
+  const base = getTenantBaseUrl(tenantName).replace(/\/+$/, '');
+  if (!path) return base;
+  const normalizedPath = String(path || '').replace(/^\/+/, '');
+  return `${base}/${normalizedPath}`;
+}
+
+function displayHost(url) {
+  return String(url || '').replace(/^https?:\/\//i, '');
+}
+
 function baseTemplate({ title, bodyHtml, tenantName }) {
-  const isIndex = (tenantName || '').toLowerCase() === 'index';
+  const isIndex = isIndexTenant(tenantName);
   const logoUrl = isIndex ? 'https://certs.atexdb.eu/public/index_logo.png' : 'https://certs.atexdb.eu/public/ATEXdb.png';
   const logoAlt = isIndex ? 'ExAI IndEx Logo' : 'ATEXdb Certs Logo';
   const footerName = isIndex ? 'ExAI IndEx' : 'ATEXdb Certs';
+  const footerUrl = buildTenantUrl(tenantName);
+  const footerUrlLabel = displayHost(footerUrl);
 
   return `
   <!DOCTYPE html>
@@ -64,7 +85,7 @@ function registrationEmailHtml({ firstName, lastName, loginUrl, tenantName }) {
         </a>
       </p>
       <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team<br/>
-         <a href="https://certs.atexdb.eu" target="_blank" rel="noopener noreferrer">certs.atexdb.eu</a>
+         <a href="${footerUrl}" target="_blank" rel="noopener noreferrer">${footerUrlLabel}</a>
       </p>
     `,
   });
@@ -91,7 +112,7 @@ function tenantInviteEmailHtml({ firstName, lastName, tenantName, loginUrl, pass
         </a>
       </p>
       <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team<br/>
-         <a href="https://certs.atexdb.eu" target="_blank" rel="noopener noreferrer">certs.atexdb.eu</a>
+         <a href="${footerUrl}" target="_blank" rel="noopener noreferrer">${footerUrlLabel}</a>
       </p>
     `,
   });
@@ -119,7 +140,7 @@ function forgotPasswordEmailHtml({ firstName, lastName, loginUrl, tempPassword, 
         </a>
       </p>
       <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team<br/>
-         <a href="https://certs.atexdb.eu" target="_blank" rel="noopener noreferrer">certs.atexdb.eu</a>
+         <a href="${footerUrl}" target="_blank" rel="noopener noreferrer">${footerUrlLabel}</a>
       </p>
     `,
   });
@@ -171,7 +192,8 @@ function certificateRequestFulfilledEmail({ firstName, lastName, certNo, request
   const safeModel = escapeHtml(model || '');
   const safeStatus = escapeHtml(status || 'fulfilled');
 
-  const appUrl = 'https://certs.atexdb.eu/cert?tab=db';
+  const appUrl = buildTenantUrl(tenantName, 'cert?tab=db');
+  const appUrlLabel = displayHost(appUrl);
 
   return baseTemplate({
     title: 'Your requested certificate is available',
@@ -215,7 +237,7 @@ function certificateRequestFulfilledEmail({ firstName, lastName, certNo, request
       </p>
 
       <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team<br/>
-         <a href="https://certs.atexdb.eu" target="_blank" rel="noopener noreferrer">certs.atexdb.eu</a>
+         <a href="${appUrl}" target="_blank" rel="noopener noreferrer">${appUrlLabel}</a>
       </p>
     `,
   });
@@ -226,7 +248,8 @@ function reportExportReadyEmail({ firstName, lastName, fileName, downloadUrl, jo
   const safeFileName = escapeHtml(fileName || 'export.zip');
   const safeJobId = escapeHtml(jobId || '');
   const safeDownloadUrl = downloadUrl && downloadUrl.startsWith('http') ? downloadUrl : null;
-  const portalUrl = 'https://certs.atexdb.eu/notifications';
+  const portalUrl = buildTenantUrl(tenantName, 'notifications');
+  const portalLabel = displayHost(portalUrl);
 
   return baseTemplate({
     title: 'Your export is ready',
@@ -255,7 +278,7 @@ function reportExportReadyEmail({ firstName, lastName, fileName, downloadUrl, jo
           : `<p>You can download the ZIP from the application by opening the Exports section.</p>`
       }
       <p>If the download link has expired, please sign in to the platform and navigate to <strong>Notifications → Exports</strong> to regenerate it.</p>
-      <p style="margin-top:20px;">Open the portal: <a href="${portalUrl}" target="_blank" rel="noopener noreferrer">${portalUrl}</a></p>
+      <p style="margin-top:20px;">Open the portal: <a href="${portalUrl}" target="_blank" rel="noopener noreferrer">${portalLabel}</a></p>
       <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team</p>
     `
   });
