@@ -1066,30 +1066,7 @@ exports.importEquipmentXLSX = async (req, res) => {
           }
         }
 
-        // 2) Ha nincs vagy nem érvényes _id, EqID + Zone alapján próbálunk frissíteni
-        if (!equipmentDoc && payload.EqID) {
-          const lookup = await Equipment.findOne({
-            tenantId,
-            Zone: zone._id,
-            EqID: payload.EqID
-          });
-          if (lookup) {
-            const updateData = { ...payload, ModifiedBy: userId };
-            delete updateData.CreatedBy;
-            delete updateData.tenantId;
-            if (entry.orderIndex == null) {
-              delete updateData.orderIndex;
-            }
-            equipmentDoc = await Equipment.findByIdAndUpdate(
-              lookup._id,
-              { $set: updateData },
-              { new: true }
-            );
-            stats.updated += 1;
-          }
-        }
-
-        // 3) Ha így sem találtunk, új eszközt hozunk létre
+        // 2) Ha így sem találtunk, új eszközt hozunk létre
         if (!equipmentDoc) {
           const createData = {
             ...payload,
