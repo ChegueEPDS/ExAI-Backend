@@ -1,4 +1,5 @@
 // controllers/inspectionController.js
+const path = require('path');
 const Inspection = require('../models/inspection');
 const Equipment = require('../models/dataplate');
 const mongoose = require('mongoose');
@@ -356,7 +357,17 @@ exports.uploadInspectionAttachment = (req, res) => {
 
     try {
       const safeEq = String(eqId).replace(/[^\w\-.]+/g, '_');
-      const cleanName = file.originalname ? file.originalname.replace(/[^\w.\-]+/g, '_') : `inspection_${Date.now()}`;
+      const originalName = file.originalname || `inspection_${Date.now()}`;
+      const ext = path.extname(originalName) || '';
+      let baseName = originalName.replace(/[^\w.\-]+/g, '_').replace(ext, '');
+      const normalizedRef = questionKey ? String(questionKey).trim() : '';
+      let alias = note || '';
+      if (normalizedRef) {
+        const safeRef = normalizedRef.replace(/[^A-Za-z0-9_-]+/g, '_');
+        baseName = `Failure-${safeRef || Date.now()}`;
+        if (!alias) alias = `Failure - ${normalizedRef}`;
+      }
+      const cleanName = `${baseName}${ext}`;
       const blobPath = `Equipment/${safeEq}/inspections/${Date.now()}_${cleanName}`;
       const guessedType = file.mimetype || 'application/octet-stream';
 
@@ -374,7 +385,7 @@ exports.uploadInspectionAttachment = (req, res) => {
         size: file.size,
         questionId: questionId || undefined,
         questionKey: questionKey || undefined,
-        note: note || ''
+        note: alias || ''
       });
     } catch (uploadErr) {
       console.error('❌ Attachment upload error:', uploadErr);

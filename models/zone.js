@@ -24,6 +24,9 @@ const ZoneSchema = new mongoose.Schema(
             enum: ['IIA', 'IIB', 'IIC', 'IIIA', 'IIIB', 'IIIC'],
             default: []
         },
+        SkidID: { type: String, trim: true },
+        SkidDescription: { type: String },
+        ProjectID: { type: String, trim: true },
         TempClass: {
             type: String,
             enum: ['T1', 'T2', 'T3', 'T4', 'T5', 'T6']

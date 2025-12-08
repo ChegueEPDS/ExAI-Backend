@@ -37,6 +37,12 @@ router.get(
 );
 
 router.get(
+  '/exreg/certificate-summary',
+  authMiddleware(),
+  exRegisterController.exportZoneCertificateSummary
+);
+
+router.get(
   '/exreg/:id/documents',
   authMiddleware(),
   exRegisterController.getDocumentsOfEquipment

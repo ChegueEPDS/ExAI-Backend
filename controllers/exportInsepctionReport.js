@@ -13,6 +13,7 @@ const Certificate = require('../models/certificate');
 const User = require('../models/user');
 const ReportExportJob = require('../models/reportExportJob');
 const azureBlob = require('../services/azureBlobService');
+const sharp = require('sharp');
 const https = require('https');
 const mailService = require('../services/mailService');
 const mailTemplates = require('../services/mailTemplates');
@@ -508,6 +509,234 @@ async function appendDocumentsToArchive(archive, docs, documentsRoot = 'document
       console.error('⚠️ Failed to append document to archive:', err?.message || err);
     }
   }
+}
+
+function orderEquipmentPicturesForItr(equipment) {
+  const ordered = [];
+  const seen = new Set();
+  if (!equipment) return ordered;
+
+  const pushUnique = (pic) => {
+    if (!pic) return;
+    const key = pic.blobPath || pic.blobUrl || pic.fileName || pic._id?.toString();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    ordered.push(pic);
+  };
+
+  const docImagesRaw = Array.isArray(equipment.documents)
+    ? equipment.documents.filter(doc => doc && (doc.blobPath || doc.blobUrl) && String(doc.type || 'document').toLowerCase() === 'image')
+    : [];
+
+  const normalizeTimestamp = (value) => {
+    const date = value ? new Date(value) : null;
+    const time = date && !Number.isNaN(date.getTime()) ? date.getTime() : 0;
+    return time;
+  };
+
+  const docDataplate = docImagesRaw
+    .filter(doc => String(doc.tag || '').toLowerCase() === 'dataplate')
+    .map(doc => ({ doc, ts: normalizeTimestamp(doc.uploadedAt) }))
+    .sort((a, b) => a.ts - b.ts);
+  const docOthers = docImagesRaw
+    .filter(doc => String(doc.tag || '').toLowerCase() !== 'dataplate')
+    .map(doc => ({ doc, ts: normalizeTimestamp(doc.uploadedAt) }))
+    .sort((a, b) => a.ts - b.ts);
+
+  docDataplate.forEach(({ doc }) => pushUnique(doc));
+  docOthers.forEach(({ doc }) => pushUnique(doc));
+
+  const equipmentPictures = Array.isArray(equipment.Pictures)
+    ? equipment.Pictures.filter(pic => pic && (pic.blobPath || pic.blobUrl))
+    : [];
+  if (equipmentPictures.length) {
+    const picDataplate = equipmentPictures.filter(pic => String(pic.tag || '').toLowerCase() === 'dataplate');
+    const picOthers = equipmentPictures.filter(pic => String(pic.tag || '').toLowerCase() !== 'dataplate');
+    picDataplate.forEach(pushUnique);
+    picOthers.forEach(pushUnique);
+  }
+
+  return ordered;
+}
+
+function resolvePictureExtension(pic, metadata = {}) {
+  const format = String(metadata?.format || '').toLowerCase();
+  if (format === 'png') return 'png';
+  if (format === 'jpeg' || format === 'jpg') return 'jpeg';
+  const type = String(pic?.contentType || '').toLowerCase();
+  if (type.includes('png')) return 'png';
+  if (type.includes('jpg') || type.includes('jpeg')) return 'jpeg';
+  const name = String(pic?.name || pic?.alias || '').toLowerCase();
+  if (name.endsWith('.png')) return 'png';
+  if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'jpeg';
+  return 'jpeg';
+}
+
+function deriveImageTitle(rawTitle, options = {}) {
+  const { isFirst, nextImageIndex, reference, isFault, fallbackName } = options;
+  if (isFirst) return 'Dataplate';
+  if (reference) return `Error ${reference}`;
+  if (isFault) {
+    const base = rawTitle || fallbackName;
+    if (base) return base.replace(/\.[^.]+$/, '');
+    return 'Failure Image';
+  }
+  const idx = nextImageIndex || 1;
+  return `Image ${idx}`;
+}
+
+async function prepareEquipmentImageForWorksheet(picture, workbook, targetWidthPx = 320, options = {}) {
+  if (!picture) return null;
+  const sourcePath = picture.blobPath || picture.blobUrl;
+  if (!sourcePath) return null;
+  try {
+    const buffer = await azureBlob.downloadToBuffer(sourcePath);
+    let metadata = {};
+    try {
+      metadata = await sharp(buffer).metadata();
+    } catch {}
+    const extension = resolvePictureExtension(picture, metadata);
+    const imgWidth = metadata?.width || null;
+    const imgHeight = metadata?.height || null;
+    const aspectRatio = imgWidth && imgHeight && imgWidth > 0 ? imgHeight / imgWidth : 0.75;
+    const computedHeight = targetWidthPx * aspectRatio;
+    const minHeight = 140;
+    const maxHeight = 500;
+    const targetHeightPx = Math.max(minHeight, Math.min(maxHeight, computedHeight || minHeight));
+    const imageId = workbook.addImage({ buffer, extension });
+    const rawTitle = picture?.alias || picture?.name || picture?.tag || picture?.fileName;
+    const lastSegment = sourcePath.split(/[\\/]/).pop() || '';
+    const cleanSegment = lastSegment.split('?')[0] || lastSegment;
+    const fallbackName = cleanSegment.replace(/\.[^.]+$/, '');
+    const reference = picture?.questionReference || picture?.reference || null;
+    const title = deriveImageTitle(rawTitle, {
+      isFirst: options?.isFirst,
+      nextImageIndex: options?.nextImageIndex,
+      reference,
+      isFault: options?.isFault || String(picture?.tag || '').toLowerCase() === 'fault',
+      fallbackName
+    });
+    return {
+      imageId,
+      widthPx: targetWidthPx,
+      heightPx: targetHeightPx,
+      title,
+      reference
+    };
+  } catch (err) {
+    try { console.warn('⚠️ Failed to prepare equipment image for ITR:', err?.message || err); } catch {}
+    return null;
+  }
+}
+
+async function appendItrEquipmentImagesSection(ws, workbook, equipment, attachmentLookup) {
+  if (!equipment && !attachmentLookup) return;
+  const orderedPictures = orderEquipmentPicturesForItr(equipment);
+  const attachmentPictures = Array.isArray(attachmentLookup?.all)
+    ? attachmentLookup.all.filter(img => img && (img.blobPath || img.blobUrl))
+    : [];
+
+  attachmentPictures.forEach(att => {
+    if (!att) return;
+    const ref = att.questionReference || att.questionKey || att.reference || null;
+    if (ref) {
+      att.questionReference = ref;
+      if (!att.tag) att.tag = 'fault';
+      if (!att.alias) att.alias = `Failure - ${ref}`;
+    }
+  });
+
+  const sources = [...orderedPictures, ...attachmentPictures];
+  if (!sources.length) return;
+
+  const preparedImages = [];
+  let nonDataplateIndex = 1;
+  const faultNameCounters = new Map();
+
+  for (let idx = 0; idx < sources.length; idx += 1) {
+    const pic = sources[idx];
+    const isFirst = idx === 0;
+    const options = {
+      isFirst,
+      nextImageIndex: nonDataplateIndex,
+      isFault: String(pic?.tag || '').toLowerCase() === 'fault'
+    };
+    const meta = await prepareEquipmentImageForWorksheet(pic, workbook, 320, options);
+    if (meta) {
+      if (meta.reference) {
+        const current = (faultNameCounters.get(meta.reference) || 0) + 1;
+        faultNameCounters.set(meta.reference, current);
+        if (current > 1) {
+          meta.title = `${meta.title} (${current})`;
+        }
+      }
+      preparedImages.push(meta);
+      if (!isFirst && !meta.title.startsWith('Error')) {
+        nonDataplateIndex += 1;
+      }
+    }
+  }
+
+  if (!preparedImages.length) return;
+
+  const spacerBefore = ws.addRow([]);
+  spacerBefore.height = 7;
+
+  const headerRow = ws.addRow([]);
+  ws.mergeCells(`A${headerRow.number}:N${headerRow.number}`);
+  const headerCell = ws.getCell(`A${headerRow.number}`);
+  headerCell.value = 'Images';
+  headerCell.font = { bold: true, size: 14 };
+  headerCell.alignment = { horizontal: 'left', vertical: 'middle' };
+  headerCell.fill = HEADER_FILL;
+  headerCell.border = BORDER_THIN;
+  headerRow.height = 22;
+
+  const columnRanges = [
+    { startCol: 'A', endCol: 'G' },
+    { startCol: 'H', endCol: 'N' }
+  ];
+
+  for (let i = 0; i < preparedImages.length; i += 2) {
+    const pair = preparedImages.slice(i, i + 2);
+
+    const titleRow = ws.addRow([]);
+    titleRow.height = 18;
+    pair.forEach((img, idx) => {
+      const range = `${columnRanges[idx].startCol}${titleRow.number}:${columnRanges[idx].endCol}${titleRow.number}`;
+      ws.mergeCells(range);
+      const titleCell = ws.getCell(`${columnRanges[idx].startCol}${titleRow.number}`);
+      if (idx === 0 && i === 0) {
+        titleCell.value = 'Dataplate';
+      } else {
+        const imageNumber = i + idx + 1;
+        titleCell.value = img.title || `Image ${imageNumber}`;
+      }
+      titleCell.font = { bold: true };
+      titleCell.alignment = { horizontal: 'left', vertical: 'middle' };
+      titleCell.border = BORDER_THIN;
+    });
+
+    const imageRow = ws.addRow([]);
+    const maxHeightPoints = Math.max(40, ...pair.map(img => (img.heightPx * 72) / 96));
+    imageRow.height = maxHeightPoints + 10;
+
+    pair.forEach((img, idx) => {
+      const range = `${columnRanges[idx].startCol}${imageRow.number}:${columnRanges[idx].endCol}${imageRow.number}`;
+      ws.mergeCells(range);
+      const anchorCell = ws.getCell(`${columnRanges[idx].startCol}${imageRow.number}`);
+      anchorCell.border = BORDER_THIN;
+
+      const columnOffset = idx === 0 ? 0 : 7.5;
+      ws.addImage(img.imageId, {
+        tl: { col: columnOffset, row: imageRow.number - 1 },
+        ext: { width: img.widthPx, height: img.heightPx }
+      });
+    });
+  }
+
+  const spacerAfter = ws.addRow([]);
+  spacerAfter.height = 7;
 }
 
 function setupArchiveStream(targetStream) {
@@ -1199,6 +1428,9 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   signatureCell.font = { bold: true, size: 16 }; //color: { argb: 'dedede' },
   signatureCell.alignment = { horizontal: 'center', vertical: 'middle' };
   signatureCell.border = BORDER_THIN;
+
+  await appendItrEquipmentImagesSection(ws, workbook, equipment, attachmentLookup);
+
 
   // Végső finomhangolás: magasság a felső sorokra
   /*[1,2,4,5,6,8,9].forEach(rn => {

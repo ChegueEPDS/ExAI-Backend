@@ -500,6 +500,8 @@ exports.createEquipment = async (req, res) => {
   try {
     const CreatedBy = req.userId;
     const tenantId = req.scope?.tenantId;
+    const tenantSlug = (req.scope?.tenantName || '').toLowerCase();
+    const isIndexTenant = tenantSlug === 'index' || tenantSlug === 'ind-ex';
     if (!tenantId) {
       return res.status(400).json({ message: "tenantId is missing from auth" });
     }
@@ -867,10 +869,15 @@ exports.importEquipmentXLSX = async (req, res) => {
   }
 
   try {
+    const tenantName = (req.scope?.tenantName || '').toLowerCase();
+    const isIndexTenant = tenantName === 'index' || tenantName === 'ind-ex';
     const zone = await Zone.findOne({ _id: zoneId, tenantId }).lean();
     if (!zone) {
       return res.status(404).json({ message: 'Zone not found for this tenant.' });
     }
+    let latestSkidId = zone?.SkidID || null;
+    let latestSkidDescription = zone?.SkidDescription || null;
+    let latestProjectId = zone?.ProjectID || null;
 
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.readFile(uploadedFile.path);
@@ -915,6 +922,17 @@ exports.importEquipmentXLSX = async (req, res) => {
       const inspectionTypeRaw = getCellString(row, headerInfo.headerMap, 'Type');
       const inspectionType = inspectionTypeRaw ? normalizeInspectionType(inspectionTypeRaw) : null;
       const inspectionDate = getCellDate(row, headerInfo.headerMap, 'Inspection Date');
+      let skidId = '';
+      let skidDescription = '';
+      let projectId = '';
+      if (isIndexTenant) {
+        skidId = getCellString(row, headerInfo.headerMap, 'Skid ID');
+        skidDescription = getCellString(row, headerInfo.headerMap, 'Skid Description');
+        projectId = getCellString(row, headerInfo.headerMap, 'Project ID');
+        if (skidId) latestSkidId = skidId;
+        if (skidDescription) latestSkidDescription = skidDescription;
+        if (projectId) latestProjectId = projectId;
+      }
 
       const rowHasData = [
         eqId,
@@ -1116,6 +1134,22 @@ exports.importEquipmentXLSX = async (req, res) => {
       }
     }
 
+    if (isIndexTenant) {
+      const zoneUpdate = {};
+      if (latestSkidId && latestSkidId !== zone.SkidID) {
+        zoneUpdate.SkidID = latestSkidId;
+      }
+      if (latestSkidDescription && latestSkidDescription !== zone.SkidDescription) {
+        zoneUpdate.SkidDescription = latestSkidDescription;
+      }
+      if (latestProjectId && latestProjectId !== zone.ProjectID) {
+        zoneUpdate.ProjectID = latestProjectId;
+      }
+      if (Object.keys(zoneUpdate).length) {
+        await Zone.updateOne({ _id: zone._id }, { $set: zoneUpdate });
+      }
+    }
+
     const issues = [...parseErrors, ...stats.errors];
 
     // Ha volt bármilyen hiba, generáljunk egy válasz XLSX-et a hibás sorokkal
@@ -1310,6 +1344,8 @@ async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspe
 exports.exportEquipmentXLSX = async (req, res) => {
   try {
     const tenantId = req.scope?.tenantId;
+    const tenantSlug = (req.scope?.tenantName || '').toLowerCase();
+    const isIndexTenant = tenantSlug === 'index' || tenantSlug === 'ind-ex';
     if (!tenantId) {
       return res.status(401).json({ message: 'Missing tenantId from auth.' });
     }
@@ -1437,6 +1473,10 @@ exports.exportEquipmentXLSX = async (req, res) => {
       'Remarks'
     ];
 
+    if (isIndexTenant) {
+      headers.splice(18, 0, 'Skid ID', 'Skid Description', 'Project ID');
+    }
+
     worksheet.columns = headers.map(header => ({
       header,
       key: header,
@@ -1448,55 +1488,50 @@ exports.exportEquipmentXLSX = async (req, res) => {
     worksheet.spliceRows(1, 0, []);
 
     const groupRow = worksheet.getRow(1);
-    // Identification (A–D): _id, #, TagNo, EqID
+    const zoneStartCol = isIndexTenant ? 22 : 19;
+    const zoneEndCol = zoneStartCol + 3;
+    const userStartCol = zoneStartCol + 4;
+    const userEndCol = userStartCol + 4;
+    const inspectionStartCol = userStartCol + 5;
+    const inspectionEndCol = inspectionStartCol + 4;
+
     groupRow.getCell(1).value = 'IDENTIFICATION';
     worksheet.mergeCells(1, 1, 1, 4);
-    // Equipment data (E–I)
     groupRow.getCell(5).value = 'EQUIPMENT DATA';
     worksheet.mergeCells(1, 5, 1, 9);
-    // Ex Data (J–N)
     groupRow.getCell(10).value = 'EX DATA';
     worksheet.mergeCells(1, 10, 1, 14);
-    // Certification (O–R)
     groupRow.getCell(15).value = 'CERTIFICATION';
     worksheet.mergeCells(1, 15, 1, 18);
-    // Zone Requirements (S–V)
-    groupRow.getCell(19).value = 'ZONE REQUIREMENTS';
-    worksheet.mergeCells(1, 19, 1, 22);
-    // User Requirement (W–AA)
-    groupRow.getCell(23).value = 'USER REQUIREMENT';
-    worksheet.mergeCells(1, 23, 1, 27);
-    // Inspection Data (AB–AF)
-    groupRow.getCell(28).value = 'INSPECTION DATA';
-    worksheet.mergeCells(1, 28, 1, 32);
+    if (isIndexTenant) {
+      groupRow.getCell(19).value = 'PROJECT / SKID';
+      worksheet.mergeCells(1, 19, 1, 21);
+    }
+    groupRow.getCell(zoneStartCol).value = 'ZONE REQUIREMENTS';
+    worksheet.mergeCells(1, zoneStartCol, 1, zoneEndCol);
+    groupRow.getCell(userStartCol).value = 'USER REQUIREMENT';
+    worksheet.mergeCells(1, userStartCol, 1, userEndCol);
+    groupRow.getCell(inspectionStartCol).value = 'INSPECTION DATA';
+    worksheet.mergeCells(1, inspectionStartCol, 1, inspectionEndCol);
 
-    // Csoportosító sor formázása (1. sor)
+    const groupColorRanges = [
+      { start: 1, end: 4, color: 'FF00AA00' },
+      { start: 5, end: 9, color: 'FFFF9900' },
+      { start: 10, end: 14, color: 'FF538DD5' },
+      { start: 15, end: 18, color: 'FF00AA00' }
+    ];
+    if (isIndexTenant) {
+      groupColorRanges.push({ start: 19, end: 21, color: 'FF80DEEA' });
+    }
+    groupColorRanges.push(
+      { start: zoneStartCol, end: zoneEndCol, color: 'FFFFFF66' },
+      { start: userStartCol, end: userEndCol, color: 'FFB1A0C7' },
+      { start: inspectionStartCol, end: inspectionEndCol, color: 'FFB0B0B0' }
+    );
+
     groupRow.eachCell((cell, colNumber) => {
-      let bg = null;
-
-      if (colNumber >= 1 && colNumber <= 4) {
-        // Identification (A–D) – zöld háttér
-        bg = 'FF00AA00';
-      } else if (colNumber >= 5 && colNumber <= 9) {
-        // Equipment data (E–I) – narancssárga háttér
-        bg = 'FFFF9900';
-      } else if (colNumber >= 10 && colNumber <= 14) {
-        // Ex Data (J–N) – kék háttér
-        bg = 'FF538DD5';
-      } else if (colNumber >= 15 && colNumber <= 18) {
-        // Certification (O–R) – zöld háttér
-        bg = 'FF00AA00';
-      } else if (colNumber >= 19 && colNumber <= 22) {
-        // Zone Requirements (S–V) – sárga háttér
-        bg = 'FFFFFF66';
-      } else if (colNumber >= 23 && colNumber <= 27) {
-        // User Requirement (W–AA) – világos lila háttér
-        bg = 'FFB1A0C7';
-      } else if (colNumber >= 28 && colNumber <= 32) {
-        // Inspection Data (AB–AF) – szürke háttér
-        bg = 'FFB0B0B0';
-      }
-
+      const range = groupColorRanges.find(r => colNumber >= r.start && colNumber <= r.end);
+      const bg = range?.color || null;
       cell.font = { bold: true, color: { argb: 'FF000000' } };
       if (bg) {
         cell.fill = {
@@ -1508,37 +1543,27 @@ exports.exportEquipmentXLSX = async (req, res) => {
         cell.fill = undefined;
       }
       cell.alignment = { horizontal: 'center', vertical: 'middle' };
-      
     });
 
-    // Fejléc formázása (2. sor – oszlopcímek, halványabb színekkel)
+    const headerColorRanges = [
+      { start: 1, end: 4, color: 'FFCCFFCC' },
+      { start: 5, end: 9, color: 'FFFFE0B2' },
+      { start: 10, end: 14, color: 'FFDCE6F1' },
+      { start: 15, end: 18, color: 'FFCCFFCC' }
+    ];
+    if (isIndexTenant) {
+      headerColorRanges.push({ start: 19, end: 21, color: 'FFE0F7FA' });
+    }
+    headerColorRanges.push(
+      { start: zoneStartCol, end: zoneEndCol, color: 'FFFFFFCC' },
+      { start: userStartCol, end: userEndCol, color: 'FFE4DFEC' },
+      { start: inspectionStartCol, end: inspectionEndCol, color: 'FFE0E0E0' }
+    );
+
     const headerRow = worksheet.getRow(2);
     headerRow.eachCell((cell, colNumber) => {
-      let bg = null;
-
-      if (colNumber >= 1 && colNumber <= 4) {
-        // Identification – világos zöld
-        bg = 'FFCCFFCC';
-      } else if (colNumber >= 5 && colNumber <= 9) {
-        // Equipment data – világos narancssárga
-        bg = 'FFFFE0B2';
-      } else if (colNumber >= 10 && colNumber <= 14) {
-        // Ex Data – világos narancssárga
-        bg = 'FFDCE6F1';
-      } else if (colNumber >= 15 && colNumber <= 18) {
-        // Certification – világos zöld
-        bg = 'FFCCFFCC';
-      } else if (colNumber >= 19 && colNumber <= 22) {
-        // Zone Requirements – világos sárga
-        bg = 'FFFFFFCC';
-      } else if (colNumber >= 23 && colNumber <= 27) {
-        // User Requirement – világos lila
-        bg = 'FFE4DFEC';
-      } else if (colNumber >= 28 && colNumber <= 32) {
-        // Inspection Data – világos szürke
-        bg = 'FFE0E0E0';
-      }
-
+      const range = headerColorRanges.find(r => colNumber >= r.start && colNumber <= r.end);
+      const bg = range?.color || null;
       cell.font = { bold: true, color: { argb: 'FF000000' } };
       if (bg) {
         cell.fill = {
@@ -1595,9 +1620,10 @@ exports.exportEquipmentXLSX = async (req, res) => {
         eq.lastInspectionDate ||
         null;
 
-      const zoneNumber = Array.isArray(zone?.Zone)
+      const zoneNumberRaw = Array.isArray(zone?.Zone)
         ? zone.Zone.join(', ')
         : (zone?.Zone != null ? String(zone.Zone) : '');
+      const zoneNumber = zoneNumberRaw ? `Zone ${zoneNumberRaw}` : '';
 
       const zoneSubGroup = Array.isArray(zone?.SubGroup)
         ? zone.SubGroup.join(', ')
@@ -1714,6 +1740,12 @@ exports.exportEquipmentXLSX = async (req, res) => {
           'Remarks': eq['Other Info'] || ''
         };
 
+        if (isIndexTenant) {
+          rowData['Skid ID'] = zone?.SkidID || '';
+          rowData['Skid Description'] = zone?.SkidDescription || '';
+          rowData['Project ID'] = zone?.ProjectID || '';
+        }
+
         const row = worksheet.addRow(rowData);
 
         row.eachCell((cell, colNumber) => {
@@ -1791,6 +1823,326 @@ exports.exportEquipmentXLSX = async (req, res) => {
     console.error('❌ exportEquipmentXLSX error:', error);
     return res.status(500).json({
       message: 'Failed to export equipment register',
+      error: error.message || String(error)
+    });
+  }
+};
+
+// GET /exreg/certificate-summary?zoneId=...
+// Exports a certificate summary per zone grouped by certificate number
+exports.exportZoneCertificateSummary = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const { zoneId } = req.query || {};
+
+    if (!tenantId) {
+      return res.status(401).json({ message: 'Missing tenantId from auth.' });
+    }
+
+    if (!zoneId) {
+      return res.status(400).json({ message: 'zoneId query parameter is required.' });
+    }
+
+    const zone = await Zone.findOne({ _id: zoneId, tenantId }).lean();
+    if (!zone) {
+      return res.status(404).json({ message: 'Zone not found for this tenant.' });
+    }
+
+    const equipments = await Equipment.find({ tenantId, Zone: zoneId })
+      .sort({ orderIndex: 1, createdAt: 1, _id: 1 })
+      .lean();
+
+    if (!equipments.length) {
+      return res.status(404).json({ message: 'No equipment found for certificate summary.' });
+    }
+
+    let certMap = new Map();
+    try {
+      certMap = await buildCertificateCacheForTenant(tenantId);
+    } catch (e) {
+      console.warn('⚠️ Certificate cache build failed for exportZoneCertificateSummary:', e?.message || e);
+      certMap = new Map();
+    }
+
+    const groupMap = new Map();
+    equipments.forEach(eq => {
+      const rawCert = typeof eq['Certificate No'] === 'string'
+        ? eq['Certificate No'].trim()
+        : '';
+      const key = rawCert ? rawCert.toLowerCase() : '__no_cert__';
+      if (!groupMap.has(key)) {
+        groupMap.set(key, {
+          displayValue: rawCert || 'No certificate',
+          rawValue: rawCert,
+          equipments: []
+        });
+      }
+      groupMap.get(key).equipments.push(eq);
+    });
+
+    const groups = Array.from(groupMap.values()).sort((a, b) => {
+      if (a.rawValue && b.rawValue) {
+        return a.rawValue.localeCompare(b.rawValue, undefined, { sensitivity: 'base', numeric: true });
+      }
+      if (!a.rawValue && b.rawValue) return 1;
+      if (a.rawValue && !b.rawValue) return -1;
+      return 0;
+    });
+
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Certificate summary');
+    const DEFAULT_FONT_SIZE = 10;
+
+    const columnDefinitions = [
+      { key: 'item', width: 6 },
+      { key: 'certificate', width: 25 },
+      { key: 'description', width: 25 },
+      { key: 'serial', width: 18 },
+      { key: 'environment', width: 5 },
+      { key: 'gasDust', width: 5 },
+      { key: 'protection', width: 6 },
+      { key: 'tempClass', width: 6 },
+      { key: 'ambient', width: 16 },
+      { key: 'inspection', width: 18 }
+    ];
+    worksheet.columns = columnDefinitions;
+
+    worksheet.getColumn(3).alignment = { horizontal: 'left', vertical: 'middle', wrapText: false };
+
+    const columnCount = columnDefinitions.length;
+    const headerStartRow = 3;
+    const headerEndRow = 4;
+
+    const titleLines = [zone.Name || 'Zone'];
+    if ((zone.Description || '').trim()) {
+      titleLines.push(zone.Description.trim());
+    }
+    titleLines.push('Certificate summary');
+    worksheet.mergeCells(1, 1, 1, columnCount);
+    const titleCell = worksheet.getCell(1, 1);
+    titleCell.value = titleLines.join('\n');
+    titleCell.font = { bold: true, size: 16 };
+    titleCell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: true, indent: 1 };
+    worksheet.getRow(1).height = 60;
+
+    worksheet.getRow(2).height = 7;
+    worksheet.getRow(3).height = 13;
+    worksheet.getRow(4).height = 56;
+
+    const groupFill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFE8EEF6' }
+    };
+    const headerBorder = {
+      top: { style: 'thin', color: { argb: 'FFB4B4B4' } },
+      left: { style: 'thin', color: { argb: 'FFB4B4B4' } },
+      bottom: { style: 'thin', color: { argb: 'FFB4B4B4' } },
+      right: { style: 'thin', color: { argb: 'FFB4B4B4' } }
+    };
+
+    function styleHeader(cell, value) {
+      cell.value = value;
+      cell.font = { bold: true, size: DEFAULT_FONT_SIZE };
+      cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+      cell.fill = groupFill;
+      cell.border = headerBorder;
+    }
+
+    worksheet.mergeCells(headerStartRow, 1, headerEndRow, 1);
+    styleHeader(worksheet.getCell(headerStartRow, 1), 'ITEM');
+
+    worksheet.mergeCells(headerStartRow, 2, headerEndRow, 2);
+    styleHeader(worksheet.getCell(headerStartRow, 2), 'CERTIFICATE NUMBER');
+
+    worksheet.mergeCells(headerStartRow, 3, headerStartRow, 4);
+    styleHeader(worksheet.getCell(headerStartRow, 3), 'EQUIPMENT');
+
+    worksheet.mergeCells(headerStartRow, 5, headerStartRow, 8);
+    styleHeader(worksheet.getCell(headerStartRow, 5), 'EX MARKING');
+
+    worksheet.mergeCells(headerStartRow, 9, headerEndRow, 9);
+    styleHeader(worksheet.getCell(headerStartRow, 9), 'AMBIENT TEMPERATURE');
+
+    worksheet.mergeCells(headerStartRow, 10, headerEndRow, 10);
+    styleHeader(worksheet.getCell(headerStartRow, 10), 'LAST INSPECTION STATUS');
+
+    const subHeaderRow = headerStartRow + 1;
+    const subHeaderFill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFF5F8FC' }
+    };
+
+    function styleSubHeader(col, label, options = {}) {
+      worksheet.mergeCells(subHeaderRow, col, headerEndRow, col);
+      const cell = worksheet.getCell(subHeaderRow, col);
+      cell.value = label;
+      cell.font = { bold: true, size: DEFAULT_FONT_SIZE };
+      cell.alignment = {
+        horizontal: 'center',
+        vertical: 'middle',
+        wrapText: true,
+        textRotation: options.rotate ? 90 : undefined
+      };
+      cell.fill = subHeaderFill;
+      cell.border = headerBorder;
+    }
+
+    styleSubHeader(3, 'DESCRIPTION');
+    styleSubHeader(4, 'SERIAL NUMBER');
+    styleSubHeader(5, 'ENVIRONMENT', { rotate: true });
+    styleSubHeader(6, 'GAS / DUST GROUP', { rotate: true });
+    styleSubHeader(7, 'TYPE OF PROTECTION', { rotate: true });
+    styleSubHeader(8, 'TEMPERATURE CLASS', { rotate: true });
+
+    let itemCounter = 1;
+    const centerColumns = new Set([1, 5, 6, 7, 8, 9, 10]);
+
+    const styleDataRow = (row) => {
+      row.height = 15;
+      row.eachCell((cell, colNumber) => {
+        const horizontal = centerColumns.has(colNumber) ? 'center' : 'left';
+        const wrapText = colNumber !== 1 && colNumber !== 3;
+        cell.alignment = { horizontal, vertical: 'middle', wrapText };
+        cell.font = { size: DEFAULT_FONT_SIZE };
+        cell.border = {
+          top: { style: 'thin', color: { argb: 'FFDDDDDD' } },
+          bottom: { style: 'thin', color: { argb: 'FFDDDDDD' } }
+        };
+      });
+    };
+
+    groups.forEach((group, index) => {
+      const eqs = group.equipments.sort((a, b) => {
+        const aIndex = typeof a.orderIndex === 'number' ? a.orderIndex : Number.MAX_SAFE_INTEGER;
+        const bIndex = typeof b.orderIndex === 'number' ? b.orderIndex : Number.MAX_SAFE_INTEGER;
+        if (aIndex !== bIndex) return aIndex - bIndex;
+        const aTag = (a.TagNo || '').toString();
+        const bTag = (b.TagNo || '').toString();
+        if (aTag && bTag && aTag !== bTag) {
+          return aTag.localeCompare(bTag, undefined, { sensitivity: 'base' });
+        }
+        const aId = (a.EqID || a._id || '').toString();
+        const bId = (b.EqID || b._id || '').toString();
+        return aId.localeCompare(bId);
+      });
+
+      const groupStartRow = worksheet.lastRow ? worksheet.lastRow.number + 1 : headerEndRow + 1;
+
+      eqs.forEach(eq => {
+        const marking = Array.isArray(eq['Ex Marking']) && eq['Ex Marking'].length
+          ? eq['Ex Marking'][0]
+          : null;
+
+        const rowValues = [
+          itemCounter,
+          '',
+          eq['Equipment Type'] || eq.EquipmentType || eq.Description || '',
+          eq['Serial Number'] || eq.SerialNumber || '',
+          (marking && (marking.Environment || marking['Environment'])) || '',
+          (marking && (marking['Gas / Dust Group'] || marking['Gas/Dust Group'])) || '',
+          (marking && (marking['Type of Protection'] || marking['Type Of Protection'])) || '',
+          (marking && (marking['Temperature Class'] || marking['Temp Class'])) || '',
+          eq['Max Ambient Temp'] || '',
+          eq.lastInspectionStatus || eq.Compliance || ''
+        ];
+
+        const row = worksheet.addRow(rowValues);
+        styleDataRow(row);
+        itemCounter += 1;
+      });
+
+      const groupEndRow = groupStartRow + eqs.length - 1;
+      if (eqs.length > 0) {
+        const certCell = worksheet.getCell(groupStartRow, 2);
+        certCell.value = group.displayValue;
+        certCell.font = { bold: true, size: DEFAULT_FONT_SIZE };
+        certCell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: true };
+        certCell.border = {
+          left: { style: 'thin', color: { argb: 'FFDDDDDD' } },
+          top: { style: 'thin', color: { argb: 'FFDDDDDD' } },
+          bottom: { style: 'thin', color: { argb: 'FFDDDDDD' } },
+          right: { style: 'thin', color: { argb: 'FFDDDDDD' } }
+        };
+        if (groupEndRow > groupStartRow) {
+          worksheet.mergeCells(groupStartRow, 2, groupEndRow, 2);
+        }
+      }
+
+      const certDoc = group.rawValue ? resolveCertificateFromCache(certMap, group.rawValue) : null;
+      const specCondition = (certDoc?.specCondition || '').trim();
+
+      if (specCondition) {
+        const conditionRow = worksheet.addRow(['', specCondition]);
+        worksheet.mergeCells(conditionRow.number, 2, conditionRow.number, columnCount);
+        const condCell = worksheet.getCell(conditionRow.number, 2);
+        condCell.value = {
+          richText: [
+            { text: 'Specific condition of use:\n', font: { bold: true, size: DEFAULT_FONT_SIZE } },
+            { text: specCondition, font: { size: DEFAULT_FONT_SIZE } }
+          ]
+        };
+        condCell.alignment = { horizontal: 'left', vertical: 'top', wrapText: true };
+        condCell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FFFFF9E3' }
+        };
+        condCell.border = {
+          top: { style: 'thin', color: { argb: 'FFE2C470' } },
+          bottom: { style: 'thin', color: { argb: 'FFE2C470' } },
+          left: { style: 'thin', color: { argb: 'FFE2C470' } },
+          right: { style: 'thin', color: { argb: 'FFE2C470' } }
+        };
+        const labelLines = 1;
+        const textLineEstimate = specCondition
+          .split('\n')
+          .reduce((acc, line) => acc + Math.max(1, Math.ceil(line.length / 90)), 0);
+        const roughLineCount = labelLines + textLineEstimate;
+        const SPECIAL_CONDITION_LINE_HEIGHT = 8;
+        conditionRow.height = Math.max(20, Math.min(400, roughLineCount * SPECIAL_CONDITION_LINE_HEIGHT));
+      }
+
+      if (index < groups.length - 1) {
+        const spacerRow = worksheet.addRow([]);
+        spacerRow.height = 7;
+      }
+    });
+
+    const autoFitColumn = (colNumber, { minWidth = 10, maxWidth = 70 } = {}) => {
+      const column = worksheet.getColumn(colNumber);
+      let maxLength = minWidth;
+      column.eachCell({ includeEmpty: false }, cell => {
+        if (cell.value == null) return;
+        let text = '';
+        const value = cell.value;
+        if (typeof value === 'object' && value.richText) {
+          text = value.richText.map(part => part.text || '').join('');
+        } else if (typeof value === 'object' && typeof value.text === 'string') {
+          text = value.text;
+        } else {
+          text = String(value);
+        }
+        maxLength = Math.max(maxLength, text.length + 2);
+      });
+      column.width = Math.min(maxWidth, Math.max(minWidth, maxLength));
+    };
+
+    autoFitColumn(3, { minWidth: 18, maxWidth: 60 });
+    autoFitColumn(4, { minWidth: 14, maxWidth: 40 });
+
+    const safeZone = slug(zone.Name || 'zone') || `zone_${zone._id}`;
+    const fileName = `${safeZone.replace(/\s+/g, '_')}_certificate_summary.xlsx`;
+
+    res.setHeader('Content-Type', EXCEL_CONTENT_TYPE);
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error('❌ exportZoneCertificateSummary error:', error);
+    return res.status(500).json({
+      message: 'Failed to export certificate summary',
       error: error.message || String(error)
     });
   }
