@@ -37,6 +37,12 @@ router.get(
 );
 
 router.get(
+  '/exreg/export-ui-xlsx',
+  authMiddleware(),
+  exRegisterController.exportEquipmentUiXLSX
+);
+
+router.get(
   '/exreg/certificate-summary',
   authMiddleware(),
   exRegisterController.exportZoneCertificateSummary

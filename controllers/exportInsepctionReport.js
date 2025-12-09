@@ -296,9 +296,32 @@ function sanitizeFileNameSegment(value, fallback = 'item') {
   return safe || fallback;
 }
 
-function buildEquipmentIdentifier(equipment) {
+function setDownloadHeaders(res, fileName, contentType) {
+  if (contentType) {
+    res.setHeader('Content-Type', contentType);
+  }
+  if (fileName) {
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+  }
+
+  const existingExpose = res.getHeader('Access-Control-Expose-Headers');
+  const exposeValues = new Set();
+  if (existingExpose) {
+    existingExpose
+      .toString()
+      .split(',')
+      .map(value => value.trim())
+      .filter(Boolean)
+      .forEach(value => exposeValues.add(value));
+  }
+  exposeValues.add('Content-Disposition');
+  res.setHeader('Access-Control-Expose-Headers', Array.from(exposeValues).join(', '));
+}
+
+function buildEquipmentIdentifier(equipment, context = {}) {
   if (!equipment) return null;
 
+  /*
   const rawOrder =
     equipment.orderIndex ??
     equipment.OrderIndex ??
@@ -332,6 +355,54 @@ function buildEquipmentIdentifier(equipment) {
     null;
 
   const parts = [orderIndex, tag, eqId]
+    .map(part => (typeof part === 'string' ? part.trim() : part))
+    .filter(part => !!part && part.toString().length > 0);
+
+  if (!parts.length) return null;
+  return parts.join('-');
+  */
+
+  const rawOrder =
+    equipment.orderIndex ??
+    equipment.OrderIndex ??
+    equipment['orderIndex'] ??
+    equipment['OrderIndex'];
+  const orderIndex =
+    typeof rawOrder === 'number' && /^\d+$/.test(rawOrder?.toString?.() || '')
+      ? rawOrder.toString()
+      : null;
+
+  const siteClient =
+    context.site?.Client ||
+    context.site?.client ||
+    context.siteClient ||
+    equipment.siteClient ||
+    equipment.SiteClient ||
+    equipment.Client ||
+    equipment.client ||
+    equipment.site?.Client ||
+    equipment.Site?.Client ||
+    null;
+
+  const zoneDescription =
+    context.zone?.Description ||
+    context.zoneDescription ||
+    equipment.zoneDescription ||
+    equipment.ZoneDescription ||
+    equipment.zone?.Description ||
+    equipment.Zone?.Description ||
+    equipment.ZoneDescription ||
+    null;
+
+  const certificateNo =
+    context.certificateNo ||
+    equipment.certificateNo ||
+    equipment.CertificateNo ||
+    equipment['Certificate No'] ||
+    equipment['Declaration of conformity'] ||
+    null;
+
+  const parts = [orderIndex, siteClient || zoneDescription, certificateNo]
     .map(part => (typeof part === 'string' ? part.trim() : part))
     .filter(part => !!part && part.toString().length > 0);
 
@@ -1439,7 +1510,15 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   });*/
 
   const identifier =
-    buildEquipmentIdentifier(equipment) ||
+    buildEquipmentIdentifier(equipment, {
+      site,
+      zone,
+      certificateNo:
+        equipment?.certificateNo ||
+        equipment?.CertificateNo ||
+        equipment?.['Certificate No'] ||
+        equipment?.['Declaration of conformity']
+    }) ||
     equipment.EqID ||
     inspection.eqId ||
     'unknown';
@@ -2101,7 +2180,15 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName }, ta
     const zone = zoneId ? zoneMap.get(zoneId) : null;
 
     const identifier =
-      buildEquipmentIdentifier(eq) ||
+      buildEquipmentIdentifier(eq, {
+        site,
+        zone,
+        certificateNo:
+          eq?.certificateNo ||
+          eq?.CertificateNo ||
+          eq?.['Certificate No'] ||
+          eq?.['Declaration of conformity']
+      }) ||
       eq['EqID'] ||
       inspection.eqId ||
       eqIdStr ||
@@ -2312,7 +2399,15 @@ async function generateLatestInspectionArchive(
     if (context.error) continue;
 
     const identifier =
-      buildEquipmentIdentifier(context.equipment) ||
+      buildEquipmentIdentifier(context.equipment, {
+        site: context.site,
+        zone: context.zone,
+        certificateNo:
+          context.equipment?.certificateNo ||
+          context.equipment?.CertificateNo ||
+          context.equipment?.['Certificate No'] ||
+          context.equipment?.['Declaration of conformity']
+      }) ||
       context.equipment?.EqID ||
       inspection.eqId;
     const attachmentLookup = includeImages
@@ -2589,7 +2684,15 @@ exports.exportInspectionXLSX = async (req, res) => {
     }
 
     const eqIdentifier =
-      buildEquipmentIdentifier(context.equipment) ||
+      buildEquipmentIdentifier(context.equipment, {
+        site: context.site,
+        zone: context.zone,
+        certificateNo:
+          context.equipment?.certificateNo ||
+          context.equipment?.CertificateNo ||
+          context.equipment?.['Certificate No'] ||
+          context.equipment?.['Declaration of conformity']
+      }) ||
       context.equipment?.EqID ||
       inspection.eqId ||
       inspection.equipmentId;
@@ -2612,8 +2715,7 @@ exports.exportInspectionXLSX = async (req, res) => {
     );
 
     if (!includeImages) {
-      res.setHeader('Content-Type', EXCEL_CONTENT_TYPE);
-      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      setDownloadHeaders(res, fileName, EXCEL_CONTENT_TYPE);
       await workbook.xlsx.write(res);
       res.end();
       return;
@@ -2623,8 +2725,7 @@ exports.exportInspectionXLSX = async (req, res) => {
     const zipIdentifier = sanitizeFileNameSegment(eqIdentifier);
     const zipName = `Inspection_${zipIdentifier}_${Date.now()}.zip`;
 
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
+    setDownloadHeaders(res, zipName, 'application/zip');
 
     const archive = archiver('zip', { zlib: { level: 9 } });
     archive.on('error', err => {
@@ -2713,7 +2814,15 @@ exports.exportPunchlistXLSX = async (req, res) => {
       if (!headerZone && zoneId && context.zone) headerZone = context.zone;
 
       const identifier =
-        buildEquipmentIdentifier(context.equipment) ||
+        buildEquipmentIdentifier(context.equipment, {
+          site: context.site,
+          zone: context.zone,
+          certificateNo:
+            context.equipment?.certificateNo ||
+            context.equipment?.CertificateNo ||
+            context.equipment?.['Certificate No'] ||
+            context.equipment?.['Declaration of conformity']
+        }) ||
         context.equipment?.EqID ||
         inspection.eqId;
       const attachmentLookup = includeImages

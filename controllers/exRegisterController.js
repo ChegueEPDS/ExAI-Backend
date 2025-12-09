@@ -57,6 +57,19 @@ const HEADER_ALIASES = {
   'comment': 'Remarks'
 };
 
+const SEARCHABLE_EQUIPMENT_FIELDS = [
+  'TagNo',
+  'EqID',
+  'Manufacturer',
+  'Model/Type',
+  'Serial Number',
+  'Equipment Type',
+  'Description',
+  'Certificate No',
+  'Compliance',
+  'Other Info'
+];
+
 const EXCEL_SERIAL_DATE_OFFSET = 25569;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const GAS_SUBGROUPS = new Set(['IIA', 'IIB', 'IIC']);
@@ -1828,6 +1841,217 @@ exports.exportEquipmentXLSX = async (req, res) => {
   }
 };
 
+// GET /exreg/export-ui-xlsx — Database UI export backend verziója
+exports.exportEquipmentUiXLSX = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) {
+      return res.status(401).json({ message: 'Missing tenantId from auth.' });
+    }
+
+    const { ids, zoneId, siteId, scheme, EqID } = req.query || {};
+    const searchTerm = typeof req.query?.search === 'string' ? req.query.search.trim() : '';
+    const filter = { tenantId };
+    const andConditions = [];
+
+    if (ids) {
+      const rawIds = String(ids)
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+
+      const objectIds = rawIds
+        .map(id => {
+          try {
+            return new mongoose.Types.ObjectId(id);
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean);
+
+      if (!objectIds.length) {
+        return res.status(400).json({ message: 'Invalid ids parameter.' });
+      }
+
+      filter._id = { $in: objectIds };
+    } else {
+      if (zoneId) filter.Zone = zoneId;
+      if (siteId) filter.Site = siteId;
+      if (EqID) filter.EqID = EqID;
+    }
+
+    if (searchTerm) {
+      const regex = new RegExp(escapeRegex(searchTerm), 'i');
+      const searchConditions = SEARCHABLE_EQUIPMENT_FIELDS.map(field => ({ [field]: regex }));
+      andConditions.push({ $or: searchConditions });
+    }
+
+    if (andConditions.length === 1) {
+      Object.assign(filter, andConditions[0]);
+    } else if (andConditions.length > 1) {
+      filter.$and = andConditions;
+    }
+
+    const equipments = await Equipment.find(filter)
+      .sort({ orderIndex: 1, createdAt: 1, _id: 1 })
+      .lean();
+
+    if (!equipments.length) {
+      return res.status(404).json({ message: 'No equipment found for export.' });
+    }
+
+    let hideAtexSpecific = false;
+    if (typeof scheme === 'string' && scheme.toUpperCase() === 'IECEX') {
+      hideAtexSpecific = true;
+    } else if (zoneId) {
+      const zoneDoc = await Zone.findOne({ _id: zoneId, tenantId }).lean();
+      hideAtexSpecific = (zoneDoc?.Scheme || '').toUpperCase() === 'IECEX';
+    }
+
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Database');
+
+    const headers = [
+      'EqID',
+      'TagNo',
+      'Manufacturer',
+      'Model/Type',
+      'Serial Number',
+      'Equipment Type',
+      'Marking',
+      ...(hideAtexSpecific ? [] : ['Equipment Group', 'Equipment Category', 'Environment']),
+      'Type of Protection',
+      'Gas / Dust Group',
+      'Temperature Class',
+      'Equipment Protection Level',
+      'IP rating',
+      'Certificate No',
+      'Max Ambient Temp',
+      'Compliance',
+      'Other Info'
+    ];
+
+    worksheet.columns = headers.map(header => ({ header, key: header, width: 12 }));
+
+    worksheet.getRow(1).eachCell(cell => {
+      cell.font = { bold: true, color: { argb: 'FFFCB040' } };
+      cell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF2E2109' }
+      };
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+    });
+
+    const centerAlignedColumns = [
+      ...(hideAtexSpecific ? [] : ['Equipment Group', 'Equipment Category', 'Environment']),
+      'Type of Protection',
+      'Gas / Dust Group',
+      'Temperature Class',
+      'Equipment Protection Level',
+      'IP rating'
+    ];
+
+    const buildRowBase = (item) => ({
+      'EqID': item?.EqID || '',
+      'TagNo': item?.TagNo || '',
+      'Manufacturer': item?.Manufacturer || '',
+      'Model/Type': item?.['Model/Type'] || '',
+      'Serial Number': item?.['Serial Number'] || '',
+      'Equipment Type': item?.['Equipment Type'] || '',
+      'Certificate No': item?.['Certificate No'] || '',
+      'Max Ambient Temp': item?.['Max Ambient Temp'] || '',
+      'Compliance': item?.Compliance || '',
+      'Other Info': item?.['Other Info'] || '',
+      'IP rating': item?.['IP rating'] || ''
+    });
+
+    const rows = [];
+    equipments.forEach(item => {
+      const exMarkings = Array.isArray(item['Ex Marking']) ? item['Ex Marking'] : [];
+      if (!exMarkings.length) {
+        rows.push({
+          ...buildRowBase(item),
+          'Marking': '',
+          'Equipment Group': '',
+          'Equipment Category': '',
+          'Environment': '',
+          'Type of Protection': '',
+          'Gas / Dust Group': '',
+          'Temperature Class': '',
+          'Equipment Protection Level': ''
+        });
+      } else {
+        exMarkings.forEach(marking => {
+          rows.push({
+            ...buildRowBase(item),
+            'Marking': marking?.Marking || '',
+            'Equipment Group': marking?.['Equipment Group'] || '',
+            'Equipment Category': marking?.['Equipment Category'] || '',
+            'Environment': marking?.Environment || '',
+            'Type of Protection': marking?.['Type of Protection'] || '',
+            'Gas / Dust Group': marking?.['Gas / Dust Group'] || '',
+            'Temperature Class': marking?.['Temperature Class'] || '',
+            'Equipment Protection Level': marking?.['Equipment Protection Level'] || ''
+          });
+        });
+      }
+    });
+
+    rows.forEach(rowData => {
+      const row = worksheet.addRow(rowData);
+      row.eachCell((cell, colNumber) => {
+        const header = headers[colNumber - 1];
+        if (header === 'Compliance') {
+          const value = (rowData['Compliance'] || '').toString();
+          cell.font = {
+            ...cell.font,
+            color:
+              value === 'Passed'
+                ? { argb: 'FF008000' }
+                : value === 'Failed'
+                  ? { argb: 'FFFF0000' }
+                  : { argb: 'FF000000' }
+          };
+        }
+
+        if (centerAlignedColumns.includes(header)) {
+          cell.alignment = { horizontal: 'center', vertical: 'middle' };
+        } else {
+          cell.alignment = { horizontal: 'left', vertical: 'middle' };
+        }
+      });
+    });
+
+    worksheet.columns?.forEach(column => {
+      if (!column || !column.eachCell) {
+        return;
+      }
+      let maxLength = 5;
+      column.eachCell({ includeEmpty: true }, cell => {
+        if (!cell?.value) return;
+        const cellLength = cell.value.toString().length;
+        if (cellLength > maxLength) {
+          maxLength = cellLength;
+        }
+      });
+      column.width = Math.min(60, maxLength + 2);
+    });
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader('Content-Type', EXCEL_CONTENT_TYPE);
+    res.setHeader('Content-Disposition', 'attachment; filename="exregister-ui.xlsx"');
+    return res.status(200).send(Buffer.from(buffer));
+  } catch (error) {
+    console.error('❌ exportEquipmentUiXLSX error:', error);
+    return res.status(500).json({
+      message: 'Failed to export UI worksheet.',
+      error: error.message || String(error)
+    });
+  }
+};
+
 // GET /exreg/certificate-summary?zoneId=...
 // Exports a certificate summary per zone grouped by certificate number
 exports.exportZoneCertificateSummary = async (req, res) => {
@@ -2178,11 +2402,17 @@ exports.listEquipment = async (req, res) => {
     }
 
     const filter = { tenantId };
+    const searchTerm = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+    const andConditions = [];
 
     if (req.query.Zone) {
       filter.Zone = req.query.Zone;
     } else if (req.query.noZone) {
-      filter.$or = [{ Zone: null }, { Zone: { $exists: false } }];
+      andConditions.push({ $or: [{ Zone: null }, { Zone: { $exists: false } }] });
+    }
+
+    if (req.query.Site) {
+      filter.Site = req.query.Site;
     }
 
     if (req.query.EqID) {
@@ -2201,7 +2431,43 @@ exports.listEquipment = async (req, res) => {
       filter["TagNo"] = req.query.TagNo;
     }
 
-    const equipments = await Equipment.find(filter).lean();
+    if (searchTerm) {
+      const regex = new RegExp(escapeRegex(searchTerm), 'i');
+      const searchConditions = SEARCHABLE_EQUIPMENT_FIELDS.map(field => ({ [field]: regex }));
+      andConditions.push({ $or: searchConditions });
+    }
+
+    if (andConditions.length === 1) {
+      Object.assign(filter, andConditions[0]);
+    } else if (andConditions.length > 1) {
+      filter.$and = andConditions;
+    }
+
+    const sortField = typeof req.query.sortBy === 'string' && req.query.sortBy.trim()
+      ? req.query.sortBy
+      : 'orderIndex';
+    const sortDir = req.query.sortDir === 'desc' ? -1 : 1;
+    const sortOptions = { [sortField]: sortDir, _id: 1 };
+
+    const rawPageSize = parseInt(req.query.pageSize || req.query.limit, 10);
+    const usePagination = Number.isFinite(rawPageSize) && rawPageSize > 0;
+    const pageSize = usePagination ? Math.max(rawPageSize, 1) : null;
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const skipParam = parseInt(req.query.skip, 10);
+    const skip = usePagination
+      ? (Number.isFinite(skipParam) && skipParam >= 0 ? skipParam : (page - 1) * pageSize)
+      : null;
+
+    let query = Equipment.find(filter).sort(sortOptions);
+    if (usePagination && pageSize != null) {
+      query = query.skip(skip || 0).limit(pageSize);
+    }
+
+    const [equipments, totalCount] = await Promise.all([
+      query.lean(),
+      usePagination ? Equipment.countDocuments(filter) : Promise.resolve(null)
+    ]);
+
     let certMap = new Map();
     try {
       certMap = await buildCertificateCacheForTenant(tenantId);
@@ -2252,6 +2518,15 @@ exports.listEquipment = async (req, res) => {
         certificateDocType: linkedCertificate?.docType || 'unknown'
       };
     });
+
+    if (usePagination && pageSize != null) {
+      return res.json({
+        items: withPaths,
+        total: typeof totalCount === 'number' ? totalCount : withPaths.length,
+        page,
+        pageSize
+      });
+    }
 
     return res.json(withPaths);
   } catch (error) {
