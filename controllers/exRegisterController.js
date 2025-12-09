@@ -2152,7 +2152,7 @@ exports.exportZoneCertificateSummary = async (req, res) => {
     worksheet.getRow(1).height = 60;
 
     worksheet.getRow(2).height = 7;
-    worksheet.getRow(3).height = 13;
+    worksheet.getRow(3).height = 10;
     worksheet.getRow(4).height = 56;
 
     const groupFill = {
@@ -2252,7 +2252,6 @@ exports.exportZoneCertificateSummary = async (req, res) => {
     };
 
     const styleDataRow = (row) => {
-      row.height = 15;
       row.eachCell((cell, colNumber) => {
         const horizontal = centerColumns.has(colNumber) ? 'center' : 'left';
         const wrapText = colNumber !== 1 && colNumber !== 3;
@@ -2345,23 +2344,117 @@ exports.exportZoneCertificateSummary = async (req, res) => {
           left: { style: 'thin', color: { argb: 'FFE2C470' } },
           right: { style: 'thin', color: { argb: 'FFE2C470' } }
         };
-
-        const addConditionRow = (text, { bold = false } = {}) => {
-          const row = worksheet.addRow(['', text]);
-          const specendCol = Math.max(2, columnCount - 2);
-          worksheet.mergeCells(row.number, 2, row.number, specendCol);
-          const cell = worksheet.getCell(row.number, 2);
-          cell.value = text;
-          cell.font = { size: DEFAULT_FONT_SIZE, bold };
-          cell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: true };
+  
+        // Utolsó két oszlop: STATUS és DESCRIPTION
+        const statusCol = Math.max(2, columnCount - 1);
+        const descriptionCol = columnCount;
+        const mergeEndCol = Math.max(2, columnCount - 2);
+  
+        // 1) Fejléc sor: Condition of use: + STATUS + DESCRIPTION
+        const headerRow = worksheet.addRow(['', 'Condition of use:']);
+  
+        // Condition header blokk B..mergeEndCol
+        worksheet.mergeCells(headerRow.number, 2, headerRow.number, mergeEndCol);
+  
+        for (let col = 2; col <= mergeEndCol; col += 1) {
+          const cell = worksheet.getCell(headerRow.number, col);
+          cell.font = { bold: true, size: DEFAULT_FONT_SIZE };
+          cell.alignment = {
+            horizontal: 'left',
+            vertical: 'middle',
+            wrapText: true,
+            indent: col === 2 ? 1 : 0
+          };
           cell.fill = conditionFill;
           cell.border = conditionBorder;
-          const approxLines = Math.max(1, Math.ceil((text || '').length / 90));
-          row.height = Math.max(15, Math.min(200, approxLines * 14));
+        }
+  
+        // STATUS header
+        const statusHeaderCell = worksheet.getCell(headerRow.number, statusCol);
+        statusHeaderCell.value = 'STATUS';
+        statusHeaderCell.font = { bold: true, size: DEFAULT_FONT_SIZE };
+        statusHeaderCell.alignment = {
+          horizontal: 'center',
+          vertical: 'middle',
+          wrapText: true
         };
+        statusHeaderCell.fill = conditionFill;
+        statusHeaderCell.border = conditionBorder;
+  
+        // DESCRIPTION header
+        const descriptionHeaderCell = worksheet.getCell(headerRow.number, descriptionCol);
+        descriptionHeaderCell.value = 'DESCRIPTION';
+        descriptionHeaderCell.font = { bold: true, size: DEFAULT_FONT_SIZE };
+        descriptionHeaderCell.alignment = {
+          horizontal: 'center',
+          vertical: 'middle',
+          wrapText: true
+        };
+        descriptionHeaderCell.fill = conditionFill;
+        descriptionHeaderCell.border = conditionBorder;
+  
+        // 2) specCondition sortörésenként külön sorba
+        const normalizedSpec = String(specCondition || '')
+          .replace(/\r\n/g, '\n')
+          .replace(/\r/g, '\n');
+  
+        const lines = normalizedSpec
+          .split('\n')
+          .map(line => line.trim())
+          .filter(line => line.length > 0);
+  
+        lines.forEach((lineText) => {
+          const row = worksheet.addRow(['', lineText]);
 
-        addConditionRow('Condition of use:', { bold: true });
-        addConditionRow(specCondition);
+          // Condition szöveg blokk B..mergeEndCol
+          worksheet.mergeCells(row.number, 2, row.number, mergeEndCol);
+
+          for (let col = 2; col <= mergeEndCol; col += 1) {
+            const cell = worksheet.getCell(row.number, col);
+            cell.font = { size: DEFAULT_FONT_SIZE };
+            cell.alignment = {
+              horizontal: 'left',
+              vertical: 'top',
+              wrapText: true,
+              indent: col === 2 ? 1 : 0
+            };
+            cell.fill = conditionFill;
+            cell.border = conditionBorder;
+          }
+
+          // STATUS és DESCRIPTION cellák – üresek, de ugyanazzal a stílussal
+          const statusCell = worksheet.getCell(row.number, statusCol);
+          statusCell.fill = conditionFill;
+          statusCell.border = conditionBorder;
+          statusCell.alignment = {
+            horizontal: 'center',
+            vertical: 'middle',
+            wrapText: true
+          };
+
+          const descriptionCell = worksheet.getCell(row.number, descriptionCol);
+          descriptionCell.fill = conditionFill;
+          descriptionCell.border = conditionBorder;
+          descriptionCell.alignment = {
+            horizontal: 'center',
+            vertical: 'middle',
+            wrapText: true
+          };
+
+          // Dinamikus sormagasság – a teljes szöveg látszódjon akkor is, ha több sorba törik
+          const approxLines = Math.max(
+            1,
+            Math.ceil(lineText.length / 265) // kb. 80 karakter / vizuális sor a B..mergeEndCol szélességen
+          );
+          const baseHeightPerLine = 12; // pontban
+          const minHeight = 12;
+          const maxHeight = 120; // ne nőjön a végtelenségig egy nagyon hosszú sor esetén
+
+          row.height = Math.max(
+            minHeight,
+            Math.min(maxHeight, approxLines * baseHeightPerLine)
+          );
+        });
       }
 
       if (index < groups.length - 1) {
