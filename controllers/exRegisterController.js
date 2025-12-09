@@ -2128,7 +2128,8 @@ exports.exportZoneCertificateSummary = async (req, res) => {
       { key: 'tempClass', width: 6 },
       { key: 'ambient', width: 16 },
       { key: 'ipRating', width: 12 },
-      { key: 'inspection', width: 18 }
+      { key: 'inspection', width: 18 },
+      { key: 'note', width: 20 }
     ];
     worksheet.columns = columnDefinitions;
 
@@ -2347,7 +2348,8 @@ exports.exportZoneCertificateSummary = async (req, res) => {
 
         const addConditionRow = (text, { bold = false } = {}) => {
           const row = worksheet.addRow(['', text]);
-          worksheet.mergeCells(row.number, 2, row.number, columnCount);
+          const specendCol = Math.max(2, columnCount - 2);
+          worksheet.mergeCells(row.number, 2, row.number, specendCol);
           const cell = worksheet.getCell(row.number, 2);
           cell.value = text;
           cell.font = { size: DEFAULT_FONT_SIZE, bold };
@@ -2358,7 +2360,7 @@ exports.exportZoneCertificateSummary = async (req, res) => {
           row.height = Math.max(15, Math.min(200, approxLines * 14));
         };
 
-        addConditionRow('Specific condition of use:', { bold: true });
+        addConditionRow('Condition of use:', { bold: true });
         addConditionRow(specCondition);
       }
 

@@ -51,10 +51,13 @@ const jsonSchema = {
     properties: {
       scheme: { type: "string", description: "ATEX or IECEx (detect if possible)" },
       certNo: { type: "string" },
+      applicant: { type: "string", description: "Applicant / certificate holder if present" },
       manufacturer: { type: "string" },
       product: { type: "string" },
       exmarking: { type: "string" },
+      protection: { type: "string", description: "Type of protection (e.g. \"flameproof enclosure \\\"d\\\"\", \"increased safety e\", etc.)" },
       specCondition: { type: "string" },
+      description: { type: "string", description: "Free-text description of the equipment/component if present" },
       xcondition: { type: "boolean", description: "true if 'X' condition applies" },
       ucondition: { type: "boolean", description: "true if 'U' component condition applies" },
       status: { type: "string" },
@@ -312,8 +315,12 @@ function extractSpecFromOCRHeuristics(ocr) {
     buf.push(line);
   }
 
-  // Post-process: join bullets into one line
-  const text = buf.join(' ').replace(/\s+/g, ' ').trim();
+  // Post-process: keep bullet lines and join with '\n'
+  const cleanedLines = buf
+    .map(l => l.replace(/\s+$/g, '')) // trim trailing whitespace
+    .filter(l => l);                  // drop completely empty lines
+
+  const text = cleanedLines.join('\n');
   return text;
 }
 
@@ -473,10 +480,13 @@ function fallbackExtractFromOCR(ocrRaw) {
   const out = {
     scheme: '',
     certNo: '',
+    applicant: '',
     manufacturer: '',
     product: '',
     exmarking: '',
+    protection: '',
     specCondition: '',
+    description: '',
     xcondition: false,
     ucondition: false,
     status: '',
@@ -505,12 +515,16 @@ function fallbackExtractFromOCR(ocrRaw) {
   out.certNo = out.certNo.replace(/\s{2,}/g, ' ').trim();
 
   // --- manufacturer / applicant ---
-  // Prefer "Manufacturer:" then fall back to "Applicant:"
+  // Prefer separate manufacturer and applicant if both exist
   m = text.match(/Manufacturer\s*[:：]\s*([^\n\r]+)/i);
   if (m) out.manufacturer = m[1].trim();
-  if (!out.manufacturer) {
-    m = text.match(/Applicant\s*[:：]\s*([^\n\r]+)/i);
-    if (m) out.manufacturer = m[1].trim();
+  
+  let mApp = text.match(/Applicant\s*[:：]\s*([^\n\r]+)/i);
+  if (mApp) out.applicant = mApp[1].trim();
+  
+  // If manufacturer is missing but applicant exists, use applicant as manufacturer fallback
+  if (!out.manufacturer && out.applicant) {
+    out.manufacturer = out.applicant;
   }
 
   // --- product/equipment ---
@@ -520,6 +534,13 @@ function fallbackExtractFromOCR(ocrRaw) {
     m = text.match(/Device\s*[:：]\s*([^\n\r]+)/i);
     if (m) out.product = m[1].trim();
   }
+
+  // --- type of protection ---
+// e.g. "Type of Protection:\nflameproof enclosure \"d\", dust protection \"t\""
+m = text.match(/Type\s+of\s+Protection\s*[:：]\s*([^\n\r]+)/i);
+if (m) {
+  out.protection = m[1].trim();
+}
 
   // --- ex marking block ---
   // Consider lines beginning with Ex ... (allow multiple lines)
@@ -586,8 +607,15 @@ async function extractCertFieldsFromOCR(ocrText) {
   const ocr = (ocrText && ocrText.length > MAX_LEN) ? (ocrText.slice(0, MAX_LEN) + "\n...[TRUNCATED]") : ocrText;
   const ocrFull = ocrText || '';
 
+  // Simple scheme hint for prompt: slightly different emphasis for IECEx vs ATEX
+  const isIECEx = /iecex/i.test(ocrFull || '');
+  const schemeHint = isIECEx
+    ? "This document appears to be an IECEx certificate. Pay special attention to headings like 'Specific conditions of use' and 'Schedule of Limitations'."
+    : "This document appears to be an ATEX certificate. Pay special attention to headings like 'Special conditions for safe use' and Annex-related notes.";
+
   const systemPrompt = [
     "You are a strict JSON extractor for ATEX and IECEx certificates.",
+    schemeHint,
     "Output exactly one JSON object that matches the requested fields.",
     "If a field is missing, return empty string for strings and false for booleans.",
     "Detect scheme: 'ATEX' or 'IECEx' if possible.",
@@ -597,7 +625,12 @@ async function extractCertFieldsFromOCR(ocrText) {
     "'Special Conditions', 'Specific Conditions', 'Conditions for safe use', or similar.",
     "Preserve the original language of the certificate. Do NOT translate anything.",
     "Return all text fields exactly as they appear in the source (including accents/diacritics and capitalization); only normalize whitespace.",
-    "Return 'specCondition' as a single line; separate multiple items with '; '.",
+    "Also return 'applicant' (applicant or certificate holder if present), 'protection' (type of protection, e.g. \"flameproof enclosure 'd'\", \"increased safety 'e'\", \"dust protection 't'\"), and 'description' (short free-text equipment description) as plain strings; if missing, use empty string.",
+    "For 'specCondition', if multiple conditions or bullet points exist:",
+    "- keep each condition on a separate line,",
+    "- preserve numbering or bullet marks (e.g. '1.', '2.' or '•'),",
+    "- separate conditions with a newline character '\\n' inside the string.",
+    "Example: \"1. The equipment shall be installed so as to minimize the risk of impact.\\n2. The enclosure shall provide IP54 or better.\"",
     "IMPORTANT rules for X/U conditions:",
     "- Set xcondition = true if the certificate number contains an 'X' token AFTER the word ATEX or IECEx,",
     "  either as a separate token (e.g., 'ATEX 065 X') or appended (e.g., 'IECEx ABC 1234X').",
@@ -605,6 +638,7 @@ async function extractCertFieldsFromOCR(ocrText) {
     "- Set ucondition = true if the certificate number has a 'U' token or ends with '...U' (IECEx component).",
     "- ONLY extract and fill 'specCondition' when xcondition or ucondition is true; otherwise set it to an empty string and do not search for it.",
     "Also return a field 'docType' with one of the following values: 'certificate' (EU/EC-Type Examination Certificate, IECEx Certificate, etc.), 'manufacturer_declaration' (e.g., Declaration of Conformity, manufacturer's declaration), or 'unknown'. If the text looks like a DoC or manufacturer declaration, choose 'manufacturer_declaration'. If unsure, return 'unknown'.",
+    "Treat 'xcondition' as the boolean \"X condition\" flag and 'specCondition' as the full text of the specific/special conditions of use.",
     "Return JSON only, with no markdown or extra text.",
     "Return ONLY a minified JSON object. No prose. No markdown. No code fences."
   ].join(' ');
@@ -612,7 +646,7 @@ async function extractCertFieldsFromOCR(ocrText) {
   const userPrompt = [
     "Check the OCR result of the ATEX / IECEx certificate and return these fields in JSON:",
     "IMPORTANT: Preserve original language from OCR; DO NOT translate any field (manufacturer, product, exmarking, specCondition, status, etc.).",
-    "scheme, certNo, manufacturer, product, exmarking, specCondition, xcondition, ucondition, status, issueDate, docType.",
+    "scheme, certNo, applicant, manufacturer, product, exmarking, protection, specCondition, xcondition, ucondition, status, issueDate, description, docType.",
     "For 'specCondition', use any of these headings if present: Special conditions for safe use; Specific conditions of use;",
     "Schedule of Limitations; Special/Specific Conditions; Conditions for safe use.",
     "IMPORTANT: Only extract specCondition when the certificate number shows X or U AFTER the word ATEX/IECEx (not the X in 'ATEX' or 'IECEx' themselves).",
@@ -664,10 +698,13 @@ async function extractCertFieldsFromOCR(ocrText) {
   // defaultok (ha üres lenne)
   parsed.scheme ??= "";
   parsed.certNo ??= "";
+  parsed.applicant ??= "";
   parsed.manufacturer ??= "";
   parsed.product ??= "";
   parsed.exmarking ??= "";
+  parsed.protection ??= "";
   parsed.specCondition ??= "";
+  parsed.description ??= "";
   parsed.xcondition = !!parsed.xcondition;
   parsed.ucondition = !!parsed.ucondition;
   parsed.status ??= "";
@@ -708,7 +745,10 @@ async function extractCertFieldsFromOCR(ocrText) {
           "Look under headings like 'Special conditions for safe use', 'Specific conditions of use', 'Schedule of Limitations', or similar.",
           "Do NOT return generic legal disclaimers like 'This EU-Type Examination Certificate relates only to the design...'.",
           "Return strictly this JSON and nothing else: { \"specCondition\": \"...\" }.",
-          "Flatten to one line; separate multiple bullet points with '; '.",
+          "If the conditions are numbered or in bullet points:",
+          "- keep each condition as a separate line,",
+          "- preserve original numbering or bullet marks,",
+          "- separate conditions with a newline character '\\n' inside the string.",
           "",
           "OCR CHUNK:",
           "-----",
