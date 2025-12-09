@@ -2120,13 +2120,14 @@ exports.exportZoneCertificateSummary = async (req, res) => {
     const columnDefinitions = [
       { key: 'item', width: 6 },
       { key: 'certificate', width: 25 },
-      { key: 'description', width: 25 },
+      { key: 'description', width: 32 },
       { key: 'serial', width: 18 },
       { key: 'environment', width: 5 },
       { key: 'gasDust', width: 5 },
       { key: 'protection', width: 6 },
       { key: 'tempClass', width: 6 },
       { key: 'ambient', width: 16 },
+      { key: 'ipRating', width: 12 },
       { key: 'inspection', width: 18 }
     ];
     worksheet.columns = columnDefinitions;
@@ -2165,6 +2166,7 @@ exports.exportZoneCertificateSummary = async (req, res) => {
       right: { style: 'thin', color: { argb: 'FFB4B4B4' } }
     };
 
+
     function styleHeader(cell, value) {
       cell.value = value;
       cell.font = { bold: true, size: DEFAULT_FONT_SIZE };
@@ -2189,7 +2191,13 @@ exports.exportZoneCertificateSummary = async (req, res) => {
     styleHeader(worksheet.getCell(headerStartRow, 9), 'AMBIENT TEMPERATURE');
 
     worksheet.mergeCells(headerStartRow, 10, headerEndRow, 10);
-    styleHeader(worksheet.getCell(headerStartRow, 10), 'LAST INSPECTION STATUS');
+    styleHeader(worksheet.getCell(headerStartRow, 10), 'IP RATING');
+
+    worksheet.mergeCells(headerStartRow, 11, headerEndRow, 11);
+    styleHeader(worksheet.getCell(headerStartRow, 11), 'STATUS');
+
+    worksheet.mergeCells(headerStartRow, 12, headerEndRow, 12);
+    styleHeader(worksheet.getCell(headerStartRow, 12), 'DESCRIPTION');
 
     const subHeaderRow = headerStartRow + 1;
     const subHeaderFill = {
@@ -2221,7 +2229,26 @@ exports.exportZoneCertificateSummary = async (req, res) => {
     styleSubHeader(8, 'TEMPERATURE CLASS', { rotate: true });
 
     let itemCounter = 1;
-    const centerColumns = new Set([1, 5, 6, 7, 8, 9, 10]);
+    const centerColumns = new Set([1, 5, 6, 7, 8, 9, 10, 11]);
+
+    const getEquipmentOrderIndex = (equipment) => {
+      if (!equipment) return null;
+      const candidates = [
+        equipment.orderIndex,
+        equipment.OrderIndex,
+        equipment['orderIndex'],
+        equipment['OrderIndex'],
+        equipment.order_index
+      ];
+      for (const value of candidates) {
+        if (value === null || value === undefined || value === '') continue;
+        const num = Number(value);
+        if (Number.isFinite(num)) {
+          return num;
+        }
+      }
+      return null;
+    };
 
     const styleDataRow = (row) => {
       row.height = 15;
@@ -2258,9 +2285,10 @@ exports.exportZoneCertificateSummary = async (req, res) => {
         const marking = Array.isArray(eq['Ex Marking']) && eq['Ex Marking'].length
           ? eq['Ex Marking'][0]
           : null;
+        const orderIndexValue = getEquipmentOrderIndex(eq);
 
         const rowValues = [
-          itemCounter,
+          orderIndexValue != null ? orderIndexValue : itemCounter,
           '',
           eq['Equipment Type'] || eq.EquipmentType || eq.Description || '',
           eq['Serial Number'] || eq.SerialNumber || '',
@@ -2269,6 +2297,13 @@ exports.exportZoneCertificateSummary = async (req, res) => {
           (marking && (marking['Type of Protection'] || marking['Type Of Protection'])) || '',
           (marking && (marking['Temperature Class'] || marking['Temp Class'])) || '',
           eq['Max Ambient Temp'] || '',
+          eq['IP Rating'] ||
+            eq['IP rating'] ||
+            eq.IPRating ||
+            eq.IpRating ||
+            eq.ipRating ||
+            eq['Req IP Rating'] ||
+            '',
           eq.lastInspectionStatus || eq.Compliance || ''
         ];
 
@@ -2298,34 +2333,33 @@ exports.exportZoneCertificateSummary = async (req, res) => {
       const specCondition = (certDoc?.specCondition || '').trim();
 
       if (specCondition) {
-        const conditionRow = worksheet.addRow(['', specCondition]);
-        worksheet.mergeCells(conditionRow.number, 2, conditionRow.number, columnCount);
-        const condCell = worksheet.getCell(conditionRow.number, 2);
-        condCell.value = {
-          richText: [
-            { text: 'Specific condition of use:\n', font: { bold: true, size: DEFAULT_FONT_SIZE } },
-            { text: specCondition, font: { size: DEFAULT_FONT_SIZE } }
-          ]
-        };
-        condCell.alignment = { horizontal: 'left', vertical: 'top', wrapText: true };
-        condCell.fill = {
+        const conditionFill = {
           type: 'pattern',
           pattern: 'solid',
           fgColor: { argb: 'FFFFF9E3' }
         };
-        condCell.border = {
+        const conditionBorder = {
           top: { style: 'thin', color: { argb: 'FFE2C470' } },
           bottom: { style: 'thin', color: { argb: 'FFE2C470' } },
           left: { style: 'thin', color: { argb: 'FFE2C470' } },
           right: { style: 'thin', color: { argb: 'FFE2C470' } }
         };
-        const labelLines = 1;
-        const textLineEstimate = specCondition
-          .split('\n')
-          .reduce((acc, line) => acc + Math.max(1, Math.ceil(line.length / 90)), 0);
-        const roughLineCount = labelLines + textLineEstimate;
-        const SPECIAL_CONDITION_LINE_HEIGHT = 8;
-        conditionRow.height = Math.max(20, Math.min(400, roughLineCount * SPECIAL_CONDITION_LINE_HEIGHT));
+
+        const addConditionRow = (text, { bold = false } = {}) => {
+          const row = worksheet.addRow(['', text]);
+          worksheet.mergeCells(row.number, 2, row.number, columnCount);
+          const cell = worksheet.getCell(row.number, 2);
+          cell.value = text;
+          cell.font = { size: DEFAULT_FONT_SIZE, bold };
+          cell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: true };
+          cell.fill = conditionFill;
+          cell.border = conditionBorder;
+          const approxLines = Math.max(1, Math.ceil((text || '').length / 90));
+          row.height = Math.max(15, Math.min(200, approxLines * 14));
+        };
+
+        addConditionRow('Specific condition of use:', { bold: true });
+        addConditionRow(specCondition);
       }
 
       if (index < groups.length - 1) {
