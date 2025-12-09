@@ -2363,7 +2363,7 @@ exports.exportZoneCertificateSummary = async (req, res) => {
             horizontal: 'left',
             vertical: 'middle',
             wrapText: true,
-            indent: col === 2 ? 1 : 0
+            indent: 0
           };
           cell.fill = conditionFill;
           cell.border = conditionBorder;
@@ -2416,7 +2416,7 @@ exports.exportZoneCertificateSummary = async (req, res) => {
               horizontal: 'left',
               vertical: 'top',
               wrapText: true,
-              indent: col === 2 ? 1 : 0
+              indent: 1
             };
             cell.fill = conditionFill;
             cell.border = conditionBorder;
@@ -2496,6 +2496,501 @@ exports.exportZoneCertificateSummary = async (req, res) => {
     console.error('❌ exportZoneCertificateSummary error:', error);
     return res.status(500).json({
       message: 'Failed to export certificate summary',
+      error: error.message || String(error)
+    });
+  }
+};
+
+// GET /exreg/certificate-summary-compact?zoneId=...
+// Ugyanaz, mint exportZoneCertificateSummary, de 1 sor / cert, aggregált ITEM és Serial Number listával
+exports.exportZoneCertificateSummaryCompact = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const { zoneId } = req.query || {};
+
+    if (!tenantId) {
+      return res.status(401).json({ message: 'Missing tenantId from auth.' });
+    }
+
+    if (!zoneId) {
+      return res.status(400).json({ message: 'zoneId query parameter is required.' });
+    }
+
+    const zone = await Zone.findOne({ _id: zoneId, tenantId }).lean();
+    if (!zone) {
+      return res.status(404).json({ message: 'Zone not found for this tenant.' });
+    }
+
+    const equipments = await Equipment.find({ tenantId, Zone: zoneId })
+      .sort({ orderIndex: 1, createdAt: 1, _id: 1 })
+      .lean();
+
+    if (!equipments.length) {
+      return res.status(404).json({ message: 'No equipment found for certificate summary.' });
+    }
+
+    let certMap = new Map();
+    try {
+      certMap = await buildCertificateCacheForTenant(tenantId);
+    } catch (e) {
+      console.warn(
+        '⚠️ Certificate cache build failed for exportZoneCertificateSummaryCompact:',
+        e?.message || e
+      );
+      certMap = new Map();
+    }
+
+    // ---- Csoportosítás cert szám szerint ----
+    const groupMap = new Map();
+    equipments.forEach(eq => {
+      const rawCert = typeof eq['Certificate No'] === 'string'
+        ? eq['Certificate No'].trim()
+        : '';
+      const key = rawCert ? rawCert.toLowerCase() : '__no_cert__';
+      if (!groupMap.has(key)) {
+        groupMap.set(key, {
+          displayValue: rawCert || 'No certificate',
+          rawValue: rawCert,
+          equipments: []
+        });
+      }
+      groupMap.get(key).equipments.push(eq);
+    });
+
+    const groups = Array.from(groupMap.values()).sort((a, b) => {
+      if (a.rawValue && b.rawValue) {
+        return a.rawValue.localeCompare(b.rawValue, undefined, {
+          sensitivity: 'base',
+          numeric: true
+        });
+      }
+      if (!a.rawValue && b.rawValue) return 1;
+      if (a.rawValue && !b.rawValue) return -1;
+      return 0;
+    });
+
+    // ---- Excel workbook ----
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Certificate summary (compact)');
+    const DEFAULT_FONT_SIZE = 10;
+
+    // ÚJ oszlopszerkezet:
+    // CERTIFICATE NUMBER | ITEM | SERIAL NUMBER | AMBIENT | IP | ENV | GAS/DUST | TYPE | TEMP CLASS | STATUS | DESCRIPTION
+    const columnDefinitions = [
+      { key: 'certificate', width: 25 },
+      { key: 'itemList', width: 14 },
+      { key: 'serialList', width: 24 },
+      { key: 'ambient', width: 16 },
+      { key: 'ipRating', width: 12 },
+      { key: 'environment', width: 5 },
+      { key: 'gasDust', width: 8 },
+      { key: 'protection', width: 8 },
+      { key: 'tempClass', width: 8 },
+      { key: 'status', width: 10 },
+      { key: 'note', width: 20 }
+    ];
+    worksheet.columns = columnDefinitions;
+
+    const columnCount = columnDefinitions.length;
+    const headerStartRow = 3;
+    const headerEndRow = 4;
+
+    // Címsor
+    const titleLines = [zone.Name || 'Zone'];
+    if ((zone.Description || '').trim()) {
+      titleLines.push(zone.Description.trim());
+    }
+    titleLines.push('Certificate summary (compact)');
+    worksheet.mergeCells(1, 1, 1, columnCount);
+    const titleCell = worksheet.getCell(1, 1);
+    titleCell.value = titleLines.join('\n');
+    titleCell.font = { bold: true, size: 16 };
+    titleCell.alignment = {
+      horizontal: 'left',
+      vertical: 'middle',
+      wrapText: true,
+      indent: 1
+    };
+    worksheet.getRow(1).height = 60;
+
+    worksheet.getRow(2).height = 7;
+    worksheet.getRow(3).height = 10;
+    worksheet.getRow(4).height = 56;
+
+    const groupFill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFE8EEF6' }
+    };
+    const headerBorder = {
+      top: { style: 'thin', color: { argb: 'FFB4B4B4' } },
+      left: { style: 'thin', color: { argb: 'FFB4B4B4' } },
+      bottom: { style: 'thin', color: { argb: 'FFB4B4B4' } },
+      right: { style: 'thin', color: { argb: 'FFB4B4B4' } }
+    };
+
+    function styleHeader(cell, value) {
+      cell.value = value;
+      cell.font = { bold: true, size: DEFAULT_FONT_SIZE };
+      cell.alignment = {
+        horizontal: 'center',
+        vertical: 'middle',
+        wrapText: true
+      };
+      cell.fill = groupFill;
+      cell.border = headerBorder;
+    }
+
+    // Fő fejlécek
+    worksheet.mergeCells(headerStartRow, 1, headerEndRow, 1);
+    styleHeader(worksheet.getCell(headerStartRow, 1), 'CERTIFICATE NUMBER');
+
+    worksheet.mergeCells(headerStartRow, 2, headerEndRow, 2);
+    styleHeader(worksheet.getCell(headerStartRow, 2), 'ITEM');
+
+    worksheet.mergeCells(headerStartRow, 3, headerEndRow, 3);
+    styleHeader(worksheet.getCell(headerStartRow, 3), 'SERIAL NUMBER');
+
+    worksheet.mergeCells(headerStartRow, 4, headerEndRow, 4);
+    styleHeader(worksheet.getCell(headerStartRow, 4), 'AMBIENT TEMPERATURE');
+
+    worksheet.mergeCells(headerStartRow, 5, headerEndRow, 5);
+    styleHeader(worksheet.getCell(headerStartRow, 5), 'IP RATING');
+
+    // EX MARKING blokk (4 oszlopot fog össze)
+    worksheet.mergeCells(headerStartRow, 6, headerStartRow, 9);
+    styleHeader(worksheet.getCell(headerStartRow, 6), 'EX MARKING');
+
+    worksheet.mergeCells(headerStartRow, 10, headerEndRow, 10);
+    styleHeader(worksheet.getCell(headerStartRow, 10), 'STATUS');
+
+    worksheet.mergeCells(headerStartRow, 11, headerEndRow, 11);
+    styleHeader(worksheet.getCell(headerStartRow, 11), 'DESCRIPTION');
+
+    const subHeaderRow = headerStartRow + 1;
+    const subHeaderFill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFF5F8FC' }
+    };
+
+    function styleSubHeader(col, label, options = {}) {
+      worksheet.mergeCells(subHeaderRow, col, headerEndRow, col);
+      const cell = worksheet.getCell(subHeaderRow, col);
+      cell.value = label;
+      cell.font = { bold: true, size: DEFAULT_FONT_SIZE };
+      cell.alignment = {
+        horizontal: 'center',
+        vertical: 'middle',
+        wrapText: true,
+        textRotation: options.rotate ? 90 : undefined
+      };
+      cell.fill = subHeaderFill;
+      cell.border = headerBorder;
+    }
+
+    // EX MARKING alfejlécek
+    styleSubHeader(6, 'ENVIRONMENT', { rotate: true });
+    styleSubHeader(7, 'GAS / DUST GROUP', { rotate: true });
+    styleSubHeader(8, 'TYPE OF PROTECTION', { rotate: true });
+    styleSubHeader(9, 'TEMPERATURE CLASS', { rotate: true });
+
+    // Mely oszlopok középre igazítottak?
+    const centerColumns = new Set([2, 4, 5, 6, 7, 8, 9, 10]);
+
+    const getEquipmentOrderIndex = (equipment) => {
+      if (!equipment) return null;
+      const candidates = [
+        equipment.orderIndex,
+        equipment.OrderIndex,
+        equipment['orderIndex'],
+        equipment['OrderIndex'],
+        equipment.order_index
+      ];
+      for (const value of candidates) {
+        if (value === null || value === undefined || value === '') continue;
+        const num = Number(value);
+        if (Number.isFinite(num)) {
+          return num;
+        }
+      }
+      return null;
+    };
+
+    const styleDataRow = (row) => {
+      row.eachCell((cell, colNumber) => {
+        const horizontal = centerColumns.has(colNumber) ? 'center' : 'left';
+        const wrapText = true;
+        cell.alignment = { horizontal, vertical: 'middle', wrapText };
+        cell.font = { size: DEFAULT_FONT_SIZE };
+        cell.border = {
+          top: { style: 'thin', color: { argb: 'FFDDDDDD' } },
+          bottom: { style: 'thin', color: { argb: 'FFDDDDDD' } }
+        };
+      });
+    };
+
+    let itemCounter = 1;
+
+    groups.forEach((group, index) => {
+      const eqs = group.equipments.sort((a, b) => {
+        const aIndex = typeof a.orderIndex === 'number' ? a.orderIndex : Number.MAX_SAFE_INTEGER;
+        const bIndex = typeof b.orderIndex === 'number' ? b.orderIndex : Number.MAX_SAFE_INTEGER;
+        if (aIndex !== bIndex) return aIndex - bIndex;
+        const aTag = (a.TagNo || '').toString();
+        const bTag = (b.TagNo || '').toString();
+        if (aTag && bTag && aTag !== bTag) {
+          return aTag.localeCompare(bTag, undefined, { sensitivity: 'base' });
+        }
+        const aId = (a.EqID || a._id || '').toString();
+        const bId = (b.EqID || b._id || '').toString();
+        return aId.localeCompare(bId);
+      });
+
+      // ---- Aggregált adatok egy certhez ----
+      const itemNumbers = [];
+      const serialNumbers = [];
+      let ambient = '';
+      let ipRating = '';
+
+      let env = '';
+      let gasDust = '';
+      let protection = '';
+      let tempClass = '';
+
+      eqs.forEach(eq => {
+        const orderIndexValue = getEquipmentOrderIndex(eq);
+        const actualItemNumber = orderIndexValue != null ? orderIndexValue : itemCounter;
+        itemNumbers.push(actualItemNumber);
+
+        const serial =
+          eq['Serial Number'] || eq.SerialNumber || '';
+        if (serial) {
+          serialNumbers.push(serial);
+        }
+
+        if (!ambient && eq['Max Ambient Temp']) {
+          ambient = eq['Max Ambient Temp'];
+        }
+
+        const ip =
+          eq['IP Rating'] ||
+          eq['IP rating'] ||
+          eq.IPRating ||
+          eq.IpRating ||
+          eq.ipRating ||
+          eq['Req IP Rating'] ||
+          '';
+        if (!ipRating && ip) {
+          ipRating = ip;
+        }
+
+        const markingArr =
+          Array.isArray(eq['Ex Marking']) && eq['Ex Marking'].length
+            ? eq['Ex Marking']
+            : null;
+
+        if (markingArr && !env && !gasDust && !protection && !tempClass) {
+          const marking = markingArr[0];
+          env = (marking && (marking.Environment || marking['Environment'])) || '';
+          gasDust =
+            (marking &&
+              (marking['Gas / Dust Group'] || marking['Gas/Dust Group'])) ||
+            '';
+          protection =
+            (marking &&
+              (marking['Type of Protection'] || marking['Type Of Protection'])) ||
+            '';
+          tempClass =
+            (marking &&
+              (marking['Temperature Class'] || marking['Temp Class'])) ||
+            '';
+        }
+
+        itemCounter += 1;
+      });
+
+      const itemList = itemNumbers.join('; ');
+      const serialList = serialNumbers.join('; ');
+
+      const rowValues = [
+        group.displayValue,
+        itemList,
+        serialList,
+        ambient,
+        ipRating,
+        env,
+        gasDust,
+        protection,
+        tempClass,
+        '', // STATUS üres
+        ''  // DESCRIPTION üres
+      ];
+
+      const row = worksheet.addRow(rowValues);
+      styleDataRow(row);
+
+      // ---- Condition of use blokk: A oszlopban kezdődik, header indent 0, minden más indent 1 ----
+      const certDoc = group.rawValue
+        ? resolveCertificateFromCache(certMap, group.rawValue)
+        : null;
+      const specCondition = (certDoc?.specCondition || '').trim();
+
+      if (specCondition) {
+        const conditionFill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FFFFF9E3' }
+        };
+        const conditionBorder = {
+          top: { style: 'thin', color: { argb: 'FFE2C470' } },
+          bottom: { style: 'thin', color: { argb: 'FFE2C470' } },
+          left: { style: 'thin', color: { argb: 'FFE2C470' } },
+          right: { style: 'thin', color: { argb: 'FFE2C470' } }
+        };
+
+        const statusCol = Math.max(1, columnCount - 1);      // 10
+        const descriptionCol = columnCount;                  // 11
+        const mergeEndCol = Math.max(1, columnCount - 2);    // 9
+
+        // Fejléc: Condition of use + STATUS + DESCRIPTION
+        const headerRow2 = worksheet.addRow(['Condition of use:']);
+
+        // Condition header blokk A..mergeEndCol
+        worksheet.mergeCells(headerRow2.number, 1, headerRow2.number, mergeEndCol);
+
+        for (let col = 1; col <= mergeEndCol; col += 1) {
+          const cell = worksheet.getCell(headerRow2.number, col);
+          cell.font = { bold: true, size: DEFAULT_FONT_SIZE };
+          cell.alignment = {
+            horizontal: 'left',
+            vertical: 'middle',
+            wrapText: true,
+            indent: 0   // csak az A oszlopban lévő "Condition of use:" nem behúzott
+          };
+          cell.fill = conditionFill;
+          cell.border = conditionBorder;
+        }
+
+        const statusHeaderCell = worksheet.getCell(headerRow2.number, statusCol);
+        statusHeaderCell.value = 'STATUS';
+        statusHeaderCell.font = { bold: true, size: DEFAULT_FONT_SIZE };
+        statusHeaderCell.alignment = {
+          horizontal: 'center',
+          vertical: 'middle',
+          wrapText: true,
+          indent: 1
+        };
+        statusHeaderCell.fill = conditionFill;
+        statusHeaderCell.border = conditionBorder;
+
+        const descriptionHeaderCell = worksheet.getCell(
+          headerRow2.number,
+          descriptionCol
+        );
+        descriptionHeaderCell.value = 'DESCRIPTION';
+        descriptionHeaderCell.font = { bold: true, size: DEFAULT_FONT_SIZE };
+        descriptionHeaderCell.alignment = {
+          horizontal: 'center',
+          vertical: 'middle',
+          wrapText: true,
+          indent: 1
+        };
+        descriptionHeaderCell.fill = conditionFill;
+        descriptionHeaderCell.border = conditionBorder;
+
+        const normalizedSpec = String(specCondition || '')
+          .replace(/\r\n/g, '\n')
+          .replace(/\r/g, '\n');
+
+        const lines = normalizedSpec
+          .split('\n')
+          .map(line => line.trim())
+          .filter(line => line.length > 0);
+
+        lines.forEach(lineText => {
+          const r = worksheet.addRow([lineText]);
+
+          // Condition szöveg blokk A..mergeEndCol
+          worksheet.mergeCells(r.number, 1, r.number, mergeEndCol);
+
+          for (let col = 1; col <= mergeEndCol; col += 1) {
+            const cell = worksheet.getCell(r.number, col);
+            cell.font = { size: DEFAULT_FONT_SIZE };
+            cell.alignment = {
+              horizontal: 'left',
+              vertical: 'top',
+              wrapText: true,
+              indent: 1        // minden sor, minden cella a blokkban indent 1
+            };
+            cell.fill = conditionFill;
+            cell.border = conditionBorder;
+          }
+
+          const statusCell = worksheet.getCell(r.number, statusCol);
+          statusCell.fill = conditionFill;
+          statusCell.border = conditionBorder;
+          statusCell.alignment = {
+            horizontal: 'center',
+            vertical: 'middle',
+            wrapText: true,
+            indent: 1
+          };
+
+          const descriptionCell2 = worksheet.getCell(r.number, descriptionCol);
+          descriptionCell2.fill = conditionFill;
+          descriptionCell2.border = conditionBorder;
+          descriptionCell2.alignment = {
+            horizontal: 'center',
+            vertical: 'middle',
+            wrapText: true,
+            indent: 1
+          };
+
+          // Itt nem állítunk sor-magasságot → Excel auto-fit a wrapText alapján
+        });
+      }
+
+      if (index < groups.length - 1) {
+        const spacerRow = worksheet.addRow([]);
+        spacerRow.height = 7;
+      }
+    });
+
+    // Egyszerű oszlop-szélesség finomhangolás (ITEM + SERIAL NUMBER)
+    const autoFitColumn = (colNumber, { minWidth = 10, maxWidth = 70 } = {}) => {
+      const column = worksheet.getColumn(colNumber);
+      let maxLength = minWidth;
+      column.eachCell({ includeEmpty: false }, cell => {
+        if (cell.value == null) return;
+        let text = '';
+        const value = cell.value;
+        if (typeof value === 'object' && value.richText) {
+          text = value.richText.map(part => part.text || '').join('');
+        } else if (typeof value === 'object' && typeof value.text === 'string') {
+          text = value.text;
+        } else {
+          text = String(value);
+        }
+        maxLength = Math.max(maxLength, text.length + 2);
+      });
+      column.width = Math.min(maxWidth, Math.max(minWidth, maxLength));
+    };
+
+    autoFitColumn(2, { minWidth: 10, maxWidth: 30 }); // ITEM lista
+    autoFitColumn(3, { minWidth: 18, maxWidth: 50 }); // SERIAL lista
+
+    const safeZone = slug(zone.Name || 'zone') || `zone_${zone._id}`;
+    const fileName = `${safeZone.replace(/\s+/g, '_')}_certificate_summary_compact.xlsx`;
+
+    res.setHeader('Content-Type', EXCEL_CONTENT_TYPE);
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error('❌ exportZoneCertificateSummaryCompact error:', error);
+    return res.status(500).json({
+      message: 'Failed to export compact certificate summary',
       error: error.message || String(error)
     });
   }

@@ -48,6 +48,14 @@ router.get(
   exRegisterController.exportZoneCertificateSummary
 );
 
+// ÚJ compact verzió:
+router.get(
+  '/exreg/certificate-summary-compact',
+  authMiddleware(),
+  exRegisterController.exportZoneCertificateSummaryCompact
+);
+
+
 router.get(
   '/exreg/:id/documents',
   authMiddleware(),
