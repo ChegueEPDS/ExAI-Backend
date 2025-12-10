@@ -2947,7 +2947,18 @@ exports.exportZoneCertificateSummaryCompact = async (req, res) => {
             indent: 1
           };
 
-          // Itt nem állítunk sor-magasságot → Excel auto-fit a wrapText alapján
+          const approxLines = Math.max(
+            1,
+            Math.ceil(lineText.length / 265) // igény szerint hangolható
+          );
+          const baseHeightPerLine = 12;
+          const minHeight = 12;
+          const maxHeight = 120;
+
+          r.height = Math.max(
+            minHeight,
+            Math.min(maxHeight, approxLines * baseHeightPerLine)
+          );
         });
       }
 

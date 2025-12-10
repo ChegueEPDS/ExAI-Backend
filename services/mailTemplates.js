@@ -71,6 +71,8 @@ function baseTemplate({ title, bodyHtml, tenantName }) {
 function registrationEmailHtml({ firstName, lastName, loginUrl, tenantName }) {
   // loginUrl legyen teljes https URL
   const safeLoginUrl = loginUrl?.startsWith('http') ? loginUrl : `https://${loginUrl}`;
+  const portalUrl = buildTenantUrl(tenantName);
+  const portalUrlLabel = displayHost(portalUrl);
   return baseTemplate({
     title: 'Welcome to ATEXdb Certs',
     tenantName,
@@ -85,7 +87,7 @@ function registrationEmailHtml({ firstName, lastName, loginUrl, tenantName }) {
         </a>
       </p>
       <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team<br/>
-         <a href="${footerUrl}" target="_blank" rel="noopener noreferrer">${footerUrlLabel}</a>
+         <a href="${portalUrl}" target="_blank" rel="noopener noreferrer">${portalUrlLabel}</a>
       </p>
     `,
   });
@@ -93,6 +95,8 @@ function registrationEmailHtml({ firstName, lastName, loginUrl, tenantName }) {
 
 function tenantInviteEmailHtml({ firstName, lastName, tenantName, loginUrl, password }) {
   const safeLoginUrl = loginUrl?.startsWith('http') ? loginUrl : `https://${loginUrl}`;
+  const portalUrl = buildTenantUrl(tenantName);
+  const portalUrlLabel = displayHost(portalUrl);
   return baseTemplate({
     title: 'You have been added to a tenant',
     tenantName,
@@ -112,7 +116,7 @@ function tenantInviteEmailHtml({ firstName, lastName, tenantName, loginUrl, pass
         </a>
       </p>
       <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team<br/>
-         <a href="${footerUrl}" target="_blank" rel="noopener noreferrer">${footerUrlLabel}</a>
+         <a href="${portalUrl}" target="_blank" rel="noopener noreferrer">${portalUrlLabel}</a>
       </p>
     `,
   });
@@ -120,6 +124,8 @@ function tenantInviteEmailHtml({ firstName, lastName, tenantName, loginUrl, pass
 
 function forgotPasswordEmailHtml({ firstName, lastName, loginUrl, tempPassword, tenantName }) {
   const safeLoginUrl = loginUrl?.startsWith('http') ? loginUrl : `https://${loginUrl}`;
+  const portalUrl = buildTenantUrl(tenantName);
+  const portalUrlLabel = displayHost(portalUrl);
   return baseTemplate({
     title: 'Your temporary password',
     tenantName,
@@ -140,7 +146,7 @@ function forgotPasswordEmailHtml({ firstName, lastName, loginUrl, tempPassword, 
         </a>
       </p>
       <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team<br/>
-         <a href="${footerUrl}" target="_blank" rel="noopener noreferrer">${footerUrlLabel}</a>
+         <a href="${portalUrl}" target="_blank" rel="noopener noreferrer">${portalUrlLabel}</a>
       </p>
     `,
   });

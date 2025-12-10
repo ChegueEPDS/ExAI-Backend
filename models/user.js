@@ -28,7 +28,9 @@ const UserSchema = new mongoose.Schema(
     password:  {
       type: String,
       required: function () { return !this.azureId; } // MS usernél nem kötelező
-    }
+    },
+    position:  { type: String },
+    positionInfo: { type: String },
   },
   { timestamps: true }
 );

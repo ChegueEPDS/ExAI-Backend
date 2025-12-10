@@ -856,9 +856,12 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
     ? new Date(inspection.inspectionDate)
     : new Date();
 
-  const inspectorName = inspection.inspectorId
-    ? `${inspection.inspectorId.firstName || ''} ${inspection.inspectorId.lastName || ''}`.trim()
+    const inspectorDoc = inspection.inspectorId || null;
+    const inspectorName = inspectorDoc
+      ? `${inspectorDoc.firstName || ''} ${inspectorDoc.lastName || inspectorDoc.name || ''}`.trim()
     : '';
+    const inspectorPosition = inspectorDoc?.position || '';
+    const inspectorPositionInfo = inspectorDoc?.positionInfo || '';
 
   const tenantName = (options.tenantName || '').toLowerCase();
   const isIndexTenant = tenantName === 'index' || tenantName === 'ind-ex';
@@ -1482,23 +1485,43 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
 
   const footerRow = ws.addRow([]);
   const fr = footerRow.number;    
-  ws.getRow(fr).height = 45;
+ // ws.getRow(fr).height = 45;
 
   // Left block: Created by
   ws.mergeCells(`A${fr}:G${fr}`);
   const createdByCell = ws.getCell(`A${fr}`);
-  createdByCell.value = inspectorName ? `Created by: ${inspectorName}` : 'Created by:';
-  createdByCell.font = { bold: true, size: 16 };
-  createdByCell.alignment = { horizontal: 'center', vertical: 'middle' };
+  
+  const createdLines = [];
+  if (inspectorName) {
+    createdLines.push(`Created by: ${inspectorName}`);
+  } else {
+    createdLines.push('Created by:');
+  }
+  if (inspectorPosition) createdLines.push(inspectorPosition);
+  if (inspectorPositionInfo) createdLines.push(inspectorPositionInfo);
+
+  createdByCell.value = createdLines.join('\n');
+  createdByCell.font = { bold: true, size: 14 };
+  createdByCell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
   createdByCell.border = BORDER_THIN;
 
   // Right block: Signature
   ws.mergeCells(`H${fr}:N${fr}`);
   const signatureCell = ws.getCell(`H${fr}`);
-  signatureCell.value = 'Signature: ____________________________';
-  signatureCell.font = { bold: true, size: 16 }; //color: { argb: 'dedede' },
-  signatureCell.alignment = { horizontal: 'center', vertical: 'middle' };
+  const signatureDateStr = inspectionDate instanceof Date
+  ? inspectionDate.toISOString().slice(0, 10)
+  : '';
+signatureCell.value = signatureDateStr
+  ? `Signature: ____________________________\nDate: ${signatureDateStr}`
+  : 'Signature: ____________________________';
+signatureCell.font = { bold: true, size: 14 };
+signatureCell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
   signatureCell.border = BORDER_THIN;
+
+  // Adjust footer row height to fit multiple lines if needed
+  const footerLineCount = Math.max(createdLines.length, signatureCell.value.split('\n').length);
+  ws.getRow(fr).height = Math.max(45, footerLineCount * 15 + 5);
+
 
   await appendItrEquipmentImagesSection(ws, workbook, equipment, attachmentLookup);
 
@@ -2108,7 +2131,7 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName }, ta
       _id: { $in: lastInspectionIds },
       tenantId
     })
-      .populate('inspectorId', 'firstName lastName name')
+    .populate('inspectorId', 'firstName lastName name position positionInfo')
       .lean();
   }
   const inspectionById = new Map(inspections.map(i => [i._id.toString(), i]));
@@ -2128,7 +2151,7 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName }, ta
   for (const eq of missingEquipments) {
     const insp = await Inspection.findOne({ equipmentId: eq._id, tenantId })
       .sort({ inspectionDate: -1, createdAt: -1 })
-      .populate('inspectorId', 'firstName lastName name')
+      .populate('inspectorId', 'firstName lastName name position positionInfo')
       .lean();
     if (insp) {
       inspectionByEquipment.set(eq._id.toString(), insp);
@@ -2670,8 +2693,8 @@ exports.exportInspectionXLSX = async (req, res) => {
     const includeImages = req.query?.includeImages === 'true';
 
     const inspection = await Inspection.findById(id)
-      .populate('inspectorId', 'firstName lastName email')
-      .lean();
+    .populate('inspectorId', 'firstName lastName name position positionInfo')
+    .lean();
 
     if (!inspection) {
       return res.status(404).json({ message: 'Inspection not found' });
