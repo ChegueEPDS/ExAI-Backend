@@ -856,15 +856,19 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
     ? new Date(inspection.inspectionDate)
     : new Date();
 
-    const inspectorDoc = inspection.inspectorId || null;
-    const inspectorName = inspectorDoc
-      ? `${inspectorDoc.firstName || ''} ${inspectorDoc.lastName || inspectorDoc.name || ''}`.trim()
+  const inspectorDoc = inspection.inspectorId || null;
+  const inspectorName = inspectorDoc
+    ? `${inspectorDoc.firstName || ''} ${inspectorDoc.lastName || inspectorDoc.name || ''}`.trim()
     : '';
-    const inspectorPosition = inspectorDoc?.position || '';
-    const inspectorPositionInfo = inspectorDoc?.positionInfo || '';
+  const inspectorPosition = inspectorDoc?.position || '';
+  const inspectorPositionInfo = inspectorDoc?.positionInfo || '';
+  const inspectorSignatureUrl =
+    inspectorDoc?.signatureBlobUrl ||
+    (inspectorDoc?.signatureBlobPath ? azureBlob.getBlobUrl(inspectorDoc.signatureBlobPath) : null);
 
   const tenantName = (options.tenantName || '').toLowerCase();
   const isIndexTenant = tenantName === 'index' || tenantName === 'ind-ex';
+  const schemeIsIECEx = typeof scheme === 'string' && scheme.toLowerCase().includes('iecex');
 
   // Oldalbeállítás: 1 oldal szélesre igazítás
   ws.pageSetup = ws.pageSetup || {};
@@ -1483,44 +1487,95 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
 
   // ===== FOOTER: Created by / Signature =====
 
-  const footerRow = ws.addRow([]);
-  const fr = footerRow.number;    
- // ws.getRow(fr).height = 45;
+  // Háromsoros footer: Name / Position / IECEx CoPC#
+  const nameRow = ws.addRow([]);
+  const nameR = nameRow.number;
+  const positionRow = ws.addRow([]);
+  const positionR = positionRow.number;
+  const copcRow = ws.addRow([]);
+  const copcR = copcRow.number;
 
-  // Left block: Created by
-  ws.mergeCells(`A${fr}:G${fr}`);
-  const createdByCell = ws.getCell(`A${fr}`);
-  
-  const createdLines = [];
-  if (inspectorName) {
-    createdLines.push(`Created by: ${inspectorName}`);
-  } else {
-    createdLines.push('Created by:');
-  }
-  if (inspectorPosition) createdLines.push(inspectorPosition);
-  if (inspectorPositionInfo) createdLines.push(inspectorPositionInfo);
+  const setFooterField = (rowNum, label, value) => {
+    ws.mergeCells(`A${rowNum}:B${rowNum}`);
+    ws.mergeCells(`C${rowNum}:G${rowNum}`);
 
-  createdByCell.value = createdLines.join('\n');
-  createdByCell.font = { bold: true, size: 14 };
-  createdByCell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
-  createdByCell.border = BORDER_THIN;
+    const labelCell = ws.getCell(`A${rowNum}`);
+    const valueCell = ws.getCell(`C${rowNum}`);
 
-  // Right block: Signature
-  ws.mergeCells(`H${fr}:N${fr}`);
-  const signatureCell = ws.getCell(`H${fr}`);
-  const signatureDateStr = inspectionDate instanceof Date
-  ? inspectionDate.toISOString().slice(0, 10)
-  : '';
-signatureCell.value = signatureDateStr
-  ? `Signature: ____________________________\nDate: ${signatureDateStr}`
-  : 'Signature: ____________________________';
-signatureCell.font = { bold: true, size: 14 };
-signatureCell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+    labelCell.value = label;
+    labelCell.font = { bold: true, size: 14 };
+    labelCell.alignment = { horizontal: 'center', vertical: 'middle' };
+    labelCell.border = BORDER_THIN;
+
+    valueCell.value = value || '';
+    valueCell.font = { bold: !!value, size: 14 };
+    valueCell.alignment = { horizontal: 'center', vertical: 'middle' };
+    valueCell.border = BORDER_THIN;
+  };
+
+  setFooterField(nameR, 'Name:', inspectorName || '');
+  setFooterField(positionR, 'Position:', inspectorPosition || '');
+  // IECEx CoPC# csak IECEx sémánál értelmezett – egyébként üresen hagyjuk a mezőt
+  setFooterField(copcR, 'IECEx CoPC#:', schemeIsIECEx ? (inspectorPositionInfo || '') : '');
+
+  // jobb oldali blokk: Signature (H–N oszlop, 3 sor magas)
+  ws.mergeCells(`H${nameR}:N${copcR}`);
+  const signatureCell = ws.getCell(`H${nameR}`);
+  const signatureDateStr =
+    inspectionDate instanceof Date ? inspectionDate.toISOString().slice(0, 10) : '';
+  signatureCell.value = signatureDateStr
+    ? `____________________________\nDate: ${signatureDateStr}`
+    : '____________________________';
+  signatureCell.font = { bold: true, size: 14 };
+  signatureCell.alignment = { horizontal: 'center', vertical: 'bottom', wrapText: true };
   signatureCell.border = BORDER_THIN;
 
-  // Adjust footer row height to fit multiple lines if needed
-  const footerLineCount = Math.max(createdLines.length, signatureCell.value.split('\n').length);
-  ws.getRow(fr).height = Math.max(45, footerLineCount * 15 + 5);
+  // Ha van aláírás kép az inspectorhoz, illesszük be a "Signature" vonal fölé,
+  // az eredeti képarány megtartásával.
+  if (inspectorSignatureUrl) {
+    try {
+      const sigBuffer = await fetchImageBuffer(inspectorSignatureUrl);
+      const meta = await sharp(sigBuffer).metadata();
+      const origWidth = meta.width || 400;
+      const origHeight = meta.height || 150;
+
+      // Cél magasság: 2 cm (≈ 0.787 in) → px (96 dpi)
+      const targetHeight = Math.round((2 / 2.54) * 96); // ~76 px
+      const scale = targetHeight / origHeight;
+      const targetWidth = Math.round(origWidth * scale);
+
+      const extension =
+        meta.format === 'png'
+          ? 'png'
+          : meta.format === 'webp'
+          ? 'webp'
+          : 'jpeg';
+
+      const imageId = workbook.addImage({
+        buffer: sigBuffer,
+        extension
+      });
+
+      // A Signature vonal fölé tegyük a képet.
+      // Egyszerű közelítés: fix vízszintes offset a H oszlophoz képest.
+      const tlCol = 10.3; // kissé jobbra tolva, hogy ne lógjon a "Signature:" szóra
+
+      // A blokk közepére pozicionáljuk függőlegesen.
+      ws.addImage(imageId, {
+        // Vízszintesen középre: H (7)–N (13) blokk közepe ≈ 10.5
+        // Függőlegesen vissza az eredeti, jól bevált pozícióra.
+        tl: { col: 10.5, row: nameR - 1 + 0.8 },
+        ext: { width: targetWidth, height: targetHeight }
+      });
+    } catch (e) {
+      console.warn('⚠️ Failed to embed inspector signature image:', e?.message || e);
+    }
+  }
+
+  // Sor magasság beállítása: mindhárom sor azonos magasságú legyen
+  ws.getRow(nameR).height = 22;
+  ws.getRow(positionR).height = 22;
+  ws.getRow(copcR).height = 22;
 
 
   await appendItrEquipmentImagesSection(ws, workbook, equipment, attachmentLookup);
@@ -2131,7 +2186,10 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName }, ta
       _id: { $in: lastInspectionIds },
       tenantId
     })
-    .populate('inspectorId', 'firstName lastName name position positionInfo')
+      .populate(
+        'inspectorId',
+        'firstName lastName name position positionInfo signatureBlobUrl signatureBlobPath'
+      )
       .lean();
   }
   const inspectionById = new Map(inspections.map(i => [i._id.toString(), i]));
@@ -2151,7 +2209,10 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName }, ta
   for (const eq of missingEquipments) {
     const insp = await Inspection.findOne({ equipmentId: eq._id, tenantId })
       .sort({ inspectionDate: -1, createdAt: -1 })
-      .populate('inspectorId', 'firstName lastName name position positionInfo')
+      .populate(
+        'inspectorId',
+        'firstName lastName name position positionInfo signatureBlobUrl signatureBlobPath'
+      )
       .lean();
     if (insp) {
       inspectionByEquipment.set(eq._id.toString(), insp);
@@ -2693,8 +2754,11 @@ exports.exportInspectionXLSX = async (req, res) => {
     const includeImages = req.query?.includeImages === 'true';
 
     const inspection = await Inspection.findById(id)
-    .populate('inspectorId', 'firstName lastName name position positionInfo')
-    .lean();
+      .populate(
+        'inspectorId',
+        'firstName lastName name position positionInfo signatureBlobUrl signatureBlobPath'
+      )
+      .lean();
 
     if (!inspection) {
       return res.status(404).json({ message: 'Inspection not found' });

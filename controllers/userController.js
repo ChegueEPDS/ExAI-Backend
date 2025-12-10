@@ -6,10 +6,12 @@ const DownloadQuota = require('../models/downloadQuota');
 const Subscription = require('../models/subscription');
 const SubscriptionModel = Subscription; // alias for clarity if needed elsewhere
 const Tenant = require('../models/tenant');
+const path = require('path');
 
 const mailService = require('../services/mailService');
 const { tenantInviteEmailHtml } = require('../services/mailTemplates');
 const { migrateAllUserDataToTenant } = require('../services/tenantMigration');
+const azureBlob = require('../services/azureBlobService');
 
 // --- Daily download quota (Free plan) helpers ---
 const FREE_DAILY_LIMIT = 3;
@@ -381,7 +383,15 @@ exports.moveUserToTenant = async (req, res) => {
 
 // Update User Profile
 exports.updateUserProfile = async (req, res) => {
-  const { firstName, lastName, nickname, billingName, billingAddress } = req.body;
+  const {
+    firstName,
+    lastName,
+    nickname,
+    billingName,
+    billingAddress,
+    position,
+    positionInfo
+  } = req.body;
 
   try {
     const tenantId = req.scope?.tenantId;
@@ -395,9 +405,41 @@ exports.updateUserProfile = async (req, res) => {
       query = { _id: req.params.userId, tenantId };
     }
 
+    // Aláírás kép feltöltése (opcionális)
+    const signatureUpdate = {};
+    const file = req.file;
+    if (file && file.buffer && req.params.userId) {
+      const userId = String(req.params.userId);
+      const extFromName = path.extname(file.originalname || '').toLowerCase();
+      const fallbackExt = file.mimetype === 'image/jpeg' ? '.jpg' : '.png';
+      const safeExt = extFromName || fallbackExt;
+      const blobPath = `data/${userId}/signature${safeExt}`;
+      const contentType = file.mimetype || (safeExt === '.jpg' ? 'image/jpeg' : 'image/png');
+
+      try {
+        await azureBlob.uploadBuffer(blobPath, file.buffer, contentType);
+        signatureUpdate.signatureBlobPath = blobPath;
+        signatureUpdate.signatureBlobUrl = azureBlob.getBlobUrl(blobPath);
+      } catch (e) {
+        console.error('❌ Failed to upload signature image:', e?.message || e);
+        return res.status(500).json({ error: 'Failed to upload signature image' });
+      }
+    }
+
+    const updateFields = {
+      firstName,
+      lastName,
+      nickname,
+      billingName,
+      billingAddress,
+      position,
+      positionInfo,
+      ...signatureUpdate
+    };
+
     const user = await User.findOneAndUpdate(
       query,
-      { firstName, lastName, nickname, billingName, billingAddress },
+      updateFields,
       { new: true }
     ).select('-password');
 

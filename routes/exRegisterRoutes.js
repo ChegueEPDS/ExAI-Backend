@@ -29,6 +29,21 @@ router.post(
   exRegisterController.importEquipmentXLSX
 );
 
+// Dokumentumok / képek tömeges importja ZIP-ből
+router.post(
+  '/exreg/import-documents-zip',
+  authMiddleware(),
+  upload.single('file'),
+  exRegisterController.importEquipmentDocumentsZip
+);
+
+// XLSX sablon a ZIP dokumentum-importhoz
+router.get(
+  '/exreg/documents-template',
+  authMiddleware(),
+  exRegisterController.downloadDocumentsTemplate
+);
+
 // Export XLSX a kiválasztott / zónához / projekthez tartozó eszközökhöz
 router.get(
   '/exreg/export-xlsx',

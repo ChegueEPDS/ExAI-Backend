@@ -11,6 +11,7 @@ const fs = require('fs');
 const azureBlob = require('../services/azureBlobService');
 const mime = require('mime-types');
 const ExcelJS = require('exceljs');
+const unzipper = require('unzipper');
 const {
   buildCertificateCacheForTenant,
   resolveCertificateFromCache
@@ -258,6 +259,68 @@ function getCellDate(row, headerMap, label) {
   const primitive = cellValueToPrimitive(row.getCell(column)?.value);
   return normalizeExcelDateValue(primitive);
 }
+
+function getCellStringByIndex(row, columnIndex) {
+  const primitive = cellValueToPrimitive(row.getCell(columnIndex)?.value);
+  if (primitive == null) return '';
+  if (primitive instanceof Date) {
+    return primitive.toISOString().split('T')[0];
+  }
+  return String(primitive).trim();
+}
+
+// 📄 XLSX sablon generálása a ZIP dokumentum-importhoz
+// GET /exreg/documents-template
+// Fejléc:
+//   A: equipmentId (_id)
+//   B: type (image|document)
+//   C: tag/docType – image: dataplate|general|fault; document: DoC|IOM|Datasheet|Other...
+//   D: filename (ahogy a ZIP-ben szerepel)
+exports.downloadDocumentsTemplate = async (req, res) => {
+  try {
+    const workbook = new ExcelJS.Workbook();
+    const ws = workbook.addWorksheet('Documents import');
+
+    ws.columns = [
+      { header: 'equipmentId', key: 'equipmentId', width: 28 },
+      { header: 'type (image|document)', key: 'type', width: 20 },
+      { header: 'tag / docType', key: 'tag', width: 32 },
+      { header: 'filename in ZIP', key: 'filename', width: 40 }
+    ];
+
+    // Minta sorok: image + document
+    ws.addRow({
+      equipmentId: '650000000000000000000000',
+      type: 'image',
+      tag: 'dataplate',
+      filename: 'photos/my_dataplate.jpg'
+    });
+    ws.addRow({
+      equipmentId: '650000000000000000000000',
+      type: 'document',
+      tag: 'DoC',
+      filename: 'docs/IECEx_certificate.pdf'
+    });
+
+    ws.getRow(1).font = { bold: true };
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="equipment-documents-template.xlsx"'
+    );
+    return res.status(200).send(Buffer.from(buffer));
+  } catch (err) {
+    console.error('❌ downloadDocumentsTemplate error:', err);
+    return res
+      .status(500)
+      .json({ message: 'Failed to generate documents template.', error: err.message || String(err) });
+  }
+};
 
 function normalizeComplianceStatus(status) {
   if (!status) return 'NA';
@@ -1249,6 +1312,253 @@ exports.importEquipmentXLSX = async (req, res) => {
     if (uploadedFile?.path) {
       try { fs.unlinkSync(uploadedFile.path); } catch (cleanupErr) {
         console.warn('⚠️ Failed to remove uploaded XLSX file:', cleanupErr?.message || cleanupErr);
+      }
+    }
+  }
+};
+
+// 📦 Dokumentumok / képek tömeges importja ZIP + XLSX alapján
+// ZIP tartalma:
+//  - egy XLSX fájl (neve egyezzen a ZIP nevével), első munkalap:
+//      Col1: equipment _id
+//      Col2: type  ("image" | "document")
+//      Col3: tag / docType:
+//            - image esetén: "dataplate" | "general" | "fault"
+//            - document esetén: "DoC" | "IOM" | "Datasheet" | vagy tetszőleges saját szöveg
+//      Col4: filename (ahogy a ZIP-ben szerepel)
+//  - maga a fájl (kép / dokumentum) a ZIP-ben (akár almappában)
+// TODO: background job + progress (mint az inspection exportnál), mert nagy ZIP-ek is jöhetnek
+exports.importEquipmentDocumentsZip = async (req, res) => {
+  const tenantId = req.scope?.tenantId;
+  const userId = req.userId;
+  const uploadedFile = req.file;
+  const zoneIdRaw = (req.body?.zoneId || req.query?.zoneId || '').trim();
+  let zoneObjectId = null;
+
+  if (!tenantId) {
+    return res.status(401).json({ message: 'Missing tenantId from auth.' });
+  }
+  if (!userId) {
+    return res.status(401).json({ message: 'Missing user context.' });
+  }
+  if (!uploadedFile) {
+    return res.status(400).json({ message: 'Missing ZIP file (field name: file).' });
+  }
+
+  try {
+    const tenantObjectId = toObjectId(tenantId);
+    if (!tenantObjectId) {
+      return res.status(400).json({ message: 'Invalid tenantId.' });
+    }
+    if (zoneIdRaw) {
+      if (!mongoose.Types.ObjectId.isValid(zoneIdRaw)) {
+        return res.status(400).json({ message: 'Invalid zoneId.' });
+      }
+      zoneObjectId = new mongoose.Types.ObjectId(zoneIdRaw);
+    }
+
+    // 1) ZIP megnyitása
+    const zipPath = uploadedFile.path;
+    const directory = await unzipper.Open.file(zipPath);
+    const allEntries = directory.files.filter(f => f.type === 'File');
+
+    if (!allEntries.length) {
+      return res.status(400).json({ message: 'ZIP archive is empty.' });
+    }
+
+    // 2) XLSX fájl keresése – a ZIP neve alapján:
+    //    ha a ZIP neve pl. "zone123_docs.zip", akkor a mapping XLSX-nek
+    //    "zone123_docs.xlsx"-nek kell lennie (bárhol a ZIP-ben).
+    const zipBaseName = path.basename(uploadedFile.originalname || '', path.extname(uploadedFile.originalname || ''));
+    let xlsxEntry = null;
+    if (zipBaseName) {
+      xlsxEntry =
+        allEntries.find(e => {
+          const base = path.basename(e.path, path.extname(e.path));
+          return base.toLowerCase() === zipBaseName.toLowerCase();
+        }) || null;
+    }
+    // Ha nem találtunk név alapján, ne essünk vissza "első xlsx"-re, mert
+    // a ZIP-ben lehetnek normál dokumentumként is .xlsx fájlok.
+    if (!xlsxEntry) {
+      return res.status(400).json({
+        message: `No XLSX mapping file found in ZIP that matches the ZIP name ("${zipBaseName}.xlsx").`
+      });
+    }
+
+    const xlsxBuffer = await xlsxEntry.buffer();
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(xlsxBuffer);
+    const worksheet = workbook.worksheets?.[0];
+    if (!worksheet) {
+      return res.status(400).json({ message: 'The XLSX mapping file has no worksheet.' });
+    }
+
+    // 3) ZIP entry map a fájlnevekhez (relatív útvonal + basename)
+    //    Csak a MAPPING XLSX-et hagyjuk ki, minden más (beleértve a többi .xlsx-et is)
+    //    dokumentumként használható.
+    const entryByName = new Map();
+    for (const entry of allEntries) {
+      // mapping XLSX → már beolvastuk, NE kerüljön a dokumentumok közé
+      if (entry === xlsxEntry) continue;
+
+      const rel = entry.path.replace(/^[/\\]+/, '');
+      entryByName.set(rel, entry);
+
+      const base = path.posix.basename(rel);
+      if (!entryByName.has(base)) {
+        entryByName.set(base, entry);
+      }
+    }
+
+    // 4) XLSX sorok feldolgozása és csoportosítás equipment szerint
+    const docsByEquipment = new Map(); // key: equipmentId -> [{ type, imageTag, docAlias, fileName, entry }]
+    const issues = [];
+
+    worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+      if (rowNumber === 1) return; // fejlécek
+
+      const equipmentId = getCellStringByIndex(row, 1);
+      const typeRaw = getCellStringByIndex(row, 2).toLowerCase();
+      const tagCell = getCellStringByIndex(row, 3);           // eredeti formázással (DoC, IOM, ...)
+      const tagRawLower = tagCell.toLowerCase();              // csak kép tagek normalizálásához
+      const fileNameCell = getCellStringByIndex(row, 4);
+
+      if (!equipmentId || !fileNameCell) {
+        return;
+      }
+
+      const normalizedName = fileNameCell.replace(/^[/\\]+/, '');
+      const entry =
+        entryByName.get(normalizedName) ||
+        entryByName.get(path.posix.basename(normalizedName));
+
+      if (!entry) {
+        issues.push(`Row ${rowNumber}: file "${fileNameCell}" not found in ZIP.`);
+        return;
+      }
+
+      const type = typeRaw === 'image' ? 'image' : 'document';
+      const imageTag = type === 'image'
+        ? normalizeImageTag(tagRawLower || 'general', 'general')
+        : null;
+      // Dokumentum esetén a 3. oszlopot "docType"/alias-ként használjuk (DoC, IOM, Datasheet, stb.)
+      const docAlias = type === 'document'
+        ? (tagCell || '')
+        : '';
+
+      if (!docsByEquipment.has(equipmentId)) {
+        docsByEquipment.set(equipmentId, []);
+      }
+      docsByEquipment.get(equipmentId).push({
+        type,
+        imageTag,
+        docAlias,
+        fileName: normalizedName,
+        entry,
+        rowNumber
+      });
+    });
+
+    if (!docsByEquipment.size) {
+      return res.status(400).json({ message: 'No valid rows found in XLSX mapping.' });
+    }
+
+    const tenantName = req.scope?.tenantName || '';
+    const results = [];
+
+    // 5) Fájlok feltöltése Azure Blobba és dokumentumok mentése equipmenthez
+    for (const [equipmentId, items] of docsByEquipment.entries()) {
+      const eqFilter = { _id: equipmentId, tenantId: tenantObjectId };
+      if (zoneObjectId) {
+        // Csak az adott zónához tartozó eszközöket engedjük importálni
+        Object.assign(eqFilter, { Zone: zoneObjectId });
+      }
+
+      const equipment = await Equipment.findOne(eqFilter);
+      if (!equipment) {
+        issues.push(
+          `Equipment ${equipmentId} not found for this tenant${
+            zoneObjectId ? ' or does not belong to this zone' : ''
+          }. Skipping its rows.`
+        );
+        continue;
+      }
+
+      let zoneDoc = null;
+      let siteDoc = null;
+      if (equipment.Zone && equipment.Site) {
+        zoneDoc = await Zone.findById(equipment.Zone);
+        siteDoc = await Site.findById(equipment.Site);
+      }
+      const zoneName = zoneDoc?.Name || (equipment.Zone ? `Zone_${equipment.Zone}` : null);
+      const siteName = siteDoc?.Name || (equipment.Site ? `Site_${equipment.Site}` : null);
+      const eqPrefix = buildEquipmentPrefix(
+        tenantName,
+        tenantId,
+        siteName,
+        zoneName,
+        equipment.EqID || equipment._id.toString()
+      );
+
+      const docs = [];
+      for (const item of items) {
+        try {
+          const buf = await item.entry.buffer();
+          const cleanName = cleanFileName(path.posix.basename(item.fileName));
+          const aliasFromXlsx = (item.docAlias || '').trim();
+          const blobPath = `${eqPrefix}/${cleanName}`;
+          const guessedType =
+            mime.lookup(cleanName) ||
+            (item.type === 'image' ? 'image/jpeg' : 'application/octet-stream');
+
+          await azureBlob.uploadBuffer(blobPath, buf, guessedType);
+
+          docs.push({
+            name: cleanName,
+            // Dokumentumnál alias: XLSX 3. oszlop (DoC/IOM/Datasheet/egyéb), ha van;
+            // különben esik vissza a fájlnévre.
+            alias: item.type === 'document' && aliasFromXlsx
+              ? aliasFromXlsx
+              : cleanName,
+            type: item.type,
+            blobPath,
+            blobUrl: azureBlob.getBlobUrl(blobPath),
+            contentType: guessedType,
+            size: buf.length,
+            uploadedAt: new Date(),
+            tag: item.type === 'image' ? item.imageTag : null
+          });
+        } catch (e) {
+          issues.push(
+            `Equipment ${equipmentId}, file "${item.fileName}": ${e?.message || 'upload failed'}`
+          );
+        }
+      }
+
+      if (docs.length) {
+        equipment.documents = [...(equipment.documents || []), ...docs];
+        await equipment.save();
+        results.push({ equipmentId: equipment._id.toString(), added: docs.length });
+      }
+    }
+
+    return res.status(200).json({
+      message: 'Bulk equipment documents imported from ZIP.',
+      updatedEquipments: results.length,
+      details: results,
+      issues
+    });
+  } catch (error) {
+    console.error('❌ importEquipmentDocumentsZip error:', error);
+    return res.status(500).json({
+      message: 'Server error during ZIP import.',
+      error: error.message || String(error)
+    });
+  } finally {
+    if (uploadedFile?.path) {
+      try { fs.unlinkSync(uploadedFile.path); } catch (cleanupErr) {
+        console.warn('⚠️ Failed to remove uploaded ZIP file:', cleanupErr?.message || cleanupErr);
       }
     }
   }
