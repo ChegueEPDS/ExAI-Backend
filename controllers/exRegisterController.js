@@ -18,6 +18,8 @@ const {
   buildCertificateCacheForTenant,
   resolveCertificateFromCache
 } = require('../helpers/certificateMatchHelper');
+const { notifyAndStore } = require('../lib/notifications/notifier');
+const { v4: uuidv4 } = require('uuid');
 
 const { BlobServiceClient } = require('@azure/storage-blob');
 const path = require('path');
@@ -1391,49 +1393,113 @@ exports.importEquipmentXLSX = async (req, res) => {
 //            - document esetén: "DoC" | "IOM" | "Datasheet" | vagy tetszőleges saját szöveg
 //      Col4: filename (ahogy a ZIP-ben szerepel)
 //  - maga a fájl (kép / dokumentum) a ZIP-ben (akár almappában)
-// TODO: background job + progress (mint az inspection exportnál), mert nagy ZIP-ek is jöhetnek
-exports.importEquipmentDocumentsZip = async (req, res) => {
-  const tenantId = req.scope?.tenantId;
-  const userId = req.userId;
-  const uploadedFile = req.file;
-  const zoneIdRaw = (req.body?.zoneId || req.query?.zoneId || '').trim();
-  let zoneObjectId = null;
+// A tényleges feldolgozás háttérjobként fut, hogy nagy (akár 2 GB) ZIP-eket is
+// biztonságosan lehessen kezelni.
 
-  if (!tenantId) {
-    return res.status(401).json({ message: 'Missing tenantId from auth.' });
+async function notifyEquipmentImportStatus(userId, {
+  jobId,
+  status,
+  updatedEquipments = null,
+  totalDocuments = null,
+  issuesCount = null,
+  errorMessage = null,
+  processed = null,
+  total = null
+} = {}) {
+  if (!userId || !jobId || !status) return;
+
+  let message;
+  switch (status) {
+    case 'queued':
+      message = 'Equipment documents import queued.';
+      break;
+    case 'running':
+      message = 'Equipment documents import is running...';
+      break;
+    case 'succeeded': {
+      const parts = [];
+      if (updatedEquipments != null) parts.push(`updated equipments: ${updatedEquipments}`);
+      if (totalDocuments != null) parts.push(`documents imported: ${totalDocuments}`);
+      if (issuesCount) parts.push(`issues: ${issuesCount}`);
+      const suffix = parts.length ? ` (${parts.join(', ')})` : '';
+      message = `Equipment documents import completed${suffix}.`;
+      break;
+    }
+    case 'failed':
+      message = `Equipment documents import failed${errorMessage ? `: ${errorMessage}` : '.'}`;
+      break;
+    default:
+      message = `Equipment documents import status: ${status}.`;
   }
-  if (!userId) {
-    return res.status(401).json({ message: 'Missing user context.' });
-  }
-  if (!uploadedFile) {
-    return res.status(400).json({ message: 'Missing ZIP file (field name: file).' });
+
+  const data = {
+    jobId,
+    jobType: 'equipment-docs-import',
+    status
+  };
+  if (updatedEquipments != null) data.updatedEquipments = updatedEquipments;
+  if (totalDocuments != null) data.totalDocuments = totalDocuments;
+  if (issuesCount != null) data.issuesCount = issuesCount;
+   // progress (processed/total) – hasonlóan az inspection export job-hoz
+  if (typeof processed === 'number' && typeof total === 'number' && total > 0) {
+    data.progress = { processed, total };
   }
 
   try {
-    const tenantObjectId = toObjectId(tenantId);
-    if (!tenantObjectId) {
-      return res.status(400).json({ message: 'Invalid tenantId.' });
-    }
-    if (zoneIdRaw) {
-      if (!mongoose.Types.ObjectId.isValid(zoneIdRaw)) {
-        return res.status(400).json({ message: 'Invalid zoneId.' });
-      }
-      zoneObjectId = new mongoose.Types.ObjectId(zoneIdRaw);
-    }
+    await notifyAndStore(userId, {
+      type: 'equipment-docs-import',
+      title: 'Equipment documents import',
+      message,
+      data,
+      meta: { route: '/notifications', jobId }
+    });
+  } catch (err) {
+    console.warn('⚠️ Failed to push equipment import status notification', err?.message || err);
+  }
+}
 
+async function runEquipmentDocumentsZipImportJob({
+  tenantId,
+  userId,
+  tenantName = '',
+  zipPath,
+  originalZipName,
+  zoneObjectId,
+  jobId
+}) {
+  if (!tenantId || !userId || !zipPath || !jobId) return;
+
+  await notifyEquipmentImportStatus(userId, { jobId, status: 'running' });
+
+  const tenantObjectId = toObjectId(tenantId);
+  if (!tenantObjectId) {
+    await notifyEquipmentImportStatus(userId, {
+      jobId,
+      status: 'failed',
+      errorMessage: 'Invalid tenantId.'
+    });
+    return;
+  }
+
+  const issues = [];
+  const results = [];
+
+  try {
     // 1) ZIP megnyitása
-    const zipPath = uploadedFile.path;
     const directory = await unzipper.Open.file(zipPath);
     const allEntries = directory.files.filter(f => f.type === 'File');
 
     if (!allEntries.length) {
-      return res.status(400).json({ message: 'ZIP archive is empty.' });
+      await notifyEquipmentImportStatus(userId, {
+        jobId,
+        status: 'failed',
+        errorMessage: 'ZIP archive is empty.'
+      });
+      return;
     }
 
-    // 2) XLSX fájl keresése – a ZIP neve alapján:
-    //    ha a ZIP neve pl. "zone123_docs.zip", akkor a mapping XLSX-nek
-    //    "zone123_docs.xlsx"-nek kell lennie (bárhol a ZIP-ben).
-    const zipBaseName = path.basename(uploadedFile.originalname || '', path.extname(uploadedFile.originalname || ''));
+    // 2) XLSX fájl keresése – a ZIP neve alapján
+    const zipBaseName = path.basename(originalZipName || '', path.extname(originalZipName || ''));
     let xlsxEntry = null;
     if (zipBaseName) {
       xlsxEntry =
@@ -1442,12 +1508,13 @@ exports.importEquipmentDocumentsZip = async (req, res) => {
           return base.toLowerCase() === zipBaseName.toLowerCase();
         }) || null;
     }
-    // Ha nem találtunk név alapján, ne essünk vissza "első xlsx"-re, mert
-    // a ZIP-ben lehetnek normál dokumentumként is .xlsx fájlok.
     if (!xlsxEntry) {
-      return res.status(400).json({
-        message: `No XLSX mapping file found in ZIP that matches the ZIP name ("${zipBaseName}.xlsx").`
+      await notifyEquipmentImportStatus(userId, {
+        jobId,
+        status: 'failed',
+        errorMessage: `No XLSX mapping file found in ZIP that matches the ZIP name ("${zipBaseName}.xlsx").`
       });
+      return;
     }
 
     const xlsxBuffer = await xlsxEntry.buffer();
@@ -1455,15 +1522,17 @@ exports.importEquipmentDocumentsZip = async (req, res) => {
     await workbook.xlsx.load(xlsxBuffer);
     const worksheet = workbook.worksheets?.[0];
     if (!worksheet) {
-      return res.status(400).json({ message: 'The XLSX mapping file has no worksheet.' });
+      await notifyEquipmentImportStatus(userId, {
+        jobId,
+        status: 'failed',
+        errorMessage: 'The XLSX mapping file has no worksheet.'
+      });
+      return;
     }
 
     // 3) ZIP entry map a fájlnevekhez (relatív útvonal + basename)
-    //    Csak a MAPPING XLSX-et hagyjuk ki, minden más (beleértve a többi .xlsx-et is)
-    //    dokumentumként használható.
     const entryByName = new Map();
     for (const entry of allEntries) {
-      // mapping XLSX → már beolvastuk, NE kerüljön a dokumentumok közé
       if (entry === xlsxEntry) continue;
 
       const rel = entry.path.replace(/^[/\\]+/, '');
@@ -1477,7 +1546,6 @@ exports.importEquipmentDocumentsZip = async (req, res) => {
 
     // 4) XLSX sorok feldolgozása és csoportosítás equipment szerint
     const docsByEquipment = new Map(); // key: equipmentId -> [{ type, imageTag, docAlias, fileName, entry }]
-    const issues = [];
 
     worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
       if (rowNumber === 1) return; // fejlécek
@@ -1506,7 +1574,6 @@ exports.importEquipmentDocumentsZip = async (req, res) => {
       const imageTag = type === 'image'
         ? normalizeImageTag(tagRawLower || 'general', 'general')
         : null;
-      // Dokumentum esetén a 3. oszlopot "docType"/alias-ként használjuk (DoC, IOM, Datasheet, stb.)
       const docAlias = type === 'document'
         ? (tagCell || '')
         : '';
@@ -1525,17 +1592,40 @@ exports.importEquipmentDocumentsZip = async (req, res) => {
     });
 
     if (!docsByEquipment.size) {
-      return res.status(400).json({ message: 'No valid rows found in XLSX mapping.' });
+      await notifyEquipmentImportStatus(userId, {
+      jobId,
+      status: 'failed',
+      errorMessage: 'No valid rows found in XLSX mapping.'
+      });
+      return;
     }
 
-    const tenantName = req.scope?.tenantName || '';
-    const results = [];
+    // Összes dokumentum számítása a progress-hez
+    let totalPlannedDocuments = 0;
+    for (const items of docsByEquipment.values()) {
+      totalPlannedDocuments += Array.isArray(items) ? items.length : 0;
+    }
+    let processedDocuments = 0;
+    if (totalPlannedDocuments > 0) {
+      await notifyEquipmentImportStatus(userId, {
+        jobId,
+        status: 'running',
+        processed: 0,
+        total: totalPlannedDocuments
+      });
+    }
+
+    const tenantNameSafe = tenantName || '';
 
     // 5) Fájlok feltöltése Azure Blobba és dokumentumok mentése equipmenthez
+    const PROGRESS_STEP_COUNT = 10;
+    const progressStep = totalPlannedDocuments > 0
+      ? Math.max(1, Math.floor(totalPlannedDocuments / PROGRESS_STEP_COUNT))
+      : 0;
+
     for (const [equipmentId, items] of docsByEquipment.entries()) {
       const eqFilter = { _id: equipmentId, tenantId: tenantObjectId };
       if (zoneObjectId) {
-        // Csak az adott zónához tartozó eszközöket engedjük importálni
         Object.assign(eqFilter, { Zone: zoneObjectId });
       }
 
@@ -1558,7 +1648,7 @@ exports.importEquipmentDocumentsZip = async (req, res) => {
       const zoneName = zoneDoc?.Name || (equipment.Zone ? `Zone_${equipment.Zone}` : null);
       const siteName = siteDoc?.Name || (equipment.Site ? `Site_${equipment.Site}` : null);
       const eqPrefix = buildEquipmentPrefix(
-        tenantName,
+        tenantNameSafe,
         tenantId,
         siteName,
         zoneName,
@@ -1586,8 +1676,6 @@ exports.importEquipmentDocumentsZip = async (req, res) => {
 
           docs.push({
             name: cleanName,
-            // Dokumentumnál alias: XLSX 3. oszlop (DoC/IOM/Datasheet/egyéb), ha van;
-            // különben esik vissza a fájlnévre.
             alias: item.type === 'document' && aliasFromXlsx
               ? aliasFromXlsx
               : cleanName,
@@ -1604,6 +1692,25 @@ exports.importEquipmentDocumentsZip = async (req, res) => {
             `Equipment ${equipmentId}, file "${item.fileName}": ${e?.message || 'upload failed'}`
           );
         }
+
+        // progress frissítés
+        processedDocuments += 1;
+        if (progressStep > 0 &&
+          (processedDocuments === totalPlannedDocuments ||
+            processedDocuments === 1 ||
+            processedDocuments % progressStep === 0)
+        ) {
+          try {
+            await notifyEquipmentImportStatus(userId, {
+              jobId,
+              status: 'running',
+              processed: processedDocuments,
+              total: totalPlannedDocuments
+            });
+          } catch (notifyErr) {
+            console.warn('⚠️ Failed to push running status notification for equipment import', notifyErr?.message || notifyErr);
+          }
+        }
       }
 
       if (docs.length) {
@@ -1613,25 +1720,94 @@ exports.importEquipmentDocumentsZip = async (req, res) => {
       }
     }
 
-    return res.status(200).json({
-      message: 'Bulk equipment documents imported from ZIP.',
-      updatedEquipments: results.length,
-      details: results,
-      issues
+    const updatedEquipments = results.length;
+    const totalDocuments = results.reduce((sum, r) => sum + (r.added || 0), 0);
+    const issuesCount = issues.length;
+
+    await notifyEquipmentImportStatus(userId, {
+      jobId,
+      status: 'succeeded',
+      updatedEquipments,
+      totalDocuments,
+      issuesCount,
+      processed: totalPlannedDocuments || totalDocuments || null,
+      total: totalPlannedDocuments || totalDocuments || null
     });
   } catch (error) {
-    console.error('❌ importEquipmentDocumentsZip error:', error);
-    return res.status(500).json({
-      message: 'Server error during ZIP import.',
-      error: error.message || String(error)
+    console.error('❌ importEquipmentDocumentsZip background job error:', error);
+    await notifyEquipmentImportStatus(userId, {
+      jobId,
+      status: 'failed',
+      errorMessage: error.message || String(error)
     });
   } finally {
-    if (uploadedFile?.path) {
-      try { fs.unlinkSync(uploadedFile.path); } catch (cleanupErr) {
+    if (zipPath) {
+      try {
+        fs.unlinkSync(zipPath);
+      } catch (cleanupErr) {
         console.warn('⚠️ Failed to remove uploaded ZIP file:', cleanupErr?.message || cleanupErr);
       }
     }
   }
+}
+
+exports.importEquipmentDocumentsZip = async (req, res) => {
+  const tenantId = req.scope?.tenantId;
+  const userId = req.scope?.userId || req.userId;
+  const uploadedFile = req.file;
+  const zoneIdRaw = (req.body?.zoneId || req.query?.zoneId || '').trim();
+  let zoneObjectId = null;
+
+  if (!tenantId) {
+    return res.status(401).json({ message: 'Missing tenantId from auth.' });
+  }
+  if (!userId) {
+    return res.status(401).json({ message: 'Missing user context.' });
+  }
+  if (!uploadedFile) {
+    return res.status(400).json({ message: 'Missing ZIP file (field name: file).' });
+  }
+
+  const tenantObjectId = toObjectId(tenantId);
+  if (!tenantObjectId) {
+    return res.status(400).json({ message: 'Invalid tenantId.' });
+  }
+  if (zoneIdRaw) {
+    if (!mongoose.Types.ObjectId.isValid(zoneIdRaw)) {
+      return res.status(400).json({ message: 'Invalid zoneId.' });
+    }
+    zoneObjectId = new mongoose.Types.ObjectId(zoneIdRaw);
+  }
+
+  const jobId = `equipment-docs-import-${Date.now()}-${uuidv4().slice(0, 8)}`;
+
+  // Kezdő "pending" / queued notification
+  await notifyEquipmentImportStatus(userId, {
+    jobId,
+    status: 'queued'
+  });
+
+  const jobPayload = {
+    tenantId,
+    userId,
+    tenantName: req.scope?.tenantName || '',
+    zipPath: uploadedFile.path,
+    originalZipName: uploadedFile.originalname || '',
+    zoneObjectId,
+    jobId
+  };
+
+  // Háttérben indul a feldolgozás, a kérés azonnal 202-vel visszatér
+  setImmediate(() => {
+    runEquipmentDocumentsZipImportJob(jobPayload).catch(err => {
+      console.error('❌ Failed to start equipment documents import job:', err);
+    });
+  });
+
+  return res.status(202).json({
+    message: 'Equipment documents import queued.',
+    jobId
+  });
 };
 
 async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspectorId, tenantId, inspectionType = 'Detailed') {
