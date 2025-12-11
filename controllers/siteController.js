@@ -10,6 +10,8 @@ const path = require('path');
 const mongoose = require('mongoose');
 const fs = require('fs');
 const mime = require('mime-types');
+const sharp = require('sharp');
+const heicConvert = require('heic-convert');
 
 // LEGACY: const axios = require('axios');
 
@@ -22,6 +24,40 @@ function cleanFileName(filename) {
       .normalize("NFKD")                         // Szétbontott ékezetek eltávolítása
       .replace(/[\u0300-\u036f]/g, "")           // Diakritikus jelek eltávolítása
       .replace(/[^a-zA-Z0-9.\-_ ]/g, "_");       // Biztonságos karakterek megtartása
+}
+
+// HEIC → PNG konverzió (azonos logika, mint exRegisterController-ben)
+async function convertHeicBufferIfNeeded(inputBuffer, originalName, originalMime) {
+  if (!inputBuffer) return { buffer: inputBuffer, name: originalName, contentType: originalMime };
+
+  const lowerName = String(originalName || '').toLowerCase();
+  const lowerMime = String(originalMime || '').toLowerCase();
+  const isHeic =
+    lowerName.endsWith('.heic') ||
+    lowerName.endsWith('.heif') ||
+    lowerMime === 'image/heic' ||
+    lowerMime === 'image/heif';
+
+  if (!isHeic) {
+    return { buffer: inputBuffer, name: originalName, contentType: originalMime };
+  }
+
+  try {
+    // Közvetlenül heic-convert-et használunk; a sharp HEIC támogatása sok környezetben hiányzik.
+    const pngBuffer = await heicConvert({
+      buffer: inputBuffer,
+      format: 'PNG',
+      quality: 1
+    });
+    const newName = originalName.replace(/\.(heic|heif)$/i, '.png') || 'image.png';
+    return { buffer: pngBuffer, name: newName, contentType: 'image/png' };
+  } catch (e) {
+    console.warn(
+      '⚠️ [siteController] HEIC → PNG conversion failed in heic-convert, using original buffer:',
+      e?.message || e
+    );
+    return { buffer: inputBuffer, name: originalName, contentType: originalMime };
+  }
 }
 
 function slug(s) {
@@ -395,13 +431,20 @@ exports.uploadFileToSite = async (req, res) => {
 
     for (const file of files) {
       const safeName = cleanFileName(file.originalname);
-      const blobPath = `${sitePrefix}/${safeName}`;
-      const guessedType = file.mimetype || mime.lookup(safeName) || 'application/octet-stream';
-      await azureBlob.uploadFile(file.path, blobPath, guessedType);
+      const srcBuffer = fs.readFileSync(file.path);
+      const inferredMime = file.mimetype || mime.lookup(safeName) || 'application/octet-stream';
+      const { buffer, name: convertedName, contentType } =
+        await convertHeicBufferIfNeeded(srcBuffer, safeName, inferredMime);
+
+      const finalName = convertedName;
+      const blobPath = `${sitePrefix}/${finalName}`;
+      const guessedType = contentType || inferredMime;
+
+      await azureBlob.uploadBuffer(blobPath, buffer, guessedType);
 
       uploadedFiles.push({
-        name: safeName,
-        alias: aliasFromForm || safeName,
+        name: finalName,
+        alias: aliasFromForm || finalName,
         blobPath: blobPath,                              // container-relative path
         blobUrl: azureBlob.getBlobUrl(blobPath),         // https url (no SAS)
         type: (guessedType && String(guessedType).startsWith('image')) ? 'image' : 'document',

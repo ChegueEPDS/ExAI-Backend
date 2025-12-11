@@ -11,6 +11,8 @@ const fs = require('fs');
 const azureBlob = require('../services/azureBlobService');
 const mime = require('mime-types');
 const ExcelJS = require('exceljs');
+const sharp = require('sharp');
+const heicConvert = require('heic-convert');
 const unzipper = require('unzipper');
 const {
   buildCertificateCacheForTenant,
@@ -267,6 +269,39 @@ function getCellStringByIndex(row, columnIndex) {
     return primitive.toISOString().split('T')[0];
   }
   return String(primitive).trim();
+}
+
+// --- HEIC → PNG konverzió helper ---
+async function convertHeicBufferIfNeeded(inputBuffer, originalName, originalMime) {
+  if (!inputBuffer) return { buffer: inputBuffer, name: originalName, contentType: originalMime };
+
+  const lowerName = String(originalName || '').toLowerCase();
+  const lowerMime = String(originalMime || '').toLowerCase();
+  const isHeic = lowerName.endsWith('.heic') ||
+    lowerName.endsWith('.heif') ||
+    lowerMime === 'image/heic' ||
+    lowerMime === 'image/heif';
+
+  if (!isHeic) {
+    return { buffer: inputBuffer, name: originalName, contentType: originalMime };
+  }
+
+  try {
+    // Közvetlenül heic-convert-et használunk; a sharp HEIC plugint sok környezet nem támogatja.
+    const pngBuffer = await heicConvert({
+      buffer: inputBuffer,
+      format: 'PNG',
+      quality: 1
+    });
+    const newName = originalName.replace(/\.(heic|heif)$/i, '.png') || 'image.png';
+    return { buffer: pngBuffer, name: newName, contentType: 'image/png' };
+  } catch (e) {
+    console.warn(
+      '⚠️ HEIC → PNG conversion failed in heic-convert, falling back to original buffer:',
+      e?.message || e
+    );
+    return { buffer: inputBuffer, name: originalName, contentType: originalMime };
+  }
 }
 
 // 📄 XLSX sablon generálása a ZIP dokumentum-importhoz
@@ -656,16 +691,26 @@ exports.createEquipment = async (req, res) => {
 
       const pictures = [];
       for (const file of equipmentFiles) {
-        const cleanName = cleanFileName(file.originalname.split('__')[1] || file.originalname);
+        const originalName = file.originalname.split('__')[1] || file.originalname;
+        const safeOriginal = cleanFileName(originalName);
+        const srcBuffer = fs.readFileSync(file.path);
+        const { buffer, name: convertedName, contentType } =
+          await convertHeicBufferIfNeeded(
+            srcBuffer,
+            safeOriginal,
+            file.mimetype || mime.lookup(safeOriginal) || 'application/octet-stream'
+          );
+
+        const cleanName = convertedName;
         const blobPath = `${eqPrefix}/${cleanName}`;
-        const guessedType = file.mimetype || mime.lookup(cleanName) || 'application/octet-stream';
-        await azureBlob.uploadFile(file.path, blobPath, guessedType);
+        const guessedType = contentType || 'image/png';
+        await azureBlob.uploadBuffer(blobPath, buffer, guessedType);
         pictures.push({
           name: cleanName,
           blobPath,
           blobUrl: azureBlob.getBlobUrl(blobPath),
           contentType: guessedType,
-          size: file.size,
+          size: buffer.length,
           uploadedAt: new Date(),
           tag: 'dataplate'
         });
@@ -749,16 +794,26 @@ exports.uploadImagesToEquipment = async (req, res) => {
 
     const pictures = [];
     for (const file of files) {
-      const cleanName = cleanFileName(file.originalname.split('__')[1] || file.originalname);
+      const originalName = file.originalname.split('__')[1] || file.originalname;
+      const safeOriginal = cleanFileName(originalName);
+      const srcBuffer = fs.readFileSync(file.path);
+      const { buffer, name: convertedName, contentType } =
+        await convertHeicBufferIfNeeded(
+          srcBuffer,
+          safeOriginal,
+          file.mimetype || mime.lookup(safeOriginal) || 'application/octet-stream'
+        );
+
+      const cleanName = convertedName;
       const blobPath = `${eqPrefix}/${cleanName}`;
-      const guessedType = file.mimetype || mime.lookup(cleanName) || 'application/octet-stream';
-      await azureBlob.uploadFile(file.path, blobPath, guessedType);
+      const guessedType = contentType || 'image/png';
+      await azureBlob.uploadBuffer(blobPath, buffer, guessedType);
       pictures.push({
         name: cleanName,
         blobPath,
         blobUrl: azureBlob.getBlobUrl(blobPath),
         contentType: guessedType,
-        size: file.size,
+        size: buffer.length,
         uploadedAt: new Date(),
         tag: 'general'
       });
@@ -823,11 +878,20 @@ exports.uploadDocumentsToEquipment = async (req, res) => {
     const requestedTag = req.body?.tag;
 
     for (const file of files) {
-      const cleanName = cleanFileName(file.originalname);
-      const blobPath = `${eqPrefix}/${cleanName}`;
-      const guessedType = file.mimetype || mime.lookup(cleanName) || 'application/octet-stream';
+      const safeOriginal = cleanFileName(file.originalname);
+      const srcBuffer = fs.readFileSync(file.path);
+      const { buffer, name: convertedName, contentType } =
+        await convertHeicBufferIfNeeded(
+          srcBuffer,
+          safeOriginal,
+          file.mimetype || mime.lookup(safeOriginal) || 'application/octet-stream'
+        );
 
-      await azureBlob.uploadFile(file.path, blobPath, guessedType);
+      const cleanName = convertedName;
+      const blobPath = `${eqPrefix}/${cleanName}`;
+      const guessedType = contentType || 'application/octet-stream';
+
+      await azureBlob.uploadBuffer(blobPath, buffer, guessedType);
 
       const typeValue = String(guessedType).startsWith('image') ? 'image' : 'document';
       docs.push({
@@ -837,7 +901,7 @@ exports.uploadDocumentsToEquipment = async (req, res) => {
         blobPath,
         blobUrl: azureBlob.getBlobUrl(blobPath),
         contentType: guessedType,
-        size: file.size,
+        size: buffer.length,
         uploadedAt: new Date(),
         tag: typeValue === 'image' ? normalizeImageTag(requestedTag, 'general') : null
       });
@@ -1504,15 +1568,21 @@ exports.importEquipmentDocumentsZip = async (req, res) => {
       const docs = [];
       for (const item of items) {
         try {
-          const buf = await item.entry.buffer();
-          const cleanName = cleanFileName(path.posix.basename(item.fileName));
-          const aliasFromXlsx = (item.docAlias || '').trim();
-          const blobPath = `${eqPrefix}/${cleanName}`;
-          const guessedType =
-            mime.lookup(cleanName) ||
+          const rawName = cleanFileName(path.posix.basename(item.fileName));
+          const srcBuf = await item.entry.buffer();
+          const inferredMime =
+            mime.lookup(rawName) ||
             (item.type === 'image' ? 'image/jpeg' : 'application/octet-stream');
 
-          await azureBlob.uploadBuffer(blobPath, buf, guessedType);
+          const { buffer, name: convertedName, contentType } =
+            await convertHeicBufferIfNeeded(srcBuf, rawName, inferredMime);
+
+          const cleanName = convertedName;
+          const aliasFromXlsx = (item.docAlias || '').trim();
+          const blobPath = `${eqPrefix}/${cleanName}`;
+          const guessedType = contentType || inferredMime;
+
+          await azureBlob.uploadBuffer(blobPath, buffer, guessedType);
 
           docs.push({
             name: cleanName,
@@ -1525,7 +1595,7 @@ exports.importEquipmentDocumentsZip = async (req, res) => {
             blobPath,
             blobUrl: azureBlob.getBlobUrl(blobPath),
             contentType: guessedType,
-            size: buf.length,
+            size: buffer.length,
             uploadedAt: new Date(),
             tag: item.type === 'image' ? item.imageTag : null
           });
