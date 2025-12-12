@@ -37,6 +37,13 @@ router.post(
   exRegisterController.importEquipmentDocumentsZip
 );
 
+// Ideiglenes feltöltési fájlok (félbehagyott ZIP-ek) manuális takarítása
+router.post(
+  '/exreg/import-documents-zip/cleanup-temp',
+  authMiddleware(),
+  exRegisterController.cleanupTempUploadsNow
+);
+
 // XLSX sablon a ZIP dokumentum-importhoz
 router.get(
   '/exreg/documents-template',

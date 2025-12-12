@@ -20,6 +20,7 @@ const {
 } = require('../helpers/certificateMatchHelper');
 const { notifyAndStore } = require('../lib/notifications/notifier');
 const { v4: uuidv4 } = require('uuid');
+const cleanupService = require('../services/cleanupService');
 
 const { BlobServiceClient } = require('@azure/storage-blob');
 const path = require('path');
@@ -1808,6 +1809,22 @@ exports.importEquipmentDocumentsZip = async (req, res) => {
     message: 'Equipment documents import queued.',
     jobId
   });
+};
+
+// Manuális cleanup endpoint: megszakított / elárvult feltöltési temp fájlok takarítására.
+// Nem kap explicit uploadId-t, hanem a cleanupUploadTempFiles-t hívja azonnali (0 ms) küszöbbel,
+// így csak a multer-temp és .zip fájlokat törli az uploads könyvtárból.
+exports.cleanupTempUploadsNow = async (_req, res) => {
+  try {
+    // Csak a néhány perce (pl. 5 perc) nem módosított temp fájlokat töröljük,
+    // így minimális az esélye, hogy éppen futó feltöltést érintenénk.
+    const FIVE_MINUTES_MS = 5 * 60 * 1000;
+    cleanupService.cleanupUploadTempFiles(FIVE_MINUTES_MS);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('❌ cleanupTempUploadsNow error:', err);
+    return res.status(500).json({ message: 'Failed to cleanup temp uploads.', error: err.message || String(err) });
+  }
 };
 
 async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspectorId, tenantId, inspectionType = 'Detailed') {
