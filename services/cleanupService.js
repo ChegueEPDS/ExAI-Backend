@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const Conversation = require('../models/conversation');
 const logger = require('../config/logger');
+const azureBlob = require('./azureBlobService');
 
 exports.removeEmptyConversations = async () => {
   try {
@@ -114,5 +115,20 @@ exports.cleanupUploadTempFiles = (maxAgeMsOverride) => {
     } catch (err) {
       logger.warn(`⚠️ Nem sikerült stat-olni az ideiglenes feltöltési fájlt: ${fullPath} - ${err.message}`);
     }
+  }
+};
+
+exports.cleanupEquipmentDocsImportErrorReports = async () => {
+  try {
+    const retentionDays =
+      Number(process.env.EQUIP_DOCS_IMPORT_ERROR_XLS_RETENTION_DAYS) > 0
+        ? Number(process.env.EQUIP_DOCS_IMPORT_ERROR_XLS_RETENTION_DAYS)
+        : 30;
+    if (!retentionDays) return;
+    const olderThanMs = retentionDays * 24 * 60 * 60 * 1000;
+    const prefix = 'equipment-docs-import-errors/';
+    await azureBlob.deleteOldUnderPrefix(prefix, olderThanMs);
+  } catch (err) {
+    logger.warn('⚠️ Failed to cleanup equipment docs import error reports', err?.message || err);
   }
 };

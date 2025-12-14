@@ -64,6 +64,39 @@ function getBlobUrl(blobPath) {
   return containerClient.getBlockBlobClient(p).url;
 }
 
+/**
+ * Delete blobs under a given prefix that are older than the given age.
+ * Age is determined from createdOn or lastModified (whichever is available).
+ * @param {string} prefix
+ * @param {number} olderThanMs
+ * @returns {Promise<{ deleted: number }>}
+ */
+async function deleteOldUnderPrefix(prefix, olderThanMs) {
+  const pfx = toBlobPath(prefix).replace(/^\/+/, '');
+  if (!pfx || !olderThanMs || olderThanMs <= 0) return { deleted: 0 };
+  const cutoff = Date.now() - olderThanMs;
+  let deleted = 0;
+
+  for await (const item of containerClient.listBlobsFlat({ prefix: pfx })) {
+    try {
+      const created = item.properties.createdOn || item.properties.lastModified;
+      if (!created) continue;
+      if (created.getTime() > cutoff) continue;
+      const block = containerClient.getBlockBlobClient(item.name);
+      const resp = await block.deleteIfExists();
+      if (resp.succeeded) deleted++;
+    } catch (e) {
+      try { console.warn('[blob] deleteOldUnderPrefix item failed:', item.name, e?.message || e); } catch {}
+    }
+  }
+
+  try {
+    console.info('[blob] deleteOldUnderPrefix done', { prefix: pfx, olderThanMs, deleted });
+  } catch {}
+
+  return { deleted };
+}
+
 // Helper: parse AccountName/AccountKey from connection string for SAS generation
 function parseConnStr(connStr) {
   const entries = String(connStr || '')
@@ -266,10 +299,9 @@ module.exports = {
     return Buffer.concat(chunks);
   },
 
-  
-
   getReadSasUrl,
   deletePrefix,
   getBlobUrl,
-  toBlobPath
+  toBlobPath,
+  deleteOldUnderPrefix
 };

@@ -1405,7 +1405,8 @@ async function notifyEquipmentImportStatus(userId, {
   issuesCount = null,
   errorMessage = null,
   processed = null,
-  total = null
+  total = null,
+  downloadUrl = null
 } = {}) {
   if (!userId || !jobId || !status) return;
 
@@ -1444,6 +1445,9 @@ async function notifyEquipmentImportStatus(userId, {
    // progress (processed/total) – hasonlóan az inspection export job-hoz
   if (typeof processed === 'number' && typeof total === 'number' && total > 0) {
     data.progress = { processed, total };
+  }
+  if (downloadUrl) {
+    data.downloadUrl = downloadUrl;
   }
 
   try {
@@ -1567,7 +1571,11 @@ async function runEquipmentDocumentsZipImportJob({
         entryByName.get(path.posix.basename(normalizedName));
 
       if (!entry) {
-        issues.push(`Row ${rowNumber}: file "${fileNameCell}" not found in ZIP.`);
+        issues.push({
+          row: rowNumber,
+          column: 4,
+          message: `File "${fileNameCell}" not found in ZIP.`
+        });
         return;
       }
 
@@ -1632,11 +1640,23 @@ async function runEquipmentDocumentsZipImportJob({
 
       const equipment = await Equipment.findOne(eqFilter);
       if (!equipment) {
-        issues.push(
-          `Equipment ${equipmentId} not found for this tenant${
-            zoneObjectId ? ' or does not belong to this zone' : ''
-          }. Skipping its rows.`
-        );
+        const baseMsg = `Equipment ${equipmentId} not found for this tenant${zoneObjectId ? ' or does not belong to this zone' : ''}. Skipping its rows.`;
+        const relatedRows = Array.isArray(items) ? items.map(it => it.rowNumber).filter(Boolean) : [];
+        if (relatedRows.length) {
+          relatedRows.forEach(rowNumber => {
+            issues.push({
+              row: rowNumber,
+              column: 1,
+              message: baseMsg
+            });
+          });
+        } else {
+          issues.push({
+            row: null,
+            column: null,
+            message: baseMsg
+          });
+        }
         continue;
       }
 
@@ -1689,9 +1709,11 @@ async function runEquipmentDocumentsZipImportJob({
             tag: item.type === 'image' ? item.imageTag : null
           });
         } catch (e) {
-          issues.push(
-            `Equipment ${equipmentId}, file "${item.fileName}": ${e?.message || 'upload failed'}`
-          );
+          issues.push({
+            row: item.rowNumber || null,
+            column: 4,
+            message: `Equipment ${equipmentId}, file "${item.fileName}": ${e?.message || 'upload failed'}`
+          });
         }
 
         // progress frissítés
@@ -1725,6 +1747,85 @@ async function runEquipmentDocumentsZipImportJob({
     const totalDocuments = results.reduce((sum, r) => sum + (r.added || 0), 0);
     const issuesCount = issues.length;
 
+    let errorReportDownloadUrl = null;
+    if (issuesCount > 0) {
+      try {
+        const workbookOut = new ExcelJS.Workbook();
+        await workbookOut.xlsx.load(xlsxBuffer);
+        const worksheetOut = workbookOut.worksheets?.[0];
+
+        if (worksheetOut) {
+          const rowFill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FFFFE5E5' } // halvány piros
+          };
+          const cellFill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FFFF8080' } // sötétebb piros
+          };
+
+          const issuesByRow = new Map();
+          issues.forEach(issue => {
+            const rowNumber = issue.row;
+            if (!rowNumber) return;
+            if (!issuesByRow.has(rowNumber)) {
+              issuesByRow.set(rowNumber, []);
+            }
+            issuesByRow.get(rowNumber).push(issue);
+          });
+
+          for (const [rowNumber, rowIssues] of issuesByRow.entries()) {
+            const row = worksheetOut.getRow(rowNumber);
+            row.eachCell(cell => {
+              cell.fill = rowFill;
+            });
+
+            rowIssues.forEach(issue => {
+              const colIndex = issue.column || 1;
+              const cell = worksheetOut.getRow(rowNumber).getCell(colIndex);
+              cell.fill = cellFill;
+              const existingNote =
+                typeof cell.note === 'string' && cell.note.length
+                  ? `${cell.note}\n`
+                  : '';
+              cell.note = `${existingNote}${issue.message || 'Invalid data in this row.'}`;
+            });
+          }
+
+          const summarySheet = workbookOut.addWorksheet('Import issues');
+          summarySheet.addRow(['Updated equipments', updatedEquipments]);
+          summarySheet.addRow(['Documents imported', totalDocuments]);
+          summarySheet.addRow(['Issues', issuesCount]);
+          summarySheet.getColumn(1).width = 24;
+          summarySheet.getColumn(2).width = 12;
+
+          const bufferOut = await workbookOut.xlsx.writeBuffer();
+          const blobName = `equipment-docs-import-errors/${tenantId}/${jobId}.xlsx`;
+          const blobPath = await azureBlob.uploadBuffer(
+            blobName,
+            Buffer.from(bufferOut),
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+          );
+          try {
+            errorReportDownloadUrl = await azureBlob.getReadSasUrl(blobPath, {
+              ttlSeconds: Number(process.env.EQUIP_DOCS_IMPORT_ERROR_XLS_TTL) || 24 * 60 * 60,
+              filename: `equipment-documents-import-errors-${jobId}.xlsx`,
+              contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            });
+          } catch (sasErr) {
+            console.warn('⚠️ Failed to build SAS URL for equipment-docs import errors XLSX', sasErr?.message || sasErr);
+          }
+        }
+      } catch (excelErr) {
+        console.warn(
+          '⚠️ Failed to generate error XLSX for equipment docs import:',
+          excelErr?.message || excelErr
+        );
+      }
+    }
+
     await notifyEquipmentImportStatus(userId, {
       jobId,
       status: 'succeeded',
@@ -1732,7 +1833,8 @@ async function runEquipmentDocumentsZipImportJob({
       totalDocuments,
       issuesCount,
       processed: totalPlannedDocuments || totalDocuments || null,
-      total: totalPlannedDocuments || totalDocuments || null
+      total: totalPlannedDocuments || totalDocuments || null,
+      downloadUrl: errorReportDownloadUrl || null
     });
   } catch (error) {
     console.error('❌ importEquipmentDocumentsZip background job error:', error);

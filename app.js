@@ -252,6 +252,7 @@ if (fs.existsSync(frontendDist)) {
 setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum
 setInterval(cleanupService.cleanupDxfResults, 3 * 60 * 60 * 1000);
 setInterval(() => cleanupService.cleanupUploadTempFiles(), 3 * 60 * 60 * 1000);
+setInterval(cleanupService.cleanupEquipmentDocsImportErrorReports, 24 * 60 * 60 * 1000); // napi egyszer
 setInterval(subscriptionSweeper.sweepExpiredSubscriptions, 60 * 60 * 1000);
 
 console.log("Starting application...");

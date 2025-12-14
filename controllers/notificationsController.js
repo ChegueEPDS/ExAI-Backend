@@ -1,6 +1,7 @@
 const bus = require('../lib/notifications/bus');
 const Notification = require('../models/notification');
 const ReportExportJob = require('../models/reportExportJob');
+const azureBlob = require('../services/azureBlobService');
 
 exports.notificationsStream = (req, res) => {
   const userId = req.userId;
@@ -100,6 +101,22 @@ exports.deleteNotification = async (req, res) => {
   const { id } = req.params;
   const doc = await Notification.findOne({ _id: id, userId });
   if (!doc) return res.status(404).json({ error: 'Not found' });
+
+  // Best-effort: ha ez egy equipment-docs-import értesítés error XLS-szel, töröljük a blobot is.
+  try {
+    const type = doc.type;
+    const data = doc.data || {};
+    const downloadUrl = data.downloadUrl || (data.meta && data.meta.downloadUrl);
+    if (type === 'equipment-docs-import' && downloadUrl) {
+      const blobPath = azureBlob.toBlobPath(downloadUrl);
+      if (blobPath) {
+        await azureBlob.deleteFile(blobPath);
+      }
+    }
+  } catch (_) {
+    // swallow – notification törlését nem blokkoljuk blob hiba miatt
+  }
+
   await Notification.deleteOne({ _id: id });
   res.json({ deleted: true });
 };
