@@ -26,7 +26,7 @@ function cleanFileName(filename) {
       .replace(/[^a-zA-Z0-9.\-_ ]/g, "_");       // Biztonságos karakterek megtartása
 }
 
-// HEIC → PNG konverzió (azonos logika, mint exRegisterController-ben)
+// HEIC → JPEG konverzió (azonos logika, mint exRegisterController-ben)
 async function convertHeicBufferIfNeeded(inputBuffer, originalName, originalMime) {
   if (!inputBuffer) return { buffer: inputBuffer, name: originalName, contentType: originalMime };
 
@@ -44,13 +44,16 @@ async function convertHeicBufferIfNeeded(inputBuffer, originalName, originalMime
 
   try {
     // Közvetlenül heic-convert-et használunk; a sharp HEIC támogatása sok környezetben hiányzik.
-    const pngBuffer = await heicConvert({
+    // PNG helyett JPEG-et használunk, mert az fényképeknél sokkal kisebb fájlméretet ad
+    // és online/PDF megjelenítésre tipikusan ez az optimális.
+    const jpegBuffer = await heicConvert({
       buffer: inputBuffer,
-      format: 'PNG',
-      quality: 1
+      format: 'JPEG',
+      // 0–1 skálán: ~0.7 jó kompromisszum minőség/méret között
+      quality: 0.7
     });
-    const newName = originalName.replace(/\.(heic|heif)$/i, '.png') || 'image.png';
-    return { buffer: pngBuffer, name: newName, contentType: 'image/png' };
+    const newName = originalName.replace(/\.(heic|heif)$/i, '.jpg') || 'image.jpg';
+    return { buffer: jpegBuffer, name: newName, contentType: 'image/jpeg' };
   } catch (e) {
     console.warn(
       '⚠️ [siteController] HEIC → PNG conversion failed in heic-convert, using original buffer:',

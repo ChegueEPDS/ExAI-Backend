@@ -7,6 +7,13 @@ const Tenant = require('../models/tenant');
 const Subscription = require('../models/subscription');
 const mailService = require('../services/mailService');
 const { registrationEmailHtml, forgotPasswordEmailHtml } = require('../services/mailTemplates');
+const Stripe = require('stripe');
+
+let stripe = null;
+const stripeKey = process.env.STRIPE_SECRET_KEY;
+if (stripeKey) {
+  stripe = new Stripe(stripeKey, { apiVersion: '2024-06-20' });
+}
 
 /**
  * ------------------------------------------------------------
@@ -243,6 +250,26 @@ exports.register = async (req, res) => {
 
     user.tenantId = personalTenant._id;
     await user.save();
+
+    // Optional: hozzunk létre Stripe Customer-t a free tenant-hez is (ha Stripe be van állítva)
+    if (stripe && !personalTenant.stripeCustomerId) {
+      try {
+        const customer = await stripe.customers.create({
+          name: personalTenant.name,
+          email: user.email,
+          metadata: {
+            tenantId: String(personalTenant._id),
+            userId: String(user._id),
+            plan: 'free',
+            tenantType: personalTenant.type || 'personal'
+          }
+        });
+        personalTenant.stripeCustomerId = customer.id;
+        await personalTenant.save();
+      } catch (err) {
+        console.warn('[stripe] Failed to create customer for free tenant:', err?.message || err);
+      }
+    }
 
     // Fire-and-forget: welcome email after successful registration
     try {

@@ -2458,14 +2458,20 @@ async function generateLatestInspectionArchive(
 
     if (equipment.lastInspectionId) {
       inspection = await Inspection.findOne({ _id: equipment.lastInspectionId, tenantId })
-        .populate('inspectorId', 'firstName lastName email')
+        .populate(
+          'inspectorId',
+          'firstName lastName name position positionInfo signatureBlobUrl signatureBlobPath email'
+        )
         .lean();
     }
 
     if (!inspection) {
       inspection = await Inspection.findOne({ equipmentId: equipment._id, tenantId })
         .sort({ inspectionDate: -1, createdAt: -1 })
-        .populate('inspectorId', 'firstName lastName email')
+        .populate(
+          'inspectorId',
+          'firstName lastName name position positionInfo signatureBlobUrl signatureBlobPath email'
+        )
         .lean();
     }
 

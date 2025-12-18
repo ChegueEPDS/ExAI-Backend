@@ -274,7 +274,7 @@ function getCellStringByIndex(row, columnIndex) {
   return String(primitive).trim();
 }
 
-// --- HEIC → PNG konverzió helper ---
+// --- HEIC → JPEG konverzió helper ---
 async function convertHeicBufferIfNeeded(inputBuffer, originalName, originalMime) {
   if (!inputBuffer) return { buffer: inputBuffer, name: originalName, contentType: originalMime };
 
@@ -291,13 +291,15 @@ async function convertHeicBufferIfNeeded(inputBuffer, originalName, originalMime
 
   try {
     // Közvetlenül heic-convert-et használunk; a sharp HEIC plugint sok környezet nem támogatja.
-    const pngBuffer = await heicConvert({
+    // PNG helyett JPEG-et használunk, mert az fényképeknél sokkal kisebb fájlméretet ad,
+    // és online / PDF megjelenítésre általában ez az optimális.
+    const jpegBuffer = await heicConvert({
       buffer: inputBuffer,
-      format: 'PNG',
-      quality: 1
+      format: 'JPEG',
+      quality: 0.7
     });
-    const newName = originalName.replace(/\.(heic|heif)$/i, '.png') || 'image.png';
-    return { buffer: pngBuffer, name: newName, contentType: 'image/png' };
+    const newName = originalName.replace(/\.(heic|heif)$/i, '.jpg') || 'image.jpg';
+    return { buffer: jpegBuffer, name: newName, contentType: 'image/jpeg' };
   } catch (e) {
     console.warn(
       '⚠️ HEIC → PNG conversion failed in heic-convert, falling back to original buffer:',

@@ -38,7 +38,7 @@ function cleanFileName(filename) {
     .replace(/[^a-zA-Z0-9.\-_ ]/g, "_");
 }
 
-// HEIC → PNG konverzió (azonos logika, mint exRegisterController-ben)
+// HEIC → JPEG konverzió (azonos logika, mint exRegisterController-ben)
 async function convertHeicBufferIfNeeded(inputBuffer, originalName, originalMime) {
   if (!inputBuffer) return { buffer: inputBuffer, name: originalName, contentType: originalMime };
 
@@ -56,13 +56,14 @@ async function convertHeicBufferIfNeeded(inputBuffer, originalName, originalMime
 
   try {
     // Közvetlenül heic-convert-et használunk; a sharp HEIC támogatása sok környezetben hiányzik.
-    const pngBuffer = await heicConvert({
+    // PNG helyett JPEG-et használunk, mert az fényképeknél sokkal kisebb fájlméretet ad.
+    const jpegBuffer = await heicConvert({
       buffer: inputBuffer,
-      format: 'PNG',
-      quality: 1
+      format: 'JPEG',
+      quality: 0.7
     });
-    const newName = originalName.replace(/\.(heic|heif)$/i, '.png') || 'image.png';
-    return { buffer: pngBuffer, name: newName, contentType: 'image/png' };
+    const newName = originalName.replace(/\.(heic|heif)$/i, '.jpg') || 'image.jpg';
+    return { buffer: jpegBuffer, name: newName, contentType: 'image/jpeg' };
   } catch (e) {
     console.warn(
       '⚠️ [zoneController] HEIC → PNG conversion failed in heic-convert, using original buffer:',
@@ -674,5 +675,79 @@ exports.deleteFileFromZone = async (req, res) => {
     return res.status(200).json({ message: "File deleted" });
   } catch (error) {
     return res.status(500).json({ message: "Failed to delete", error: error.message });
+  }
+};
+
+// 🗑️ Összes eszközhöz tartozó kép törlése egy zónán belül
+exports.deleteEquipmentImagesInZone = async (req, res) => {
+  try {
+    const zoneId = req.params.id;
+    const tenantIdStr = req.scope?.tenantId;
+    const tenantObjectId = toObjectId(tenantIdStr);
+    if (!tenantObjectId) {
+      return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
+    }
+
+    const zone = await Zone.findOne({ _id: zoneId, tenantId: tenantObjectId }).select('_id Name');
+    if (!zone) {
+      return res.status(404).json({ message: 'Zone not found' });
+    }
+
+    const equipments = await Equipment.find({ Zone: zoneId, tenantId: tenantObjectId });
+    if (!equipments.length) {
+      return res.status(200).json({ message: 'No equipment found in this zone.', deletedEquipments: 0, deletedBlobs: 0 });
+    }
+
+    const blobPaths = new Set();
+
+    // Gyűjtsük össze az összes képfájlt (Pictures + documents type==='image')
+    equipments.forEach(eq => {
+      (eq.Pictures || []).forEach(pic => {
+        const raw = pic?.blobPath || pic?.blobUrl;
+        const p = raw ? azureBlob.toBlobPath(raw) : '';
+        if (p) blobPaths.add(p);
+      });
+      (eq.documents || []).forEach(doc => {
+        if (doc && doc.type === 'image') {
+          const raw = doc.blobPath || doc.blobUrl;
+          const p = raw ? azureBlob.toBlobPath(raw) : '';
+          if (p) blobPaths.add(p);
+        }
+      });
+    });
+
+    let deleted = 0;
+    for (const p of blobPaths) {
+      try {
+        await azureBlob.deleteFile(p);
+        deleted++;
+      } catch (e) {
+        try {
+          console.warn('⚠️ Failed to delete equipment image blob from zone cleanup:', p, e?.message || e);
+        } catch (_) {}
+      }
+    }
+
+    // Tisztítsuk a DB-t: képek kiürítése az érintett eszközöknél
+    for (const eq of equipments) {
+      const hasPictures = Array.isArray(eq.Pictures) && eq.Pictures.length;
+      const hasImageDocs = Array.isArray(eq.documents) && eq.documents.some(d => d && d.type === 'image');
+      if (!hasPictures && !hasImageDocs) continue;
+
+      eq.Pictures = [];
+      if (Array.isArray(eq.documents)) {
+        eq.documents = eq.documents.filter(d => !d || d.type !== 'image');
+      }
+      await eq.save();
+    }
+
+    return res.status(200).json({
+      message: 'All equipment images deleted in zone.',
+      deletedEquipments: equipments.length,
+      deletedBlobs: deleted
+    });
+  } catch (error) {
+    console.error('❌ deleteEquipmentImagesInZone error:', error);
+    return res.status(500).json({ message: 'Failed to delete equipment images in zone', error: error.message || String(error) });
   }
 };

@@ -40,11 +40,18 @@ router.post(
     authMiddleware(),
     zoneController.getFilesOfZone
   );
-  
+
   router.delete(
     '/:zoneId/files/:fileId',
     authMiddleware(),
     zoneController.deleteFileFromZone
+  );
+
+  // Összes eszközkép törlése egy zónán belül
+  router.delete(
+    '/:id/equipment-images',
+    authMiddleware(),
+    zoneController.deleteEquipmentImagesInZone
   );
 
 module.exports = router;
