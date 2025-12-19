@@ -34,6 +34,15 @@ const UserSchema = new mongoose.Schema(
     // Optional inspector signature stored in Azure Blob Storage
     signatureBlobPath: { type: String },
     signatureBlobUrl: { type: String },
+
+    emailVerified: { type: Boolean, default: true },
+    emailVerificationToken: { type: String },
+    emailVerificationExpires: { type: Date },
+
+    // Opcionális: regisztrációkor kiválasztott fizetős csomag (másik böngésző/tab esetén is)
+    pendingCheckoutPlan: { type: String }, // 'pro' | 'team' | 'pro_yearly' | 'team_yearly'
+    pendingCheckoutSeats: { type: Number },
+    pendingCheckoutCompanyName: { type: String },
   },
   { timestamps: true }
 );

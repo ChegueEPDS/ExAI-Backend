@@ -93,6 +93,31 @@ function registrationEmailHtml({ firstName, lastName, loginUrl, tenantName }) {
   });
 }
 
+function emailVerificationEmailHtml({ firstName, lastName, verifyUrl, tenantName }) {
+  const safeVerifyUrl = verifyUrl?.startsWith('http') ? verifyUrl : `https://${verifyUrl}`;
+  const portalUrl = buildTenantUrl(tenantName);
+  const portalUrlLabel = displayHost(portalUrl);
+  return baseTemplate({
+    title: 'Confirm your email address',
+    tenantName,
+    bodyHtml: `
+      <h2 style="color:#131313;">Dear ${firstName} ${lastName},</h2>
+      <p>Thank you for registering on the <strong>${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb Certs'}</strong> platform.</p>
+      <p>Before you can sign in and start using the service, please confirm your email address.</p>
+      <p style="margin:30px 0; text-align:center;">
+        <a href="${safeVerifyUrl}" target="_blank" rel="noopener noreferrer"
+           style="background:#f8d201; color:#131313; text-decoration:none; padding:12px 24px; border-radius:4px; font-size:16px; display:inline-block;">
+          Confirm my email
+        </a>
+      </p>
+      <p>If you did not create this account, you can safely ignore this email.</p>
+      <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team<br/>
+         <a href="${portalUrl}" target="_blank" rel="noopener noreferrer">${portalUrlLabel}</a>
+      </p>
+    `,
+  });
+}
+
 function tenantInviteEmailHtml({ firstName, lastName, tenantName, loginUrl, password }) {
   const safeLoginUrl = loginUrl?.startsWith('http') ? loginUrl : `https://${loginUrl}`;
   const portalUrl = buildTenantUrl(tenantName);
@@ -302,6 +327,7 @@ function escapeHtml(s) {
 
 module.exports = {
   registrationEmailHtml,
+  emailVerificationEmailHtml,
   tenantInviteEmailHtml,
   forgotPasswordEmailHtml,
   uploadCompletedEmail,

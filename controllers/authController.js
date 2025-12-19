@@ -1,13 +1,15 @@
 // controllers/authController.js
 const bcrypt = require('bcrypt');
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { validationResult } = require('express-validator');
 const User = require('../models/user');
 const Tenant = require('../models/tenant');
 const Subscription = require('../models/subscription');
 const mailService = require('../services/mailService');
-const { registrationEmailHtml, forgotPasswordEmailHtml } = require('../services/mailTemplates');
+const { registrationEmailHtml, emailVerificationEmailHtml, forgotPasswordEmailHtml } = require('../services/mailTemplates');
 const Stripe = require('stripe');
+const { ensureStripeCustomerForTenant } = require('../services/stripeCustomerProvisioning');
 
 let stripe = null;
 const stripeKey = process.env.STRIPE_SECRET_KEY;
@@ -221,7 +223,17 @@ exports.register = async (req, res) => {
   }
 
   // ⚠️ FIGYELEM: plan/companyName/seats/tenantName mostantól IGNORÁLVA regisztrációnál
-  const { firstName, lastName, email, password, nickname, role } = req.body || {};
+  const {
+    firstName,
+    lastName,
+    email,
+    password,
+    nickname,
+    role,
+    desiredPlan,
+    desiredSeats,
+    desiredCompanyName,
+  } = req.body || {};
 
   try {
     const existingUser = await User.findOne({ email });
@@ -230,6 +242,27 @@ exports.register = async (req, res) => {
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
+    const emailToken = crypto.randomBytes(32).toString('hex');
+    const emailTokenExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    // Opcionális: fizetős csomag kiválasztás regisztrációnál (verifikáció után Stripe-ra irányítás)
+    const normalizedDesiredPlan = String(desiredPlan || '').trim().toLowerCase();
+    const allowedPlans = new Set(['pro', 'team', 'pro_yearly', 'team_yearly', '']);
+    if (!allowedPlans.has(normalizedDesiredPlan)) {
+      return res.status(400).json({ error: 'Invalid desiredPlan' });
+    }
+    const pendingSeatsRaw = Number(desiredSeats);
+    const pendingSeats =
+      normalizedDesiredPlan.startsWith('team')
+        ? (Number.isInteger(pendingSeatsRaw) ? Math.max(5, pendingSeatsRaw) : 5)
+        : 1;
+    const pendingCompanyName =
+      normalizedDesiredPlan.startsWith('team')
+        ? String(desiredCompanyName || '').trim()
+        : '';
+    if (normalizedDesiredPlan.startsWith('team') && !pendingCompanyName) {
+      return res.status(400).json({ error: 'desiredCompanyName is required for team plans' });
+    }
 
     // 1) user létrehozása – NINCS subscriptionTier kézzel írva
     let user = await User.create({
@@ -239,6 +272,16 @@ exports.register = async (req, res) => {
       password: hashedPassword,
       role: role || 'User',
       nickname: nickname || undefined,
+      emailVerified: false,
+      emailVerificationToken: emailToken,
+      emailVerificationExpires: emailTokenExpires,
+      ...(normalizedDesiredPlan
+        ? {
+            pendingCheckoutPlan: normalizedDesiredPlan,
+            pendingCheckoutSeats: pendingSeats,
+            pendingCheckoutCompanyName: pendingCompanyName || undefined,
+          }
+        : {}),
     });
 
     // 2) personal + free tenant KÖTELEZŐ
@@ -251,69 +294,31 @@ exports.register = async (req, res) => {
     user.tenantId = personalTenant._id;
     await user.save();
 
-    // Optional: hozzunk létre Stripe Customer-t a free tenant-hez is (ha Stripe be van állítva)
-    if (stripe && !personalTenant.stripeCustomerId) {
-      try {
-        const customer = await stripe.customers.create({
-          name: personalTenant.name,
-          email: user.email,
-          metadata: {
-            tenantId: String(personalTenant._id),
-            userId: String(user._id),
-            plan: 'free',
-            tenantType: personalTenant.type || 'personal'
-          }
-        });
-        personalTenant.stripeCustomerId = customer.id;
-        await personalTenant.save();
-      } catch (err) {
-        console.warn('[stripe] Failed to create customer for free tenant:', err?.message || err);
-      }
-    }
-
-    // Fire-and-forget: welcome email after successful registration
+    // Fire-and-forget: e-mail verifikációs link
     try {
-      const loginUrl = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
-      const html = registrationEmailHtml({
+      const appBase = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
+      const verifyUrl = `${appBase.replace(/\/+$/, '')}/verify-email?token=${encodeURIComponent(emailToken)}`;
+      const html = emailVerificationEmailHtml({
         firstName: user.firstName || '',
         lastName: user.lastName || '',
-        loginUrl,
+        verifyUrl,
         tenantName: personalTenant.name
       });
       mailService.sendMail({
         to: user.email,
-        subject: 'Welcome to ATEXdb Certs',
+        subject: 'Confirm your email for ATEXdb Certs',
         html,
         from: process.env.MAIL_SENDER_UPN
       })
-      .then(() => console.log('[mail] Registration welcome email sent to', user.email))
-      .catch(err => console.warn('[mail] Registration e-mail failed:', err?.message || err));
+      .then(() => console.log('[mail] Registration verification email sent to', user.email))
+      .catch(err => console.warn('[mail] Registration verification e-mail failed:', err?.message || err));
     } catch (err) {
-      console.warn('[mail] Registration e-mail setup failed:', err?.message || err);
+      console.warn('[mail] Registration verification e-mail setup failed:', err?.message || err);
     }
 
-    const token = await signAccessTokenWithSubscription(user);
-
     return res.status(201).json({
-      message: 'User registered successfully',
-      token,
-      user: {
-        id: user._id,
-        email: user.email,
-        tenantId: user.tenantId,
-        tenantName: personalTenant.name,
-        role: user.role,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        nickname: user.nickname || null,
-      },
-      tenant: {
-        id: personalTenant._id,
-        name: personalTenant.name,
-        type: personalTenant.type,
-        plan: personalTenant.plan,
-        seats: personalTenant.seats,
-      }
+      message: 'User registered successfully. Please confirm your email before signing in.',
+      requiresEmailVerification: true
     });
   } catch (error) {
     console.error('❌ Registration error:', error);
@@ -343,6 +348,10 @@ exports.login = async (req, res) => {
       return res.status(400).json({ error: 'Incorrect password' });
     }
 
+    if (user.emailVerified === false) {
+      return res.status(403).json({ error: 'Please verify your email address before logging in.' });
+    }
+
     // Ha régi usernek nincs tenantja → állítsuk be tenantName alapján, különben personal
     if (!user.tenantId) {
       const ensured = await ensureTenantForUserFromName(user, tenantName);
@@ -353,6 +362,148 @@ exports.login = async (req, res) => {
     return res.status(200).json({ token });
   } catch (error) {
     console.error('❌ Login error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// ----------------------
+// 🔹 E-mail verifikáció
+//   Body or query: token
+// ----------------------
+exports.verifyEmail = async (req, res) => {
+  try {
+    const token = String(req.body?.token || req.query?.token || '').trim();
+    if (!token) {
+      return res.status(400).json({ error: 'Verification token is required' });
+    }
+
+    let user = await User.findOne({
+      emailVerificationToken: token,
+      emailVerificationExpires: { $gt: new Date() },
+    });
+
+    if (!user) {
+      return res.status(400).json({ error: 'Invalid or expired verification token' });
+    }
+
+    user.emailVerified = true;
+    user.emailVerificationToken = undefined;
+    user.emailVerificationExpires = undefined;
+
+    const pendingCheckout =
+      user.pendingCheckoutPlan && ['pro', 'team', 'pro_yearly', 'team_yearly'].includes(String(user.pendingCheckoutPlan))
+        ? {
+            plan: String(user.pendingCheckoutPlan),
+            seats:
+              String(user.pendingCheckoutPlan).startsWith('team')
+                ? Math.max(5, Number(user.pendingCheckoutSeats || 5))
+                : 1,
+            companyName: String(user.pendingCheckoutCompanyName || ''),
+          }
+        : null;
+
+    // Pending checkout adatot egyszer használjuk (verifikáció után töröljük)
+    user.pendingCheckoutPlan = undefined;
+    user.pendingCheckoutSeats = undefined;
+    user.pendingCheckoutCompanyName = undefined;
+    await user.save();
+
+    if (!user.tenantId) {
+      const ensured = await ensureTenantForUserFromName(user, null);
+      user = ensured.user;
+    }
+
+    // Stripe Customer csak visszaigazolás után (free user esetén is)
+    if (stripe && user?.tenantId) {
+      try {
+        const tenant = await Tenant.findById(user.tenantId);
+        if (tenant) {
+          await ensureStripeCustomerForTenant({ stripe, tenantDoc: tenant, user });
+        }
+      } catch (err) {
+        console.warn('[stripe] Failed to create customer after email verification:', err?.message || err);
+      }
+    }
+
+    const accessToken = await signAccessTokenWithSubscription(user);
+
+    return res.status(200).json({
+      message: 'Email verified successfully',
+      token: accessToken,
+      pendingCheckout,
+    });
+  } catch (error) {
+    console.error('❌ Email verification error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// ----------------------
+// 🔹 Resend email verification
+//   Body: { email }
+// ----------------------
+exports.resendVerificationEmail = async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    let user = await User.findOne({ email });
+    if (!user) {
+      // ne fedjük fel, ha nincs ilyen user
+      return res.status(200).json({
+        message: 'If that email exists and is not yet verified, a verification message has been sent.'
+      });
+    }
+
+    if (user.emailVerified === true) {
+      return res.status(400).json({ error: 'Email is already verified.' });
+    }
+
+    const emailToken = crypto.randomBytes(32).toString('hex');
+    const emailTokenExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    user.emailVerificationToken = emailToken;
+    user.emailVerificationExpires = emailTokenExpires;
+    await user.save();
+
+    // Tenant név brandinghez
+    let tenantName = null;
+    if (user.tenantId) {
+      try {
+        const t = await Tenant.findById(user.tenantId).select('name').lean();
+        tenantName = t?.name || null;
+      } catch (_) {
+        tenantName = null;
+      }
+    }
+
+    const appBase = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
+    const verifyUrl = `${appBase.replace(/\/+$/, '')}/verify-email?token=${encodeURIComponent(emailToken)}`;
+    const html = emailVerificationEmailHtml({
+      firstName: user.firstName || '',
+      lastName: user.lastName || '',
+      verifyUrl,
+      tenantName: tenantName || undefined
+    });
+
+    mailService
+      .sendMail({
+        to: user.email,
+        subject: 'Confirm your email for ATEXdb Certs',
+        html,
+        from: process.env.MAIL_SENDER_UPN
+      })
+      .then(() => console.log('[mail] Resend verification email sent to', user.email))
+      .catch(err =>
+        console.warn('[mail] Resend verification e-mail failed:', err?.message || err)
+      );
+
+    return res.status(200).json({
+      message: 'Verification email sent. Please check your inbox.'
+    });
+  } catch (error) {
+    console.error('❌ Resend verification email error:', error);
     return res.status(500).json({ error: 'Internal server error' });
   }
 };
@@ -473,9 +624,16 @@ exports.forgotPassword = async (req, res) => {
     }
 
     const user = await User.findOne({ email });
-    // Respond 200 regardless, to avoid user enumeration
     if (!user) {
-      return res.status(200).json({ message: 'If that email exists, a reset message has been sent.' });
+      // ne leplezzük le, hogy nincs ilyen user
+      return res.status(200).json({ message: 'If that email exists and is verified, a reset message has been sent.' });
+    }
+
+    // Nem verifikált felhasználónál ne engedjünk jelszó resetet
+    if (user.emailVerified === false) {
+      return res.status(400).json({
+        error: 'Email is not verified. Please verify your email address before resetting the password.'
+      });
     }
 
     // Generate and set temporary password

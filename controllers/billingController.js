@@ -11,6 +11,9 @@ if (stripeKey) {
     stripe = new Stripe(stripeKey, { apiVersion: '2024-06-20' });
 }
 
+const { ensureStripeCustomerForTenant } = require('../services/stripeCustomerProvisioning');
+const brevoService = require('../services/brevoService');
+
 // Env-driven toggle for phone collection in Checkout (default: false)
 const COLLECT_PHONE = String(process.env.STRIPE_CHECKOUT_COLLECT_PHONE || 'false').toLowerCase() === 'true';
 
@@ -235,13 +238,11 @@ exports.createCheckoutSession = async (req, res) => {
 
             let customerId = tenant.stripeCustomerId;
             if (!customerId) {
-                const customer = await stripe.customers.create({
-                    name: tenant.name,
-                    metadata: { tenantId: String(tenant._id) }
+                customerId = await ensureStripeCustomerForTenant({
+                  stripe,
+                  tenantDoc: tenant,
+                  user: req.user || null
                 });
-                customerId = customer.id;
-                tenant.stripeCustomerId = customerId;
-                await tenant.save();
             }
 
             console.log('[billing] creating PRO checkout session with:', JSON.stringify({
@@ -299,6 +300,7 @@ exports.createCheckoutSession = async (req, res) => {
                 // TEAM: free-first flow (no tenant yet)
                 const newCustomer = await stripe.customers.create({
                     name: (companyName || 'Company').toString(),
+                    email: req.user?.email || undefined,
                     metadata: {
                         intent: 'team',
                         userId: (req.user?.id || req.user?._id || userId || '').toString(),
@@ -306,6 +308,14 @@ exports.createCheckoutSession = async (req, res) => {
                     }
                 });
                 const customerId = newCustomer.id;
+                // Fire-and-forget Brevo sync on Stripe customer creation (no tenant yet)
+                brevoService.onStripeCustomerCreated({
+                  email: req.user?.email || null,
+                  firstName: req.user?.firstName || '',
+                  lastName: req.user?.lastName || '',
+                  stripeCustomerId: customerId,
+                  tenant: { name: (companyName || '').toString(), plan: 'team', type: 'company' },
+                });
                 const clientRef = `team|${(req.user?.id || req.user?._id || userId || '').toString()}`;
                 const meta = {
                     intent: 'team',
@@ -359,13 +369,11 @@ exports.createCheckoutSession = async (req, res) => {
 
                 let customerId = tenant.stripeCustomerId;
                 if (!customerId) {
-                    const customer = await stripe.customers.create({
-                        name: tenant.name,
-                        metadata: { tenantId: String(tenant._id) }
+                    customerId = await ensureStripeCustomerForTenant({
+                      stripe,
+                      tenantDoc: tenant,
+                      user: req.user || null
                     });
-                    customerId = customer.id;
-                    tenant.stripeCustomerId = customerId;
-                    await tenant.save();
                 }
                 const meta = {
                     plan: normalizedPlan,
