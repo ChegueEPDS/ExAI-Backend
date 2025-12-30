@@ -21,6 +21,8 @@ const {
 const { notifyAndStore } = require('../lib/notifications/notifier');
 const { v4: uuidv4 } = require('uuid');
 const cleanupService = require('../services/cleanupService');
+const EquipmentDataVersion = require('../models/equipmentDataVersion');
+const { createEquipmentDataVersion } = require('../services/equipmentVersioningService');
 
 const { BlobServiceClient } = require('@azure/storage-blob');
 const path = require('path');
@@ -662,6 +664,7 @@ exports.createEquipment = async (req, res) => {
         typeof equipment.EqID === 'string'
           ? equipment.EqID.trim()
           : (equipment.EqID || '');
+      const eqId = rawEqId;
 
       // Blob elérési útvonalhoz kell egy azonosító, de az EqID mezőt nem töltjük ki automatikusan,
       // ha üresen jött (így a DB-ben az EqID üres maradhat).
@@ -751,11 +754,45 @@ exports.createEquipment = async (req, res) => {
           { $set: updateFields },
           { new: true }
         );
+        try {
+          await createEquipmentDataVersion({
+            tenantId,
+            equipmentId: existingEquipment._id,
+            changedBy: CreatedBy,
+            source: 'update',
+            oldSnapshot: existingEquipment.toObject({ depopulate: true }),
+            newSnapshot: saved?.toObject?.({ depopulate: true }) || saved
+          });
+        } catch (versionErr) {
+          try {
+            console.warn(
+              '⚠️ Failed to write equipment data version (createEquipment update):',
+              versionErr?.message || versionErr
+            );
+          } catch {}
+        }
         results.push(saved);
       } else {
         updateFields.CreatedBy = CreatedBy;
         const newEquipment = new Equipment(updateFields);
         const saved = await newEquipment.save();
+        try {
+          await createEquipmentDataVersion({
+            tenantId,
+            equipmentId: saved._id,
+            changedBy: CreatedBy,
+            source: 'create',
+            oldSnapshot: {},
+            newSnapshot: saved?.toObject?.({ depopulate: true }) || saved
+          });
+        } catch (versionErr) {
+          try {
+            console.warn(
+              '⚠️ Failed to write equipment data version (createEquipment create):',
+              versionErr?.message || versionErr
+            );
+          } catch {}
+        }
         results.push(saved);
       }
     }
@@ -3861,6 +3898,7 @@ exports.updateEquipment = async (req, res) => {
     if (!equipment) {
       return res.status(404).json({ error: 'Eszköz nem található.' });
     }
+    const oldSnapshotForVersioning = equipment.toObject({ depopulate: true });
 
     // 🔧 Ez a kulcspont: FormData-ból bontsuk ki a JSON-t
     let updatedFields = {};
@@ -3888,6 +3926,21 @@ exports.updateEquipment = async (req, res) => {
       { $set: updatedFields },
       { new: true, runValidators: true }
     );
+
+    try {
+      await createEquipmentDataVersion({
+        tenantId,
+        equipmentId: id,
+        changedBy: ModifiedBy,
+        source: 'update',
+        oldSnapshot: oldSnapshotForVersioning,
+        newSnapshot: updatedEquipment?.toObject?.({ depopulate: true }) || updatedEquipment
+      });
+    } catch (versionErr) {
+      try {
+        console.warn('⚠️ Failed to write equipment data version:', versionErr?.message || versionErr);
+      } catch {}
+    }
 
     // --- Handle blob move if Site/Zone/EqID changed ---
     try {
@@ -3984,6 +4037,70 @@ exports.updateEquipment = async (req, res) => {
   } catch (error) {
     console.error('❌ Hiba módosítás közben:', error);
     return res.status(500).json({ error: 'Nem sikerült módosítani az eszközt.' });
+  }
+};
+
+// --- Equipment data versioning (SCD2-like) ---
+// GET /exreg/:id/versions
+exports.listEquipmentDataVersions = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) return res.status(401).json({ message: 'Missing tenantId' });
+
+    const equipment = await Equipment.findOne({ _id: id, tenantId }).select('_id').lean();
+    if (!equipment) return res.status(404).json({ message: 'Equipment not found' });
+
+    const versions = await EquipmentDataVersion.find({ tenantId, equipmentId: id })
+      .sort({ changedAt: -1, version: -1 })
+      .select('version changedAt changedBy source changedPaths previousVersionId')
+      .populate('changedBy', 'firstName lastName email')
+      .lean();
+
+    return res.json(versions || []);
+  } catch (err) {
+    console.error('❌ listEquipmentDataVersions error:', err);
+    return res.status(500).json({ message: 'Failed to load equipment data versions.' });
+  }
+};
+
+// GET /exreg/:id/versions/:versionId
+exports.getEquipmentDataVersion = async (req, res) => {
+  try {
+    const { id, versionId } = req.params;
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) return res.status(401).json({ message: 'Missing tenantId' });
+
+    const equipment = await Equipment.findOne({ _id: id, tenantId }).select('_id').lean();
+    if (!equipment) return res.status(404).json({ message: 'Equipment not found' });
+
+    const versionDoc = await EquipmentDataVersion.findOne({
+      _id: versionId,
+      tenantId,
+      equipmentId: id
+    })
+      .populate('changedBy', 'firstName lastName email')
+      .lean();
+
+    if (!versionDoc) return res.status(404).json({ message: 'Version not found' });
+
+    const previous = versionDoc.previousVersionId
+      ? await EquipmentDataVersion.findOne({
+          _id: versionDoc.previousVersionId,
+          tenantId,
+          equipmentId: id
+        })
+          .select('snapshot version changedAt')
+          .lean()
+      : null;
+
+    return res.json({
+      version: versionDoc,
+      previousVersion: previous
+    });
+  } catch (err) {
+    console.error('❌ getEquipmentDataVersion error:', err);
+    return res.status(500).json({ message: 'Failed to load equipment data version.' });
   }
 };
 

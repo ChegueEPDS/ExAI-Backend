@@ -96,6 +96,10 @@ router.get('/exreg', authMiddleware(), exRegisterController.listEquipment);
 // Lekérés ID alapján (GET /exreg/:id)
 router.get('/exreg/:id', authMiddleware(), exRegisterController.getEquipmentById);
 
+// Equipment data history (SCD2-like versions)
+router.get('/exreg/:id/versions', authMiddleware(), exRegisterController.listEquipmentDataVersions);
+router.get('/exreg/:id/versions/:versionId', authMiddleware(), exRegisterController.getEquipmentDataVersion);
+
 // Módosítás
 router.put('/exreg/:id', authMiddleware(), upload.array('pictures'), exRegisterController.updateEquipment);
 
