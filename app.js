@@ -40,6 +40,8 @@ const mailRoutes = require('./routes/mailRoutes');
 const certificateRequestRoutes = require('./routes/certificateRequestRoutes');
 const inspectionRoutes = require('./routes/inspectionRoutes');
 const downloadRoutes = require('./routes/downloadRoutes');
+const mobileSyncRoutes = require('./routes/mobileSyncRoutes');
+const mobileSyncWorker = require('./services/mobileSyncWorker');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -63,11 +65,25 @@ const allowedOrigins = process.env.CORS_ALLOWED_ORIGINS
   ? process.env.CORS_ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
   : [];
 
+// Allow local/mobile app origins by default (keeps existing allowlist behavior intact)
+const defaultDevOrigins = new Set([
+  'http://localhost',
+  'http://localhost:8100',
+  'http://127.0.0.1',
+  'http://127.0.0.1:8100',
+  'capacitor://localhost',
+  'ionic://localhost'
+]);
+
 // Reusable CORS options (applies to REST + SSE)
 const corsOptions = {
   origin: function (origin, callback) {
     // allow same-origin or server-to-server (no origin), and allow-listed origins
-    if (!origin || allowedOrigins.includes(origin)) {
+    if (
+      !origin ||
+      allowedOrigins.includes(origin) ||
+      defaultDevOrigins.has(origin)
+    ) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
@@ -79,6 +95,8 @@ const corsOptions = {
     'Authorization',
     'Content-Type',
     'x-ms-graph-token',
+    'x-captcha-token',
+    'x-captcha-bypass',
     'x-user-id',        // frontend legacy header (allowed for backwards-compat)
     'x-tenant-id',      // optional explicit tenant header if ever sent
     'x-request-id',     // optional tracing
@@ -207,8 +225,16 @@ app.use('/api', inviteRoutes);
 app.use('/api', mailRoutes);
 app.use('/api', inspectionRoutes);
 app.use('/api', downloadRoutes);
+app.use('/api', mobileSyncRoutes);
 
-reportExportCleanup.start();
+const backgroundJobsDisabled =
+  process.env.DISABLE_BACKGROUND_JOBS === '1' ||
+  process.env.DISABLE_BACKGROUND_JOBS === 'true' ||
+  process.env.NODE_ENV === 'test';
+
+if (!backgroundJobsDisabled) {
+  reportExportCleanup.start();
+}
 
 
 /**
@@ -250,12 +276,16 @@ if (fs.existsSync(frontendDist)) {
   console.warn('[SPA] Frontend dist folder not found:', frontendDist);
 }
 
-// Periodikus tisztítás
-setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum
-setInterval(cleanupService.cleanupDxfResults, 3 * 60 * 60 * 1000);
-setInterval(() => cleanupService.cleanupUploadTempFiles(), 3 * 60 * 60 * 1000);
-setInterval(cleanupService.cleanupEquipmentDocsImportErrorReports, 24 * 60 * 60 * 1000); // napi egyszer
-setInterval(subscriptionSweeper.sweepExpiredSubscriptions, 60 * 60 * 1000);
+if (!backgroundJobsDisabled) {
+  // Periodikus tisztítás
+  setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum
+  setInterval(cleanupService.cleanupDxfResults, 3 * 60 * 60 * 1000);
+  setInterval(() => cleanupService.cleanupUploadTempFiles(), 3 * 60 * 60 * 1000);
+  setInterval(cleanupService.cleanupEquipmentDocsImportErrorReports, 24 * 60 * 60 * 1000); // napi egyszer
+  setInterval(subscriptionSweeper.sweepExpiredSubscriptions, 60 * 60 * 1000);
+  // Mobile sync background processing (best-effort in-process worker)
+  mobileSyncWorker.start({ intervalMs: 5000 });
+}
 
 console.log("Starting application...");
 process.on('unhandledRejection', (reason) => {
@@ -266,8 +296,11 @@ process.on('uncaughtException', (err) => {
   // Consider graceful shutdown in production
 });
 
-const server = app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+// Ensure the server is reachable from other devices on the LAN (mobile testing).
+// You can override with HOST env var (e.g. HOST=127.0.0.1 to restrict).
+const host = process.env.HOST || '0.0.0.0';
+const server = app.listen(port, host, () => {
+  console.log(`Server listening on http://${host}:${port}`);
 });
 
 // --- Keep long SSE connections alive and avoid premature timeouts ---

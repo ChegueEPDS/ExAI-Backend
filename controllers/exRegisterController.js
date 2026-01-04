@@ -3754,6 +3754,15 @@ exports.listEquipment = async (req, res) => {
     const searchTerm = typeof req.query.search === 'string' ? req.query.search.trim() : '';
     const andConditions = [];
 
+    if (req.query.updatedSince) {
+      const raw = String(req.query.updatedSince).trim();
+      const asNum = Number(raw);
+      const d = Number.isFinite(asNum) ? new Date(asNum) : new Date(raw);
+      if (!Number.isNaN(d.getTime())) {
+        filter.updatedAt = { $gt: d };
+      }
+    }
+
     if (req.query.Zone) {
       filter.Zone = req.query.Zone;
     } else if (req.query.noZone) {
@@ -3826,7 +3835,10 @@ exports.listEquipment = async (req, res) => {
     }
 
     const withPaths = equipments.map(eq => {
-      const firstBlobUrl = eq.Pictures?.find?.(p => p.blobUrl)?.blobUrl || null;
+      const firstBlobUrl =
+        eq.Pictures?.find?.(p => p.blobUrl)?.blobUrl ||
+        eq.documents?.find?.(d => (d.type === 'image' || d.type === undefined) && d.blobUrl)?.blobUrl ||
+        null;
       const certDoc = resolveCertificateFromCache(certMap, eq['Certificate No']);
 
       let xCondition = eq['X condition'];

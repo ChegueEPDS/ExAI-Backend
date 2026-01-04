@@ -162,7 +162,17 @@ exports.getAllSites = async (req, res) => {
             return res.status(400).json({ message: "Invalid or missing tenantId in auth" });
         }
 
-        const sites = await Site.find({ tenantId: tenantObjectId })
+        const filter = { tenantId: tenantObjectId };
+        if (req.query.updatedSince) {
+          const raw = String(req.query.updatedSince).trim();
+          const asNum = Number(raw);
+          const d = Number.isFinite(asNum) ? new Date(asNum) : new Date(raw);
+          if (!Number.isNaN(d.getTime())) {
+            filter.updatedAt = { $gt: d };
+          }
+        }
+
+        const sites = await Site.find(filter)
             .populate('CreatedBy', 'firstName lastName nickname');
 
         res.status(200).json(sites);

@@ -143,6 +143,14 @@ exports.getZones = async (req, res) => {
     const { siteId } = req.query;
 
     let query = { tenantId: tenantObjectId };
+    if (req.query.updatedSince) {
+      const raw = String(req.query.updatedSince).trim();
+      const asNum = Number(raw);
+      const d = Number.isFinite(asNum) ? new Date(asNum) : new Date(raw);
+      if (!Number.isNaN(d.getTime())) {
+        query.updatedAt = { $gt: d };
+      }
+    }
     if (siteId) {
       if (!mongoose.Types.ObjectId.isValid(siteId)) {
         return res.status(400).json({ message: "Invalid siteId format" });

@@ -4,6 +4,13 @@ const logger = require('../config/logger');
 
 const SECRET = process.env.RECAPTCHA_SECRET;
 const MIN_SCORE = parseFloat(process.env.RECAPTCHA_MIN_SCORE || '0.5');
+const BYPASS_KEY = process.env.RECAPTCHA_BYPASS_KEY || process.env.CAPTCHA_BYPASS_KEY || null;
+const DISABLED =
+  process.env.RECAPTCHA_DISABLED === '1' ||
+  process.env.RECAPTCHA_DISABLED === 'true' ||
+  process.env.CAPTCHA_DISABLED === '1' ||
+  process.env.CAPTCHA_DISABLED === 'true';
+const BYPASS_HEADER = (process.env.RECAPTCHA_BYPASS_HEADER || 'x-captcha-bypass').toLowerCase();
 
 function log(level, msg) {
   try {
@@ -39,6 +46,19 @@ function log(level, msg) {
 async function captchaVerify(req, res, next) {
   try {
     log('info', `[reCAPTCHA] Incoming request path: ${req.path}, IP: ${req.ip}`);
+
+    if (DISABLED) {
+      req.captcha = { bypassed: true, reason: 'disabled' };
+      log('warn', '[reCAPTCHA] Bypassed (disabled by env).');
+      return next();
+    }
+
+    const bypassValue = req.headers?.[BYPASS_HEADER] || null;
+    if (BYPASS_KEY && bypassValue && String(bypassValue) === String(BYPASS_KEY)) {
+      req.captcha = { bypassed: true, reason: 'header-bypass' };
+      log('warn', '[reCAPTCHA] Bypassed (header key match).');
+      return next();
+    }
 
     // Accept token from body, headers, or query
     const token =
