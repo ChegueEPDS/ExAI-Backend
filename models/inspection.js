@@ -104,6 +104,22 @@ const InspectionSchema = new Schema(
       enum: ['Passed', 'Failed'],
       required: true,
     },
+
+    // Review workflow (mobile sync creates pending inspections)
+    reviewStatus: {
+      type: String,
+      enum: ['pending', 'final'],
+      default: 'final',
+      index: true
+    },
+    source: {
+      type: String,
+      enum: ['manual', 'mobileSync', 'import', 'unknown'],
+      default: 'manual',
+      index: true
+    },
+    finalizedAt: { type: Date, default: null },
+    finalizedBy: { type: Schema.Types.ObjectId, ref: 'User', required: false }
   },
   {
     timestamps: true, // createdAt, updatedAt automatikusan

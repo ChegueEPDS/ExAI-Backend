@@ -7,6 +7,7 @@ const mongoose = require('mongoose');
 const fs = require('fs');
 const path = require('path');
 const azureBlob = require('../services/azureBlobService');
+const { recordTombstone } = require('../services/syncTombstoneService');
 const xlsx = require('xlsx');
 const mime = require('mime-types');
 const ExcelJS = require('exceljs');
@@ -271,6 +272,18 @@ exports.deleteZone = async (req, res) => {
 
     const zone = await Zone.findOne({ _id: zoneId, tenantId: tenantObjectId });
     if (!zone) return res.status(404).json({ error: 'Zone not found' });
+
+    try {
+      await recordTombstone({
+        tenantId: tenantObjectId,
+        entityType: 'zone',
+        entityId: zone._id,
+        deletedBy: req.userId || null,
+        meta: { siteId: zone.Site || null, Name: zone.Name || '' }
+      });
+    } catch (e) {
+      console.warn('⚠️ Failed to write zone tombstone:', e?.message || e);
+    }
 
     // need site name to compute prefix
     const site = await Site.findOne({ _id: zone.Site, tenantId: tenantObjectId }).select('Name');

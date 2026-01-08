@@ -12,6 +12,7 @@ const fs = require('fs');
 const mime = require('mime-types');
 const sharp = require('sharp');
 const heicConvert = require('heic-convert');
+const { recordTombstone } = require('../services/syncTombstoneService');
 
 // LEGACY: const axios = require('axios');
 
@@ -389,6 +390,18 @@ exports.deleteSite = async (req, res) => {
 
     const site = await Site.findOne({ _id: siteId, tenantId: tenantObjectId });
     if (!site) return res.status(404).json({ message: "Site not found" });
+
+    try {
+      await recordTombstone({
+        tenantId: tenantObjectId,
+        entityType: 'site',
+        entityId: site._id,
+        deletedBy: req.userId || null,
+        meta: { Name: site.Name || '' }
+      });
+    } catch (e) {
+      console.warn('⚠️ Failed to write site tombstone:', e?.message || e);
+    }
 
     // child records
     await Equipment.deleteMany({ Site: siteId, tenantId: tenantObjectId });

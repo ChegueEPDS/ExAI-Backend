@@ -8,6 +8,8 @@ const authMiddleware = require('../middlewares/authMiddleware');
 // Új inspection létrehozása
 // POST /api/inspections
 router.post('/inspections', authMiddleware(), express.json(), inspectionController.createInspection);
+router.put('/inspections/:id', authMiddleware(), express.json(), inspectionController.updateInspection);
+router.post('/inspections/:id/regenerate', authMiddleware(), express.json(), inspectionController.regenerateInspection);
 router.post('/inspections/upload-attachment', authMiddleware(), inspectionController.uploadInspectionAttachment);
 router.delete('/inspections/attachment', authMiddleware(), express.json(), inspectionController.deleteInspectionAttachment);
 

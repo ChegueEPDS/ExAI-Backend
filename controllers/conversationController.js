@@ -1148,15 +1148,25 @@ exports.chatWithFilesStream = async (req, res) => {
         }
 
         const cleaned = (accText || '').replace(/【.*?】/g, '');
-        const sanitized = sanitizeHtml(cleaned, {
-          allowedTags: ['a', 'b', 'i', 'strong', 'em', 'u', 's', 'br', 'p', 'ul', 'ol', 'li', 'blockquote', 'code', 'pre', 'span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table', 'thead', 'tbody', 'tr', 'th', 'td'],
-          allowedAttributes: { 'span': ['class'], 'a': ['href', 'title', 'target', 'rel'] },
-          transformTags: {
-            'a': sanitizeHtml.simpleTransform('a', { target: '_blank', rel: 'noopener noreferrer' }, true)
-          },
-          disallowedTagsMode: 'discard'
-        });
-        const finalHtml = marked(sanitized);
+	    // Render markdown -> HTML, then sanitize the generated HTML.
+	    // This keeps formatting consistent (lists, tables, headings) and prevents raw-HTML injection.
+	    let renderedHtml = '';
+	    try {
+	      renderedHtml = (typeof marked?.parse === 'function')
+	        ? marked.parse(cleaned, { gfm: true })
+	        : marked(cleaned);
+	    } catch {
+	      renderedHtml = `<pre>${sanitizeHtml(cleaned)}</pre>`;
+	    }
+	
+	    const finalHtml = sanitizeHtml(renderedHtml, {
+	      allowedTags: ['a', 'b', 'i', 'strong', 'em', 'u', 's', 'br', 'p', 'ul', 'ol', 'li', 'blockquote', 'code', 'pre', 'span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table', 'thead', 'tbody', 'tr', 'th', 'td'],
+	      allowedAttributes: { 'span': ['class'], 'a': ['href', 'title', 'target', 'rel'] },
+	      transformTags: {
+	        'a': sanitizeHtml.simpleTransform('a', { target: '_blank', rel: 'noopener noreferrer' }, true)
+	      },
+	      disallowedTagsMode: 'discard'
+	    });
 
         conversation.messages.push({ role: 'user', content: message, meta: { kind: 'chat-with-files', mode, fileIds } });
         conversation.messages.push({ role: 'assistant', content: finalHtml, images: [] });
@@ -1208,10 +1218,12 @@ exports.chatWithFilesStream = async (req, res) => {
 };
 
 const Conversation = require('../models/conversation');
+const RagChunk = require('../models/ragChunk');
 const InjectionRule = require('../models/injectionRule');
 const axios = require('axios');
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 const logger = require('../config/logger');
 const categorizeMessageUsingAI = require('../helpers/categorizeMessage');
 const delay = require('../helpers/delay');
@@ -1231,6 +1243,7 @@ const mammoth = require('mammoth');
 const fs = require('fs');
 const { runUploadAndSummarize } = require('../services/summaryCore');
 const { notifyAndStore } = require('../lib/notifications/notifier');
+const OpenAI = require('openai');
 
 const FormData = require('form-data');
 
@@ -1345,6 +1358,396 @@ function chunkByTokens(str, maxTokens) {
     chunks.push(encoder.decode(slice));
   }
   return chunks.length ? chunks : [''];
+}
+
+function cosineSimilarity(a = [], b = []) {
+  const n = Math.min(a.length, b.length);
+  if (!n) return 0;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < n; i++) {
+    const av = Number(a[i] || 0);
+    const bv = Number(b[i] || 0);
+    dot += av * bv;
+    na += av * av;
+    nb += bv * bv;
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom ? dot / denom : 0;
+}
+
+function tokenTrim(text, maxTokens) {
+  const ids = encoder.encode(String(text || ''));
+  return encoder.decode(ids.slice(0, Math.max(0, maxTokens)));
+}
+
+function sanitizeEmbeddingInput(s) {
+  // Embeddings input must be a string; remove NUL + other control chars (keep \n \r \t).
+  return String(s || '')
+    .replace(/\u0000/g, '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ' ')
+    .trim();
+}
+
+function detectIntent(userMsg = '') {
+  const m = String(userMsg || '').toLowerCase();
+  const has = (...kws) => kws.some(k => m.includes(k));
+
+  const nb = has('notified body', 'tanúsító', 'tanusito', 'nb', 'megfelelőség', 'megfelelos', 'compliance', 'audit');
+  const risk = has('kockázat', 'kockazat', 'risk', 'hazard', 'veszély', 'veszely', 'fmea');
+  const compare = has('összehasonl', 'osszehasonl', 'compare', 'comparison', 'különbség', 'kulonbseg', 'diff', 'versus', 'vs ');
+  const changed = has('mi változott', 'mi valtozott', 'változás', 'valtozas', 'change log', 'changelog', 'delta', 'változott', 'valtozott');
+  const standards = has('szabvány', 'szabvany', 'standard', 'standards', '60079', 'clause', 'követelmény', 'kovetelmeny', 'requirement');
+  const exec = has('vezetői', 'vezetoi', 'executive', 'vezetői összefoglaló', 'vezetoi osszefoglalo', 'összefoglaló', 'osszefoglalo', 'tl;dr', 'tldr');
+  const howto = has('hogyan', 'hogy volt', 'hogy volt?', 'how', 'how was', 'módszer', 'modszer', 'method', 'folyamat', 'process');
+
+  if (nb || risk) return 'nb_audit';
+  if (changed) return 'what_changed';
+  if (compare) return 'comparison';
+  if (standards) return 'standards';
+  if (exec) return 'exec_summary';
+  if (howto) return 'howto';
+  return 'general';
+}
+
+function detectLanguage(userMsg = '') {
+  const raw = String(userMsg || '');
+  const s = raw.toLowerCase();
+  // Very lightweight heuristic: Hungarian has frequent accented vowels and function words.
+  const hasHuAccents = /[áéíóöőúüű]/i.test(raw);
+  const huWords = ['hogy', 'és', 'nem', 'kell', 'szerint', 'mi', 'milyen', 'mennyire', 'megfelel', 'kockázat', 'szabvány', 'tanús', 'törlés', 'kérdés'];
+  const huHits = huWords.reduce((n, w) => n + (s.includes(w) ? 1 : 0), 0);
+  if (hasHuAccents || huHits >= 2) return 'hu';
+
+  // English fallback heuristic
+  const enWords = ['the', 'and', 'not', 'must', 'should', 'analysis', 'risk', 'compliance', 'standard', 'compare', 'change'];
+  const enHits = enWords.reduce((n, w) => n + (s.includes(w) ? 1 : 0), 0);
+  if (enHits >= 2) return 'en';
+
+  // Default: prefer Hungarian only when clearly indicated, otherwise English.
+  return 'en';
+}
+
+function safeJsonParse(s) {
+  try { return JSON.parse(String(s || '')); } catch { return null; }
+}
+
+function stripHeadersFooters(text) {
+  // Conservative cleanup: remove page-number lines and highly repetitive boilerplate.
+  const raw = String(text || '');
+  if (!raw.trim()) return raw;
+
+  const lines = raw.split(/\r?\n/);
+  const normalized = lines.map(l => String(l || '').replace(/\s+/g, ' ').trim());
+
+  const pageLine = (s) => {
+    const t = String(s || '').trim();
+    if (!t) return false;
+    if (/^\d+\s*\/\s*\d+$/.test(t)) return true;                       // "3/12"
+    if (/^(page\s*)?\d+(\s*(of|\/)\s*\d+)?$/i.test(t)) return true;     // "Page 3 of 12" / "3 of 12" / "Page 3"
+    if (/^-\s*\d+\s*-$/.test(t)) return true;                           // "- 3 -"
+    return false;
+  };
+
+  // Build frequency table for short-ish lines (common headers/footers).
+  const freq = new Map();
+  for (const s of normalized) {
+    if (!s) continue;
+    if (s.length > 90) continue;
+    // Ignore lines that are mostly digits/punctuation (handled by pageLine)
+    if (/^[\d\s\-_/().]+$/.test(s)) continue;
+    freq.set(s, (freq.get(s) || 0) + 1);
+  }
+
+  const boilerplate = (s) => /(confidential|all rights reserved|©|copyright)/i.test(s);
+
+  const cleaned = [];
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    const s = normalized[i];
+    if (!s) {
+      cleaned.push(rawLine);
+      continue;
+    }
+    if (pageLine(s)) continue;
+    const c = freq.get(s) || 0;
+    // Only strip repeated boilerplate, not general repeated phrases.
+    if (c >= 2 && boilerplate(s)) continue;
+    cleaned.push(rawLine);
+  }
+
+  return cleaned.join('\n');
+}
+
+function parseNumberLoose(v) {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v !== 'string') return NaN;
+  const s0 = v.trim();
+  if (!s0) return NaN;
+  // Normalize "1 234,56" / "1,234.56" / "1234.56"
+  const s1 = s0.replace(/\s+/g, '').replace(',', '.');
+  // Strip trailing units/symbols (keep digits, dot, minus, exponent)
+  const s2 = s1.replace(/[^0-9eE.+-]/g, '');
+  const n = Number(s2);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function computeColumnStats(rows, colIdx, { maxRows = 20000 } = {}) {
+  let count = 0;
+  let sum = 0;
+  let min = Infinity;
+  let max = -Infinity;
+  for (let r = 0; r < rows.length && r < maxRows; r++) {
+    const row = rows[r];
+    if (!Array.isArray(row)) continue;
+    const n = parseNumberLoose(row[colIdx]);
+    if (!Number.isFinite(n)) continue;
+    count++;
+    sum += n;
+    if (n < min) min = n;
+    if (n > max) max = n;
+  }
+  return {
+    count,
+    min: count ? min : null,
+    max: count ? max : null,
+    avg: count ? (sum / count) : null,
+  };
+}
+
+function buildTablePreview(rows, { maxRows = 18, maxCols = 12 } = {}) {
+  const out = [];
+  const take = rows.slice(0, maxRows);
+  for (let r = 0; r < take.length; r++) {
+    const row = Array.isArray(take[r]) ? take[r] : [];
+    const cells = row.slice(0, maxCols).map(v => {
+      const s = String(v ?? '').replace(/\s+/g, ' ').trim();
+      return s.length > 40 ? s.slice(0, 37) + '…' : s;
+    });
+    out.push(`[${r}] ${JSON.stringify(cells)}`);
+  }
+  return out.join('\n');
+}
+
+async function analyzeExcelColumnsWithLM(openaiClient, wb, { model, maxSheets = 6 } = {}) {
+  const sheets = (wb?.SheetNames || []).slice(0, maxSheets);
+  const previews = [];
+
+  for (const sheet of sheets) {
+    const rows = xlsx.utils.sheet_to_json(wb.Sheets[sheet], { header: 1, blankrows: false });
+    if (!Array.isArray(rows) || !rows.length) continue;
+    const head = buildTablePreview(rows.slice(0, 30), { maxRows: 14, maxCols: 12 });
+    const tail = buildTablePreview(rows.slice(-30), { maxRows: 8, maxCols: 12 });
+    previews.push(`SHEET: ${sheet}\nFIRST_ROWS:\n${head}\nLAST_ROWS:\n${tail}`);
+  }
+
+  if (!previews.length) return { sheets: [] };
+
+  const sys = [
+    'You are a data analyst extracting structure from spreadsheets.',
+    'You do not know the column headers; infer structure from values and patterns.',
+    'Return STRICT JSON only, no prose.',
+    'Goal: pick up to 6 numeric measurement columns per sheet that are most relevant for safety/compliance/risk analysis.',
+    'Avoid pure IDs, counters, timestamps unless they are central to the analysis.'
+  ].join(' ');
+
+  const user = [
+    'For each sheet, infer up to 6 key numeric columns.',
+    'Return JSON schema:',
+    '{ "sheets": [ { "name": string, "columns": [ { "index": number, "label": string, "unit": string|null, "reason": string } ] } ] }',
+    'Column index is 0-based within the row arrays shown.',
+    '',
+    previews.join('\n\n---\n\n')
+  ].join('\n');
+
+  const resp = await openaiClient.chat.completions.create({
+    model: model || 'gpt-5-mini',
+    messages: [{ role: 'system', content: sys }, { role: 'user', content: user }]
+  });
+  const txt = String(resp?.choices?.[0]?.message?.content || '').trim();
+
+  try {
+    return JSON.parse(txt);
+  } catch {
+    // Try to salvage JSON object from mixed output
+    const m = txt.match(/\{[\s\S]*\}/);
+    if (m) {
+      try { return JSON.parse(m[0]); } catch { }
+    }
+    return { sheets: [] };
+  }
+}
+
+async function extractFileToTextForRag(file, baseUrl, opts = {}) {
+  const mt = String(file?.mimetype || '').toLowerCase();
+  const name = String(file?.originalname || '');
+  const lowerName = name.toLowerCase();
+
+  try {
+    if (mt === 'application/pdf' || lowerName.endsWith('.pdf')) {
+      const form = new FormData();
+      form.append('file', file.buffer, { filename: name, contentType: file.mimetype || 'application/pdf' });
+      form.append('certType', 'ATEX');
+      const resp = await axiosClient.post(`${baseUrl}/api/pdfcert`, form, { headers: form.getHeaders(), timeout: 300000 });
+      const txt = String(resp.data?.recognizedText || '');
+      return stripHeadersFooters(txt);
+    }
+    if (mt.startsWith('image/')) {
+      const form = new FormData();
+      form.append('image', file.buffer, { filename: name, contentType: file.mimetype || 'application/octet-stream' });
+      const upload = await axiosClient.post(`${baseUrl}/api/vision/upload`, form, { headers: form.getHeaders(), timeout: 300000 });
+      const imageUrl = upload.data?.image_url;
+      if (!imageUrl) return '';
+      const analyze = await axiosClient.post(`${baseUrl}/api/vision/analyze`, {
+        image_urls: [imageUrl],
+        user_input: 'Extract all readable text and labels. If tables appear, describe them row-wise.'
+      }, { timeout: 300000, headers: { 'Content-Type': 'application/json' } });
+      return String(analyze.data?.result || '');
+    }
+    if (mt.includes('wordprocessingml') || lowerName.endsWith('.docx')) {
+      const outRaw = await mammoth.extractRawText({ buffer: file.buffer });
+      return stripHeadersFooters(String(outRaw?.value || ''));
+    }
+    if (mt.includes('msword') || lowerName.endsWith('.doc')) {
+      try { return stripHeadersFooters(file.buffer.toString('utf8')); } catch { return ''; }
+    }
+    if (
+      mt.includes('excel') || mt.includes('spreadsheetml') ||
+      lowerName.endsWith('.xls') || lowerName.endsWith('.xlsx')
+    ) {
+      const wb = xlsx.read(file.buffer, { type: 'buffer' });
+      const parts = [];
+
+      // Header-agnostic (LM-based) column selection + server-side stats.
+      const enableExcelLm = String(opts.enableExcelLm ?? process.env.FILE_CHAT_EXCEL_LM ?? '1') !== '0';
+      const excelModel = opts.excelModel || process.env.FILE_CHAT_EXCEL_MODEL || 'gpt-5-mini';
+      if (enableExcelLm && opts.openai) {
+        try {
+          const spec = await analyzeExcelColumnsWithLM(opts.openai, wb, { model: excelModel });
+          const sheetsSpec = Array.isArray(spec?.sheets) ? spec.sheets : [];
+
+          if (sheetsSpec.length) {
+            parts.push('--- EXCEL_STATS (auto-extracted; verify against original spreadsheet) ---');
+            for (const sh of sheetsSpec.slice(0, 6)) {
+              const sheetName = String(sh?.name || '');
+              if (!sheetName || !wb.Sheets[sheetName]) continue;
+              const rows = xlsx.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, blankrows: false });
+              const cols = Array.isArray(sh?.columns) ? sh.columns : [];
+              const statsLines = [];
+              for (const c of cols.slice(0, 6)) {
+                const idx = Number(c?.index);
+                if (!Number.isFinite(idx) || idx < 0) continue;
+                const st = computeColumnStats(rows, idx, { maxRows: 20000 });
+                if (!st.count) continue;
+                const label = String(c?.label || `col_${idx}`);
+                const unit = (c?.unit === null || c?.unit === undefined) ? '' : ` ${String(c.unit)}`;
+                statsLines.push(`- ${label} (col ${idx})${unit}: max=${st.max}, min=${st.min}, avg=${st.avg}, n=${st.count}`);
+              }
+              if (statsLines.length) {
+                parts.push(`SHEET: ${sheetName}`);
+                parts.push(...statsLines);
+              }
+            }
+            parts.push('--- END EXCEL_STATS ---\n');
+          }
+        } catch (e) {
+          // Non-fatal: proceed with CSV text below.
+          try { logger.warn('[CHAT_WITH_FILES_COMPLETIONS] Excel LM analysis failed:', e?.message); } catch { }
+        }
+      }
+
+      wb.SheetNames.forEach(sheet => {
+        const csv = xlsx.utils.sheet_to_csv(wb.Sheets[sheet], { blankrows: false });
+        parts.push(`-- SHEET: ${sheet} --\n${csv}`);
+      });
+      return parts.join('\n\n');
+    }
+    if (mt === 'text/plain' || lowerName.endsWith('.txt') || lowerName.endsWith('.md') || lowerName.endsWith('.html')) {
+      try { return file.buffer.toString('utf8'); } catch { return ''; }
+    }
+
+    try { return file.buffer.toString('utf8'); } catch { return ''; }
+  } catch {
+    return '';
+  }
+}
+
+async function createEmbeddingVector(openaiClient, text, { embeddingModel }) {
+  const input0 = sanitizeEmbeddingInput(text);
+  const input = sanitizeEmbeddingInput(tokenTrim(input0, 800));
+  if (!input) return [];
+
+  try {
+    const resp = await openaiClient.embeddings.create({
+      model: embeddingModel,
+      input: [input]
+    });
+    return resp.data?.[0]?.embedding || [];
+  } catch (e) {
+    try {
+      logger.error('[CHAT_WITH_FILES_COMPLETIONS] embeddings.create failed', {
+        model: embeddingModel,
+        inputType: typeof input,
+        inputChars: input.length,
+        inputPreview: input.slice(0, 180),
+        status: e?.response?.status || e?.status || null,
+        serverMsg: e?.response?.data?.error?.message || e?.response?.data?.message || e?.message || null,
+        message: e?.message,
+        code: e?.code || null,
+        name: e?.name || null
+      });
+    } catch { }
+    throw e;
+  }
+}
+
+function escapeRegExp(s) {
+  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeForSearch(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[\u2010-\u2015]/g, '-') // dashes
+    .replace(/[^a-z0-9áéíóöőúüűßąćęłńśźż\-]+/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function keywordScore(query, text) {
+  const q = normalizeForSearch(query);
+  const t = normalizeForSearch(text);
+  if (!q || !t) return 0;
+
+  const phrase = q.length >= 10 ? q : '';
+  const terms = q
+    .split(' ')
+    .filter(x => x.length >= 3)
+    .slice(0, 14);
+  if (!terms.length) return 0;
+
+  let score = 0;
+  for (const term of terms) {
+    const re = new RegExp(`\\b${escapeRegExp(term)}\\b`, 'g');
+    const matches = t.match(re);
+    if (matches?.length) score += matches.length;
+  }
+  if (phrase && t.includes(phrase)) score += 6;
+  return score;
+}
+
+function chunkWithOverlap(text, { chunkTokens = 900, overlapTokens = 120 } = {}) {
+  const ids = encoder.encode(String(text || ''));
+  const chunks = [];
+  if (!ids.length) return [''];
+  const step = Math.max(1, chunkTokens - overlapTokens);
+  for (let i = 0; i < ids.length; i += step) {
+    const slice = ids.slice(i, Math.min(i + chunkTokens, ids.length));
+    chunks.push(encoder.decode(slice));
+    if (i + chunkTokens >= ids.length) break;
+  }
+  return chunks;
 }
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -2030,6 +2433,1009 @@ exports.uploadAndAskStream = [
   }
 ];
 
+// ===== Chat-with-files via Chat Completions (gpt-5 capable), without Assistants vector stores (SSE) =====
+// POST /api/chat/with-files-completions/stream
+// - multipart/form-data: files[], threadId, message, mode=hybrid|sandbox
+// - hybrid: persist chunks+embeddings in Mongo (RagChunk) per thread
+// - sandbox: use only currently uploaded files (no DB persistence)
+exports.chatWithFilesCompletionsStream = async (req, res) => {
+  const send = sseInit(req, res);
+
+  let conversation;
+  try {
+    const t0 = Date.now();
+    const { mode: rawMode, message, threadId } = req.body || {};
+    const mode = (rawMode === 'sandbox' ? 'sandbox' : 'hybrid');
+    const userId = req.userId;
+    const reqCt = String(req.headers?.['content-type'] || '');
+    const reqLen = Number(req.headers?.['content-length'] || 0) || null;
+
+    const logHttpError = (label, err) => {
+      try {
+        const status = err?.response?.status;
+        const hdrs = err?.response?.headers || {};
+        const reqId =
+          hdrs['x-request-id'] ||
+          hdrs['openai-request-id'] ||
+          hdrs['request-id'] ||
+          null;
+        const serverMsg = err?.response?.data?.error?.message || err?.response?.data?.message || null;
+        logger.error(`[CHAT_WITH_FILES_COMPLETIONS] ${label}`, {
+          status,
+          reqId,
+          serverMsg,
+          message: err?.message,
+          stack: err?.stack,
+        });
+      } catch {
+        logger.error(`[CHAT_WITH_FILES_COMPLETIONS] ${label}: ${err?.message || err}`);
+      }
+    };
+
+    const headersAssistantsV2 = (extra = {}) => ({
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      'OpenAI-Beta': 'assistants=v2',
+      ...extra
+    });
+
+    async function getAssistantVectorStoreId(assistantId) {
+      if (!assistantId) return null;
+      try {
+        const r = await axios.get(
+          `https://api.openai.com/v1/assistants/${assistantId}`,
+          { headers: headersAssistantsV2() }
+        );
+        const ids = r.data?.tool_resources?.file_search?.vector_store_ids || [];
+        return ids[0] || null;
+      } catch (e) {
+        logger.warn('[CHAT_WITH_FILES_COMPLETIONS] getAssistantVectorStoreId failed', e?.response?.data || e?.message);
+        return null;
+      }
+    }
+
+    function coerceSearchText(maybe) {
+      if (!maybe) return '';
+      if (typeof maybe === 'string') return maybe;
+      if (Array.isArray(maybe)) {
+        return maybe
+          .map(x => (typeof x === 'string' ? x : (x?.text || x?.text?.value || x?.content || '')))
+          .filter(Boolean)
+          .join('');
+      }
+      if (typeof maybe === 'object') return String(maybe.text || maybe?.text?.value || maybe.content || '');
+      return String(maybe);
+    }
+
+    async function searchVectorStore(vectorStoreId, query, limit = 5) {
+      if (!vectorStoreId || !query) return [];
+      const url = `https://api.openai.com/v1/vector_stores/${vectorStoreId}/search`;
+      try {
+        const r = await axios.post(
+          url,
+          { query: String(query), max_num_results: Math.max(1, Math.min(limit, 20)) },
+          { headers: headersAssistantsV2({ 'Content-Type': 'application/json' }) }
+        );
+        return r.data?.data || r.data?.results || [];
+      } catch (e) {
+        logger.warn('[CHAT_WITH_FILES_COMPLETIONS] vector store search failed', {
+          status: e?.response?.status,
+          message: e?.response?.data?.error?.message || e?.message
+        });
+        return [];
+      }
+    }
+
+    if (!userId) {
+      send('error', { message: 'Hiányzó vagy érvénytelen JWT.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      send('error', { message: 'A message kötelező, nem lehet üres.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    if (!threadId || typeof threadId !== 'string' || !threadId.trim()) {
+      send('error', { message: 'A threadId kötelező, nem lehet üres.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+
+    const user = await User.findById(userId).select('tenantId');
+    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
+    if (!tenantId) {
+      send('error', { message: 'Hiányzó tenant azonosító.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+
+    conversation = await Conversation.findOne({ threadId, userId, tenantId });
+    if (!conversation) {
+      send('error', { message: 'A megadott szál nem található.' });
+      send('done', { ok: false });
+      return res.end();
+    }
+
+    const baseUrl = (process.env.BASE_URL || 'http://localhost:3000').replace(/\/+$/, '');
+    const embeddingModel = process.env.RAG_EMBEDDING_MODEL || 'text-embedding-3-small';
+    const completionsPrimary = process.env.FILE_CHAT_COMPLETIONS_MODEL || 'gpt-5-mini';
+    const completionsFallback = process.env.FILE_CHAT_COMPLETIONS_FALLBACK || 'gpt-4o-mini';
+
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    let embeddingsEnabled = true;
+    let embeddingsDisabledReason = null;
+    const embeddingStatus = (err) => (err?.response?.status || err?.status || 0);
+    const isEmbeddingForbidden = (err) => embeddingStatus(err) === 403;
+
+    // ---- 1) Prepare chunks (hybrid: persist; sandbox: ephemeral) ----
+    const uploads = Array.isArray(req.files) ? req.files : [];
+    const nowFiles = uploads.map(f => f.originalname).filter(Boolean);
+
+    logger.info('[CHAT_WITH_FILES_COMPLETIONS] start', {
+      threadId,
+      userId: String(userId),
+      tenantId: String(tenantId),
+      mode,
+      uploads: uploads.length,
+      files: nowFiles,
+      contentType: reqCt,
+      contentLength: reqLen,
+      embeddingModel,
+      completionsPrimary,
+      completionsFallback,
+    });
+
+    send('progress', { stage: 'rag.prepare', mode, uploads: uploads.length });
+
+    let ephemeralChunks = []; // { filename, chunkIndex, text, tokens, embedding }
+
+    if (mode === 'sandbox') {
+      // sandbox: do not touch DB; build in-memory chunks
+      for (const f of uploads) {
+        const fileT0 = Date.now();
+        send('progress', { stage: 'rag.extract', file: f.originalname });
+        logger.info('[CHAT_WITH_FILES_COMPLETIONS] extracting (sandbox)', { file: f.originalname, size: f.size, mimetype: f.mimetype });
+        let safeText = '';
+        let limited = [];
+        try {
+          const text = await extractFileToTextForRag(f, baseUrl, { openai, enableExcelLm: true });
+          safeText = String(text || '').replace(/\u0000/g, '');
+          const chunks = chunkWithOverlap(safeText, { chunkTokens: 900, overlapTokens: 120 }).filter(x => String(x || '').trim());
+          limited = chunks.slice(0, 80);
+        } catch (e) {
+          logger.error('[CHAT_WITH_FILES_COMPLETIONS] chunking failed (sandbox)', {
+            file: f.originalname,
+            message: e?.message,
+            stack: e?.stack,
+            textType: typeof safeText,
+            textPreview: String(safeText || '').slice(0, 200)
+          });
+          throw e;
+        }
+        logger.info('[CHAT_WITH_FILES_COMPLETIONS] extracted (sandbox)', {
+          file: f.originalname,
+          chars: safeText.length,
+          chunks: limited.length,
+          ms: Date.now() - fileT0
+        });
+        send('progress', { stage: 'rag.chunk', file: f.originalname, chunks: limited.length });
+        for (let i = 0; i < limited.length; i++) {
+          const chunkText = String(limited[i] ?? '');
+          if (!sanitizeEmbeddingInput(chunkText)) {
+            send('progress', { stage: 'rag.skipChunk', file: f.originalname, chunk: i + 1, reason: 'empty_or_invalid' });
+            continue;
+          }
+          let tokens = 0;
+          try {
+            tokens = encoder.encode(chunkText).length;
+          } catch (e) {
+            logger.error('[CHAT_WITH_FILES_COMPLETIONS] tokenization failed (sandbox)', {
+              file: f.originalname,
+              chunk: i,
+              chunkType: typeof chunkText,
+              chunkPreview: String(chunkText || '').slice(0, 200),
+              message: e?.message,
+              stack: e?.stack
+            });
+            throw e;
+	          }
+	          send('progress', { stage: 'rag.embed', file: f.originalname, chunk: i + 1, total: limited.length });
+	          let embedding = [];
+	          if (embeddingsEnabled) {
+	            try {
+	              embedding = await createEmbeddingVector(openai, chunkText, { embeddingModel });
+	            } catch (e) {
+	              if (isEmbeddingForbidden(e)) {
+	                embeddingsEnabled = false;
+	                embeddingsDisabledReason = `embeddings forbidden (403) model=${embeddingModel}`;
+	                logger.warn('[CHAT_WITH_FILES_COMPLETIONS] embeddings disabled, falling back to keyword retrieval', { reason: embeddingsDisabledReason });
+	                try { send('progress', { stage: 'rag.embed.disabled', reason: '403_forbidden' }); } catch { }
+	                embedding = [];
+	              } else {
+	                logHttpError(`embedding failed (sandbox) file=${f.originalname} chunk=${i}`, e);
+	                throw e;
+	              }
+	            }
+	          }
+	          ephemeralChunks.push({ filename: f.originalname, chunkIndex: i, text: chunkText, tokens, embedding });
+	        }
+	      }
+	    } else {
+      // hybrid: persist to RagChunk per threadId (skip duplicates by content hash)
+      for (const f of uploads) {
+        const fileT0 = Date.now();
+        const fileHash = crypto.createHash('sha256').update(f.buffer).update(f.originalname || '').digest('hex');
+        const already = await RagChunk.exists({ threadId, tenantId, filename: f.originalname, fileHash });
+        if (already) {
+          send('progress', { stage: 'rag.skip', file: f.originalname, reason: 'already_ingested' });
+          logger.info('[CHAT_WITH_FILES_COMPLETIONS] skip ingest (already)', { file: f.originalname, fileHash });
+          continue;
+        }
+
+        // Replace any earlier version of the same filename in this thread
+        await RagChunk.deleteMany({ threadId, tenantId, filename: f.originalname }).catch((e) => {
+          logger.warn('[CHAT_WITH_FILES_COMPLETIONS] failed to delete prior chunks', { file: f.originalname, message: e?.message });
+        });
+
+        send('progress', { stage: 'rag.extract', file: f.originalname });
+        logger.info('[CHAT_WITH_FILES_COMPLETIONS] extracting (hybrid)', { file: f.originalname, size: f.size, mimetype: f.mimetype, fileHash });
+        let safeText = '';
+        let limited = [];
+        try {
+          const text = await extractFileToTextForRag(f, baseUrl, { openai, enableExcelLm: true });
+          safeText = String(text || '').replace(/\u0000/g, '');
+          const chunks = chunkWithOverlap(safeText, { chunkTokens: 900, overlapTokens: 120 }).filter(x => String(x || '').trim());
+          limited = chunks.slice(0, 80);
+        } catch (e) {
+          logger.error('[CHAT_WITH_FILES_COMPLETIONS] chunking failed (hybrid)', {
+            file: f.originalname,
+            fileHash,
+            message: e?.message,
+            stack: e?.stack,
+            textType: typeof safeText,
+            textPreview: String(safeText || '').slice(0, 200)
+          });
+          throw e;
+        }
+        logger.info('[CHAT_WITH_FILES_COMPLETIONS] extracted (hybrid)', {
+          file: f.originalname,
+          chars: safeText.length,
+          chunks: limited.length,
+          ms: Date.now() - fileT0
+        });
+        send('progress', { stage: 'rag.chunk', file: f.originalname, chunks: limited.length });
+
+        const docs = [];
+        for (let i = 0; i < limited.length; i++) {
+          const chunkText = String(limited[i] ?? '');
+          if (!sanitizeEmbeddingInput(chunkText)) {
+            send('progress', { stage: 'rag.skipChunk', file: f.originalname, chunk: i + 1, reason: 'empty_or_invalid' });
+            continue;
+          }
+          let tokens = 0;
+          try {
+            tokens = encoder.encode(chunkText).length;
+          } catch (e) {
+            logger.error('[CHAT_WITH_FILES_COMPLETIONS] tokenization failed (hybrid)', {
+              file: f.originalname,
+              fileHash,
+              chunk: i,
+              chunkType: typeof chunkText,
+              chunkPreview: String(chunkText || '').slice(0, 200),
+              message: e?.message,
+              stack: e?.stack
+            });
+            throw e;
+	          }
+	          send('progress', { stage: 'rag.embed', file: f.originalname, chunk: i + 1, total: limited.length });
+	          let embedding = [];
+	          if (embeddingsEnabled) {
+	            try {
+	              embedding = await createEmbeddingVector(openai, chunkText, { embeddingModel });
+	            } catch (e) {
+	              if (isEmbeddingForbidden(e)) {
+	                embeddingsEnabled = false;
+	                embeddingsDisabledReason = `embeddings forbidden (403) model=${embeddingModel}`;
+	                logger.warn('[CHAT_WITH_FILES_COMPLETIONS] embeddings disabled, falling back to keyword retrieval', { reason: embeddingsDisabledReason });
+	                try { send('progress', { stage: 'rag.embed.disabled', reason: '403_forbidden' }); } catch { }
+	                embedding = [];
+	              } else {
+	                logHttpError(`embedding failed (hybrid) file=${f.originalname} chunk=${i}`, e);
+	                throw e;
+	              }
+	            }
+	          }
+	          docs.push({
+	            threadId,
+	            tenantId,
+	            userId,
+            filename: f.originalname,
+            fileHash,
+            chunkIndex: i,
+            text: chunkText,
+            tokens,
+            embedding
+          });
+        }
+        if (docs.length) {
+          try {
+            await RagChunk.insertMany(docs);
+          } catch (e) {
+            logger.error('[CHAT_WITH_FILES_COMPLETIONS] RagChunk insertMany failed', { file: f.originalname, chunks: docs.length, message: e?.message });
+            throw e;
+          }
+          send('progress', { stage: 'rag.ingested', file: f.originalname, chunks: docs.length });
+          logger.info('[CHAT_WITH_FILES_COMPLETIONS] ingested', { file: f.originalname, chunks: docs.length });
+        } else {
+          send('progress', { stage: 'rag.ingested', file: f.originalname, chunks: 0 });
+          logger.warn('[CHAT_WITH_FILES_COMPLETIONS] ingested empty', { file: f.originalname });
+        }
+      }
+    }
+
+	    // ---- 2) Retrieve relevant chunks ----
+	    send('progress', { stage: 'rag.search.start' });
+	    let qEmbedding = [];
+	    if (embeddingsEnabled) {
+	      try {
+	        qEmbedding = await createEmbeddingVector(openai, message, { embeddingModel });
+	      } catch (e) {
+	        if (isEmbeddingForbidden(e)) {
+	          embeddingsEnabled = false;
+	          embeddingsDisabledReason = `question embeddings forbidden (403) model=${embeddingModel}`;
+	          logger.warn('[CHAT_WITH_FILES_COMPLETIONS] embeddings disabled at question step, falling back to keyword retrieval', { reason: embeddingsDisabledReason });
+	          try { send('progress', { stage: 'rag.embed.disabled', reason: '403_forbidden' }); } catch { }
+	          qEmbedding = [];
+	        } else {
+	          logHttpError('question embedding failed', e);
+	          throw e;
+	        }
+	      }
+	    }
+
+    let candidates = [];
+    if (mode === 'sandbox') {
+      candidates = ephemeralChunks;
+    } else {
+      try {
+        candidates = await RagChunk.find({ threadId, tenantId })
+          .select('filename chunkIndex text tokens embedding')
+          .limit(4000)
+          .lean();
+      } catch (e) {
+        logger.error('[CHAT_WITH_FILES_COMPLETIONS] RagChunk find failed', { threadId, tenantId: String(tenantId), message: e?.message });
+        throw e;
+      }
+    }
+
+    const candidatesWithEmb = (candidates || []).filter(c => Array.isArray(c.embedding) && c.embedding.length);
+
+	    // Intent-aware retrieval: add a few sub-queries for broader questions (more like web UI).
+	    const intent = detectIntent(message);
+	    const lang = detectLanguage(message);
+	    const subQueries = (() => {
+	      if (intent === 'nb_audit') return [
+	        'compliance requirements and marking',
+	        'temperature / surface temperature / Ts / Tc evidence',
+        'tests, certificates, reports, IP/IK, safety measures',
+      ];
+      if (intent === 'comparison') return [
+        'differences between documents/versions/specifications',
+        'changed values, requirements, limits, markings',
+      ];
+      if (intent === 'what_changed') return [
+        'changes, revisions, updates, modified values',
+        'added/removed requirements or notes',
+      ];
+      if (intent === 'standards') return [
+        'standards mentioned, clauses, requirements',
+        'compliance checklist and obligations',
+      ];
+      if (intent === 'exec_summary') return [
+        'key findings, key risks, decision points',
+        'recommendations and next steps',
+      ];
+      if (intent === 'howto') return [
+        'procedure, steps, method described',
+        'inputs/outputs, responsibilities, workflow',
+      ];
+      return [];
+    })();
+
+	    let scoredAll = [];
+	    if (embeddingsEnabled && Array.isArray(qEmbedding) && qEmbedding.length && candidatesWithEmb.length) {
+	      const embeddings = [qEmbedding];
+	      for (const sq of subQueries.slice(0, 3)) {
+	        try {
+	          const e = await createEmbeddingVector(openai, `${message}\n\n${sq}`, { embeddingModel });
+	          if (Array.isArray(e) && e.length) embeddings.push(e);
+	        } catch {
+	          // non-fatal: keep base embedding
+	        }
+	      }
+	
+	      // Score by maximum similarity across embeddings (question + sub-queries)
+	      scoredAll = candidatesWithEmb
+	        .map(c => {
+	          let best = -Infinity;
+	          for (const e of embeddings) {
+	            const s = cosineSimilarity(e, c.embedding);
+	            if (s > best) best = s;
+	          }
+	          return { ...c, _score: best };
+	        })
+	        .sort((a, b) => b._score - a._score);
+	    } else {
+	      const queries = [message, ...subQueries].slice(0, 4);
+	      scoredAll = (candidates || [])
+	        .map(c => {
+	          let best = 0;
+	          for (const q of queries) {
+	            const s = keywordScore(q, c.text);
+	            if (s > best) best = s;
+	          }
+	          return { ...c, _score: best };
+	        })
+	        .sort((a, b) => b._score - a._score);
+	    }
+
+    // Retrieval strategy (more "ChatGPT UI-like" for broad prompts):
+    // - keep some per-file coverage (topKPerFile)
+    // - also keep a small global topK to catch the best hits
+    const topKPerFile = 3;
+    const globalTopK = 8;
+    const maxTotal = 18;
+
+    const perFile = new Map(); // filename -> entries[]
+    for (const s of scoredAll) {
+      const fn = String(s.filename || '');
+      if (!fn) continue;
+      const arr = perFile.get(fn) || [];
+      if (arr.length < topKPerFile) {
+        arr.push(s);
+        perFile.set(fn, arr);
+      }
+    }
+
+    const picked = [];
+    const seenKey = new Set();
+    const pushUnique = (s) => {
+      const key = `${s.filename}#${s.chunkIndex}`;
+      if (seenKey.has(key)) return;
+      seenKey.add(key);
+      picked.push(s);
+    };
+
+    // 1) global best hits
+    scoredAll.slice(0, globalTopK).forEach(pushUnique);
+    // 2) per-file top hits
+    for (const arr of perFile.values()) arr.forEach(pushUnique);
+
+    // 3) ensure first chunk per file is present (often contains title/scope)
+    const firstByFile = new Map();
+    for (const c of candidates || []) {
+      const fn = String(c.filename || '');
+      if (!fn) continue;
+      if (Number(c.chunkIndex) === 0 && !firstByFile.has(fn)) firstByFile.set(fn, c);
+    }
+    for (const [fn, c] of firstByFile.entries()) {
+      if (picked.length >= maxTotal) break;
+      pushUnique({ ...c, _score: 0 });
+    }
+
+    const scored = picked.slice(0, maxTotal);
+
+    const filesInScope = Array.from(new Set([
+      ...(mode === 'sandbox' ? nowFiles : []),
+      ...(mode === 'hybrid' ? (candidates || []).map(x => x.filename).filter(Boolean) : [])
+    ])).slice(0, 50);
+
+    const safeFilename = (filename) => String(filename || '').trim() || 'unknown';
+
+    const contextBlock = scored.length
+      ? scored.map(s => `SOURCE: ${safeFilename(s.filename)}\n${s.text}`).join('\n\n---\n\n')
+      : '';
+
+    // ---- 2b) Optional: include assistant vector-store as BACKGROUND KB (secondary, not "evidence") ----
+    // Goal:
+    // - Improve "web-like" accuracy/coverage via curated KB, while keeping uploaded files as the primary source.
+    // - Never claim KB facts come from uploaded files; keep it clearly separated.
+    const wantsBackgroundKb = String(process.env.FILE_CHAT_BACKGROUND_VS || '1') !== '0';
+    let backgroundKbBlock = '';
+    if (wantsBackgroundKb) {
+      try {
+        send('progress', { stage: 'kb.search.start' });
+        const tenantDoc = await Tenant.findById(tenantId).select('name').lean();
+        const tenantKey = String(tenantDoc?.name || '').toLowerCase();
+        const assistantId = assistants.byTenant?.[tenantKey] || assistants['default'];
+        const vectorStoreId = await getAssistantVectorStoreId(assistantId);
+        if (vectorStoreId) {
+          const envHits = Number(process.env.FILE_CHAT_BACKGROUND_VS_HITS || 0);
+          const envMax = Number(process.env.FILE_CHAT_BACKGROUND_VS_MAX || 0);
+          const envPerFile = Number(process.env.FILE_CHAT_BACKGROUND_VS_PER_FILE || 0);
+          const hitsPerQueryBase = (envHits > 0 ? envHits : 6);
+          const maxItemsBase = (envMax > 0 ? envMax : 14);
+          const perFileBase = (envPerFile > 0 ? envPerFile : 3);
+
+          const isKnowledgeHeavy = intent === 'standards' || intent === 'nb_audit';
+          const hitsPerQuery = isKnowledgeHeavy ? Math.max(hitsPerQueryBase, 10) : hitsPerQueryBase;
+          const maxItems = isKnowledgeHeavy ? Math.max(maxItemsBase, 24) : maxItemsBase;
+          const perFileLimit = isKnowledgeHeavy ? Math.max(perFileBase, 4) : perFileBase;
+
+          const kbQueries = [message, ...subQueries].slice(0, isKnowledgeHeavy ? 4 : 3);
+          const raw = [];
+          for (const q of kbQueries) {
+            const hits = await searchVectorStore(vectorStoreId, q, hitsPerQuery);
+            raw.push(...(hits || []));
+          }
+
+          // Normalize + rank.
+          const normalized = (raw || []).map(it => {
+            const fileId = it.file_id || it.fileId || it.file?.id || it?.file?.file_id || null;
+            const score = typeof it.score === 'number' ? it.score : (typeof it._score === 'number' ? it._score : null);
+            const text =
+              coerceSearchText(it.content) ||
+              coerceSearchText(it.text) ||
+              coerceSearchText(it?.chunk?.text) ||
+              '';
+            const clean = String(text || '').trim();
+            return { fileId, score: (typeof score === 'number' ? score : 0), text: clean };
+          }).filter(x => x.text);
+
+          normalized.sort((a, b) => b.score - a.score);
+
+          // Dedupe + cap per file for coverage.
+          const byKey = new Map();
+          const perFileCount = new Map();
+          for (const it of normalized) {
+            const fileId = it.fileId || null;
+            const clean = String(it.text || '').trim();
+            if (!clean) continue;
+            const already = perFileCount.get(fileId || 'kb') || 0;
+            if (already >= perFileLimit) continue;
+            const key = `${fileId || 'kb'}::${clean.slice(0, 240)}`;
+            if (byKey.has(key)) continue;
+            byKey.set(key, { fileId, score: it.score, text: clean.slice(0, 1800) });
+            perFileCount.set(fileId || 'kb', already + 1);
+            if (byKey.size >= maxItems) break;
+          }
+
+          const items = Array.from(byKey.values()).slice(0, maxItems);
+
+          // Best-effort filename enrichment (only for top few unique file IDs)
+          const fileIds = Array.from(new Set(items.map(x => x.fileId).filter(Boolean))).slice(0, 10);
+          const idToName = new Map();
+          for (const fid of fileIds) {
+            try {
+              const fr = await axios.get(`https://api.openai.com/v1/files/${fid}`, {
+                headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
+              });
+              idToName.set(fid, fr.data?.filename || fid);
+            } catch {
+              idToName.set(fid, fid);
+            }
+          }
+
+          if (items.length) {
+            backgroundKbBlock = items
+              .map(x => {
+                const name = x.fileId ? (idToName.get(x.fileId) || x.fileId) : 'KB';
+                return `KB_SOURCE: ${safeFilename(name)}\n${x.text}`;
+              })
+              .join('\n\n---\n\n');
+          }
+        }
+        send('progress', { stage: 'kb.search.done', hits: backgroundKbBlock ? backgroundKbBlock.split('\n\n---\n\n').length : 0 });
+      } catch (e) {
+        logger.warn('[CHAT_WITH_FILES_COMPLETIONS] background KB failed', e?.response?.data || e?.message);
+        try { send('progress', { stage: 'kb.search.done', hits: 0 }); } catch { }
+      }
+    }
+
+	    // Surface retrieval strategy to UI/logs (helps debugging when embeddings are forbidden)
+	    try {
+	      send('progress', {
+	        stage: 'rag.search.strategy',
+	        strategy: embeddingsEnabled ? 'embeddings' : 'keyword',
+	        reason: embeddingsDisabledReason || null
+	      });
+	    } catch { }
+
+	    send('progress', { stage: 'rag.search.done', hits: scored.length, files: filesInScope.length });
+	    logger.info('[CHAT_WITH_FILES_COMPLETIONS] retrieval', {
+	      mode,
+	      candidates: (candidates || []).length,
+	      hits: scored.length,
+	      embeddingsEnabled,
+	      embeddingsDisabledReason,
+	      top: scored.slice(0, 5).map(s => ({
+	        file: s.filename,
+	        chunk: s.chunkIndex,
+	        score: Number.isFinite(s?._score) ? Number(s._score.toFixed(4)) : null
+	      }))
+	    });
+
+    // ---- 3) Optional evidence-summaries (per file) to make broad requests more "web UI-like" ----
+    const wantsEvidencePass = String(process.env.FILE_CHAT_EVIDENCE_PASS || '1') !== '0';
+    const evidenceSummaries = [];
+
+    const retryable = (status) => status === 429 || (status >= 500 && status < 600);
+    async function chatOnceWithRetry(modelName, messages, label) {
+      let attempt = 0;
+      let delayMs = 800;
+      while (attempt < 5) {
+        attempt++;
+        try {
+          const r = await openai.chat.completions.create({ model: modelName, messages });
+          return String(r?.choices?.[0]?.message?.content || '');
+        } catch (e) {
+          const status = e?.response?.status || 0;
+          if (!retryable(status) || attempt >= 5) throw e;
+          try { send('progress', { stage: 'assistant.retry', label, attempt, status, waitMs: delayMs }); } catch { }
+          await delay(delayMs);
+          delayMs = Math.min(delayMs * 2, 8000);
+        }
+      }
+      return '';
+    }
+
+    if (wantsEvidencePass && scored.length) {
+      send('progress', { stage: 'evidence.start', files: filesInScope.length });
+      const byFile = new Map();
+      for (const s of scored) {
+        const fn = String(s.filename || '');
+        if (!fn) continue;
+        const arr = byFile.get(fn) || [];
+        arr.push(s);
+        byFile.set(fn, arr);
+      }
+      for (const [fn, arr] of byFile.entries()) {
+        send('progress', { stage: 'evidence.file', file: fn });
+        const snippets = arr.slice(0, 6).map(s => `SOURCE: ${safeFilename(fn)}\n${s.text}`).join('\n\n---\n\n');
+        const sys = [
+          'You are extracting evidence from a single document snippet.',
+          'Return 5–10 bullet points of concrete, verifiable claims/facts found in the snippet.',
+          'If the snippet contains measurements, limits, labels/markings, materials, IP/IK ratings, temperatures, or test outcomes, include the numeric values verbatim.',
+          'Do not invent clauses or requirements. Do not ask clarifying questions.',
+          'Keep it short and factual.'
+        ].join(' ');
+        const msgs = [
+          { role: 'system', content: sys },
+          { role: 'user', content: `FILENAME: ${safeFilename(fn)}\n\nSNIPPETS:\n${snippets}` }
+        ];
+        let summaryText = '';
+        try {
+          summaryText = await chatOnceWithRetry(completionsPrimary, msgs, 'evidence.primary');
+        } catch (e) {
+          summaryText = await chatOnceWithRetry(completionsFallback, msgs, 'evidence.fallback');
+        }
+        if (summaryText && summaryText.trim()) {
+          evidenceSummaries.push(`FILE: ${safeFilename(fn)}\n${summaryText.trim()}`);
+        }
+      }
+      send('progress', { stage: 'evidence.done', files: evidenceSummaries.length });
+    }
+
+    // ---- 4) Build prompt (closest to OpenAI UI: strong grounding + best-effort) ----
+    const history = (Array.isArray(conversation.messages) ? conversation.messages : [])
+      .slice(-10)
+      .map(m => `${String(m.role || '').toUpperCase()}: ${stripHtml(m.content || '')}`)
+      .join('\n');
+
+    const wantsCompliance =
+      /megfelel|megfelelős|kockázat|risk|compliance|audit|atex|iecex|60079/i.test(String(message || ''));
+
+	    // Web-style always: concise, dynamic structure, like ChatGPT UI.
+	    // Optional: small format planner to keep answers web-like but question-dependent.
+	    const wantsFormatPlanner = String(process.env.FILE_CHAT_FORMAT_PLANNER || '1') !== '0';
+	    const plannerModel = process.env.FILE_CHAT_FORMAT_PLANNER_MODEL || completionsPrimary;
+	    let plan = null;
+	    if (wantsFormatPlanner) {
+	      try {
+	        send('progress', { stage: 'planner.start', model: plannerModel });
+	        const plannerSys = [
+	          'You are a response-format planner for an AI assistant.',
+	          'Given a user question and file list, choose the best web-chat style structure.',
+	          'Return ONLY valid JSON.',
+	          'Do not include markdown or prose.',
+	          'Keys:',
+	          '- language: "hu" | "en"',
+	          '- intent: "nb_audit" | "comparison" | "what_changed" | "standards" | "exec_summary" | "howto" | "general"',
+	          '- executive: boolean (true = leadership/consultant tone if appropriate)',
+	          '- structure: short string describing section titles (in the target language)',
+	          '- length: "short" | "medium" | "long"',
+	          '- ask_clarifying: boolean (only if strictly required)',
+	          '- clarifying_question: string (empty if not needed)'
+	        ].join(' ');
+	        const plannerUser = [
+	          `language_hint=${lang}`,
+	          `intent_hint=${intent}`,
+	          `files=${(filesInScope || []).slice(0, 30).join(' | ')}`,
+	          `question=${String(message || '').slice(0, 3000)}`
+	        ].join('\n');
+	        const pr = await openai.chat.completions.create({
+	          model: plannerModel,
+	          messages: [
+	            { role: 'system', content: plannerSys },
+	            { role: 'user', content: plannerUser }
+	          ]
+	        });
+	        const content = String(pr?.choices?.[0]?.message?.content || '').trim();
+	        const parsed = safeJsonParse(content);
+	        if (parsed && typeof parsed === 'object') plan = parsed;
+	        send('progress', { stage: 'planner.done', ok: !!plan });
+	      } catch (e) {
+	        logger.warn('[CHAT_WITH_FILES_COMPLETIONS] planner failed', e?.response?.data || e?.message);
+	        try { send('progress', { stage: 'planner.done', ok: false }); } catch { }
+	        plan = null;
+	      }
+	    }
+
+	    const systemBase = [
+	      'You are a helpful, precise assistant in the style of ChatGPT.',
+	      'Use the provided FILE CONTEXT and EVIDENCE SUMMARIES as the primary source of truth.',
+	      'If BACKGROUND KB is present, use it as secondary background knowledge to improve accuracy and fill gaps, but keep the uploaded files as the primary focus.',
+	      'Never claim BACKGROUND KB facts come from the uploaded files.',
+	      'Do NOT output a separate "Háttértudás" section; use background knowledge silently. If you must qualify a statement, do it inline with a short prefix like: "Általános szabványismeret alapján:" or "Általános háttértudás alapján:".',
+	      'Do NOT invent certificate numbers, test reports, or test outcomes for the specific product/documents.',
+	      'Clause numbers: only mention a clause number if it appears in the provided excerpts; otherwise do not cite clause numbers.',
+	      'Numeric limits/definitions: if not present in the provided excerpts, you may still state widely-known standard knowledge ONLY when you clearly label it as general knowledge (not file evidence) and you are confident; if uncertain, say it is not verified here.',
+	      'Do not start the answer with "Rövid válasz" or "Short conclusion". Start directly with the analysis.',
+	      'You MAY reference filenames when it helps attribution, but do NOT mention chunk numbers or any internal identifiers.',
+	      'Structure the answer like the ChatGPT web UI: start with 1–2 direct sentences (no label like "Rövid összefoglaló"), then concise headings and short lists/tables as needed (no boilerplate).',
+	      'Respond in the same language as the user message, including section titles; do not mix languages in a single response.'
+	    ];
+	
+	    const systemAuditWebFor = (l) => (l === 'hu')
+	      ? [
+	        'Ha a user megfelelőség/kockázat/audit jellegű elemzést kér:',
+	        '- Használd (ha releváns) az alábbi fő részeket, röviden, webes ChatGPT stílusban:',
+	        '  1) Megfelelőségi elemzés',
+	        '  2) Hőmérséklet és határértékek',
+	        '  3) Kockázatok (rövid táblázat + 3–6 bullet)',
+	        '  4) Következtetés',
+	        '  5) Következő lépések',
+	        '- A fenti 5 pont legyen a fő szerkezet: ne adj külön top-level szekciókat mint "Alkalmazott dokumentumok", "Melléklet", "Prioritások/ütemterv", "Clause-by-clause".',
+	        '- Ne írj felelős/határidő bontást, timeline-t vagy mellékleteket, csak ha a user kéri.',
+	        '- A leírás legyen döntés‑kész, kerülje a hosszú szabványelméletet.',
+	        '- Ha van EXCEL_STATS, használd a max/min értékeket; ha a limit nem szerepel az anyagban, akkor csak háttértudásként (inline jelöléssel) említsd, vagy jelezd, hogy nincs itt igazolva.'
+	      ]
+	      : [
+	        'If the user asks for compliance/risk/audit:',
+	        '- Use these main sections (if relevant), concise and web-ChatGPT-like:',
+	        '  1) Compliance',
+	        '  2) Temperature & Limits',
+	        '  3) Risks (short table + 3–6 bullets)',
+	        '  4) Conclusion',
+	        '  5) Next Steps',
+	        '- Keep these 5 as the main structure: do not add separate top-level sections like "Evidence inventory", "Appendix", "Timeline", or "Clause-by-clause".',
+	        '- Do not assign owners/deadlines unless the user asks.',
+	        '- Prefer decision-ready statements over long standards theory.',
+	        '- If spreadsheets contain EXCEL_STATS blocks, use maxima/minima; if a limit is not in the excerpts, only mention it as general knowledge (inline label) or state it is not verified here.'
+	      ];
+
+    const systemComparison = [
+      'If the user asks for comparison or what changed:',
+      '- Identify the compared items (documents/versions) from filenames and content.',
+      '- Produce a compact comparison table: Item/Aspect, Doc A, Doc B, Difference, Impact/Notes.',
+      '- If you cannot uniquely identify A vs B, ask ONE clarifying question at the top, then proceed with best-effort grouping.'
+    ];
+
+	    const systemStandardsFor = (l) => (l === 'hu')
+	      ? [
+	        'Ha a user szabványokat/követelményeket kér:',
+	        '- Sorold fel a fájlokban ténylegesen megjelenő szabványokat.',
+	        '- Adj rövid checklistet, milyen bizonyíték kell a megfeleléshez.',
+	        '- Klauzulaszámot ne találj ki; ha nincs a kivonatban, ne említsd.'
+	      ]
+	      : [
+	        'If the user asks about standards/requirements:',
+	        '- List the standards explicitly mentioned in the provided excerpts.',
+	        '- Provide a short checklist of what evidence is needed to demonstrate compliance.',
+	        '- Do not invent clause numbers; if not in excerpts, do not cite.'
+	      ];
+
+	    const systemExec = [
+	      'If the user asks for an executive summary:',
+	      '- Start with 5 bullet key points.',
+	      '- Then a short risk/decision section (3 bullets).',
+	      '- Then "Next steps" (5 bullets).',
+	      '- Keep it to ~1 page.'
+	    ];
+
+	    const systemExecutiveConsultantFor = (l) => (l === 'hu')
+	      ? [
+	        'Ha a kérdés döntés-előkészítő jellegű vagy a user vezetői tanácsadó szintet vár:',
+	        '- Fogalmazz vezetői/konzultáns hangon: döntési opciók, trade-offok, kockázatok, költség/idő/erőforrás hatás, ajánlott irány.',
+	        '- Ne írj hosszú módszertani fejtegetést; legyél rövid és akcióorientált.',
+	        '- Ha kritikus hiányzó információ van, tegyél fel legfeljebb 1 tisztázó kérdést, majd adj best-effort javaslatot feltételezésekkel.'
+	      ]
+	      : [
+	        'If the question is decision-prep or the user expects executive-consultant level:',
+	        '- Use an executive/consultant tone: options, trade-offs, risks, cost/time/resource impact, recommended path.',
+	        '- Avoid long methodology; be concise and action-oriented.',
+	        '- If a critical input is missing, ask at most 1 clarifying question, then still provide a best-effort recommendation with assumptions.'
+	      ];
+
+    const systemHowto = [
+      'If the user asks "how" / process:',
+      '- Provide a step-by-step description based on the documents.',
+      '- If a step is not evidenced, say it is not in the provided excerpts.'
+    ];
+
+	    const plannedIntent = (plan?.intent && typeof plan.intent === 'string') ? String(plan.intent) : intent;
+	    const plannedLang = lang;
+	    const plannedExec = !!plan?.executive;
+
+	    const systemExtras = [];
+	    if (plannedIntent === 'nb_audit' || wantsCompliance) systemExtras.push(...systemAuditWebFor(plannedLang));
+	    if (plannedIntent === 'comparison' || plannedIntent === 'what_changed') systemExtras.push(...systemComparison);
+	    if (plannedIntent === 'standards') systemExtras.push(...systemStandardsFor(plannedLang));
+	    if (plannedIntent === 'exec_summary') systemExtras.push(...systemExec);
+	    if (plannedIntent === 'howto') systemExtras.push(...systemHowto);
+	    if (plannedExec) systemExtras.push(...systemExecutiveConsultantFor(plannedLang));
+
+	    const system = [...systemBase, ...systemExtras].join(' ');
+
+	    const outputLengthHint = (plannedIntent === 'exec_summary')
+	      ? (plannedLang === 'hu' ? 'Tartsd ~1 oldal alatt.' : 'Keep it to ~1 page.')
+	      : (plannedIntent === 'comparison' || plannedIntent === 'what_changed')
+	        ? 'Keep it to a table + short notes.'
+	        : (plannedIntent === 'standards')
+	          ? 'Keep it to a standards list + checklist + short notes.'
+	          : (plannedIntent === 'nb_audit' || wantsCompliance)
+	            ? 'Keep it concise and decision-ready (roughly 1–2 pages). Prefer tables + bullets over long prose.'
+	            : 'Keep the answer concise; avoid long generic explanations.';
+
+    const userParts = [];
+    if (filesInScope.length) {
+      userParts.push('Files in scope:\n' + filesInScope.map(n => `- ${safeFilename(n)}`).join('\n'));
+    }
+    if (evidenceSummaries.length) {
+      userParts.push(`EVIDENCE SUMMARIES (auto-extracted per file; may be incomplete):\n\n${evidenceSummaries.join('\n\n')}`);
+    }
+	    if (contextBlock) {
+	      userParts.push(`FILE CONTEXT (top matches):\n\n${contextBlock}`);
+	    } else {
+	      userParts.push('FILE CONTEXT: (no relevant chunks found)');
+	    }
+	    if (history) {
+	      userParts.push(`Conversation (for continuity; not evidence):\n${history}`);
+	    }
+	    userParts.push(`USER QUESTION:\n${message}`);
+	    userParts.push(outputLengthHint);
+
+	    const messages = [{ role: 'system', content: system }];
+	    if (plan && (plan?.structure || plan?.ask_clarifying)) {
+	      const planLines = [];
+	      if (plan?.structure) planLines.push(`structure=${String(plan.structure).slice(0, 400)}`);
+	      if (plan?.length) planLines.push(`length=${String(plan.length).slice(0, 40)}`);
+	      if (plan?.executive) planLines.push('executive=true');
+	      if (plan?.ask_clarifying && plan?.clarifying_question) {
+	        planLines.push(`clarifying_question=${String(plan.clarifying_question).slice(0, 400)}`);
+	      }
+	      messages.push({
+	        role: 'system',
+	        content: `INTERNAL FORMAT PLAN (do not mention this plan in the answer):\n${planLines.join('\n')}`
+	      });
+	    }
+	    if (backgroundKbBlock) {
+	      messages.push({
+	        role: 'system',
+	        content:
+	          'INTERNAL BACKGROUND KB SNIPPETS (assistant vector store; use silently; do not add a separate section; do not claim these come from uploads):\n\n' +
+	          backgroundKbBlock
+	      });
+	    }
+	    messages.push({ role: 'user', content: userParts.join('\n\n') });
+
+    // ---- 5) Stream chat completions ----
+    let accText = '';
+    let usedModel = completionsPrimary;
+
+    async function runStream(modelName) {
+      const streamT0 = Date.now();
+      try {
+        const stream = await openai.chat.completions.create({
+          model: modelName,
+          messages,
+          stream: true
+        });
+        for await (const part of stream) {
+          const delta = part?.choices?.[0]?.delta?.content || '';
+          if (delta) {
+            accText += delta;
+            send('token', { delta });
+          }
+        }
+      } catch (e) {
+        logHttpError(`chat stream failed model=${modelName}`, e);
+        throw e;
+      } finally {
+        logger.info('[CHAT_WITH_FILES_COMPLETIONS] stream finished', { model: modelName, ms: Date.now() - streamT0, outChars: accText.length });
+      }
+    }
+
+    try {
+      send('assistant.status', { stage: 'assistant.start', model: completionsPrimary });
+      await runStream(completionsPrimary);
+      send('assistant.status', { stage: 'assistant.done', model: completionsPrimary });
+    } catch (e) {
+      usedModel = completionsFallback;
+      send('assistant.status', { stage: 'assistant.fallback', model: completionsFallback, error: e?.message || 'primary failed' });
+      await runStream(completionsFallback);
+      send('assistant.status', { stage: 'assistant.done', model: completionsFallback });
+	    }
+	
+	    // ---- 5) Persist to Conversation + respond ----
+	    let cleaned = (accText || '').replace(/【.*?】/g, '');
+	    // Some model outputs start with an explicit short conclusion/header - strip it to match desired web-style.
+	    cleaned = cleaned.replace(/^\s*Rövid\s+válasz\s*[:\-–—]\s*/i, '');
+	    cleaned = cleaned.replace(/^\s*Rövid\s+válasz\s*\n+/i, '');
+	    cleaned = cleaned.replace(/^\s*Rövid\s+összefoglaló\s*[:\-–—]?\s*/i, '');
+	    cleaned = cleaned.replace(/^\s*Rövid\s+összefoglaló\s*\n+/i, '');
+	    cleaned = cleaned.replace(/^\s*Rövid\s+összegzés\s*[:\-–—]?\s*/i, '');
+	    cleaned = cleaned.replace(/^\s*Rövid\s+összegzés\s*\n+/i, '');
+	    cleaned = cleaned.replace(/^\s*Short\s+conclusion\s*[:\-–—]?\s*/i, '');
+	    cleaned = cleaned.replace(/^\s*Short\s+conclusion\s*\n+/i, '');
+	    const sanitized = sanitizeHtml(cleaned, {
+	      allowedTags: ['a', 'b', 'i', 'strong', 'em', 'u', 's', 'br', 'p', 'ul', 'ol', 'li', 'blockquote', 'code', 'pre', 'span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table', 'thead', 'tbody', 'tr', 'th', 'td'],
+	      allowedAttributes: { 'span': ['class'], 'a': ['href', 'title', 'target', 'rel'] },
+      transformTags: {
+        'a': sanitizeHtml.simpleTransform('a', { target: '_blank', rel: 'noopener noreferrer' }, true)
+      },
+      disallowedTagsMode: 'discard'
+    });
+	    const finalHtml = marked(sanitized);
+	
+	    conversation.messages.push({
+	      role: 'user',
+	      content: message,
+	      meta: {
+	        kind: 'chat-with-files-completions',
+	        mode,
+	        model: usedModel,
+	        uploads: nowFiles,
+	        retrieval: {
+	          strategy: embeddingsEnabled ? 'embeddings' : 'keyword',
+	          reason: embeddingsDisabledReason || null
+	        }
+	      }
+	    });
+    conversation.messages.push({ role: 'assistant', content: finalHtml, images: [] });
+    await conversation.save();
+    const savedAssistant = conversation.messages.slice().reverse().find(m => m.role === 'assistant');
+
+    send('final', { html: finalHtml, messageId: savedAssistant?._id || null });
+    send('done', { ok: true });
+    logger.info('[CHAT_WITH_FILES_COMPLETIONS] done', {
+      threadId,
+      mode,
+      model: usedModel,
+      uploads: uploads.length,
+      outChars: accText.length,
+      msTotal: Date.now() - t0
+    });
+    return res.end();
+
+  } catch (e) {
+    try {
+      logger.error('[CHAT_WITH_FILES_COMPLETIONS] hiba', {
+        message: e?.message,
+        stack: e?.stack,
+        name: e?.name,
+        type: typeof e,
+        keys: e && typeof e === 'object' ? Object.keys(e) : null
+      });
+    } catch {
+      logger.error('[CHAT_WITH_FILES_COMPLETIONS] hiba:', e?.message);
+    }
+    send('error', { message: e?.message || 'Váratlan hiba történt.' });
+    send('done', { ok: false });
+    return res.end();
+  }
+};
+
 // Új beszélgetés indítása
 exports.startNewConversation = async (req, res) => {
   try {
@@ -2712,6 +4118,12 @@ exports.deleteConversation = async (req, res) => {
     await safeDelete(() =>
       axios.delete(`https://api.openai.com/v1/threads/${threadId}`, { headers: headers() })
     );
+
+    // Local RAG cleanup (best-effort): remove stored chunks for this thread
+    await (async () => {
+      try { await RagChunk.deleteMany({ threadId, tenantId }); }
+      catch (e) { logger.warn('[DELETE][CLEANUP] RagChunk deleteMany failed:', e?.message); }
+    })();
 
     // Finally, remove conversation from DB
     await Conversation.deleteOne({ threadId, userId, tenantId });

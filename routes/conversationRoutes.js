@@ -12,7 +12,8 @@ const {
   uploadAndSummarizeStream,
   uploadAndAskStream,
   sendMessageStream,
-  chatWithFilesStream
+  chatWithFilesStream,
+  chatWithFilesCompletionsStream
 } = require('../controllers/conversationController');
 const authMiddleware = require('../middlewares/authMiddleware');
 const multer = require('multer');
@@ -77,6 +78,14 @@ router.post(
   authMiddleware(),
   safeUploadArray('files', 10), // ugyanaz a Busboy/Multer safe wrapper mint máshol
   chatWithFilesStream
+);
+
+// Chat-with-files via Chat Completions (gpt-5 capable), without Assistants vector stores
+router.post(
+  '/chat/with-files-completions/stream',
+  authMiddleware(),
+  safeUploadArray('files', 10),
+  chatWithFilesCompletionsStream
 );
 
 module.exports = router;

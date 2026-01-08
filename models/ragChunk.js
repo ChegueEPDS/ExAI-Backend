@@ -7,6 +7,7 @@ const RagChunkSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
 
   filename: { type: String, default: '' },
+  fileHash: { type: String, default: '' }, // sha256(file buffer + name); helps dedupe/replace
   chunkIndex: { type: Number, default: 0 },
   text: { type: String, default: '' },
   tokens: { type: Number, default: 0 },
@@ -18,5 +19,6 @@ const RagChunkSchema = new mongoose.Schema({
 });
 
 RagChunkSchema.index({ threadId: 1, chunkIndex: 1 }, { unique: false });
+RagChunkSchema.index({ threadId: 1, tenantId: 1, filename: 1, fileHash: 1 }, { unique: false });
 
 module.exports = mongoose.model('RagChunk', RagChunkSchema);

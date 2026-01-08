@@ -9,6 +9,11 @@ const IGNORED_TOP_LEVEL_KEYS = new Set([
   'ModifiedBy',
   'createdAt',
   'updatedAt',
+  // Mobile sync / async processing internal flags (should not produce user-visible versions)
+  'isProcessed',
+  'mobileSync',
+  'pendingReview',
+  'pendingInspectionId',
   'Pictures',
   'documents',
   'lastInspectionDate',

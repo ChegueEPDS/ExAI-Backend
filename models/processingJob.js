@@ -21,6 +21,9 @@ const ProcessingJobSchema = new mongoose.Schema(
     startedAt: { type: Date, default: null },
     finishedAt: { type: Date, default: null },
     equipmentIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Equipment', default: [] }],
+    // Optional per-equipment metadata for async processing (e.g. mobile failure note).
+    // Keys are equipmentId strings.
+    metaByEquipmentId: { type: mongoose.Schema.Types.Mixed, default: {} },
     errorItems: [
       {
         equipmentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Equipment', required: false },

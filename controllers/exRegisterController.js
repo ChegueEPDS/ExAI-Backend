@@ -23,6 +23,7 @@ const { v4: uuidv4 } = require('uuid');
 const cleanupService = require('../services/cleanupService');
 const EquipmentDataVersion = require('../models/equipmentDataVersion');
 const { createEquipmentDataVersion } = require('../services/equipmentVersioningService');
+const { recordTombstone } = require('../services/syncTombstoneService');
 
 const { BlobServiceClient } = require('@azure/storage-blob');
 const path = require('path');
@@ -425,10 +426,22 @@ function extractProtectionTypesFromEquipment(equipmentDoc) {
   const protection = equipmentDoc?.['Ex Marking']?.[0]?.['Type of Protection'] || '';
   if (!protection) return [];
 
-  return String(protection)
-    .split(/[;,|/ ]+/)
-    .map(token => token.trim().toLowerCase())
-    .filter(Boolean);
+  try {
+    // Use the same canonicalization set as Questions.protectionTypes (handles multi-word values like "op is").
+    // eslint-disable-next-line global-require
+    const { KNOWN_SET_LOWER, normalizeProtectionTypes } = require('../helpers/protectionTypes');
+    const tokens = normalizeProtectionTypes(protection).map(v => String(v).trim().toLowerCase());
+    const hasKnown = tokens.some(t => KNOWN_SET_LOWER.has(t));
+    if (!hasKnown && tokens.length) {
+      return Array.from(new Set(['d', 'e', ...tokens]));
+    }
+    return tokens;
+  } catch {
+    return String(protection)
+      .split(/[;,|/ ]+/)
+      .map(token => token.trim().toLowerCase())
+      .filter(Boolean);
+  }
 }
 
 async function loadAutoInspectionQuestions(equipmentDoc, tenantId, inspectionType = 'Detailed') {
@@ -515,45 +528,12 @@ async function getRelevantEquipmentTypesForDevice(equipmentDoc, tenantId) {
 }
 
 async function findCertificateByCertNoForTenant(certNoRaw, tenantId) {
-  if (!certNoRaw || !certNoRaw.trim()) return null;
-
-  const parts = certNoRaw
-    .split(/[/,]/)
-    .map(part => part.trim())
-    .filter(Boolean);
-
-  if (!parts.length) return null;
-
-  const regexConditions = parts.map(part => {
-    const normalized = part.replace(/\s+/g, '').toLowerCase();
-    const pattern = normalized
-      .split('')
-      .map(ch => escapeRegex(ch))
-      .join('.*');
-    return {
-      certNo: {
-        $regex: new RegExp(pattern, 'i')
-      }
-    };
-  });
-
-  const tenantObjectId = toObjectId(tenantId);
-  const visibilityFilter = tenantObjectId
-    ? {
-        $or: [
-          { visibility: 'public' },
-          { tenantId: tenantObjectId }
-        ]
-      }
-    : { visibility: 'public' };
-
+  if (!certNoRaw || !String(certNoRaw).trim()) return null;
   try {
-    return await Certificate.findOne({
-      ...visibilityFilter,
-      $or: regexConditions
-    })
-      .select('specCondition certNo')
-      .lean();
+    const certMap = await buildCertificateCacheForTenant(tenantId);
+    const hit = resolveCertificateFromCache(certMap, certNoRaw);
+    if (!hit) return null;
+    return { specCondition: hit.specCondition, certNo: hit.certNo };
   } catch (err) {
     console.error('⚠️ Failed to resolve certificate for auto inspection:', err);
     return null;
@@ -3801,6 +3781,14 @@ exports.listEquipment = async (req, res) => {
       filter.$and = andConditions;
     }
 
+    // Hide mobile-created equipment until async processing is finished.
+    // Can be overridden with ?includeUnprocessed=true
+    const includeUnprocessed = String(req.query.includeUnprocessed || 'false').toLowerCase() === 'true';
+    if (!includeUnprocessed) {
+      // Include legacy docs where the field doesn't exist yet (MongoDB doesn't match missing fields on {isProcessed: true}).
+      filter.isProcessed = { $ne: false };
+    }
+
     const sortField = typeof req.query.sortBy === 'string' && req.query.sortBy.trim()
       ? req.query.sortBy
       : 'orderIndex';
@@ -4194,6 +4182,18 @@ exports.deleteEquipment = async (req, res) => {
       return res.status(404).json({ error: 'Az eszköz nem található vagy nem tartozik a vállalatához.' });
     }
 
+    try {
+      await recordTombstone({
+        tenantId,
+        entityType: 'equipment',
+        entityId: equipment._id,
+        deletedBy: req.userId || null,
+        meta: { siteId: equipment.Site || null, zoneId: equipment.Zone || null, EqID: equipment.EqID || '' }
+      });
+    } catch (e) {
+      console.warn('⚠️ Failed to write equipment tombstone:', e?.message || e);
+    }
+
     await deleteEquipmentInternal(equipment, tenantId, tenantName);
 
     return res.json({ message: 'Az eszköz és a hozzá tartozó inspectionök sikeresen törölve.' });
@@ -4234,6 +4234,20 @@ exports.bulkDeleteEquipment = async (req, res) => {
     if (!equipments.length) {
       return res.status(404).json({ error: 'Egyik megadott eszköz sem található vagy nem tartozik a vállalatához.' });
     }
+
+    try {
+      await Promise.all(
+        equipments.map((equipment) =>
+          recordTombstone({
+            tenantId,
+            entityType: 'equipment',
+            entityId: equipment._id,
+            deletedBy: req.userId || null,
+            meta: { siteId: equipment.Site || null, zoneId: equipment.Zone || null, EqID: equipment.EqID || '' }
+          }).catch(() => {})
+        )
+      );
+    } catch {}
 
     const results = [];
     // Limitált párhuzamosság: egyszerre max 5 törlés fusson

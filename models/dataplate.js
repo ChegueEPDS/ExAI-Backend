@@ -29,6 +29,16 @@ const EquipmentSchema = new mongoose.Schema({
     "Specific": String 
   },
   "Other Info": { type: String },
+  // Mobile sync: hide newly created equipment until async processing finishes.
+  isProcessed: { type: Boolean, default: true, index: true },
+  mobileSync: {
+    jobId: { type: String, default: null, index: true },
+    status: { type: String, enum: ['queued', 'processing', 'done', 'error', null], default: null },
+    finishedAt: { type: Date, default: null }
+  },
+  // Mobile sync review workflow: the auto-generated inspection is pending until reviewed in web.
+  pendingReview: { type: Boolean, default: false, index: true },
+  pendingInspectionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Inspection', default: null },
   "Compliance": { 
     type: String, 
     enum: ["NA", "Passed", "Failed"], 

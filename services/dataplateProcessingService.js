@@ -2,6 +2,7 @@ const azureBlob = require('./azureBlobService');
 const { ocrImageBufferToDataplatePrompt } = require('../helpers/azureVisionOcr');
 const { runDataplateAssistant } = require('./assistantRunner');
 const { buildEquipmentFromDataplateTable } = require('../helpers/htmlTableParser');
+const { normalizeProtectionTypes } = require('../helpers/protectionTypes');
 
 function pickFirstDataplateImage(equipmentDoc) {
   const docs = Array.isArray(equipmentDoc?.documents) ? equipmentDoc.documents : [];
@@ -69,6 +70,21 @@ async function processDataplateForEquipment({ equipmentDoc, tenantKey, userId })
     return { processed: false, reason: 'assistant_table_parse_failed' };
   }
 
+  // Normalize "Type of Protection" to the supported set used by questions/inspections.
+  if (Array.isArray(parsed['Ex Marking'])) {
+    parsed['Ex Marking'] = parsed['Ex Marking'].map((m) => {
+      const normalized = normalizeProtectionTypes(m?.['Type of Protection']);
+      const next = { ...(m || {}) };
+      if (normalized.length) {
+        next['Type of Protection'] = normalized.join('; ');
+      } else if (typeof next['Type of Protection'] === 'string') {
+        // don't keep un-parseable free text
+        next['Type of Protection'] = '';
+      }
+      return next;
+    });
+  }
+
   let changed = false;
   changed = setNestedIfEmpty(equipmentDoc, 'Manufacturer', parsed.Manufacturer) || changed;
   changed = setNestedIfEmpty(equipmentDoc, 'Model/Type', parsed['Model/Type']) || changed;
@@ -84,10 +100,30 @@ async function processDataplateForEquipment({ equipmentDoc, tenantKey, userId })
   // Ex Marking: only set if currently empty
   const currentMarks = equipmentDoc.get ? equipmentDoc.get('Ex Marking') : equipmentDoc['Ex Marking'];
   const hasMarks = Array.isArray(currentMarks) && currentMarks.length > 0;
-  if (!hasMarks && Array.isArray(parsed['Ex Marking']) && parsed['Ex Marking'].length) {
-    if (equipmentDoc.set) equipmentDoc.set('Ex Marking', parsed['Ex Marking']);
-    else equipmentDoc['Ex Marking'] = parsed['Ex Marking'];
-    changed = true;
+  const parsedMarks = Array.isArray(parsed['Ex Marking']) ? parsed['Ex Marking'] : [];
+  if (parsedMarks.length) {
+    if (!hasMarks) {
+      if (equipmentDoc.set) equipmentDoc.set('Ex Marking', parsedMarks);
+      else equipmentDoc['Ex Marking'] = parsedMarks;
+      changed = true;
+    } else {
+      const existingMarks = Array.isArray(currentMarks) ? currentMarks : [];
+      const existingFirst = existingMarks[0] && typeof existingMarks[0] === 'object' ? existingMarks[0] : {};
+      const parsedFirst = parsedMarks[0] && typeof parsedMarks[0] === 'object' ? parsedMarks[0] : {};
+      const nextFirst = { ...existingFirst };
+
+      Object.keys(parsedFirst).forEach((k) => {
+        const cur = String(nextFirst[k] || '').trim();
+        const nxt = String(parsedFirst[k] || '').trim();
+        if (!cur && nxt) nextFirst[k] = parsedFirst[k];
+      });
+
+      existingMarks[0] = nextFirst;
+      if (equipmentDoc.set) equipmentDoc.set('Ex Marking', existingMarks);
+      else equipmentDoc['Ex Marking'] = existingMarks;
+      if (equipmentDoc.markModified) equipmentDoc.markModified('Ex Marking');
+      changed = true;
+    }
   }
 
   // Compliance from assistant only if current is NA

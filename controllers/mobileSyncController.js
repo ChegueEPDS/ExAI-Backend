@@ -9,6 +9,9 @@ const Zone = require('../models/zone');
 const ProcessingJob = require('../models/processingJob');
 const azureBlob = require('../services/azureBlobService');
 const { createEquipmentDataVersion } = require('../services/equipmentVersioningService');
+const { normalizeProtectionTypes } = require('../helpers/protectionTypes');
+const SyncTombstone = require('../models/syncTombstone');
+const { parseSinceDate } = require('../services/syncTombstoneService');
 
 const toObjectId = (value) => {
   if (!value) return null;
@@ -173,6 +176,7 @@ exports.mobileSync = async (req, res) => {
   const tempIdToEquipmentId = {};
   // Only newly created equipment should be post-processed (OCR + auto inspection).
   const newlyCreatedEquipmentIds = [];
+  const metaByEquipmentId = {};
 
   for (const item of items) {
     const tempId = String(item?.tempId || '').trim();
@@ -191,6 +195,22 @@ exports.mobileSync = async (req, res) => {
     const EqID = eqIdRaw || `MOB_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const compliance = normalizeCompliance(item?.Compliance ?? item?.compliance, 'NA');
     const otherInfo = item?.['Other Info'] ?? item?.otherInfo ?? '';
+    const equipmentTypeRaw =
+      typeof item?.equipmentType === 'string'
+        ? item.equipmentType.trim()
+        : typeof item?.['Equipment Type'] === 'string'
+          ? item['Equipment Type'].trim()
+          : typeof item?.EquipmentType === 'string'
+            ? item.EquipmentType.trim()
+            : '';
+    const failureNote =
+      typeof item?.failureNote === 'string'
+        ? item.failureNote
+        : typeof item?.['Failure Note'] === 'string'
+          ? item['Failure Note']
+          : '';
+    const protectionTypesRaw = Array.isArray(item?.protectionTypes) ? item.protectionTypes : null;
+    const normalizedProtectionTypes = protectionTypesRaw ? normalizeProtectionTypes(protectionTypesRaw) : [];
 
     let saved = null;
     if (existingEquipmentId) {
@@ -203,6 +223,7 @@ exports.mobileSync = async (req, res) => {
       existing.Site = siteId;
       existing.Zone = zoneId;
       if (eqIdRaw) existing.EqID = EqID;
+      if (equipmentTypeRaw) existing['Equipment Type'] = equipmentTypeRaw;
       existing.Compliance = compliance;
       existing['Other Info'] = otherInfo;
       saved = await existing.save();
@@ -219,33 +240,53 @@ exports.mobileSync = async (req, res) => {
         });
       } catch {}
     } else {
-      const equipmentDoc = new Equipment({
+      const equipmentPayload = {
         EqID: EqID,
         Site: siteId,
         Zone: zoneId,
         Compliance: compliance,
         'Other Info': otherInfo,
+        isProcessed: false,
+        mobileSync: { status: 'queued' },
         CreatedBy: userId,
         ModifiedBy: userId,
         tenantId,
         orderIndex: await getNextOrderIndex(tenantId, siteId, zoneId)
-      });
+      };
+      if (equipmentTypeRaw) equipmentPayload['Equipment Type'] = equipmentTypeRaw;
+
+      const equipmentDoc = new Equipment(equipmentPayload);
 
       saved = await equipmentDoc.save();
       newlyCreatedEquipmentIds.push(saved._id);
       tempIdToEquipmentId[tempId] = String(saved._id);
+      if (failureNote) metaByEquipmentId[String(saved._id)] = { failureNote };
 
       try {
         await createEquipmentDataVersion({
           tenantId,
           equipmentId: saved._id,
           changedBy: userId,
-          source: 'import',
+          source: 'create',
           oldSnapshot: {},
           newSnapshot: saved?.toObject?.({ depopulate: true }) || saved,
           ensureBaseline: false
         });
       } catch {}
+    }
+
+    // Manual protection selection from mobile (applies to existing + new).
+    // If empty, we leave it untouched (OCR may fill for newly created equipment later).
+    if (normalizedProtectionTypes.length && saved) {
+      try {
+        const marks = Array.isArray(saved['Ex Marking']) ? saved['Ex Marking'] : [];
+        if (!marks.length) marks.push({});
+        marks[0] = { ...(marks[0] || {}), 'Type of Protection': normalizedProtectionTypes.join('; ') };
+        saved['Ex Marking'] = marks;
+        await saved.save();
+      } catch {
+        // ignore
+      }
     }
 
     // Attach files that belong to this tempId
@@ -307,7 +348,8 @@ exports.mobileSync = async (req, res) => {
           status: 'queued',
           total: totalToProcess,
           processed: 0,
-          equipmentIds: newlyCreatedEquipmentIds
+          equipmentIds: newlyCreatedEquipmentIds,
+          metaByEquipmentId
         })
       : await ProcessingJob.create({
           tenantId,
@@ -321,10 +363,86 @@ exports.mobileSync = async (req, res) => {
           finishedAt: new Date()
         });
 
+  // Attach jobId to newly created equipment for traceability.
+  if (totalToProcess > 0) {
+    try {
+      await Equipment.updateMany(
+        { _id: { $in: newlyCreatedEquipmentIds }, tenantId },
+        { $set: { 'mobileSync.jobId': String(job._id), 'mobileSync.status': 'queued', isProcessed: false } }
+      );
+    } catch {
+      // ignore
+    }
+  }
+
   return res.status(201).json({
     jobId: String(job._id),
     map: tempIdToEquipmentId
   });
+};
+
+// GET /api/mobile/deletions?since=<iso|ms>&types=site,zone,equipment&zoneId=<id>
+// Returns tombstone ids so the mobile client can remove deleted entities from local cache.
+exports.getMobileDeletions = async (req, res) => {
+  try {
+    const tenantIdStr = req.scope?.tenantId;
+    const tenantId = toObjectId(tenantIdStr);
+    if (!tenantId) {
+      return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
+    }
+
+    const since = parseSinceDate(req.query.since);
+    if (!since) {
+      return res.status(400).json({ message: 'since query param is required (ISO date or ms timestamp).' });
+    }
+
+    const rawTypes = typeof req.query.types === 'string' ? req.query.types : '';
+    const requested = rawTypes
+      ? rawTypes.split(',').map((s) => s.trim()).filter(Boolean)
+      : ['site', 'zone', 'equipment'];
+
+    const allowed = new Set(['site', 'zone', 'equipment']);
+    const types = requested.filter((t) => allowed.has(t));
+    if (!types.length) {
+      return res.json({ sites: [], zones: [], equipment: [] });
+    }
+
+    const zoneId = typeof req.query.zoneId === 'string' ? req.query.zoneId.trim() : '';
+
+    const docs = await SyncTombstone.find({
+      tenantId,
+      entityType: { $in: types },
+      deletedAt: { $gt: since }
+    })
+      .select('entityType entityId meta deletedAt')
+      .lean();
+
+    const result = { sites: [], zones: [], equipment: [] };
+    for (const d of docs || []) {
+      const type = d?.entityType;
+      const idStr = d?.entityId ? String(d.entityId) : '';
+      if (!type || !idStr) continue;
+
+      if (type === 'equipment' && zoneId) {
+        const z = d?.meta?.zoneId ? String(d.meta.zoneId) : '';
+        if (z && z !== zoneId) continue;
+      }
+
+      if (type === 'site') result.sites.push(idStr);
+      if (type === 'zone') result.zones.push(idStr);
+      if (type === 'equipment') result.equipment.push(idStr);
+    }
+
+    // Deduplicate
+    result.sites = Array.from(new Set(result.sites));
+    result.zones = Array.from(new Set(result.zones));
+    result.equipment = Array.from(new Set(result.equipment));
+
+    return res.json(result);
+  } catch (error) {
+    console.error('❌ getMobileDeletions failed:', error);
+    return res.status(500).json({ message: 'Failed to load deletions.' });
+  }
 };
 
 // GET /api/mobile/sync/:jobId/status

@@ -5,6 +5,10 @@ const Equipment = require('../models/dataplate');
 const mongoose = require('mongoose');
 const multer = require('multer');
 const azureBlob = require('../services/azureBlobService');
+const Question = require('../models/questions');
+const QuestionTypeMapping = require('../models/questionTypeMapping');
+const { buildCertificateCacheForTenant, resolveCertificateFromCache } = require('../helpers/certificateMatchHelper');
+const { KNOWN_SET_LOWER, normalizeProtectionTypes } = require('../helpers/protectionTypes');
 
 const upload = multer({ dest: 'uploads/' });
 
@@ -30,6 +34,126 @@ function buildSummaryAndStatus(results = []) {
     summary: { failedCount, naCount, passedCount },
     status
   };
+}
+
+function escapeRegex(s) {
+  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function extractProtectionTokens(equipmentDoc) {
+  const protection = equipmentDoc?.['Ex Marking']?.[0]?.['Type of Protection'] || '';
+  if (!protection) return [];
+  const tokens = normalizeProtectionTypes(protection).map((v) => String(v).trim().toLowerCase());
+  const hasKnown = tokens.some((t) => KNOWN_SET_LOWER.has(t));
+  if (!hasKnown && tokens.length) {
+    return Array.from(new Set(['d', 'e', ...tokens]));
+  }
+  return tokens;
+}
+
+async function computeRelevantEquipmentTypes(equipmentDoc, tenantId) {
+  const rawType =
+    (equipmentDoc && typeof equipmentDoc === 'object'
+      ? equipmentDoc['Equipment Type'] || equipmentDoc.EquipmentType || ''
+      : '') || '';
+  const normalized = String(rawType).toLowerCase().trim();
+  const result = new Set();
+  if (!normalized) return result;
+
+  const tenantObjectId = tenantId && mongoose.Types.ObjectId.isValid(tenantId) ? new mongoose.Types.ObjectId(tenantId) : null;
+  if (!tenantObjectId) return result;
+
+  const mappings = await QuestionTypeMapping.find({ tenantId: tenantObjectId, active: true })
+    .select('equipmentPattern equipmentTypes')
+    .lean();
+  (mappings || []).forEach((m) => {
+    const pattern = String(m.equipmentPattern || '').toLowerCase().trim();
+    if (!pattern) return;
+    if (!normalized.includes(pattern)) return;
+    (m.equipmentTypes || []).forEach((t) => {
+      if (!t) return;
+      result.add(String(t).toLowerCase());
+    });
+  });
+  return result;
+}
+
+async function buildSpecialConditionResultFromEquipment(equipmentDoc, tenantId) {
+  const equipmentSpecific =
+    (equipmentDoc &&
+    typeof equipmentDoc === 'object' &&
+    equipmentDoc['X condition'] &&
+    typeof equipmentDoc['X condition'].Specific === 'string'
+      ? equipmentDoc['X condition'].Specific
+      : '').trim();
+
+  let text = equipmentSpecific;
+  if (!text) {
+    const certNo = equipmentDoc?.['Certificate No'] || equipmentDoc?.CertificateNo;
+    if (certNo) {
+      const certMap = await buildCertificateCacheForTenant(tenantId);
+      const cert = resolveCertificateFromCache(certMap, String(certNo));
+      text = (cert?.specCondition || '').trim();
+    }
+  }
+  if (!text) return null;
+
+  return {
+    questionId: undefined,
+    table: 'SC',
+    group: 'SC',
+    number: 1,
+    equipmentType: 'Special Condition',
+    protectionTypes: [],
+    status: 'Passed',
+    note: '',
+    questionText: { eng: text, hun: '' }
+  };
+}
+
+async function generateInspectionResultsForEquipment({ equipmentDoc, tenantId, inspectionType }) {
+  const protections = extractProtectionTokens(equipmentDoc);
+  const filter = {};
+  const tenantObjectId = tenantId && mongoose.Types.ObjectId.isValid(tenantId) ? new mongoose.Types.ObjectId(tenantId) : null;
+  if (tenantObjectId) filter.tenantId = tenantObjectId;
+  if (protections.length) {
+    filter.protectionTypes = { $in: protections.map((t) => new RegExp(`^${escapeRegex(t)}$`, 'i')) };
+  }
+
+  let questions = await Question.find(filter).lean();
+  if ((!questions || !questions.length) && tenantObjectId) {
+    const fallbackFilter = { ...filter };
+    delete fallbackFilter.tenantId;
+    questions = await Question.find(fallbackFilter).lean();
+  }
+
+  const relevantTypes = await computeRelevantEquipmentTypes(equipmentDoc, tenantId);
+  const basePassedTypes = new Set(['general', 'environment', 'additional checks']);
+
+  let results = (questions || [])
+    .filter((q) => {
+      const types = Array.isArray(q.inspectionTypes) ? q.inspectionTypes : [];
+      return !types.length || types.includes(inspectionType);
+    })
+    .map((q) => {
+      const eqType = (q.equipmentType || '').toLowerCase();
+      const shouldBePassed = basePassedTypes.has(eqType) || relevantTypes.has(eqType);
+      return {
+        questionId: q._id ? new mongoose.Types.ObjectId(q._id) : undefined,
+        table: q.table || q.Table || '',
+        group: q.group || q.Group || '',
+        number: q.number ?? q.Number ?? null,
+        equipmentType: q.equipmentType || '',
+        protectionTypes: Array.isArray(q.protectionTypes) ? q.protectionTypes : [],
+        status: shouldBePassed ? 'Passed' : 'NA',
+        note: '',
+        questionText: { eng: q.questionText?.eng || '', hun: q.questionText?.hun || '' }
+      };
+    });
+
+  const sc = await buildSpecialConditionResultFromEquipment(equipmentDoc, tenantId);
+  if (sc) results.push(sc);
+  return results;
 }
 
 /**
@@ -164,7 +288,11 @@ exports.createInspection = async (req, res) => {
       results: normalizedResults,
       attachments: normalizedAttachments,
       summary,
-      status
+      status,
+      reviewStatus: 'final',
+      source: 'manual',
+      finalizedAt: new Date(),
+      finalizedBy: inspectorId
     });
 
     await inspection.save();
@@ -217,6 +345,166 @@ exports.createInspection = async (req, res) => {
   } catch (error) {
     console.error('❌ Hiba az inspection létrehozása közben:', error);
     return res.status(500).json({ message: 'Belső szerverhiba az inspection létrehozásakor.' });
+  }
+};
+
+exports.updateInspection = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const userId = req.userId;
+    const { id } = req.params;
+    if (!tenantId) return res.status(400).json({ message: 'tenantId is missing from auth' });
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: 'Invalid inspection id.' });
+
+    const inspection = await Inspection.findOne({ _id: id, tenantId });
+    if (!inspection) return res.status(404).json({ message: 'Inspection not found.' });
+
+    const {
+      inspectionDate,
+      validUntil,
+      inspectionType,
+      results = [],
+      attachments = [],
+      finalize = false
+    } = req.body || {};
+
+    const finalizedNow = finalize ? new Date() : null;
+    const effectiveInspectionDate = finalize
+      ? (finalizedNow || new Date())
+      : (inspectionDate ? new Date(inspectionDate) : null);
+    const effectiveValidUntil = finalize
+      ? (() => {
+        const d = new Date(effectiveInspectionDate);
+        d.setFullYear(d.getFullYear() + 3);
+        return d;
+      })()
+      : (validUntil ? new Date(validUntil) : null);
+
+    if (!effectiveInspectionDate || !effectiveValidUntil) {
+      return res.status(400).json({ message: 'inspectionDate és validUntil kötelező mezők.' });
+    }
+    if (!Array.isArray(results) || results.length === 0) {
+      return res.status(400).json({ message: 'results mezőnek legalább egy kérdést tartalmaznia kell.' });
+    }
+
+    const normalizedResults = results.map(r => ({
+      questionId: r.questionId ? new mongoose.Types.ObjectId(r.questionId) : undefined,
+      table: r.table || r.Table || undefined,
+      group: r.group || r.Group || undefined,
+      number: r.number ?? r.Number,
+      equipmentType: r.equipmentType || undefined,
+      protectionTypes: Array.isArray(r.protectionTypes) ? r.protectionTypes : [],
+      status: r.status,
+      note: r.note || '',
+      questionText: {
+        eng: r.questionText?.eng || r.questionText?.EN || r.questionText?.En || '',
+        hun: r.questionText?.hun || r.questionText?.HU || r.questionText?.Hu || ''
+      }
+    }));
+
+    const normalizedAttachments = (attachments || []).map(a => ({
+      blobPath: a.blobPath,
+      blobUrl: a.blobUrl,
+      type: a.type || 'image',
+      contentType: a.contentType || (a.type === 'image' ? 'image/*' : 'application/octet-stream'),
+      size: a.size ?? null,
+      questionId: a.questionId ? new mongoose.Types.ObjectId(a.questionId) : undefined,
+      questionKey: a.questionKey || undefined,
+      note: a.note || '',
+      createdBy: userId
+    }));
+
+    const { summary, status } = buildSummaryAndStatus(normalizedResults);
+
+    // When finalizing a pending inspection, the inspectionDate must reflect the close time
+    // so it naturally appears at the top of the timeline.
+    inspection.inspectionDate = effectiveInspectionDate;
+    inspection.validUntil = effectiveValidUntil;
+    inspection.inspectionType = inspectionType || inspection.inspectionType;
+    inspection.results = normalizedResults;
+    inspection.attachments = normalizedAttachments;
+    inspection.summary = summary;
+    inspection.status = status;
+
+    if (finalize) {
+      inspection.reviewStatus = 'final';
+      inspection.finalizedAt = finalizedNow || new Date();
+      inspection.finalizedBy = userId;
+    }
+
+    await inspection.save();
+
+    if (finalize) {
+      const equipment = await Equipment.findOne({ _id: inspection.equipmentId, tenantId });
+      if (equipment) {
+        equipment.lastInspectionDate = inspection.inspectionDate;
+        equipment.lastInspectionValidUntil = inspection.validUntil;
+        equipment.lastInspectionStatus = inspection.status;
+        equipment.lastInspectionId = inspection._id;
+        equipment.Compliance = inspection.status;
+        equipment.pendingReview = false;
+        equipment.pendingInspectionId = null;
+        await equipment.save();
+      }
+    }
+
+    return res.json(inspection);
+  } catch (error) {
+    console.error('❌ updateInspection failed:', error);
+    return res.status(500).json({ message: 'Failed to update inspection.' });
+  }
+};
+
+exports.regenerateInspection = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const userId = req.userId;
+    const { id } = req.params;
+    if (!tenantId) return res.status(400).json({ message: 'tenantId is missing from auth' });
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: 'Invalid inspection id.' });
+
+    const inspection = await Inspection.findOne({ _id: id, tenantId });
+    if (!inspection) return res.status(404).json({ message: 'Inspection not found.' });
+    if (String(inspection.reviewStatus || 'final') !== 'pending') {
+      return res.status(400).json({ message: 'Only pending inspections can be regenerated.' });
+    }
+
+    const equipment = await Equipment.findOne({ _id: inspection.equipmentId, tenantId });
+    if (!equipment) return res.status(404).json({ message: 'Equipment not found for inspection.' });
+
+    const inspectionType = req.body?.inspectionType || inspection.inspectionType || 'Detailed';
+    const generated = await generateInspectionResultsForEquipment({
+      equipmentDoc: equipment,
+      tenantId,
+      inspectionType
+    });
+
+    const existingByQuestionId = new Map();
+    (inspection.results || []).forEach((r) => {
+      const idStr = r?.questionId ? String(r.questionId) : '';
+      if (idStr) existingByQuestionId.set(idStr, r);
+    });
+
+    const merged = generated.map((r) => {
+      const idStr = r?.questionId ? String(r.questionId) : '';
+      const prev = idStr ? existingByQuestionId.get(idStr) : null;
+      if (!prev) return r;
+      return { ...r, status: prev.status, note: prev.note || '' };
+    });
+
+    const { summary, status } = buildSummaryAndStatus(merged);
+    inspection.results = merged;
+    inspection.summary = summary;
+    inspection.status = status;
+    inspection.inspectionType = inspectionType;
+    await inspection.save();
+
+    return res.json(inspection);
+  } catch (error) {
+    console.error('❌ regenerateInspection failed:', error);
+    return res.status(500).json({ message: 'Failed to regenerate inspection.' });
   }
 };
 
