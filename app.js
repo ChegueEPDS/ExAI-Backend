@@ -98,6 +98,7 @@ const corsOptions = {
     'x-ms-graph-token',
     'x-captcha-token',
     'x-captcha-bypass',
+    'x-client',        // mobile vs web client hint
     'x-user-id',        // frontend legacy header (allowed for backwards-compat)
     'x-tenant-id',      // optional explicit tenant header if ever sent
     'x-request-id',     // optional tracing

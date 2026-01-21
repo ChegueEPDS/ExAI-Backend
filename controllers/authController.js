@@ -190,9 +190,13 @@ async function ensureTenantForUserFromName(user, tenantName) {
   return { user, tenant };
 }
 
-async function signAccessTokenWithSubscription(user) {
+async function signAccessTokenWithSubscription(user, opts = {}) {
   const meta = await getTenantMeta(user.tenantId);
   const subscription = await getSubscriptionSnapshot(user.tenantId);
+  const expiresIn =
+    (opts && opts.expiresIn) ||
+    process.env.JWT_EXPIRES_IN ||
+    '1h';
 
   const payload = {
     sub: String(user._id),
@@ -209,7 +213,13 @@ async function signAccessTokenWithSubscription(user) {
     type: 'access',
     v: 2,
   };
-  return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '1h' });
+  return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn });
+}
+
+function getAccessTokenExpiresIn(req) {
+  const client = String(req?.headers?.['x-client'] || '').toLowerCase();
+  if (client === 'mobile') return process.env.JWT_EXPIRES_IN_MOBILE || '30d';
+  return process.env.JWT_EXPIRES_IN_WEB || process.env.JWT_EXPIRES_IN || '1h';
 }
 
 // ----------------------
@@ -358,7 +368,7 @@ exports.login = async (req, res) => {
       user = ensured.user;
     }
 
-    const token = await signAccessTokenWithSubscription(user);
+    const token = await signAccessTokenWithSubscription(user, { expiresIn: getAccessTokenExpiresIn(req) });
     return res.status(200).json({ token });
   } catch (error) {
     console.error('❌ Login error:', error);
@@ -425,7 +435,7 @@ exports.verifyEmail = async (req, res) => {
       }
     }
 
-    const accessToken = await signAccessTokenWithSubscription(user);
+    const accessToken = await signAccessTokenWithSubscription(user, { expiresIn: getAccessTokenExpiresIn(req) });
 
     return res.status(200).json({
       message: 'Email verified successfully',
@@ -555,7 +565,7 @@ exports.microsoftLogin = async (req, res) => {
       user = ensured.user;
     }
 
-    const token = await signAccessTokenWithSubscription(user);
+    const token = await signAccessTokenWithSubscription(user, { expiresIn: getAccessTokenExpiresIn(req) });
     return res.status(200).json({ token });
   } catch (error) {
     console.error('❌ Microsoft login error:', error);
@@ -585,7 +595,7 @@ exports.renewToken = async (req, res) => {
       user = ensured.user;
     }
 
-    const newToken = await signAccessTokenWithSubscription(user);
+    const newToken = await signAccessTokenWithSubscription(user, { expiresIn: getAccessTokenExpiresIn(req) });
     return res.status(200).json({ token: newToken });
   } catch (error) {
     if (error.name === 'TokenExpiredError') {
