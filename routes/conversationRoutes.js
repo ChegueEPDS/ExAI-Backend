@@ -15,6 +15,7 @@ const {
   chatWithFilesStream,
   chatWithFilesCompletionsStream
 } = require('../controllers/conversationController');
+const { chatGovernedStream } = require('../controllers/governedChatController');
 const authMiddleware = require('../middlewares/authMiddleware');
 const multer = require('multer');
 
@@ -86,6 +87,13 @@ router.post(
   authMiddleware(),
   safeUploadArray('files', 10),
   chatWithFilesCompletionsStream
+);
+
+// Governed RAG (project + dataset version + approval + numeric traceability)
+router.post(
+  '/chat/governed/stream',
+  authMiddleware(),
+  chatGovernedStream
 );
 
 module.exports = router;

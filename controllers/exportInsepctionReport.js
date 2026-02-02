@@ -79,6 +79,64 @@ const PROJECT_REPORT_DIRS = {
 };
 const REPORT_PROGRESS_STEP_COUNT = 10;
 
+function normalizeInspectionSeverity(value) {
+  if (value === null || value === undefined) return null;
+  const normalized = String(value).trim().toUpperCase();
+  return ['P1', 'P2', 'P3', 'P4'].includes(normalized) ? normalized : null;
+}
+
+function buildNoteCellValueWithSeverity(note, severity) {
+  const normalizedSeverity = normalizeInspectionSeverity(severity);
+  const noteText = (note || '').toString();
+
+  if (!normalizedSeverity) {
+    return { value: noteText, text: noteText };
+  }
+
+  if (!noteText) {
+    return {
+      value: {
+        richText: [
+          { text: 'Severity: ' },
+          { text: normalizedSeverity, font: { bold: true } }
+        ]
+      },
+      text: `Severity: ${normalizedSeverity}`
+    };
+  }
+
+  return {
+    value: {
+      richText: [
+        { text: `${noteText} - Severity: ` },
+        { text: normalizedSeverity, font: { bold: true } }
+      ]
+    },
+    text: `${noteText} - Severity: ${normalizedSeverity}`
+  };
+}
+
+function buildCommentCellValueWithSeverity(note, severity, imageNames = []) {
+  const safeImageNames = Array.isArray(imageNames) ? imageNames.filter(Boolean) : [];
+  const imagesLine = safeImageNames.length ? `Images: ${safeImageNames.join(', ')}` : '';
+  const normalizedSeverity = normalizeInspectionSeverity(severity);
+
+  if (!normalizedSeverity) {
+    const baseComment = (note || '').toString();
+    const text = imagesLine ? (baseComment ? `${baseComment}\n${imagesLine}` : imagesLine) : baseComment;
+    return { value: text, text };
+  }
+
+  const base = buildNoteCellValueWithSeverity(note, normalizedSeverity);
+  if (!imagesLine) return base;
+
+  const suffix = `\n${imagesLine}`;
+  if (base.value && typeof base.value === 'object' && Array.isArray(base.value.richText)) {
+    base.value.richText.push({ text: suffix });
+  }
+  return { value: base.value, text: `${base.text}${suffix}` };
+}
+
 function buildExportJobContext(job = {}) {
   return (
     job?.meta?.siteName ||
@@ -1422,10 +1480,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
         '';
 
       const imageNames = attachmentLookup ? attachmentLookup.getFileNamesForResult(r) : [];
-      const baseComment = r.note || '';
-      const commentWithImages = imageNames.length
-        ? (baseComment ? `${baseComment}\nImages: ${imageNames.join(', ')}` : `Images: ${imageNames.join(', ')}`)
-        : baseComment;
+      const commentCellInfo = buildCommentCellValueWithSeverity(r.note, r.severity, imageNames);
 
       const row = ws.addRow([
         ref,
@@ -1437,7 +1492,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
         passedMark,
         failedMark,
         naMark,
-        commentWithImages
+        commentCellInfo.value
       ]);
 
       const rn = row.number;
@@ -1475,7 +1530,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       // Sor magasság becslése a kérdés hossza alapján,
       // hogy a teljes szöveg látható legyen több sorban is.
       const approxCharsPerLine = 65; // kb. ennyi karakter fér el egy sorban
-      const textLength = (questionText?.length || 0) + (commentWithImages?.length || 0) || 1;
+      const textLength = (questionText?.length || 0) + (commentCellInfo.text?.length || 0) || 1;
       const lineCount = Math.max(1, Math.ceil(textLength / approxCharsPerLine));
       ws.getRow(rn).height = lineCount * 15; // 15 pont / sor, szükség esetén növelhető
     });
@@ -2111,11 +2166,12 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
   });
 
   sortedFailures.forEach(item => {
+    const noteCellInfo = buildNoteCellValueWithSeverity(item.note, item.severity);
     const rowValues = [];
     rowValues[1] = item.eqId || '';      // A (merged A-B)
     rowValues[3] = item.ref || '';       // C
     rowValues[4] = item.check || '';     // D (merged D-H)
-    rowValues[9] = item.note || '';      // I (merged I-L)
+    rowValues[9] = noteCellInfo.value;   // I (merged I-L)
     rowValues[13] = Array.isArray(item.imageNames) && item.imageNames.length
       ? item.imageNames.join(', ')
       : ''; // M (merged M-N)
@@ -2142,7 +2198,7 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
     });
 
     const checkText = item.check || '';
-    const noteText = item.note || '';
+    const noteText = noteCellInfo.text || '';
     const imageText = Array.isArray(item.imageNames) ? item.imageNames.join(', ') : '';
     const textLength = Math.max(checkText.length, noteText.length, imageText.length, 1);
     const lineCount = Math.max(1, Math.ceil(textLength / 60));
@@ -2377,6 +2433,7 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName }, ta
           ref,
           check: checkText,
           note: r.note || '',
+          severity: r.severity || null,
           imageNames: imageNames || []
         };
         projectFailures.push(failure);
@@ -2949,6 +3006,7 @@ exports.exportPunchlistXLSX = async (req, res) => {
           ref,
           check: checkText,
           note: r.note || '',
+          severity: r.severity || null,
           imageNames: includeImages ? imageNames : []
         });
       });

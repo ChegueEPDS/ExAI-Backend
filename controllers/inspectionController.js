@@ -36,6 +36,25 @@ function buildSummaryAndStatus(results = []) {
   };
 }
 
+function computeFailureSeverity(results = []) {
+  // Highest severity wins: P1 > P2 > P3 > P4
+  const rank = { P1: 4, P2: 3, P3: 2, P4: 1 };
+  let best = null;
+  let bestRank = 0;
+
+  for (const r of results || []) {
+    if (!r || r.status !== 'Failed') continue;
+    const sev = String(r.severity || '').toUpperCase();
+    const rnk = rank[sev] || 0;
+    if (rnk > bestRank) {
+      bestRank = rnk;
+      best = sev;
+    }
+  }
+
+  return best && ['P1', 'P2', 'P3', 'P4'].includes(best) ? best : null;
+}
+
 function escapeRegex(s) {
   return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -252,6 +271,7 @@ exports.createInspection = async (req, res) => {
         : [],
       status: r.status, // 'Passed' | 'Failed' | 'NA'
       note: r.note || '',
+      severity: r.status === 'Failed' ? (r.severity ? String(r.severity).toUpperCase() : null) : null,
       questionText: {
         eng: r.questionText?.eng || r.questionText?.EN || r.questionText?.En || '',
         hun: r.questionText?.hun || r.questionText?.HU || r.questionText?.Hu || ''
@@ -273,6 +293,7 @@ exports.createInspection = async (req, res) => {
 
     // ---- Összefoglaló és globális státusz számítása ----
     const { summary, status } = buildSummaryAndStatus(normalizedResults);
+    const failureSeverity = status === 'Failed' ? computeFailureSeverity(normalizedResults) : null;
 
     // ---- Inspection dokumentum létrehozása ----
     const inspection = new Inspection({
@@ -289,6 +310,7 @@ exports.createInspection = async (req, res) => {
       attachments: normalizedAttachments,
       summary,
       status,
+      failureSeverity,
       reviewStatus: 'final',
       source: 'manual',
       finalizedAt: new Date(),
@@ -303,7 +325,8 @@ exports.createInspection = async (req, res) => {
       // lastInspectionDate, lastInspectionValidUntil, lastInspectionStatus, lastInspectionId mezőkkel.
       equipment.Compliance = status; // ahogy eddig is
       equipment.lastInspectionDate = inspection.inspectionDate;
-      equipment.lastInspectionValidUntil = inspection.validUntil;
+      // Failed inspectionnek nincs "next inspection date"-je (UI: ne jelenjen meg PLANNED).
+      equipment.lastInspectionValidUntil = status === 'Failed' ? null : inspection.validUntil;
       equipment.lastInspectionStatus = status;
       equipment.lastInspectionId = inspection._id;
 
@@ -397,6 +420,7 @@ exports.updateInspection = async (req, res) => {
       protectionTypes: Array.isArray(r.protectionTypes) ? r.protectionTypes : [],
       status: r.status,
       note: r.note || '',
+      severity: r.status === 'Failed' ? (r.severity ? String(r.severity).toUpperCase() : null) : null,
       questionText: {
         eng: r.questionText?.eng || r.questionText?.EN || r.questionText?.En || '',
         hun: r.questionText?.hun || r.questionText?.HU || r.questionText?.Hu || ''
@@ -416,6 +440,7 @@ exports.updateInspection = async (req, res) => {
     }));
 
     const { summary, status } = buildSummaryAndStatus(normalizedResults);
+    const failureSeverity = status === 'Failed' ? computeFailureSeverity(normalizedResults) : null;
 
     // When finalizing a pending inspection, the inspectionDate must reflect the close time
     // so it naturally appears at the top of the timeline.
@@ -426,6 +451,7 @@ exports.updateInspection = async (req, res) => {
     inspection.attachments = normalizedAttachments;
     inspection.summary = summary;
     inspection.status = status;
+    inspection.failureSeverity = failureSeverity;
 
     if (finalize) {
       inspection.reviewStatus = 'final';
@@ -439,7 +465,7 @@ exports.updateInspection = async (req, res) => {
       const equipment = await Equipment.findOne({ _id: inspection.equipmentId, tenantId });
       if (equipment) {
         equipment.lastInspectionDate = inspection.inspectionDate;
-        equipment.lastInspectionValidUntil = inspection.validUntil;
+        equipment.lastInspectionValidUntil = inspection.status === 'Failed' ? null : inspection.validUntil;
         equipment.lastInspectionStatus = inspection.status;
         equipment.lastInspectionId = inspection._id;
         equipment.Compliance = inspection.status;
@@ -491,13 +517,15 @@ exports.regenerateInspection = async (req, res) => {
       const idStr = r?.questionId ? String(r.questionId) : '';
       const prev = idStr ? existingByQuestionId.get(idStr) : null;
       if (!prev) return r;
-      return { ...r, status: prev.status, note: prev.note || '' };
+      return { ...r, status: prev.status, note: prev.note || '', severity: prev.severity ?? null };
     });
 
     const { summary, status } = buildSummaryAndStatus(merged);
+    const failureSeverity = status === 'Failed' ? computeFailureSeverity(merged) : null;
     inspection.results = merged;
     inspection.summary = summary;
     inspection.status = status;
+    inspection.failureSeverity = failureSeverity;
     inspection.inspectionType = inspectionType;
     await inspection.save();
 
@@ -793,7 +821,7 @@ exports.deleteInspection = async (req, res) => {
             if (latest) {
               equipment.Compliance = latest.status;
               equipment.lastInspectionDate = latest.inspectionDate;
-              equipment.lastInspectionValidUntil = latest.validUntil;
+              equipment.lastInspectionValidUntil = latest.status === 'Failed' ? null : latest.validUntil;
               equipment.lastInspectionStatus = latest.status;
               equipment.lastInspectionId = latest._id;
             } else {

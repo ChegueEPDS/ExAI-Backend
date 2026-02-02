@@ -48,6 +48,33 @@ const TenantSchema = new mongoose.Schema(
 
     // hogyan kezeli az üléseket
     seatsManaged: { type: String, enum: ['stripe', 'manual'], default: 'stripe' },
+
+    // Dashboard settings (used by Insp-Ex analytics)
+    dashboardSettings: {
+      slaTargets: {
+        maintenanceHours: {
+          P1: { type: Number, default: 24, min: 0 },
+          P2: { type: Number, default: 72, min: 0 },
+          P3: { type: Number, default: 168, min: 0 },
+          P4: { type: Number, default: 336, min: 0 }
+        },
+        // Inspection failure SLA targets (hours) by severity
+        inspectionHours: {
+          P1: { type: Number, default: 24, min: 0 },
+          P2: { type: Number, default: 72, min: 0 },
+          P3: { type: Number, default: 168, min: 0 },
+          P4: { type: Number, default: 336, min: 0 }
+        }
+      }
+    }
+    ,
+    // Optional: per-tenant OpenAI assistant override (avoids hardcoding tenant names in config)
+    assistantId: {
+      type: String,
+      trim: true,
+      default: '',
+      match: /^$|^asst_[A-Za-z0-9]+$/,
+    }
   },
   { timestamps: true }
 );

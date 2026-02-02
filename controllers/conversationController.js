@@ -116,24 +116,28 @@ exports.sendMessageStream = async (req, res) => {
       send('done', { ok: false });
       return res.end();
     }
-    const tenantDoc = await Tenant.findById(tenantId).select('name');
+    const tenantDoc = await Tenant.findById(tenantId).select('name assistantId');
     if (!tenantDoc) {
       send('error', { message: 'Tenant nem található.' });
       send('done', { ok: false });
       return res.end();
     }
-    const tenantKey = String(tenantDoc.name || '').toLowerCase();
-    const assistantId = assistants.byTenant?.[tenantKey] || assistants['default'];
-    // DEBUG: Assistant selection trace (STREAM)
-    logger.debug('[ASSISTANT PICK][STREAM] req.scope.tenantId:', req.scope?.tenantId);
-    logger.debug('[ASSISTANT PICK][STREAM] user.tenantId:', user?.tenantId ? String(user.tenantId) : null);
-    logger.debug('[ASSISTANT PICK][STREAM] resolved tenantId:', tenantId);
-    logger.debug('[ASSISTANT PICK][STREAM] tenantDoc:', { id: tenantDoc?._id, name: tenantDoc?.name });
-    logger.debug('[ASSISTANT PICK][STREAM] tenantKey:', tenantKey);
-    logger.debug('[ASSISTANT PICK][STREAM] assistants.byTenant keys:', Object.keys(assistants.byTenant || {}));
-    logger.debug('[ASSISTANT PICK][STREAM] assistants.byTenant[tenantKey]:', (assistants.byTenant || {})[tenantKey] || null);
-    logger.debug('[ASSISTANT PICK][STREAM] default assistantId:', assistants['default']);
-    logger.debug('[ASSISTANT PICK][STREAM] chosen assistantId:', assistantId);
+    const { assistantId, tenantKey, source } = await resolveAssistantContext({ tenantId, tenantDoc, logTag: 'STREAM' });
+    if (!assistantId) {
+      send('error', { message: 'Nincs beállítva asszisztens ehhez a tenant-hoz (ASSISTANT_ID_DEFAULT/tenant.assistantId).' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    logger.debug('[ASSISTANT PICK][STREAM_EXTRA]', {
+      reqTenantId: req.scope?.tenantId || null,
+      userTenantId: user?.tenantId ? String(user.tenantId) : null,
+      tenantId,
+      tenantKey,
+      assistantId,
+      source,
+      assistantsByTenantKeys: Object.keys(assistants.byTenant || {}),
+      defaultAssistantId: assistants.default || assistants['default'] || null
+    });
 
     // ---- Determine user plan (best-effort from various middleware-attached places) ----
     // 1) Try req.auth.subscription?.plan (auth controller attaches subscription snapshot)
@@ -239,16 +243,22 @@ exports.sendMessageStream = async (req, res) => {
     const styleForPlain = getStyleInstructions('plain');
     const tabularHint = buildTabularHint(message);
 
+    // IMPORTANT:
+    // Passing `instructions` in the run payload overrides the assistant's stored instructions.
+    // To keep the tenant-specific persona (e.g. EPDS) we always prepend the assistant's instructions.
+    const assistantPrompt = await getAssistantPromptCached(assistantId);
+    const baseInstructions = `${assistantPrompt}\n\n${styleForPlain}${convBlock}`;
+
     if (applicableInjection) {
-      const assistantData = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {
-        headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2' }
-      });
-      const assistantPrompt = assistantData.data.instructions || '';
-      const finalInstructions = `${styleForPlain}${convBlock}\n${assistantPrompt}\n\n${tabularHint ? tabularHint + '\n\n' : ''}Always put the following sentence at the end of the explanation part as a <strong>Note:</strong>, exactly as written, in a separate paragraph between <em> tags: :\n\n"${applicableInjection}"`;      logger.info('[STREAM] 📋 Final instructions before sending:', finalInstructions);
-      payload.instructions = finalInstructions;
+      payload.instructions =
+        `${baseInstructions}\n\n${tabularHint ? tabularHint + '\n\n' : ''}` +
+        'Always put the following sentence at the end of the explanation part as a <strong>Note:</strong>, ' +
+        'exactly as written, in a separate paragraph between <em> tags: :\n\n' +
+        `"${applicableInjection}"`;
     } else {
-      // No injection rule matched → still enforce ChatGPT-like structure
-      payload.instructions = tabularHint ? `${styleForPlain}${convBlock}\n\n${tabularHint}` : `${styleForPlain}${convBlock}`;    }
+      // No injection rule matched → still enforce ChatGPT-like structure (without losing assistant persona)
+      payload.instructions = tabularHint ? `${baseInstructions}\n\n${tabularHint}` : baseInstructions;
+    }
 
     // ---- OpenAI SSE stream (no model override; use assistant default) ----
     const openaiResp = await axios({
@@ -657,14 +667,18 @@ exports.chatWithFilesStream = async (req, res) => {
       send('done', { ok: false });
       return res.end();
     }
-    const tenantDoc = await Tenant.findById(tenantId).select('name');
+    const tenantDoc = await Tenant.findById(tenantId).select('name assistantId');
     if (!tenantDoc) {
       send('error', { message: 'Tenant nem található.' });
       send('done', { ok: false });
       return res.end();
     }
-    const tenantKey = String(tenantDoc.name || '').toLowerCase();
-    const baseAssistantId = assistants.byTenant?.[tenantKey] || assistants['default'];
+    const { assistantId: baseAssistantId, tenantKey } = await resolveAssistantContext({ tenantId, tenantDoc, logTag: 'FILES' });
+    if (!baseAssistantId) {
+      send('error', { message: 'Nincs beállítva asszisztens ehhez a tenant-hoz (ASSISTANT_ID_DEFAULT/tenant.assistantId).' });
+      send('done', { ok: false });
+      return res.end();
+    }
 
     // ---- Load conversation & ownership ----
     const conversation = await Conversation.findOne({ threadId, userId, tenantId });
@@ -1231,10 +1245,10 @@ const { body, validationResult } = require('express-validator');
 const { marked } = require('marked');
 const tiktoken = require('tiktoken');
 const assistants = require('../config/assistants');
+const { resolveAssistantContext } = require('../services/assistantResolver');
 const User = require('../models/user');
 const Tenant = require('../models/tenant');
 const { fetchFromAzureSearch } = require('../helpers/azureSearchHelpers');
-console.log('fetchFromAzureSearch:', typeof fetchFromAzureSearch);
 const { createEmbedding } = require('../helpers/openaiHelpers');
 const sanitizeHtml = require('sanitize-html');
 const multer = require('multer');
@@ -1246,6 +1260,34 @@ const { notifyAndStore } = require('../lib/notifications/notifier');
 const OpenAI = require('openai');
 
 const FormData = require('form-data');
+
+// Cache assistant instructions so streaming runs can include the assistant persona
+// even when we override run instructions for style/continuity.
+const assistantPromptCache = new Map(); // assistantId -> { instructions: string, fetchedAt: number }
+async function getAssistantPromptCached(assistantId) {
+  const id = String(assistantId || '').trim();
+  if (!id) return '';
+
+  const now = Date.now();
+  const cached = assistantPromptCache.get(id);
+  const ttlMs = Number(process.env.ASSISTANT_PROMPT_CACHE_MS || 5 * 60_000);
+  if (cached && typeof cached.fetchedAt === 'number' && (now - cached.fetchedAt) < ttlMs) {
+    return String(cached.instructions || '');
+  }
+
+  try {
+    const assistantData = await axios.get(`https://api.openai.com/v1/assistants/${id}`, {
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2' }
+    });
+    const instructions = String(assistantData?.data?.instructions || '');
+    assistantPromptCache.set(id, { instructions, fetchedAt: now });
+    return instructions;
+  } catch (e) {
+    logger.warn('[ASSISTANT PROMPT] failed to fetch assistant instructions:', e?.message);
+    assistantPromptCache.set(id, { instructions: '', fetchedAt: now });
+    return '';
+  }
+}
 
 // --- Optional PDF creator (fallbacks to null if 'pdfkit' is not installed) ---
 async function tryMakePdfFromText(text, title = 'Converted from spreadsheet') {
@@ -1887,24 +1929,28 @@ exports.uploadAndSummarizeStream = async (req, res) => {
       send('done', { ok: false });
       return res.end();
     }
-    const tenantDoc = await Tenant.findById(tenantId).select('name');
+    const tenantDoc = await Tenant.findById(tenantId).select('name assistantId');
     if (!tenantDoc) {
       send('error', { message: 'Tenant nem található.' });
       send('done', { ok: false });
       return res.end();
     }
-    const tenantKey = String(tenantDoc.name || '').toLowerCase();
-    const assistantId = assistants.byTenant?.[tenantKey] || assistants['default'];
-    // DEBUG: Assistant selection trace (UPLOAD_SUMMARY)
-    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] req.scope.tenantId:', req.scope?.tenantId);
-    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] user.tenantId:', user?.tenantId ? String(user.tenantId) : null);
-    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] resolved tenantId:', tenantId);
-    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] tenantDoc:', { id: tenantDoc?._id, name: tenantDoc?.name });
-    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] tenantKey:', tenantKey);
-    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] assistants.byTenant keys:', Object.keys(assistants.byTenant || {}));
-    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] assistants.byTenant[tenantKey]:', (assistants.byTenant || {})[tenantKey] || null);
-    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] default assistantId:', assistants['default']);
-    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY] chosen assistantId:', assistantId);
+    const { assistantId, tenantKey, source } = await resolveAssistantContext({ tenantId, tenantDoc, logTag: 'UPLOAD_SUMMARY' });
+    if (!assistantId) {
+      send('error', { message: 'Nincs beállítva asszisztens ehhez a tenant-hoz (ASSISTANT_ID_DEFAULT/tenant.assistantId).' });
+      send('done', { ok: false });
+      return res.end();
+    }
+    logger.debug('[ASSISTANT PICK][UPLOAD_SUMMARY_EXTRA]', {
+      reqTenantId: req.scope?.tenantId || null,
+      userTenantId: user?.tenantId ? String(user.tenantId) : null,
+      tenantId,
+      tenantKey,
+      assistantId,
+      source,
+      assistantsByTenantKeys: Object.keys(assistants.byTenant || {}),
+      defaultAssistantId: assistants.default || assistants['default'] || null
+    });
 
     // Initialize job in DB
     await jobInit(conversation, 'upload_and_summarize', {
@@ -2945,9 +2991,8 @@ exports.chatWithFilesCompletionsStream = async (req, res) => {
     if (wantsBackgroundKb) {
       try {
         send('progress', { stage: 'kb.search.start' });
-        const tenantDoc = await Tenant.findById(tenantId).select('name').lean();
-        const tenantKey = String(tenantDoc?.name || '').toLowerCase();
-        const assistantId = assistants.byTenant?.[tenantKey] || assistants['default'];
+        const tenantDoc = await Tenant.findById(tenantId).select('name assistantId').lean();
+        const { assistantId } = await resolveAssistantContext({ tenantId, tenantDoc, logTag: 'FILE_KB' });
         const vectorStoreId = await getAssistantVectorStoreId(assistantId);
         if (vectorStoreId) {
           const envHits = Number(process.env.FILE_CHAT_BACKGROUND_VS_HITS || 0);
@@ -3450,17 +3495,22 @@ exports.startNewConversation = async (req, res) => {
     });
     const threadId = threadResponse.data.id;
 
+    // Internal project id used by governed chat + dataset ingestion.
+    // Keep it opaque and stable for the lifetime of the conversation.
+    const governedProjectId = `p_${crypto.randomBytes(8).toString('hex')}`;
+
     const newConversation = new Conversation({
       threadId,
       messages: [],
       userId,
       tenantId: req.scope?.tenantId || undefined,
+      governedProjectId,
     });
 
     await newConversation.save();
     logger.info('Új szál létrehozva:', threadId);
 
-    res.status(200).json({ threadId });
+    res.status(200).json({ threadId, governedProjectId });
   } catch (error) {
     logger.error('Hiba az új szál létrehozása során:', error.message);
     res.status(500).json({ error: 'Nem sikerült új szálat létrehozni.' });
@@ -3518,12 +3568,14 @@ exports.sendMessage = [
         return res.status(404).json({ error: 'Felhasználó nem található.' });
       }
 
-      const tenantDoc = await Tenant.findById(tenantId).select('name');
+      const tenantDoc = await Tenant.findById(tenantId).select('name assistantId');
       if (!tenantDoc) {
         return res.status(404).json({ error: 'Tenant nem található.' });
       }
-      const tenantKey = String(tenantDoc.name || '').toLowerCase();
-      const assistantId = assistants.byTenant?.[tenantKey] || assistants['default'];
+      const { assistantId, tenantKey } = await resolveAssistantContext({ tenantId, tenantDoc, logTag: 'CHAT' });
+      if (!assistantId) {
+        return res.status(500).json({ error: 'Nincs beállítva asszisztens ehhez a tenant-hoz (ASSISTANT_ID_DEFAULT/tenant.assistantId).' });
+      }
 
       // Determine user plan (best effort) and log context
       // 1) Try req.auth.subscription?.plan (auth controller attaches subscription snapshot)
@@ -3888,7 +3940,7 @@ exports.getConversations = async (req, res) => {
     const conversations = await Conversation
       .find({ userId, tenantId })
       .sort({ updatedAt: -1, createdAt: -1 })
-      .select('threadId messages job hasBackgroundJob updatedAt createdAt')
+      .select('threadId messages job hasBackgroundJob governedProjectId chatBackend updatedAt createdAt')
       .lean();
 
     const conversationList = conversations.map(c => ({
@@ -3896,6 +3948,8 @@ exports.getConversations = async (req, res) => {
       messages: c.messages,
       job: c.job || null,
       hasBackgroundJob: !!c.hasBackgroundJob,
+      governedProjectId: c.governedProjectId || null,
+      chatBackend: c.chatBackend || 'normal',
       updatedAt: c.updatedAt,
     }));
 
@@ -4090,9 +4144,9 @@ exports.deleteConversation = async (req, res) => {
         let assistantId = conversation.assistantId;
         if (!assistantId) {
           // fallback to tenant default assistant
-          const tenant = await Tenant.findById(tenantId).select('name');
-          const tenantKey = String(tenant?.name || '').toLowerCase();
-          assistantId = assistants.byTenant?.[tenantKey] || assistants['default'];
+          const tenant = await Tenant.findById(tenantId).select('name assistantId').lean();
+          const resolved = await resolveAssistantContext({ tenantId, tenantDoc: tenant, logTag: 'CLEANUP' });
+          assistantId = resolved.assistantId;
         }
         vectorStoreId = await getAssistantVectorStoreId(assistantId);
       }
@@ -4123,6 +4177,55 @@ exports.deleteConversation = async (req, res) => {
     await (async () => {
       try { await RagChunk.deleteMany({ threadId, tenantId }); }
       catch (e) { logger.warn('[DELETE][CLEANUP] RagChunk deleteMany failed:', e?.message); }
+    })();
+
+    // Governed RAG cleanup (best-effort): delete all datasets + vectors + blobs under this conversation's internal projectId.
+    await (async () => {
+      const projectId = String(conversation.governedProjectId || '').trim();
+      if (!projectId) return;
+      try {
+        logger.info('[DELETE][CLEANUP] governed project cleanup start', { tenantId: String(tenantId), projectId, threadId });
+      } catch { }
+
+      const Dataset = require('../models/dataset');
+      const DatasetFile = require('../models/datasetFile');
+      const DatasetRowChunk = require('../models/datasetRowChunk');
+      const DatasetTableCell = require('../models/datasetTableCell');
+      const DatasetDocChunk = require('../models/datasetDocChunk');
+      const DatasetImageChunk = require('../models/datasetImageChunk');
+      const DatasetDerivedMetric = require('../models/datasetDerivedMetric');
+      const DatasetTableSchema = require('../models/datasetTableSchema');
+      const azureBlob = require('../services/azureBlobService');
+      const pinecone = require('../services/pineconeService');
+
+      // 1) Pinecone vectors (scoped by tenant+project namespace)
+      if (pinecone.isPineconeEnabled()) {
+        const namespace = pinecone.resolveNamespace({ tenantId, projectId });
+        await safeDelete(() =>
+          pinecone.deleteByFilter({
+            namespace,
+            filter: { tenantId: String(tenantId), projectId: String(projectId) },
+            bestEffort: true,
+          })
+        );
+      }
+
+      // 2) DB records
+      await safeDelete(() => DatasetRowChunk.deleteMany({ tenantId, projectId }));
+      await safeDelete(() => DatasetTableCell.deleteMany({ tenantId, projectId }));
+      await safeDelete(() => DatasetDocChunk.deleteMany({ tenantId, projectId }));
+      await safeDelete(() => DatasetImageChunk.deleteMany({ tenantId, projectId }));
+      await safeDelete(() => DatasetDerivedMetric.deleteMany({ tenantId, projectId }));
+      await safeDelete(() => DatasetTableSchema.deleteMany({ tenantId, projectId }));
+      await safeDelete(() => DatasetFile.deleteMany({ tenantId, projectId }));
+      await safeDelete(() => Dataset.deleteMany({ tenantId, projectId }));
+
+      // 3) Blobs under datasets/<tenantId>/<projectId>/
+      await safeDelete(() => azureBlob.deletePrefix(`datasets/${tenantId}/${projectId}/`));
+
+      try {
+        logger.info('[DELETE][CLEANUP] governed project cleanup done', { tenantId: String(tenantId), projectId, threadId });
+      } catch { }
     })();
 
     // Finally, remove conversation from DB

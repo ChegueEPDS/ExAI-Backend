@@ -19,7 +19,7 @@ const MessageSchema = new mongoose.Schema({
 // ——— Background job állapot a beszélgetéshez kötve ———
 const JobSchema = new mongoose.Schema({
   // jelenlegi feladat típusa (később bővíthető)
-  type: { type: String, enum: ['upload_and_summarize', 'chat_with_files'], required: true },
+  type: { type: String, enum: ['upload_and_summarize', 'chat_with_files', 'governed_chat'], required: true },
 
   // fő állapot
   status: {
@@ -68,6 +68,14 @@ const ConversationSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   tenantId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', required: true, index: true },
   title: { type: String },
+
+  // Governed RAG: internal project identifier used to scope datasets + Pinecone namespace
+  governedProjectId: { type: String, default: null, index: true },
+
+  // Persist which backend should handle follow-up messages for this thread.
+  // - normal: /api/chat/stream
+  // - governed: /api/chat/governed/stream (Pinecone + tenant standards + project dataset)
+  chatBackend: { type: String, enum: ['normal', 'governed'], default: 'normal', index: true },
 
   // Persist file-search context for hybrid/sandbox chats
   assistantId:   { type: String, default: null },     // sandbox esetben saját asszisztens

@@ -4,11 +4,10 @@
 
 const axios = require('axios');
 const logger = require('../config/logger');
-const assistants = require('../config/assistants');
 const User = require('../models/user'); // Felhasználói modell
 const fs = require('fs');
 const FormData = require('form-data');
-const Tenant = require('../models/tenant');
+const { resolveAssistantContext } = require('../services/assistantResolver');
 
 // Segédfüggvény: asszisztenshez tartozó vector store ID lekérése
 async function getVectorStoreId(assistantId) {
@@ -21,36 +20,13 @@ async function getVectorStoreId(assistantId) {
   return response.data.tool_resources?.file_search?.vector_store_ids?.[0];
 }
 
-/**
- * Resolve assistant ID with priority: tenant → default
- * (company has been removed)
- */
-async function resolveAssistantId(tenantId) {
-    try {
-      logger.debug('[ASSISTANT PICK][INSTR] incoming tenantId:', String(tenantId || ''));
-      // 1) közvetlen ID mapping (ha használsz ilyet)
-      if (assistants?.byTenantId && tenantId && assistants.byTenantId[String(tenantId)]) {
-        const id = assistants.byTenantId[String(tenantId)];
-        logger.debug('[ASSISTANT PICK][INSTR] byTenantId hit:', id);
-        return id;
-      }
-      // 2) tenant name -> byTenant
-      if (tenantId && assistants?.byTenant) {
-        const t = await Tenant.findById(tenantId).select('name');
-        logger.debug('[ASSISTANT PICK][INSTR] tenant doc:', t ? { _id: t._id, name: t.name } : null);
-        const key = String(t?.name || '').toLowerCase();
-        const hit = key && assistants.byTenant[key];
-        logger.debug('[ASSISTANT PICK][INSTR] tenantKey:', key, 'hit:', !!hit);
-        if (hit) return hit;
-      }
-      const def = assistants.default || assistants['default'];
-      logger.debug('[ASSISTANT PICK][INSTR] fallback default:', def);
-      return def;
-    } catch (e) {
-      logger.warn('[ASSISTANT PICK][INSTR] error, falling back to default:', e?.message);
-      return assistants.default || assistants['default'];
-    }
+async function resolveAssistantIdOrThrow(tenantId) {
+  const { assistantId } = await resolveAssistantContext({ tenantId, logTag: 'INSTR' });
+  if (!assistantId) {
+    throw new Error('ASSISTANT_ID not configured (no tenant override and no default).');
   }
+  return assistantId;
+}
 
 // 📥 Fájlok listázása a vector store-ból – névvel együtt
 // 📥 Fájlok listázása a vector store-ból – LAPOZÁSSAL (20/db), visszafelé kompatibilisen
@@ -60,7 +36,7 @@ exports.listAssistantFiles = async (req, res) => {
     if (!user) return res.status(404).json({ error: 'Felhasználó nem található.' });
 
     const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-    const assistantId = await resolveAssistantId(tenantId);
+    const assistantId = await resolveAssistantIdOrThrow(tenantId);
     logger.info(`Vector store list – assistant: ${assistantId} (tenant=${tenantId})`);
 
     const vectorStoreId = await getVectorStoreId(assistantId);
@@ -193,7 +169,7 @@ exports.uploadAssistantFile = async (req, res) => {
     if (!user) return res.status(404).json({ error: 'Felhasználó nem található.' });
 
     const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-    const assistantId = await resolveAssistantId(tenantId);
+    const assistantId = await resolveAssistantIdOrThrow(tenantId);
     logger.info(`Vector store upload – assistant: ${assistantId} (tenant=${tenantId})`);
 
     const vectorStoreId = await getVectorStoreId(assistantId);
@@ -250,7 +226,7 @@ exports.deleteAssistantFile = async (req, res) => {
     if (!user) return res.status(404).json({ error: 'Felhasználó nem található.' });
 
     const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-    const assistantId = await resolveAssistantId(tenantId);
+    const assistantId = await resolveAssistantIdOrThrow(tenantId);
     logger.info(`Vector store delete – assistant: ${assistantId} (tenant=${tenantId})`);
 
     const vectorStoreId = await getVectorStoreId(assistantId);
@@ -302,7 +278,7 @@ exports.getAssistantInstructions = async (req, res) => {
 
     // Az asszisztens azonosító kiválasztása tenant alapján
     const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-    const assistantId = await resolveAssistantId(tenantId);
+    const assistantId = await resolveAssistantIdOrThrow(tenantId);
     logger.info(`Lekérdezett asszisztens ID: ${assistantId} (Tenant: ${tenantId})`);
 
     // OpenAI API hívás az asszisztens utasításaiért
@@ -381,7 +357,7 @@ exports.updateAssistantConfig = async (req, res) => {
 
     // Az asszisztens azonosító kiválasztása tenant alapján
     const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-    const assistantId = await resolveAssistantId(tenantId);
+    const assistantId = await resolveAssistantIdOrThrow(tenantId);
     logger.info(`Asszisztens konfiguráció frissítése – assistant: ${assistantId} (tenant=${tenantId})`);
 
     // Összeállítjuk a frissítendő adatokat csak a megadott mezőkkel

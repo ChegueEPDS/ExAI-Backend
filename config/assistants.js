@@ -1,6 +1,7 @@
 const assistants = {
   default: process.env.ASSISTANT_ID_DEFAULT,
   byTenant: {
+    'epds': process.env.ASSISTANT_ID_EPDS,
     'pgmed': process.env.ASSISTANT_ID_PGMED,
     'viresol': process.env.ASSISTANT_ID_VIRESOL,
     'xiii': process.env.ASSISTANT_ID_XIII,
@@ -11,7 +12,8 @@ const assistants = {
     'archicon': process.env.ASSISTANT_ID_ARCHICON,
     'robex': process.env.ASSISTANT_ID_ROBEX,
     'wolff': process.env.ASSISTANT_ID_WOLFF
-  }
+  },
+  byTenantId: {}
 };
 
 module.exports = assistants;

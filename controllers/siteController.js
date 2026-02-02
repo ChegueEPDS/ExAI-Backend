@@ -6,6 +6,7 @@ const Equipment = require('../models/dataplate'); // 👈 importáljuk a modell 
 // LEGACY (OneDrive/SharePoint) — kept for reference:
 // const { getOrCreateFolder, deleteOneDriveItemById } = require('../controllers/graphController');
 const azureBlob = require('../services/azureBlobService');
+const { computeOperationalSummary, computeOverallStatusSummary, computeMaintenanceSeveritySummary } = require('../services/operationalSummaryService');
 const path = require('path');
 const mongoose = require('mongoose');
 const fs = require('fs');
@@ -289,6 +290,68 @@ exports.getSiteSummary = async (req, res) => {
       message: 'Failed to fetch site summary.',
       error: error.message || String(error)
     });
+  }
+};
+
+// GET /api/sites/:id/operational-summary
+exports.getSiteOperationalSummary = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) return res.status(401).json({ message: 'Missing tenantId from auth.' });
+    const siteId = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(siteId)) {
+      return res.status(400).json({ message: 'Invalid site id.' });
+    }
+
+    const summary = await computeOperationalSummary({
+      tenantId,
+      siteId
+    });
+
+    return res.json({ siteId, ...summary });
+  } catch (error) {
+    console.error('❌ getSiteOperationalSummary error:', error);
+    return res.status(500).json({ message: 'Failed to fetch site operational summary.' });
+  }
+};
+
+// GET /api/sites/:id/overall-status-summary
+exports.getSiteOverallStatusSummary = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) return res.status(401).json({ message: 'Missing tenantId from auth.' });
+    const siteId = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(siteId)) {
+      return res.status(400).json({ message: 'Invalid site id.' });
+    }
+
+    const summary = await computeOverallStatusSummary({ tenantId, siteId });
+    return res.json({ siteId, ...summary });
+  } catch (error) {
+    console.error('❌ getSiteOverallStatusSummary error:', error);
+    return res.status(500).json({ message: 'Failed to fetch site overall status summary.' });
+  }
+};
+
+// GET /api/sites/:id/maintenance-severity-summary
+exports.getSiteMaintenanceSeveritySummary = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) return res.status(401).json({ message: 'Missing tenantId from auth.' });
+    const siteId = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(siteId)) {
+      return res.status(400).json({ message: 'Invalid site id.' });
+    }
+
+    const summary = await computeMaintenanceSeveritySummary({
+      tenantId,
+      siteId
+    });
+
+    return res.json({ siteId, ...summary });
+  } catch (error) {
+    console.error('❌ getSiteMaintenanceSeveritySummary error:', error);
+    return res.status(500).json({ message: 'Failed to fetch site maintenance severity summary.' });
   }
 };
 

@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const connectDB = require('./config/db');
 const logger = require('./config/logger');
+const requestIdMiddleware = require('./middlewares/requestIdMiddleware');
 const limiter = require('./middlewares/rateLimiter');
 const cleanupService = require('./services/cleanupService');
 const subscriptionSweeper = require('./services/subscriptionSweeper');
@@ -35,6 +36,7 @@ const billingRoutes = require('./routes/billing');
 const billingWebhook = require('./routes/billingWebhook');
 const upgradeRoutes = require('./routes/upgrade');
 const tenantRoutes = require('./routes/tenantRoutes');
+const healthMetricsRoutes = require('./routes/healthMetricsRoutes');
 const inviteRoutes = require('./routes/inviteRoutes');
 const mailRoutes = require('./routes/mailRoutes');
 const consentRoutes = require('./routes/consentRoutes');
@@ -42,7 +44,15 @@ const certificateRequestRoutes = require('./routes/certificateRequestRoutes');
 const inspectionRoutes = require('./routes/inspectionRoutes');
 const downloadRoutes = require('./routes/downloadRoutes');
 const mobileSyncRoutes = require('./routes/mobileSyncRoutes');
+const datasetRoutes = require('./routes/datasetRoutes');
+const standardRoutes = require('./routes/standardRoutes');
 const mobileSyncWorker = require('./services/mobileSyncWorker');
+const statusSummaryRoutes = require('./routes/statusSummaryRoutes');
+const rootCauseRoutes = require('./routes/rootCauseRoutes');
+const maintenanceSeverityRoutes = require('./routes/maintenanceSeverityRoutes');
+const dashboardSettingsRoutes = require('./routes/dashboardSettingsRoutes');
+const dashboardAnalyticsRoutes = require('./routes/dashboardAnalyticsRoutes');
+const plannedInspectionRoutes = require('./routes/plannedInspectionRoutes');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -62,9 +72,30 @@ connectDB().then(() => console.log('Database connected successfully')).catch((er
   process.exit(1); // Exit if DB connection fails
 });
 
-const allowedOrigins = process.env.CORS_ALLOWED_ORIGINS
-  ? process.env.CORS_ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
+const rawCorsAllowedOrigins = process.env.CORS_ALLOWED_ORIGINS
+  ? process.env.CORS_ALLOWED_ORIGINS.split(',').map((origin) => origin.trim()).filter(Boolean)
   : [];
+
+// CORS allow list supports:
+// - exact origins: "https://certs.atexdb.eu"
+// - origin wildcard (scheme + host): "https://*.insp-ex.com"
+// - hostname suffix: "*.insp-ex.com" or "insp-ex.com"
+const allowedOriginsExact = new Set(
+  rawCorsAllowedOrigins.filter((v) => (v.startsWith('http://') || v.startsWith('https://')) && !v.includes('*'))
+);
+
+const allowedOriginWildcardRegexes = rawCorsAllowedOrigins
+  .filter((v) => (v.startsWith('http://') || v.startsWith('https://')) && v.includes('*'))
+  .map((pattern) => {
+    // Escape regex chars except '*', then convert '*' to '.*' and anchor.
+    const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+    return new RegExp(`^${escaped}$`, 'i');
+  });
+
+const allowedHostnameSuffixes = rawCorsAllowedOrigins
+  .filter((v) => !(v.startsWith('http://') || v.startsWith('https://')))
+  .map((v) => v.replace(/^\*\./, '').replace(/^\./, '').toLowerCase())
+  .filter(Boolean);
 
 // Allow local/mobile app origins by default (keeps existing allowlist behavior intact)
 const defaultDevOrigins = new Set([
@@ -77,19 +108,47 @@ const defaultDevOrigins = new Set([
 ]);
 
 // Reusable CORS options (applies to REST + SSE)
-const corsOptions = {
-  origin: function (origin, callback) {
-    // allow same-origin or server-to-server (no origin), and allow-listed origins
-    if (
-      !origin ||
-      allowedOrigins.includes(origin) ||
-      defaultDevOrigins.has(origin)
-    ) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+function isOriginAllowed(origin) {
+  // allow same-origin or server-to-server (no origin)
+  if (!origin) return true;
+
+  if (allowedOriginsExact.has(origin)) return true;
+  if (allowedOriginWildcardRegexes.some((re) => re.test(origin))) return true;
+  if (defaultDevOrigins.has(origin)) return true;
+
+  // hostname suffix matching (e.g. "*.insp-ex.com") – allow only over https (except localhost/dev)
+  try {
+    const u = new URL(origin);
+    const host = (u.hostname || '').toLowerCase();
+    const isLocalHost = host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0';
+    const isHttps = u.protocol === 'https:';
+    const okSuffix =
+      host && allowedHostnameSuffixes.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+    if ((isHttps || isLocalHost) && okSuffix) return true;
+  } catch {}
+
+  return false;
+}
+
+function getClientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff.trim()) return xff.split(',')[0].trim();
+  if (Array.isArray(xff) && xff.length) return String(xff[0] || '').trim();
+  return req.ip || req.connection?.remoteAddress || '';
+}
+
+function logCorsDenied(req, origin) {
+  logger.error('[cors] Not allowed by CORS', {
+    origin: origin || null,
+    host: req.headers.host || null,
+    method: req.method,
+    path: req.originalUrl || req.url,
+    ip: getClientIp(req) || null,
+    userAgent: req.headers['user-agent'] || null
+  });
+}
+
+const corsOptionsBase = {
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   credentials: true,
   allowedHeaders: [
@@ -98,6 +157,7 @@ const corsOptions = {
     'x-ms-graph-token',
     'x-captcha-token',
     'x-captcha-bypass',
+    'x-no-redirect-on-401',
     'x-client',        // mobile vs web client hint
     'x-user-id',        // frontend legacy header (allowed for backwards-compat)
     'x-tenant-id',      // optional explicit tenant header if ever sent
@@ -109,9 +169,22 @@ const corsOptions = {
   optionsSuccessStatus: 204
 };
 
-app.use(cors(corsOptions));
+const corsDelegate = (req, callback) => {
+  const origin = req.header('Origin');
+  if (isOriginAllowed(origin)) {
+    callback(null, { ...corsOptionsBase, origin: true });
+    return;
+  }
+  logCorsDenied(req, origin);
+  callback(new Error('Not allowed by CORS'));
+};
+
+app.use(cors(corsDelegate));
 // Ensure CORS is applied to preflight requests across all routes
-app.options('*', cors(corsOptions));
+app.options('*', cors(corsDelegate));
+
+// Request correlation id (used in logs and returned as response header)
+app.use(requestIdMiddleware);
 
 // Hint proxies not to buffer (useful for SSE)
 app.use((req, res, next) => {
@@ -223,12 +296,21 @@ app.use('/api', notificationsRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api', upgradeRoutes);
 app.use('/api', tenantRoutes);
+app.use('/api', healthMetricsRoutes);
+app.use('/api', statusSummaryRoutes);
+app.use('/api', rootCauseRoutes);
+app.use('/api', maintenanceSeverityRoutes);
+app.use('/api', dashboardSettingsRoutes);
+app.use('/api', dashboardAnalyticsRoutes);
+app.use('/api', plannedInspectionRoutes);
 app.use('/api', inviteRoutes);
 app.use('/api', mailRoutes);
 app.use('/api', consentRoutes);
 app.use('/api', inspectionRoutes);
 app.use('/api', downloadRoutes);
 app.use('/api', mobileSyncRoutes);
+app.use('/api', datasetRoutes);
+app.use('/api', standardRoutes);
 
 const backgroundJobsDisabled =
   process.env.DISABLE_BACKGROUND_JOBS === '1' ||

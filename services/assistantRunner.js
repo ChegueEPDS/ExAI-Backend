@@ -13,13 +13,10 @@ const axiosInst = axios.create({
   timeout: 60_000
 });
 
+const { resolveAssistantIdByTenantKey } = require('./assistantResolver');
+
 function resolveAssistantIdByTenant(tenantKey) {
-  try {
-    const map = require('../config/assistants');
-    return map?.byTenant?.[tenantKey] || map?.default || map?.['default'] || process.env.ASSISTANT_ID || '';
-  } catch {
-    return process.env.ASSISTANT_ID || '';
-  }
+  return resolveAssistantIdByTenantKey(tenantKey) || '';
 }
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -98,4 +95,3 @@ async function runDataplateAssistant({ tenantKey, message }) {
 }
 
 module.exports = { runDataplateAssistant, resolveAssistantIdByTenant };
-

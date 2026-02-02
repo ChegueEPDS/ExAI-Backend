@@ -3715,6 +3715,8 @@ exports.getEquipmentById = async (req, res) => {
       return res.status(404).json({ error: 'Eszköz nem található.' });
     }
 
+    // Backfill computed defaults for older docs where the field doesn't exist yet.
+    if (!equipment.operationalStatus) equipment.operationalStatus = 'operating';
     res.json(equipment);
   } catch (error) {
     console.error('❌ Hiba az eszköz lekérdezésekor:', error);
@@ -3823,6 +3825,7 @@ exports.listEquipment = async (req, res) => {
     }
 
     const withPaths = equipments.map(eq => {
+      const operationalStatus = eq.operationalStatus || 'operating';
       const firstBlobUrl =
         eq.Pictures?.find?.(p => p.blobUrl)?.blobUrl ||
         eq.documents?.find?.(d => (d.type === 'image' || d.type === undefined) && d.blobUrl)?.blobUrl ||
@@ -3861,6 +3864,7 @@ exports.listEquipment = async (req, res) => {
 
       return {
         ...eq,
+        operationalStatus,
         BlobPreviewUrl: firstBlobUrl,
         'X condition': xCondition,
         _linkedCertificate: linkedCertificate,

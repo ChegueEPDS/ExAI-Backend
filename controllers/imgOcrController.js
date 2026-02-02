@@ -558,7 +558,14 @@ exports.uploadPdfWithFormRecognizer = [
       logger.info("📊 Extracted Data:", extractedData);
       logger.info("📊 Extracted Data:", JSON.stringify(extractedData, null, 2));
 
-      res.json({ recognizedText: extractedText, extractedData });
+      const pagesText = Array.isArray(analyzeResult?.pages)
+        ? analyzeResult.pages
+            .map((p) => (p?.lines || []).map((l) => l?.content).filter(Boolean).join('\n'))
+            .map((t) => String(t || '').trim())
+            .filter(Boolean)
+        : [];
+
+      res.json({ recognizedText: extractedText, extractedData, pagesText });
 
       await fs.promises.unlink(filePath);
       logger.info('🗑️ PDF fájl törölve.');

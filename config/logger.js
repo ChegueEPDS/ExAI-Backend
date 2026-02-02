@@ -11,8 +11,11 @@ const logger = createLogger({
     new transports.Console({
       format: format.combine(
         format.colorize(),
-        format.printf(({ level, message, timestamp }) => {
-          return `${timestamp} [${level}]: ${message}`;
+        format.printf((info) => {
+          const { level, message, timestamp, ...rest } = info || {};
+          const metaKeys = Object.keys(rest || {}).filter(k => rest[k] !== undefined);
+          const meta = metaKeys.length ? ` ${JSON.stringify(rest)}` : '';
+          return `${timestamp} [${level}]: ${message}${meta}`;
         })
       )
     }),

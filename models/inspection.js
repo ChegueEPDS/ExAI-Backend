@@ -24,6 +24,9 @@ const InspectionResultSchema = new Schema(
     // Rövid megjegyzés, főleg Failed esetén (de lehet NA/Passed-re is)
     note: { type: String },
 
+    // Severity only relevant when status === 'Failed'
+    severity: { type: String, enum: ['P1', 'P2', 'P3', 'P4', null], default: null },
+
     // Kérdés szöveg snapshot (hogy ha később változik a question DB, ez akkor is megmaradjon)
     questionText: {
       eng: { type: String, required: false },
@@ -103,6 +106,15 @@ const InspectionSchema = new Schema(
       type: String,
       enum: ['Passed', 'Failed'],
       required: true,
+    },
+
+    // Aggregated failure severity for the inspection (max severity across failed items)
+    // null when status === 'Passed'
+    failureSeverity: {
+      type: String,
+      enum: ['P1', 'P2', 'P3', 'P4', null],
+      default: null,
+      index: true
     },
 
     // Review workflow (mobile sync creates pending inspections)

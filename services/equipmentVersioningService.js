@@ -19,7 +19,11 @@ const IGNORED_TOP_LEVEL_KEYS = new Set([
   'lastInspectionDate',
   'lastInspectionValidUntil',
   'lastInspectionStatus',
-  'lastInspectionId'
+  'lastInspectionId',
+  // Maintenance UI uses explicit events; avoid duplicating them in SCD2 history.
+  'operationalStatus',
+  'operationalStatusChangedAt',
+  'operationalStatusChangedBy'
 ]);
 
 function normalizeScalar(value) {
@@ -88,6 +92,22 @@ function computeChangedPaths(oldSnapshot, newSnapshot) {
     if (deepEqual(no, nn)) return;
 
     if (Array.isArray(no) || Array.isArray(nn)) {
+      if (Array.isArray(no) && Array.isArray(nn)) {
+        const sameLen = no.length === nn.length;
+        const bothObjects =
+          sameLen &&
+          no.every((v) => isPlainObject(v)) &&
+          nn.every((v) => isPlainObject(v));
+
+        if (bothObjects) {
+          for (let i = 0; i < no.length; i += 1) {
+            const nextPath = basePath ? `${basePath}.${i}` : String(i);
+            walk(no[i], nn[i], nextPath);
+          }
+          return;
+        }
+      }
+
       changed.add(basePath);
       return;
     }

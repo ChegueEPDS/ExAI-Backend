@@ -13,6 +13,7 @@ const mime = require('mime-types');
 const ExcelJS = require('exceljs');
 const sharp = require('sharp');
 const heicConvert = require('heic-convert');
+const { computeOperationalSummary, computeMaintenanceSeveritySummary } = require('../services/operationalSummaryService');
 
 // Helper: convert string tenantId to ObjectId safely
 const toObjectId = (id) => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null);
@@ -176,6 +177,58 @@ exports.getZoneById = async (req, res) => {
     res.status(200).json(zone);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+};
+
+// GET /api/zones/:id/operational-summary
+exports.getZoneOperationalSummary = async (req, res) => {
+  try {
+    const tenantIdStr = req.scope?.tenantId;
+    const tenantObjectId = toObjectId(tenantIdStr);
+    if (!tenantObjectId) {
+      return res.status(400).json({ message: "Invalid or missing tenantId in auth" });
+    }
+
+    const zoneId = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(zoneId)) {
+      return res.status(400).json({ message: 'Invalid zone id.' });
+    }
+
+    const summary = await computeOperationalSummary({
+      tenantId: tenantIdStr,
+      zoneId
+    });
+
+    return res.json({ zoneId, ...summary });
+  } catch (error) {
+    console.error('❌ getZoneOperationalSummary error:', error);
+    return res.status(500).json({ message: 'Failed to fetch zone operational summary.' });
+  }
+};
+
+// GET /api/zones/:id/maintenance-severity-summary
+exports.getZoneMaintenanceSeveritySummary = async (req, res) => {
+  try {
+    const tenantIdStr = req.scope?.tenantId;
+    const tenantObjectId = toObjectId(tenantIdStr);
+    if (!tenantObjectId) {
+      return res.status(400).json({ message: "Invalid or missing tenantId in auth" });
+    }
+
+    const zoneId = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(zoneId)) {
+      return res.status(400).json({ message: 'Invalid zone id.' });
+    }
+
+    const summary = await computeMaintenanceSeveritySummary({
+      tenantId: tenantIdStr,
+      zoneId
+    });
+
+    return res.json({ zoneId, ...summary });
+  } catch (error) {
+    console.error('❌ getZoneMaintenanceSeveritySummary error:', error);
+    return res.status(500).json({ message: 'Failed to fetch zone maintenance severity summary.' });
   }
 };
 

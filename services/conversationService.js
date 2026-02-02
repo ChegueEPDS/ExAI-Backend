@@ -1,5 +1,6 @@
 const Conversation = require('../models/conversation');
 const axios = require('axios');
+const { resolveAssistantIdByTenantKey } = require('./assistantResolver');
 
 // Create a single axios instance with shared headers for Assistants v2
 const axiosInst = axios.create({
@@ -14,12 +15,7 @@ const axiosInst = axios.create({
 
 // Resolve assistant id from tenant key
 function resolveAssistantIdByTenant(tenantKey) {
-  try {
-    const map = require('../config/assistants');
-    return (map.byTenant && map.byTenant[tenantKey]) ? map.byTenant[tenantKey] : (map.default || map['default']);
-  } catch {
-    return process.env.ASSISTANT_ID_DEFAULT || '';
-  }
+  return resolveAssistantIdByTenantKey(tenantKey) || '';
 }
 // Optional: try to load User model to resolve plan (won't throw if not present)
 let UserModelOptional = null;

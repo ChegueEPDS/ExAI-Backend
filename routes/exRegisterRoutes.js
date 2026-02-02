@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const exRegisterController = require('../controllers/exRegisterController');
+const maintenanceController = require('../controllers/maintenanceController');
 const authMiddleware = require('../middlewares/authMiddleware');
 const multer = require('multer'); 
 const upload = multer({ dest: 'uploads/' });
@@ -99,6 +100,14 @@ router.get('/exreg/:id', authMiddleware(), exRegisterController.getEquipmentById
 // Equipment data history (SCD2-like versions)
 router.get('/exreg/:id/versions', authMiddleware(), exRegisterController.listEquipmentDataVersions);
 router.get('/exreg/:id/versions/:versionId', authMiddleware(), exRegisterController.getEquipmentDataVersion);
+
+// Unified timeline history: inspections + equipment versions + maintenance actions
+router.get('/exreg/:id/history', authMiddleware(), maintenanceController.getEquipmentHistory);
+
+// Maintenance actions
+router.post('/exreg/:id/maintenance/faults', authMiddleware(), maintenanceController.reportFault);
+router.post('/exreg/:id/maintenance/repairs/start', authMiddleware(), maintenanceController.startRepair);
+router.post('/exreg/:id/maintenance/repairs/:repairId/complete', authMiddleware(), maintenanceController.completeRepair);
 
 // Módosítás
 router.put('/exreg/:id', authMiddleware(), upload.array('pictures'), exRegisterController.updateEquipment);
