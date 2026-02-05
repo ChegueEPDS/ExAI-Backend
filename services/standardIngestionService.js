@@ -106,6 +106,52 @@ function parseClausesHeuristic(text) {
   return clauses.length ? clauses : null;
 }
 
+function escapeRegex(s) {
+  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function guessPrimaryFilenameForClauseText(clauseText, filenames) {
+  const t = String(clauseText || '');
+  for (const fn of (Array.isArray(filenames) ? filenames : [])) {
+    if (!fn) continue;
+    if (t.includes(`--- FILE: ${fn} ---`)) return fn;
+    if (t.includes(`FILE=${fn}`)) return fn;
+  }
+  return String(filenames?.[0] || '');
+}
+
+function attachPageOrLocToHeuristicClauses(clauses, pageSegments) {
+  const segs = Array.isArray(pageSegments) ? pageSegments : [];
+  if (!segs.length) return clauses;
+
+  const filenames = Array.from(new Set(segs.map(s => String(s?.filename || '').trim()).filter(Boolean)));
+  if (!filenames.length) return clauses;
+
+  // For each clauseId, find the first page that contains the clauseId marker (best-effort).
+  // This preserves human clause IDs (e.g., 3.69.4) while enabling page jump in the UI.
+  return (Array.isArray(clauses) ? clauses : []).map(c => {
+    const clauseId = String(c?.clauseId || '').trim();
+    if (!clauseId) return c;
+
+    const fn = guessPrimaryFilenameForClauseText(c?.text, filenames) || filenames[0];
+    const pages = segs.filter(s => String(s?.filename || '').trim() === fn);
+    const re = new RegExp(`(^|\\n)\\s*${escapeRegex(clauseId)}(\\s|$)`, 'm');
+    let foundPageNo = null;
+    for (const p of pages) {
+      const txt = String(p?.text || '');
+      if (re.test(txt)) {
+        const n = Number(p?.pageNo || 0);
+        if (Number.isFinite(n) && n > 0) {
+          foundPageNo = n;
+          break;
+        }
+      }
+    }
+    if (!foundPageNo) return c;
+    return { ...c, pageOrLoc: `${fn} page:${foundPageNo}` };
+  });
+}
+
 function splitClauseByTokens({ clauseId, title, text, pageOrLoc = '' }, { maxTokens = 500, overlapTokens = 80 } = {}) {
   const ids = encoder.encode(String(text || ''));
   if (ids.length <= maxTokens) return [{ clauseId, title, text, pageOrLoc }];
@@ -275,7 +321,7 @@ async function ingestStandardFiles({
     const parsed = parseClausesHeuristic(clean);
     let clauses0;
     if (parsed) {
-      clauses0 = parsed;
+      clauses0 = attachPageOrLocToHeuristicClauses(parsed, pageSegments);
     } else if (pageSegments.length) {
       clauses0 = [];
       let chunkSeq = 0;

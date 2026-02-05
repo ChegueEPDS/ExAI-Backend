@@ -4,6 +4,7 @@ const StandardClause = require('../models/standardClause');
 const StandardSet = require('../models/standardSet');
 const logger = require('../config/logger');
 const { ingestStandardFiles, deleteStandard } = require('../services/standardIngestionService');
+const azureBlob = require('../services/azureBlobService');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024, files: 10 } });
 exports.uploadMulter = upload;
@@ -26,6 +27,47 @@ exports.getStandard = async (req, res) => {
     if (!std) return res.status(404).json({ ok: false, error: 'not found' });
     return res.json({ ok: true, standard: std });
   } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || 'failed' });
+  }
+};
+
+// Return a short-lived SAS URL for the primary PDF of a tenant standard.
+// Frontend uses this to open the PDF directly from Blob Storage.
+exports.getStandardPdfUrl = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const { standardRef } = req.params;
+
+    const std = await Standard.findOne({ _id: standardRef, tenantId }).lean();
+    if (!std) return res.status(404).json({ ok: false, error: 'not found' });
+
+    const files = Array.isArray(std?.sourceFiles) ? std.sourceFiles : [];
+    const pdf = files.find(f =>
+      String(f?.contentType || '').toLowerCase().includes('pdf') ||
+      String(f?.filename || '').toLowerCase().endsWith('.pdf') ||
+      String(f?.blobPath || '').toLowerCase().endsWith('.pdf')
+    );
+    if (!pdf?.blobPath) return res.status(404).json({ ok: false, error: 'no pdf source file' });
+
+    const ttlSeconds = Math.max(60, Math.min(Number(process.env.STANDARD_PDF_SAS_TTL_SECONDS || 600), 3600));
+    const url = await azureBlob.getReadSasUrl(String(pdf.blobPath), {
+      ttlSeconds,
+      filename: String(pdf.filename || `${std.standardId || std.name || 'standard'}.pdf`),
+      contentType: 'application/pdf',
+      httpsOnly: true,
+    });
+
+    return res.json({
+      ok: true,
+      standardRef: String(std._id),
+      standardId: String(std.standardId || ''),
+      edition: String(std.edition || ''),
+      filename: String(pdf.filename || ''),
+      url,
+      ttlSeconds,
+    });
+  } catch (e) {
+    try { logger.error('standards.pdf.error', { requestId: req?.requestId, error: e?.message || 'failed' }); } catch { }
     return res.status(500).json({ ok: false, error: e?.message || 'failed' });
   }
 };

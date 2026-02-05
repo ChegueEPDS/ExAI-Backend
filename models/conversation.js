@@ -77,6 +77,14 @@ const ConversationSchema = new mongoose.Schema({
   // - governed: /api/chat/governed/stream (Pinecone + tenant standards + project dataset)
   chatBackend: { type: String, enum: ['normal', 'governed'], default: 'normal', index: true },
 
+  // Standard Explorer (tenant library): optional "standards-only" governed chat mode.
+  // When enabled, the UI opens the selected standard PDF from Blob and routes messages to governed retrieval,
+  // prioritizing this standard but allowing fallback to the full tenant library if needed.
+  standardExplorer: {
+    enabled: { type: Boolean, default: false, index: true },
+    standardRef: { type: mongoose.Schema.Types.ObjectId, ref: 'Standard', default: null, index: true },
+  },
+
   // Persist file-search context for hybrid/sandbox chats
   assistantId:   { type: String, default: null },     // sandbox esetben saját asszisztens
   vectorStoreId: { type: String, default: null },     // sandbox esetben saját store

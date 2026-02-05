@@ -52,6 +52,33 @@ exports.listDatasets = async (req, res) => {
   }
 };
 
+exports.listDatasetFiles = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const projectId = requireProjectId(req);
+    const datasetVersion = Number(req.params.version);
+    if (!Number.isInteger(datasetVersion) || datasetVersion <= 0) {
+      return res.status(400).json({ ok: false, error: 'dataset version must be a positive integer' });
+    }
+
+    const ds = await Dataset.findOne({ tenantId, projectId, version: datasetVersion }).select('_id version status').lean();
+    if (!ds) return res.status(404).json({ ok: false, error: 'dataset not found' });
+
+    const items = await DatasetFile.find({ tenantId, projectId, datasetVersion })
+      .sort({ updatedAt: -1 })
+      .select('filename contentType size sha256 approvalStatus indexingStatus indexingError storage createdAt updatedAt')
+      .lean();
+
+    return res.json({
+      ok: true,
+      dataset: { id: String(ds._id), version: ds.version, status: ds.status },
+      items,
+    });
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: e?.message || 'failed' });
+  }
+};
+
 exports.uploadDatasetFiles = [
   upload.array('files', 10),
   async (req, res) => {
@@ -127,6 +154,142 @@ exports.uploadDatasetFiles = [
     } catch (e) {
       try { logger.error('dataset.upload.error', { requestId: req?.requestId, error: e?.message || 'failed' }); } catch { }
       return res.status(400).json({ ok: false, error: e?.message || 'failed' });
+    }
+  }
+];
+
+function writeSse(res, event, data) {
+  if (res.writableEnded) return;
+  const payload = data === undefined ? '' : JSON.stringify(data);
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${payload}\n\n`);
+}
+
+function startSse(res) {
+  res.status(200);
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  // Initial comment so proxies start streaming immediately
+  res.write(`:ok\n\n`);
+}
+
+exports.uploadDatasetFilesStream = [
+  upload.array('files', 10),
+  async (req, res) => {
+    const heartbeatMs = 10_000;
+    let hb = null;
+    try {
+      startSse(res);
+
+      hb = setInterval(() => {
+        try {
+          // comment heartbeat (EventSource compatible)
+          if (!res.writableEnded) res.write(`:ping ${Date.now()}\n\n`);
+        } catch { }
+      }, heartbeatMs);
+
+      const tenantId = req.scope?.tenantId;
+      const userId = req.userId;
+      const projectId = requireProjectId(req);
+      const datasetVersion = Number(req.params.version);
+
+      writeSse(res, 'progress', { stage: 'dataset.resolve', projectId, datasetVersion });
+      const ds = await resolveOrCreateDataset({ tenantId, projectId, userId, version: datasetVersion });
+      if (ds.status === 'approved') {
+        writeSse(res, 'error', { error: 'dataset is approved; create a new version' });
+        return res.end();
+      }
+
+      const files = Array.isArray(req.files) ? req.files : [];
+      if (!files.length) {
+        writeSse(res, 'error', { error: 'no files uploaded' });
+        return res.end();
+      }
+
+      const debugEnabled =
+        String(process.env.DEBUG_GOVERNED || '').trim() === '1' ||
+        String(process.env.DEBUG_GOVERNED || '').trim().toLowerCase() === 'true';
+
+      try {
+        logger.info('dataset.upload.start', {
+          requestId: req.requestId,
+          tenantId: String(tenantId || ''),
+          userId: String(userId || ''),
+          projectId,
+          datasetVersion: ds.version,
+          files: files.map(f => ({ name: f.originalname, size: f.size, type: f.mimetype })),
+        });
+      } catch { }
+
+      writeSse(res, 'progress', {
+        stage: 'upload.start',
+        datasetVersion: ds.version,
+        files: files.map(f => ({ name: f.originalname, size: f.size, type: f.mimetype })),
+      });
+
+      const results = [];
+      let idx = 0;
+      for (const f of files) {
+        idx += 1;
+        if (req.aborted || res.writableEnded) break;
+
+        const filename = String(f.originalname || 'upload.bin');
+        const lower = filename.toLowerCase();
+        const isSpreadsheet = lower.endsWith('.xls') || lower.endsWith('.xlsx') || lower.endsWith('.csv');
+        const contentType = String(f.mimetype || 'application/octet-stream');
+        const sha256 = crypto.createHash('sha256').update(f.buffer).digest('hex');
+        const blobPath = `datasets/${tenantId}/${projectId}/v${ds.version}/${Date.now()}-${sha256}-${filename}`.replace(/\s+/g, '_');
+
+        writeSse(res, 'progress', { stage: 'upload.file', idx, total: files.length, filename, kind: isSpreadsheet ? 'tabular' : 'document' });
+        await azureBlob.uploadBuffer(blobPath, f.buffer, contentType, { overwrite: true });
+
+        if (debugEnabled) {
+          try { logger.info('dataset.upload.file', { requestId: req.requestId, projectId, datasetVersion: ds.version, filename, kind: isSpreadsheet ? 'tabular' : 'document', blobPath }); } catch { }
+        }
+
+        writeSse(res, 'progress', { stage: 'ingest.start', filename, kind: isSpreadsheet ? 'tabular' : 'document' });
+        const ing = isSpreadsheet
+          ? await ingestTabularFileBuffer({
+            tenantId,
+            projectId,
+            datasetId: ds._id,
+            datasetVersion: ds.version,
+            userId,
+            fileBuffer: f.buffer,
+            filename,
+            contentType,
+            blobPath,
+            trace: { requestId: req.requestId },
+          })
+          : await ingestDocumentFileBuffer({
+            tenantId,
+            projectId,
+            datasetId: ds._id,
+            datasetVersion: ds.version,
+            userId,
+            fileBuffer: f.buffer,
+            filename,
+            contentType,
+            blobPath,
+            trace: { requestId: req.requestId },
+          });
+        results.push({ filename, kind: isSpreadsheet ? 'tabular' : 'document', ...ing });
+        writeSse(res, 'progress', { stage: 'ingest.done', filename, kind: isSpreadsheet ? 'tabular' : 'document' });
+      }
+
+      try { logger.info('dataset.upload.done', { requestId: req.requestId, projectId, datasetVersion: ds.version, files: results.length }); } catch { }
+      writeSse(res, 'final', { ok: true, dataset: { id: String(ds._id), version: ds.version, status: ds.status }, files: results });
+      writeSse(res, 'done', {});
+      return res.end();
+    } catch (e) {
+      try { logger.error('dataset.upload.error', { requestId: req?.requestId, error: e?.message || 'failed' }); } catch { }
+      try { writeSse(res, 'error', { error: e?.message || 'failed' }); } catch { }
+      try { writeSse(res, 'done', {}); } catch { }
+      return res.end();
+    } finally {
+      if (hb) clearInterval(hb);
     }
   }
 ];

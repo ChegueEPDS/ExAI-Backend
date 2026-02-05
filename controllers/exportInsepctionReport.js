@@ -1659,12 +1659,35 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   return { workbook, fileName };
 }
 
+function normalizeRequestHost(rawHost) {
+  const host = String(rawHost || '').split(',')[0].trim().toLowerCase();
+  return host.replace(/:\d+$/, '');
+}
+
+function isInspExHost(rawHost) {
+  const host = normalizeRequestHost(rawHost);
+  if (!host) return false;
+  if (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0') return true;
+  return host === 'insp-ex.com' || host.endsWith('.insp-ex.com');
+}
+
 function buildProjectExRegisterWorkbook(equipments, {
   zoneMap,
   inspectionById,
   inspectionByEquipment,
-  certMap
+  certMap,
+  tenantName,
+  requestHost
 }) {
+  const hostBased = isInspExHost(requestHost);
+  const tenantSlugRaw = (tenantName || '').toLowerCase().trim();
+  const tenantSlug = tenantSlugRaw.replace(/_/g, '-');
+  const tenantBasedIsInspEx =
+    tenantSlug === 'insp-ex' ||
+    tenantSlug === 'inspex' ||
+    tenantSlug === 'insp ex';
+  const includeUserRequirement = requestHost ? !hostBased : !tenantBasedIsInspEx;
+
   const workbook = new ExcelJS.Workbook();
   const worksheet = workbook.addWorksheet('Database');
 
@@ -1691,17 +1714,23 @@ function buildProjectExRegisterWorkbook(equipments, {
     'Gas / Dust Group',
     'Temp Rating',
     'Ambient Temp',
-    'Req Zone',
-    'Req Gas / Dust Group',
-    'Req Temp Rating',
-    'Req Ambient Temp',
-    'Req IP Rating',
     'Inspection Date',
     'Inspector',
     'Type',
     'Status',
     'Remarks'
   ];
+  if (includeUserRequirement) {
+    headers.splice(
+      headers.indexOf('Inspection Date'),
+      0,
+      'Req Zone',
+      'Req Gas / Dust Group',
+      'Req Temp Rating',
+      'Req Ambient Temp',
+      'Req IP Rating'
+    );
+  }
 
   worksheet.columns = headers.map(header => ({
     header,
@@ -1717,8 +1746,15 @@ function buildProjectExRegisterWorkbook(equipments, {
     { start: 10, end: 14, label: 'EX DATA', color: 'FF538DD5' },
     { start: 15, end: 18, label: 'CERTIFICATION', color: 'FF00AA00' },
     { start: 19, end: 22, label: 'ZONE REQUIREMENTS', color: 'FFFFFF66' },
-    { start: 23, end: 27, label: 'USER REQUIREMENT', color: 'FFB1A0C7' },
-    { start: 28, end: 32, label: 'INSPECTION DATA', color: 'FFB0B0B0' }
+    ...(includeUserRequirement
+      ? [{ start: 23, end: 27, label: 'USER REQUIREMENT', color: 'FFB1A0C7' }]
+      : []),
+    {
+      start: includeUserRequirement ? 28 : 23,
+      end: includeUserRequirement ? 32 : 27,
+      label: 'INSPECTION DATA',
+      color: 'FFB0B0B0'
+    }
   ];
 
   mergeDefs.forEach(def => {
@@ -1742,8 +1778,11 @@ function buildProjectExRegisterWorkbook(equipments, {
     else if (colNumber >= 10 && colNumber <= 14) bg = 'FFDCE6F1';
     else if (colNumber >= 15 && colNumber <= 18) bg = 'FFCCFFCC';
     else if (colNumber >= 19 && colNumber <= 22) bg = 'FFFFFFCC';
-    else if (colNumber >= 23 && colNumber <= 27) bg = 'FFE4DFEC';
-    else if (colNumber >= 28 && colNumber <= 32) bg = 'FFE0E0E0';
+    else if (includeUserRequirement && colNumber >= 23 && colNumber <= 27) bg = 'FFE4DFEC';
+    else if (
+      (!includeUserRequirement && colNumber >= 23 && colNumber <= 27) ||
+      (includeUserRequirement && colNumber >= 28 && colNumber <= 32)
+    ) bg = 'FFE0E0E0';
 
     cell.font = { bold: true, color: { argb: 'FF000000' } };
     if (bg) {
@@ -1768,13 +1807,15 @@ function buildProjectExRegisterWorkbook(equipments, {
     'Gas / Dust Group',
     'Temp. Rating',
     'Ambient Temp',
-    'Req Zone',
-    'Req Gas / Dust Group',
-    'Req Temp Rating',
-    'Req Ambient Temp',
-    'Req IP Rating',
     'Status'
   ]);
+  if (includeUserRequirement) {
+    centerAlignedColumns.add('Req Zone');
+    centerAlignedColumns.add('Req Gas / Dust Group');
+    centerAlignedColumns.add('Req Temp Rating');
+    centerAlignedColumns.add('Req Ambient Temp');
+    centerAlignedColumns.add('Req IP Rating');
+  }
 
   let equipmentIndex = 0;
   for (const eq of equipments) {
@@ -1814,25 +1855,32 @@ function buildProjectExRegisterWorkbook(equipments, {
     if (zone?.AmbientTempMax != null) ambientParts.push(`+${zone.AmbientTempMax}°C`);
     const ambientDisplay = ambientParts.join(' / ');
 
-    const clientReq = Array.isArray(zone?.clientReq) && zone.clientReq.length
-      ? zone.clientReq[0]
-      : null;
-    const clientReqZoneNumber = Array.isArray(clientReq?.Zone)
-      ? clientReq.Zone.join(', ')
-      : (clientReq?.Zone != null ? String(clientReq.Zone) : '');
-    const clientReqGasDustGroup = Array.isArray(clientReq?.SubGroup)
-      ? clientReq.SubGroup.join(', ')
-      : (clientReq?.SubGroup != null ? String(clientReq.SubGroup) : '');
-    const clientReqTempParts = [];
-    if (clientReq?.TempClass) clientReqTempParts.push(clientReq.TempClass);
-    if (typeof clientReq?.MaxTemp === 'number') clientReqTempParts.push(`${clientReq.MaxTemp}°C`);
-    const clientReqTempDisplay = clientReqTempParts.join(' / ');
+    let clientReqZoneNumber = '';
+    let clientReqGasDustGroup = '';
+    let clientReqTempDisplay = '';
+    let clientReqAmbientDisplay = '';
+    let clientReqIpRating = '';
+    if (includeUserRequirement) {
+      const clientReq = Array.isArray(zone?.clientReq) && zone.clientReq.length
+        ? zone.clientReq[0]
+        : null;
+      clientReqZoneNumber = Array.isArray(clientReq?.Zone)
+        ? clientReq.Zone.join(', ')
+        : (clientReq?.Zone != null ? String(clientReq.Zone) : '');
+      clientReqGasDustGroup = Array.isArray(clientReq?.SubGroup)
+        ? clientReq.SubGroup.join(', ')
+        : (clientReq?.SubGroup != null ? String(clientReq.SubGroup) : '');
+      const clientReqTempParts = [];
+      if (clientReq?.TempClass) clientReqTempParts.push(clientReq.TempClass);
+      if (typeof clientReq?.MaxTemp === 'number') clientReqTempParts.push(`${clientReq.MaxTemp}°C`);
+      clientReqTempDisplay = clientReqTempParts.join(' / ');
 
-    const clientReqAmbientParts = [];
-    if (clientReq?.AmbientTempMin != null) clientReqAmbientParts.push(`${clientReq.AmbientTempMin}°C`);
-    if (clientReq?.AmbientTempMax != null) clientReqAmbientParts.push(`+${clientReq.AmbientTempMax}°C`);
-    const clientReqAmbientDisplay = clientReqAmbientParts.join(' / ');
-    const clientReqIpRating = clientReq?.IpRating || '';
+      const clientReqAmbientParts = [];
+      if (clientReq?.AmbientTempMin != null) clientReqAmbientParts.push(`${clientReq.AmbientTempMin}°C`);
+      if (clientReq?.AmbientTempMax != null) clientReqAmbientParts.push(`+${clientReq.AmbientTempMax}°C`);
+      clientReqAmbientDisplay = clientReqAmbientParts.join(' / ');
+      clientReqIpRating = clientReq?.IpRating || '';
+    }
 
     const cert = resolveCertificateFromCache(certMap, eq['Certificate No']);
     const hasSpecialCondition = !!(cert && (cert.specCondition || cert.xcondition));
@@ -1875,17 +1923,19 @@ function buildProjectExRegisterWorkbook(equipments, {
         'Gas / Dust Group': zoneSubGroup,
         'Temp Rating': zoneTempDisplay,
         'Ambient Temp': ambientDisplay,
-        'Req Zone': clientReqZoneNumber,
-        'Req Gas / Dust Group': clientReqGasDustGroup,
-        'Req Temp Rating': clientReqTempDisplay,
-        'Req Ambient Temp': clientReqAmbientDisplay,
-        'Req IP Rating': clientReqIpRating,
         'Status': eq['Compliance'] || '',
         'Inspection Date': inspectionDate ? new Date(inspectionDate) : '',
         'Inspector': inspectorName,
         'Type': inspection?.inspectionType || '',
         'Remarks': eq['Other Info'] || ''
       };
+      if (includeUserRequirement) {
+        rowData['Req Zone'] = clientReqZoneNumber;
+        rowData['Req Gas / Dust Group'] = clientReqGasDustGroup;
+        rowData['Req Temp Rating'] = clientReqTempDisplay;
+        rowData['Req Ambient Temp'] = clientReqAmbientDisplay;
+        rowData['Req IP Rating'] = clientReqIpRating;
+      }
 
       const row = worksheet.addRow(rowData);
       row.eachCell((cell, colNumber) => {
@@ -2209,7 +2259,7 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
   return { workbook, fileName };
 }
 
-async function generateProjectReportArchive({ tenantId, siteId, tenantName }, targetStream, progressCb = null) {
+async function generateProjectReportArchive({ tenantId, siteId, tenantName, requestHost }, targetStream, progressCb = null) {
   const site = await Site.findOne({ _id: siteId }).lean();
   if (!site) {
     throw new Error('Project not found.');
@@ -2290,7 +2340,9 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName }, ta
     zoneMap,
     inspectionById,
     inspectionByEquipment,
-    certMap
+    certMap,
+    tenantName,
+    requestHost
   });
   const safeSiteName = sanitizeFileNameSegment(site?.Name || site?.SiteName || 'project');
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -2466,7 +2518,7 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName }, ta
 }
 
 async function generateLatestInspectionArchive(
-  { tenantId, siteId, zoneId, includeImages, tenantName },
+  { tenantId, siteId, zoneId, includeImages, tenantName, requestHost },
   targetStream,
   progressCb = null
 ) {
@@ -2623,6 +2675,7 @@ async function runReportExportJob(jobId) {
   if (!job) return;
 
   const tenantName = job.meta?.tenantName || '';
+  const requestHost = job.meta?.requestHost || '';
   console.info(`[report-job ${job.jobId}] started (${job.type}) for tenant ${job.tenantId}`);
   const blobPath = buildReportBlobPath(job.tenantId, job.jobId);
   const uploadStream = new PassThrough();
@@ -2639,7 +2692,7 @@ async function runReportExportJob(jobId) {
     const progressCallback = createProgressCallback(job);
     if (job.type === REPORT_JOB_TYPES.PROJECT_FULL) {
       result = await generateProjectReportArchive(
-        { tenantId: job.tenantId, siteId: job.params?.siteId, tenantName },
+        { tenantId: job.tenantId, siteId: job.params?.siteId, tenantName, requestHost },
         uploadStream,
         progressCallback
       );
@@ -2650,7 +2703,8 @@ async function runReportExportJob(jobId) {
           siteId: job.params?.siteId,
           zoneId: job.params?.zoneId,
           includeImages: job.params?.includeImages !== false,
-          tenantName
+          tenantName,
+          requestHost
         },
         uploadStream,
         progressCallback
@@ -3088,7 +3142,8 @@ exports.exportProjectFullReport = async (req, res) => {
       params: { siteId },
       tenantName: req.scope?.tenantName || '',
       meta: {
-        siteName: site?.Name || site?.SiteName || ''
+        siteName: site?.Name || site?.SiteName || '',
+        requestHost: req.get('x-forwarded-host') || req.get('host') || req.hostname || ''
       }
     });
 
@@ -3114,7 +3169,9 @@ exports.exportLatestInspectionReportsZip = async (req, res) => {
       return res.status(400).json({ message: 'Kérjük adjon meg zoneId vagy siteId paramétert.' });
     }
 
-    const meta = {};
+    const meta = {
+      requestHost: req.get('x-forwarded-host') || req.get('host') || req.hostname || ''
+    };
     if (siteId) {
       const site = await Site.findOne({ _id: siteId, tenantId }).select('Name SiteName').lean();
       if (!site) {

@@ -176,12 +176,23 @@ const corsDelegate = (req, callback) => {
     return;
   }
   logCorsDenied(req, origin);
-  callback(new Error('Not allowed by CORS'));
+  // Do NOT throw here: throwing turns into a 500 without CORS headers and the browser surfaces it as a confusing "CORS missing header".
+  // Instead, mark the request and let a normal 403 response happen.
+  req.corsDenied = true;
+  callback(null, { ...corsOptionsBase, origin: false });
 };
 
 app.use(cors(corsDelegate));
 // Ensure CORS is applied to preflight requests across all routes
 app.options('*', cors(corsDelegate));
+
+// Hard block disallowed origins (after CORS evaluation), but with a clean 403 (no stack trace noise).
+app.use((req, res, next) => {
+  if (req.corsDenied) {
+    return res.status(403).json({ ok: false, error: 'Not allowed by CORS' });
+  }
+  return next();
+});
 
 // Request correlation id (used in logs and returned as response header)
 app.use(requestIdMiddleware);

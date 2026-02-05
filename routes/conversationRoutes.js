@@ -13,7 +13,8 @@ const {
   uploadAndAskStream,
   sendMessageStream,
   chatWithFilesStream,
-  chatWithFilesCompletionsStream
+  chatWithFilesCompletionsStream,
+  setStandardExplorer
 } = require('../controllers/conversationController');
 const { chatGovernedStream } = require('../controllers/governedChatController');
 const authMiddleware = require('../middlewares/authMiddleware');
@@ -60,6 +61,7 @@ router.post('/aisearch', authMiddleware(), searchAndRespond);
 
 // Korábbi beszélgetés betöltése
 router.get('/conversation', authMiddleware(), getConversationById);
+router.post('/conversation/standard-explorer', authMiddleware(), setStandardExplorer);
 
 router.post(
   '/upload-and-summarize/stream',

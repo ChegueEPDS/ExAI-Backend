@@ -294,6 +294,7 @@ function buildCitationsMarkdown(quotes, lang = 'en') {
   const items = (Array.isArray(quotes) ? quotes : [])
     .map((q) => ({
       fileName: String(q?.fileName || q?.filename || q?.standardId || '').trim(),
+      clauseId: String(q?.clauseId || '').trim(),
       pageOrLoc: String(q?.pageOrLoc || q?.loc || q?.page || '').trim(),
       quote: String(q?.quote || q?.text || '').replace(/\s+/g, ' ').trim(),
     }))
@@ -304,7 +305,10 @@ function buildCitationsMarkdown(quotes, lang = 'en') {
   const heading = String(lang).toLowerCase() === 'hu' ? 'Hivatkozások' : 'References';
   const lines = [`\n\n---\n\n### ${heading}`];
   for (const it of items) {
-    const loc = it.pageOrLoc ? ` (${it.pageOrLoc})` : '';
+    const parts = [];
+    if (it.clauseId) parts.push(`cl.${it.clauseId}`);
+    if (it.pageOrLoc) parts.push(it.pageOrLoc);
+    const loc = parts.length ? ` (${parts.join(', ')})` : '';
     lines.push(`- **${it.fileName}**${loc}: ${it.quote}`);
   }
   return lines.join('\n');
@@ -367,9 +371,22 @@ function hybridScoreValue({ query, text, vectorScore }) {
 
 async function applyRerank({ query, kind, items, trace }) {
   // items: [{ id, kind, title, loc, text, _score }]
-  const maxForRerank = Math.max(5, Math.min(Number(process.env.RERANK_MAX_ITEMS || 40), 80));
+  const maxForRerank = (() => {
+    const k = String(kind || '').trim().toLowerCase();
+    const raw = k === 'standard_clause'
+      ? (process.env.RERANK_MAX_ITEMS_STANDARD_CLAUSE ?? process.env.RERANK_MAX_ITEMS)
+      : process.env.RERANK_MAX_ITEMS;
+    return Math.max(5, Math.min(Number(raw || 40), 80));
+  })();
   const slice = (items || []).slice(0, maxForRerank);
-  const r = await rerankWithLLM({ query, items: slice.map(x => ({ id: x.id, kind, title: x.title, loc: x.loc, text: x.text })), trace });
+  const r = await rerankWithLLM({
+    query,
+    kind,
+    items: slice.map(x => ({ id: x.id, kind, title: x.title, loc: x.loc, text: x.text })),
+    trace,
+    model: String(kind || '').trim().toLowerCase() === 'standard_clause' ? (process.env.RERANK_MODEL_STANDARD_CLAUSE || null) : null,
+    maxItems: maxForRerank,
+  });
   const order = Array.isArray(r?.order) ? r.order : [];
   if (!order.length) return items || [];
   const byId = new Map((items || []).map(x => [String(x.id), x]));
@@ -419,6 +436,16 @@ function detectLanguage(userMsg = '') {
 
   // Default: prefer Hungarian only when clearly indicated, otherwise English.
   return 'en';
+}
+
+function isDefinitionLikeQuestion(message) {
+  const s = String(message || '').toLowerCase();
+  if (/\b\d+(?:\.\d+){1,5}\b/.test(s)) return true; // clause id like 3.69.4
+  const needles = [
+    'definition', 'define', 'means', 'what does', 'what is the definition',
+    'mit jelent', 'jelentése', 'definíció', 'definicio', 'magyarázd el', 'magyarázat',
+  ];
+  return needles.some(n => s.includes(n));
 }
 
 function numericEvidenceRequired() {
@@ -712,7 +739,7 @@ exports.chatGovernedStream = async (req, res) => {
   try {
     const userId = req.userId;
     const tenantId = req.scope?.tenantId;
-    const { threadId, message } = req.body || {};
+    const { threadId, message, standardRef: requestedStandardRef0 } = req.body || {};
     const requestedVersion = req.body?.datasetVersion;
 
     const debugEnabled =
@@ -736,7 +763,7 @@ exports.chatGovernedStream = async (req, res) => {
     }
 
     const lang = detectLanguage(message);
-    const answerMode = detectAnswerMode(message);
+    let answerMode = detectAnswerMode(message);
 
     try {
       logger.info('governed.start', {
@@ -755,6 +782,23 @@ exports.chatGovernedStream = async (req, res) => {
       send('error', { message: 'Conversation not found.' });
       send('done', { ok: false });
       return res.end();
+    }
+
+    // --- Standard Explorer mode (tenant standard library, PDF-only) ---
+    // If the client pins a standardRef, persist it on the conversation and allow governed chat without project datasets.
+    const requestedStandardRef = String(requestedStandardRef0 || '').trim();
+    if (requestedStandardRef) {
+      try {
+        conversation.standardExplorer = { enabled: true, standardRef: requestedStandardRef };
+      } catch { }
+    }
+    const standardExplorerEnabled = !!(conversation?.standardExplorer?.enabled);
+    const primaryStandardRef = standardExplorerEnabled
+      ? String(conversation?.standardExplorer?.standardRef || '').trim()
+      : '';
+    // Standard Explorer should behave like the legacy "standard chat": quote + explain, not a project-summary report.
+    if (standardExplorerEnabled) {
+      answerMode = 'chat';
     }
 
     // Resolve (or create) an internal projectId for this thread, so the client doesn't need to manage it.
@@ -806,7 +850,7 @@ exports.chatGovernedStream = async (req, res) => {
     } else {
       ds = await Dataset.findOne({ tenantId, projectId }).sort({ version: -1 }).lean();
     }
-    if (!ds) {
+    if (!ds && !standardExplorerEnabled) {
       await setConversationJob(conversation, {
         type: 'governed_chat',
         status: 'succeeded',
@@ -819,22 +863,28 @@ exports.chatGovernedStream = async (req, res) => {
       return res.end();
     }
 
-    const datasetVersion = ds.version;
+    const datasetVersion = ds ? ds.version : null;
     await setConversationJob(conversation, {
       type: 'governed_chat',
       stage: 'dataset.selected',
       meta: { datasetVersion },
       progress: { lastMessage: 'dataset.selected' },
     });
-    const allowedFiles = await DatasetFile.find({
-      tenantId,
-      projectId,
-      datasetVersion,
-      approvalStatus: { $ne: 'rejected' },
-      indexingStatus: 'done'
-    }).select('filename').lean();
-    const allowedFilenames = Array.from(new Set((allowedFiles || []).map(x => x.filename).filter(Boolean))).slice(0, 200);
-    if (!allowedFilenames.length) {
+
+    let allowedFilenames = [];
+    if (ds) {
+      const allowedFiles = await DatasetFile.find({
+        tenantId,
+        projectId,
+        datasetVersion,
+        approvalStatus: { $ne: 'rejected' },
+        indexingStatus: 'done'
+      }).select('filename').lean();
+      allowedFilenames = Array.from(new Set((allowedFiles || []).map(x => x.filename).filter(Boolean))).slice(0, 200);
+    }
+
+    // In Standard Explorer mode we can answer purely from tenant standard library (no project files required).
+    if (!allowedFilenames.length && !standardExplorerEnabled) {
       await setConversationJob(conversation, {
         type: 'governed_chat',
         status: 'succeeded',
@@ -872,7 +922,7 @@ exports.chatGovernedStream = async (req, res) => {
       }
     });
 
-    send('progress', { stage: 'retrieval.start', datasetVersion, files: allowedFilenames.length });
+    send('progress', { stage: 'retrieval.start', datasetVersion, files: allowedFilenames.length, standardExplorer: standardExplorerEnabled ? { standardRef: primaryStandardRef } : null });
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const embeddingModel = process.env.RAG_EMBEDDING_MODEL || 'text-embedding-3-small';
@@ -900,7 +950,7 @@ exports.chatGovernedStream = async (req, res) => {
     // --- Pre-retrieve a few doc snippets to help standard routing ---
     let routingEvidenceText = '';
     try {
-      if (pineconeEnabled && Array.isArray(qEmbedding) && qEmbedding.length) {
+      if (pineconeEnabled && Array.isArray(qEmbedding) && qEmbedding.length && allowedFilenames.length) {
         const baseFilter = {
           tenantId: String(tenantId),
           projectId: String(projectId),
@@ -922,11 +972,11 @@ exports.chatGovernedStream = async (req, res) => {
     const chosenFromNumeric = parseClarifyNumericSelection(conversation, message);
     let selectedSets = [];
     let clarify = null;
-    if (chosenFromNumeric) {
+    if (!standardExplorerEnabled && chosenFromNumeric) {
       const doc = await StandardSet.findOne({ tenantId, _id: chosenFromNumeric }).populate('standardRefs').lean();
       selectedSets = doc ? [doc] : [];
     }
-    if (!selectedSets.length) {
+    if (!standardExplorerEnabled && !selectedSets.length) {
       ({ selectedSets, clarify } = await resolveStandardSelection({ tenantId, message, evidenceText: routingEvidenceText, openai }));
     }
     if (clarify) {
@@ -956,6 +1006,9 @@ exports.chatGovernedStream = async (req, res) => {
         .map(r => String(r?._id || r))
         .filter(Boolean)
     ));
+    if (standardExplorerEnabled && primaryStandardRef) {
+      selectedStandardRefs.unshift(primaryStandardRef);
+    }
     if (debugEnabled) {
       try {
         logger.info('governed.standardSets.selected', {
@@ -986,25 +1039,25 @@ exports.chatGovernedStream = async (req, res) => {
         filename: { $in: allowedFilenames },
       };
 
-      const tableMatches = await pinecone.queryVectors({
+      const tableMatches = allowedFilenames.length ? await pinecone.queryVectors({
         namespace,
         vector: qEmbedding,
         topK: candTables,
         filter: { ...baseFilter, kind: 'table_row' },
-      });
-      const docMatches = await pinecone.queryVectors({
+      }) : [];
+      const docMatches = allowedFilenames.length ? await pinecone.queryVectors({
         namespace,
         vector: qEmbedding,
         topK: candDocs,
         filter: { ...baseFilter, kind: 'doc_chunk' },
-      });
+      }) : [];
       const candImg = Number(process.env.GOVERNED_RAG_IMG_CANDIDATES || 20);
-      const imgMatches = await pinecone.queryVectors({
+      const imgMatches = allowedFilenames.length ? await pinecone.queryVectors({
         namespace,
         vector: qEmbedding,
         topK: candImg,
         filter: { ...baseFilter, kind: 'image_chunk' },
-      });
+      }) : [];
 
       // Standard library is stored under a separate "projectId" key for namespace isolation
       const stdNamespace = pinecone.resolveNamespace({ tenantId, projectId: 'standard-library' });
@@ -1012,15 +1065,30 @@ exports.chatGovernedStream = async (req, res) => {
         tenantId: String(tenantId),
         kind: 'standard_clause',
       };
+      // Standard retrieval:
+      // - If a primary standard is pinned (Standard Explorer), prioritize that standard first.
+      // - If results are weak, expand to full tenant library without forcing the user to pick sets.
+      let stdMatches = [];
       if (selectedStandardRefs.length) {
-        stdFilter.standardRef = { $in: selectedStandardRefs };
+        const primaryFilter = { ...stdFilter, standardRef: { $in: selectedStandardRefs } };
+        stdMatches = await pinecone.queryVectors({ namespace: stdNamespace, vector: qEmbedding, topK: candStd, filter: primaryFilter });
+
+        // Fallback expansion (still keep primary hits first).
+        const minMatches = Math.max(4, Math.min(Number(process.env.STANDARD_EXPLORER_FALLBACK_MIN_MATCHES || 10), candStd));
+        if (standardExplorerEnabled && (stdMatches || []).length < minMatches) {
+          const extra = await pinecone.queryVectors({ namespace: stdNamespace, vector: qEmbedding, topK: candStd, filter: stdFilter });
+          const seen = new Set((stdMatches || []).map(m => String(m?.id || '')));
+          for (const m of (extra || [])) {
+            const id = String(m?.id || '');
+            if (!id || seen.has(id)) continue;
+            stdMatches.push(m);
+            seen.add(id);
+            if (stdMatches.length >= candStd) break;
+          }
+        }
+      } else {
+        stdMatches = await pinecone.queryVectors({ namespace: stdNamespace, vector: qEmbedding, topK: candStd, filter: stdFilter });
       }
-      const stdMatches = await pinecone.queryVectors({
-        namespace: stdNamespace,
-        vector: qEmbedding,
-        topK: candStd,
-        filter: stdFilter,
-      });
       if (debugEnabled) {
         try {
           logger.info('governed.retrieval.pinecone.matches', {
@@ -1251,13 +1319,16 @@ exports.chatGovernedStream = async (req, res) => {
       }
 
       // Neighbor expansion for standards (seq +/- 1)
+      const neighborRadius = (standardExplorerEnabled && isDefinitionLikeQuestion(message)) ? 2 : 1;
       const neighbors = [];
       for (const s of scoredStandards) {
         const seq = Number(s?.seq || 0);
         const ref = s?.standardRef;
         if (!ref || !seq) continue;
-        neighbors.push({ ref, seq: seq - 1 });
-        neighbors.push({ ref, seq: seq + 1 });
+        for (let d = 1; d <= neighborRadius; d += 1) {
+          neighbors.push({ ref, seq: seq - d });
+          neighbors.push({ ref, seq: seq + d });
+        }
       }
       if (neighbors.length) {
         const or = neighbors
@@ -1424,7 +1495,7 @@ exports.chatGovernedStream = async (req, res) => {
       contextParts.push('STANDARD_CONTEXT (tenant library):');
       for (const s of scoredStandards) {
         contextParts.push(
-          `STD_SOURCE standard=${s.standardId}${s.edition ? `:${s.edition}` : ''} clause=${s.clauseId} loc=${s.pageOrLoc} quoteId=${s.quoteId}\n${s.text}`.trim()
+          `STD_SOURCE standardRef=${String(s.standardRef || '')} standard=${s.standardId}${s.edition ? `:${s.edition}` : ''} clause=${s.clauseId} loc=${s.pageOrLoc} quoteId=${s.quoteId}\n${s.text}`.trim()
         );
         contextParts.push('---');
       }
@@ -1495,7 +1566,7 @@ exports.chatGovernedStream = async (req, res) => {
       } catch { }
     }
 
-    const systemPartsHu = [
+    let systemPartsHu = [
       `NYELV: ${languageLabel(lang)}.`,
       `MÓD: ${answerMode === 'report' ? 'RIport/elemzés' : 'Chat'} (automatikus; a kérdés alapján).`,
       'Te egy mérnöki compliance / elemző asszisztens vagy.',
@@ -1530,13 +1601,13 @@ exports.chatGovernedStream = async (req, res) => {
       '{ "answer": string, "numericEvidence": [',
       '  { "kind": "cell", "fileName": string, "sheet": string, "rowIndex": number, "colIndex": number, "cell": string, "value": string },',
       '  { "kind": "computed", "op": "delta|range|sum|avg", "value": string, "unit": string, "sources": [ { "fileName": string, "sheet": string, "rowIndex": number, "colIndex": number, "cell": string, "value": string } ] }',
-      '], "quotes": [ { "fileName": string, "pageOrLoc": string, "quote": string, "sourceType": "standard|document|image" } ] }',
+      '], "quotes": [ { "fileName": string, "standardRef": string?, "clauseId": string?, "pageOrLoc": string, "quote": string, "sourceType": "standard|document|image" } ] }',
       'A "numericEvidence" lista: XLSX cellák + (opcionális) számolt értékek forrás cellákkal. A "cell" mezőt töltsd ki, ha elérhető (pl. "C15").',
       'A "quotes" listában legyen rövid idézet (1-3 mondat) a releváns dokumentum/standard részről (fileName + pageOrLoc).',
       'Válasz struktúra javaslat: "Projekt összefoglaló", "Fő megállapítások", "Compliance mátrix" (Markdown táblázat), "Kockázatok / hiányok", "Következő lépések".'
     ];
 
-    const systemPartsEn = [
+    let systemPartsEn = [
       `LANGUAGE: ${languageLabel(lang)} (respond in this language).`,
       `MODE: ${answerMode === 'report' ? 'REPORT' : 'CHAT'} (auto; based on the user question).`,
       'You are an engineering compliance / analysis assistant.',
@@ -1571,11 +1642,39 @@ exports.chatGovernedStream = async (req, res) => {
       '{ "answer": string, "numericEvidence": [',
       '  { "kind": "cell", "fileName": string, "sheet": string, "rowIndex": number, "colIndex": number, "cell": string, "value": string },',
       '  { "kind": "computed", "op": "delta|range|sum|avg", "value": string, "unit": string, "sources": [ { "fileName": string, "sheet": string, "rowIndex": number, "colIndex": number, "cell": string, "value": string } ] }',
-      '], "quotes": [ { "fileName": string, "pageOrLoc": string, "quote": string, "sourceType": "standard|document|image" } ] }',
+      '], "quotes": [ { "fileName": string, "standardRef": string?, "clauseId": string?, "pageOrLoc": string, "quote": string, "sourceType": "standard|document|image" } ] }',
       'The "numericEvidence" list must contain XLSX cells and (optionally) computed values with source cells. Fill "cell" if available (e.g., "C15").',
       'The "quotes" list must include short excerpts (1-3 sentences) from the relevant document/standard (fileName + pageOrLoc).',
       'Suggested structure: "Project summary", "Key findings", "Compliance matrix" (Markdown table), "Risks / gaps", "Next actions".'
     ];
+
+    // Override style for Standard Explorer: quote + explain (legacy standard chat style).
+    if (standardExplorerEnabled) {
+      systemPartsHu.push(
+        'STANDARD EXPLORER MÓD: ez a beszélgetés a tenant szabványtárából (PDF) dolgozik.',
+        'Válasz stílus: a régi "standard chat" jelleg — NEM projekt-riport, NEM kötelező compliance mátrix, hacsak a user nem kéri.',
+        'KÖTELEZŐ FORMÁTUM (ne térj el):',
+        '1) Idézetek: a JSON "answer" mezőben a `<h3>Explanation:</h3>` sor ELŐTT kizárólag a pontos, szó szerinti idézet(ek) legyenek (címkék/forrás sorok/fejezetcímek nélkül), hogy a PDF-ben a kiemelés működjön.',
+        '2) Ezután legyen pontosan: `<h3>Explanation:</h3>`',
+        '3) Alatta rövid magyarázat magyarul: mit jelent az idézet a kérdés szempontjából + add meg, hol található (standardId, clauseId, pageOrLoc).',
+        'Ha a teljes idézethez több STD_SOURCE rész kell (több chunk / szomszédos rész), akkor több bekezdésben idézz, mindegyiket szó szerint. Ne találj ki hiányzó részt.',
+        'Kötelező: töltsd ki a "quotes" tömböt a felhasznált standard idézetekkel és add meg legalább: fileName/standardId, clauseId (ha elérhető), pageOrLoc, quote (rövid kivonat), sourceType="standard".',
+        'TILOS ebben a módban: "Project summary", "Key findings", "Risks / gaps", "Recommended next actions" (vagy ezek magyar megfelelői), hacsak a user explicit nem kér kockázatelemzést vagy összefoglalót.',
+        'Ha nincs releváns idézet a kontextusban, válasz: NOT FOUND.'
+      );
+      systemPartsEn.push(
+        'STANDARD EXPLORER MODE: this thread answers from the tenant standard library (PDF).',
+        'Response style: like the legacy "standard chat" — NOT a project-summary report and no compliance matrix unless the user explicitly asks.',
+        'REQUIRED FORMAT (do not deviate):',
+        '1) Quotes: in JSON "answer", BEFORE the exact line `<h3>Explanation:</h3>`, include ONLY exact verbatim quote(s) (no labels/source lines/headings) so PDF highlighting works.',
+        '2) Then output exactly: `<h3>Explanation:</h3>`',
+        '3) Then a short explanation in the user language + where it is found (standardId, clauseId, pageOrLoc).',
+        'If the full quote spans multiple STD_SOURCE chunks, include multiple paragraphs of verbatim quotes. Do not invent missing text.',
+        'Required: fill the "quotes" array with the standard excerpts you used, including at least: fileName/standardId, clauseId (if available), pageOrLoc, quote, sourceType="standard".',
+        'Forbidden in this mode: "Project summary", "Key findings", "Risks / gaps", "Recommended next actions" unless the user explicitly requests a report/risk assessment.',
+        'If no relevant quote is present in the provided context, return NOT FOUND.'
+      );
+    }
 
     const system = (lang === 'hu' ? systemPartsHu : systemPartsEn).join(' ');
 
@@ -1608,6 +1707,12 @@ exports.chatGovernedStream = async (req, res) => {
     const resp = await openai.chat.completions.create({
       model: process.env.FILE_CHAT_COMPLETIONS_MODEL || 'gpt-5-mini',
       response_format: { type: 'json_object' },
+      ...(standardExplorerEnabled
+        ? {
+            temperature: 0,
+            max_tokens: Math.max(600, Math.min(Number(process.env.STANDARD_EXPLORER_MAX_OUTPUT_TOKENS || 2500), 10000)),
+          }
+        : {}),
       messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
     });
     const txt = String(resp?.choices?.[0]?.message?.content || '').trim();
@@ -1635,9 +1740,139 @@ exports.chatGovernedStream = async (req, res) => {
     let numericEvidence = (parsed && Array.isArray(parsed.numericEvidence)) ? parsed.numericEvidence : [];
     let quotes = (parsed && Array.isArray(parsed.quotes)) ? parsed.quotes : [];
 
+    function stripStandardExplorerScaffolding(answerText) {
+      const txt = String(answerText || '');
+      const explTag = '<h3>Explanation:</h3>';
+      const idx = txt.indexOf(explTag);
+      const before = idx >= 0 ? txt.slice(0, idx) : txt;
+      const after = idx >= 0 ? txt.slice(idx) : '';
+
+      const forbidden = [
+        'project summary',
+        'key findings',
+        'compliance matrix',
+        'risks / gaps',
+        'recommended next actions',
+        'next actions',
+        // HU variants (in case model drifts)
+        'projekt összefoglaló',
+        'fő megállapítások',
+        'compliance mátrix',
+        'kockázatok / hiányok',
+        'következő lépések',
+      ];
+
+      const cleanedBefore = before
+        .split('\n')
+        .filter(line => {
+          const s = String(line || '').trim();
+          if (!s) return false;
+          const sLower = s.toLowerCase();
+          const sLowerNoHash = sLower.replace(/^#+\s*/, '');
+          if (forbidden.some(f => sLowerNoHash === f)) return false;
+          if (sLowerNoHash.startsWith('question:')) return false;
+          if (sLowerNoHash.startsWith('short answer:')) return false;
+          if (sLowerNoHash.startsWith('references')) return false;
+          if (sLowerNoHash.startsWith('hivatkozások')) return false;
+          return true;
+        })
+        .join('\n')
+        .trim();
+
+      if (idx < 0) return cleanedBefore;
+      return `${cleanedBefore}\n\n${after}`.trim();
+    }
+
+    function enrichQuotesWithStandardRef(quotes0) {
+      const out = Array.isArray(quotes0) ? quotes0.map(q => ({ ...(q || {}) })) : [];
+      const stdRefByStandardId = new Map();
+      const stdRefByFileName = new Map();
+      for (const s of scoredStandards || []) {
+        if (s?.standardId && s?.standardRef) stdRefByStandardId.set(String(s.standardId), String(s.standardRef));
+        if (s?.fileName && s?.standardRef) stdRefByFileName.set(String(s.fileName), String(s.standardRef));
+      }
+
+      function normName(v) {
+        return String(v || '')
+          .trim()
+          .replace(/\.pdf$/i, '')
+          .replace(/\s+/g, ' ');
+      }
+
+      for (const q of out) {
+        const st = String(q?.sourceType || '').toLowerCase();
+        if (st !== 'standard') continue;
+        const existing = String(q?.standardRef || '').trim();
+        if (existing) continue;
+
+        const fileName = normName(q?.fileName);
+        const stdId = normName(q?.standardId || q?.standard || q?.standard_id);
+
+        const byStd = stdRefByStandardId.get(stdId);
+        const byFile = stdRefByFileName.get(fileName) || stdRefByStandardId.get(fileName);
+        const picked = byStd || byFile || '';
+        if (picked) q.standardRef = picked;
+      }
+      return out;
+    }
+
+    if (standardExplorerEnabled) {
+      function sanitizeStandardQuoteForDisplay(q) {
+        return String(q || '')
+          .replace(/\s*\[(?:SOURCE|Source):[^\]]+\]\s*/g, ' ')
+          .replace(/\s*\((?:SOURCE|Source):[^)]+\)\s*/g, ' ')
+          .replace(/\s*SOURCE:\s*.+$/gmi, ' ')
+          .replace(/\u00A0/g, ' ')
+          .replace(/\u00AD/g, '') // soft hyphen
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+
+      function extractExplanationText(answerText, lang0) {
+        const txt = String(answerText || '').trim();
+        if (!txt) return '';
+
+        const tag = '<h3>Explanation:</h3>';
+        const idx = txt.indexOf(tag);
+        if (idx >= 0) return txt.slice(idx + tag.length).trim();
+
+        // Accept looser headings and normalize to the exact tag later.
+        const m = txt.match(/(?:^|\n)\s*(Explanation|Magyarázat)\s*:\s*(?:\n|$)/i);
+        if (m && typeof m.index === 'number') {
+          const cut = m.index + m[0].length;
+          return txt.slice(cut).trim();
+        }
+
+        // Fallback: treat whole answer as explanation (we will rebuild the quote-block from quotes[] anyway).
+        return txt;
+      }
+
+      answer = stripStandardExplorerScaffolding(answer);
+      quotes = enrichQuotesWithStandardRef(quotes);
+
+      // Hard-enforce the legacy format using the structured quotes[]:
+      // - verbatim quotes first (no labels), then the exact <h3>Explanation:</h3>, then explanation.
+      try {
+        const stdQuotes = (Array.isArray(quotes) ? quotes : [])
+          .filter(q => String(q?.sourceType || '').toLowerCase() === 'standard' && String(q?.quote || '').trim())
+          .map(q => sanitizeStandardQuoteForDisplay(q.quote))
+          .filter(Boolean);
+
+        if (stdQuotes.length) {
+          const explanation = extractExplanationText(answer, lang).trim();
+          const quoteBlock = stdQuotes.join('\n\n');
+          // Keep explanation even if empty (UI splitting depends on the tag).
+          answer = `${quoteBlock}\n\n<h3>Explanation:</h3>\n\n${explanation}`.trim();
+        }
+      } catch { }
+    }
+
     async function validateOrExplainFailure({ answerText, numericEvidence0, quotes0 }) {
       const out = { ok: true, uncovered: [], invalidEvidence: false };
       if (String(answerText).trim() === 'NOT FOUND') return out;
+      // Standards-only / Standard Explorer chats may legitimately contain numbers without XLSX evidence.
+      // In that case we skip numericEvidence enforcement to avoid false warnings.
+      if (!datasetVersion) return out;
       if (!numericEvidenceRequired()) return out;
       const nums = extractAnswerNumericKeys(answerText);
       if (!nums.length) return out;
@@ -1748,7 +1983,7 @@ exports.chatGovernedStream = async (req, res) => {
       } catch { }
     }
 
-    send('final', { html: finalHtml });
+    send('final', { html: finalHtml, quotes });
     send('done', { ok: true });
     try { logger.info('governed.done', { requestId: req.requestId, ok: true }); } catch { }
     try { res.end(); } catch { }

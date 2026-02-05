@@ -215,7 +215,19 @@ async function chooseFailureTargetKey({ failureNote, candidates }) {
   }
 }
 
-async function ensureAutoInspectionFromMobileSync({ equipmentDoc, tenantId, userId, failureNoteFromJob }) {
+function normalizeInspectionSeverity(value) {
+  if (value === null || value === undefined) return null;
+  const normalized = String(value).trim().toUpperCase();
+  return ['P1', 'P2', 'P3', 'P4'].includes(normalized) ? normalized : null;
+}
+
+async function ensureAutoInspectionFromMobileSync({
+  equipmentDoc,
+  tenantId,
+  userId,
+  failureNoteFromJob,
+  failureSeverityFromJob
+}) {
   const already = equipmentDoc.pendingInspectionId
     ? await Inspection.findOne({ _id: equipmentDoc.pendingInspectionId, tenantId }).select('_id').lean()
     : null;
@@ -284,6 +296,7 @@ async function ensureAutoInspectionFromMobileSync({ equipmentDoc, tenantId, user
   if (compliance === 'Failed') {
     const failureNoteRaw = String(failureNoteFromJob || '').trim();
     const failureNote = failureNoteRaw || 'Failed (no failure note provided).';
+    const failureSeverity = normalizeInspectionSeverity(failureSeverityFromJob);
     const passedCandidates = results
       .filter((r) => r.status === 'Passed' && r.table !== 'SC')
       .slice(0, 80)
@@ -306,7 +319,7 @@ async function ensureAutoInspectionFromMobileSync({ equipmentDoc, tenantId, user
         results = results.map((r) => {
           const k = `${r.table}__${r.group}__${r.number ?? ''}__${r.questionId ? String(r.questionId) : ''}`;
           if (k !== targetKey) return r;
-          return { ...r, status: 'Failed', note: failureNote };
+          return { ...r, status: 'Failed', note: failureNote, severity: failureSeverity };
         });
       }
     }
@@ -364,6 +377,7 @@ async function ensureAutoInspectionFromMobileSync({ equipmentDoc, tenantId, user
     attachments,
     summary,
     status,
+    failureSeverity: status === 'Failed' ? normalizeInspectionSeverity(failureSeverityFromJob) : null,
     reviewStatus: 'pending',
     source: 'mobileSync'
   });
@@ -433,7 +447,14 @@ async function processOneJob(job) {
       // Auto inspection for mobile-created equipment (Passed or Failed).
       try {
         const failureNoteFromJob = metaByEquipmentId?.[String(equipmentId)]?.failureNote;
-        await ensureAutoInspectionFromMobileSync({ equipmentDoc, tenantId, userId, failureNoteFromJob });
+        const failureSeverityFromJob = metaByEquipmentId?.[String(equipmentId)]?.failureSeverity;
+        await ensureAutoInspectionFromMobileSync({
+          equipmentDoc,
+          tenantId,
+          userId,
+          failureNoteFromJob,
+          failureSeverityFromJob
+        });
       } catch (e) {
         hadErrors = true;
         await ProcessingJob.updateOne(

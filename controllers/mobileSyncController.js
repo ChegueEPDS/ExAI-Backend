@@ -64,6 +64,12 @@ function normalizeCompliance(value, fallback = 'NA') {
   return fallback;
 }
 
+function normalizeSeverity(input) {
+  const raw = typeof input === 'string' ? input.trim().toUpperCase() : '';
+  if (raw === 'P1' || raw === 'P2' || raw === 'P3' || raw === 'P4') return raw;
+  return null;
+}
+
 async function getNextOrderIndex(tenantId, siteId = null, zoneId = null) {
   const filter = { tenantId };
   if (siteId) filter.Site = siteId;
@@ -209,6 +215,10 @@ exports.mobileSync = async (req, res) => {
         : typeof item?.['Failure Note'] === 'string'
           ? item['Failure Note']
           : '';
+    const failureSeverity =
+      normalizeSeverity(item?.failureSeverity) ||
+      normalizeSeverity(item?.severity) ||
+      null;
     const protectionTypesRaw = Array.isArray(item?.protectionTypes) ? item.protectionTypes : null;
     const normalizedProtectionTypes = protectionTypesRaw ? normalizeProtectionTypes(protectionTypesRaw) : [];
 
@@ -260,7 +270,12 @@ exports.mobileSync = async (req, res) => {
       saved = await equipmentDoc.save();
       newlyCreatedEquipmentIds.push(saved._id);
       tempIdToEquipmentId[tempId] = String(saved._id);
-      if (failureNote) metaByEquipmentId[String(saved._id)] = { failureNote };
+      if (failureNote || failureSeverity) {
+        metaByEquipmentId[String(saved._id)] = {
+          ...(failureNote ? { failureNote } : {}),
+          ...(failureSeverity ? { failureSeverity } : {})
+        };
+      }
 
       try {
         await createEquipmentDataVersion({

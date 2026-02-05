@@ -3940,7 +3940,7 @@ exports.getConversations = async (req, res) => {
     const conversations = await Conversation
       .find({ userId, tenantId })
       .sort({ updatedAt: -1, createdAt: -1 })
-      .select('threadId messages job hasBackgroundJob governedProjectId chatBackend updatedAt createdAt')
+      .select('threadId messages job hasBackgroundJob governedProjectId chatBackend standardExplorer updatedAt createdAt')
       .lean();
 
     const conversationList = conversations.map(c => ({
@@ -3950,6 +3950,7 @@ exports.getConversations = async (req, res) => {
       hasBackgroundJob: !!c.hasBackgroundJob,
       governedProjectId: c.governedProjectId || null,
       chatBackend: c.chatBackend || 'normal',
+      standardExplorer: c.standardExplorer || { enabled: false, standardRef: null },
       updatedAt: c.updatedAt,
     }));
 
@@ -3957,6 +3958,42 @@ exports.getConversations = async (req, res) => {
   } catch (error) {
     logger.error('Hiba a beszélgetések lekérése során:', error.message);
     res.status(500).json({ error: 'Váratlan hiba történt.' });
+  }
+};
+
+// Enable Standard Explorer (tenant standard library) for a thread and pin a primary standard.
+// POST /api/conversation/standard-explorer { threadId, standardRef }
+exports.setStandardExplorer = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId || undefined;
+    const userId = req.userId;
+    const threadId = String(req.body?.threadId || '').trim();
+    const standardRef = String(req.body?.standardRef || '').trim();
+    const enabled = String(req.body?.enabled ?? 'true').trim().toLowerCase() !== 'false';
+
+    if (!threadId) return res.status(400).json({ ok: false, error: 'threadId is required' });
+    if (enabled && !standardRef) return res.status(400).json({ ok: false, error: 'standardRef is required' });
+
+    const conversation = await Conversation.findOne({ threadId, userId, tenantId });
+    if (!conversation) return res.status(404).json({ ok: false, error: 'not found' });
+
+    conversation.standardExplorer = {
+      enabled: !!enabled,
+      standardRef: enabled ? standardRef : null,
+    };
+    // Standard explorer always routes to governed (standards-only retrieval).
+    conversation.chatBackend = enabled ? 'governed' : (conversation.chatBackend || 'normal');
+    await conversation.save();
+
+    return res.json({
+      ok: true,
+      threadId: conversation.threadId,
+      chatBackend: conversation.chatBackend,
+      standardExplorer: conversation.standardExplorer,
+    });
+  } catch (e) {
+    logger.error('standardExplorer.set.error', { message: e?.message });
+    return res.status(500).json({ ok: false, error: e?.message || 'failed' });
   }
 };
 

@@ -6,16 +6,28 @@ function rerankEnabled() {
   return v === '1' || v === 'true' || v === 'yes';
 }
 
-function rerankModel() {
+function rerankModelForKind(kind) {
+  const k = String(kind || '').trim().toLowerCase();
+  if (k === 'standard_clause') {
+    return process.env.RERANK_MODEL_STANDARD_CLAUSE || process.env.RERANK_MODEL || process.env.FILE_CHAT_COMPLETIONS_MODEL || 'gpt-5-mini';
+  }
   return process.env.RERANK_MODEL || process.env.FILE_CHAT_COMPLETIONS_MODEL || 'gpt-5-mini';
 }
 
-async function rerankWithLLM({ query, items, trace = null }) {
+function rerankMaxItemsForKind(kind) {
+  const k = String(kind || '').trim().toLowerCase();
+  const raw = k === 'standard_clause'
+    ? (process.env.RERANK_MAX_ITEMS_STANDARD_CLAUSE ?? process.env.RERANK_MAX_ITEMS)
+    : process.env.RERANK_MAX_ITEMS;
+  return Math.max(5, Math.min(Number(raw || 40), 80));
+}
+
+async function rerankWithLLM({ query, kind = '', items, trace = null, model: modelOverride = null, maxItems: maxItemsOverride = null }) {
   if (!rerankEnabled()) return { ok: true, skipped: true, order: (items || []).map(i => i.id) };
   const list = Array.isArray(items) ? items : [];
   if (!list.length) return { ok: true, order: [] };
 
-  const maxItems = Math.max(5, Math.min(Number(process.env.RERANK_MAX_ITEMS || 40), 80));
+  const maxItems = Math.max(5, Math.min(Number(maxItemsOverride || rerankMaxItemsForKind(kind)), 80));
   const compact = list.slice(0, maxItems).map((it) => ({
     id: String(it?.id || '').trim(),
     kind: String(it?.kind || '').trim(),
@@ -27,7 +39,7 @@ async function rerankWithLLM({ query, items, trace = null }) {
   if (!compact.length) return { ok: true, order: [] };
 
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  const model = rerankModel();
+  const model = String(modelOverride || rerankModelForKind(kind)).trim() || 'gpt-5-mini';
 
   const system = [
     'You are a reranking component for an engineering compliance RAG system.',
@@ -87,4 +99,3 @@ module.exports = {
   rerankWithLLM,
   rerankEnabled,
 };
-

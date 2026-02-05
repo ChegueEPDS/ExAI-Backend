@@ -66,6 +66,38 @@ const HEADER_ALIASES = {
   'comment': 'Remarks'
 };
 
+function isIndexTenantSlug(tenantSlug) {
+  const s = String(tenantSlug || '').trim().toLowerCase();
+  return s === 'index' || s === 'ind-ex';
+}
+
+function isInspExTenantSlug(tenantSlug) {
+  const s = String(tenantSlug || '').trim().toLowerCase();
+  return s === 'insp-ex' || s === 'inspex' || s === 'insp_ex';
+}
+
+function isProjectSkidTenantSlug(tenantSlug) {
+  return isIndexTenantSlug(tenantSlug) || isInspExTenantSlug(tenantSlug);
+}
+
+function getRequestHostname(req) {
+  const raw =
+    req?.get?.('x-forwarded-host') ||
+    req?.get?.('host') ||
+    req?.headers?.host ||
+    req?.hostname ||
+    '';
+  const host = String(raw || '').split(',')[0].trim().toLowerCase();
+  return host.replace(/:\d+$/, '');
+}
+
+function isInspExRequestHost(req) {
+  const host = getRequestHostname(req);
+  if (!host) return false;
+  if (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0') return true;
+  return host === 'insp-ex.com' || host.endsWith('.insp-ex.com');
+}
+
 const SEARCHABLE_EQUIPMENT_FIELDS = [
   'TagNo',
   'EqID',
@@ -599,7 +631,7 @@ exports.createEquipment = async (req, res) => {
     const CreatedBy = req.userId;
     const tenantId = req.scope?.tenantId;
     const tenantSlug = (req.scope?.tenantName || '').toLowerCase();
-    const isIndexTenant = tenantSlug === 'index' || tenantSlug === 'ind-ex';
+    const isIndexTenant = isIndexTenantSlug(tenantSlug);
     if (!tenantId) {
       return res.status(400).json({ message: "tenantId is missing from auth" });
     }
@@ -1032,7 +1064,7 @@ exports.importEquipmentXLSX = async (req, res) => {
 
   try {
     const tenantName = (req.scope?.tenantName || '').toLowerCase();
-    const isIndexTenant = tenantName === 'index' || tenantName === 'ind-ex';
+    const includeProjectSkid = isProjectSkidTenantSlug(tenantName) || isInspExRequestHost(req);
     const zone = await Zone.findOne({ _id: zoneId, tenantId }).lean();
     if (!zone) {
       return res.status(404).json({ message: 'Zone not found for this tenant.' });
@@ -1087,7 +1119,7 @@ exports.importEquipmentXLSX = async (req, res) => {
       let skidId = '';
       let skidDescription = '';
       let projectId = '';
-      if (isIndexTenant) {
+      if (includeProjectSkid) {
         skidId = getCellString(row, headerInfo.headerMap, 'Skid ID');
         skidDescription = getCellString(row, headerInfo.headerMap, 'Skid Description');
         projectId = getCellString(row, headerInfo.headerMap, 'Project ID');
@@ -1296,7 +1328,7 @@ exports.importEquipmentXLSX = async (req, res) => {
       }
     }
 
-    if (isIndexTenant) {
+    if (includeProjectSkid) {
       const zoneUpdate = {};
       if (latestSkidId && latestSkidId !== zone.SkidID) {
         zoneUpdate.SkidID = latestSkidId;
@@ -2052,7 +2084,10 @@ exports.exportEquipmentXLSX = async (req, res) => {
   try {
     const tenantId = req.scope?.tenantId;
     const tenantSlug = (req.scope?.tenantName || '').toLowerCase();
-    const isIndexTenant = tenantSlug === 'index' || tenantSlug === 'ind-ex';
+    const isIndexTenant = isIndexTenantSlug(tenantSlug);
+    const isInspExDomain = isInspExRequestHost(req);
+    const includeProjectSkid = isProjectSkidTenantSlug(tenantSlug) || isInspExDomain;
+    const includeUserRequirement = !isInspExDomain;
     if (!tenantId) {
       return res.status(401).json({ message: 'Missing tenantId from auth.' });
     }
@@ -2180,8 +2215,22 @@ exports.exportEquipmentXLSX = async (req, res) => {
       'Remarks'
     ];
 
-    if (isIndexTenant) {
+    if (includeProjectSkid) {
       headers.splice(18, 0, 'Skid ID', 'Skid Description', 'Project ID');
+    }
+
+    if (!includeUserRequirement) {
+      // Insp-Ex: keep IndEx-like layout but without USER REQUIREMENT columns.
+      const toRemove = new Set([
+        'Req Zone',
+        'Req Gas / Dust Group',
+        'Req Temp Rating',
+        'Req Ambient Temp',
+        'Req IP Rating'
+      ]);
+      for (let i = headers.length - 1; i >= 0; i--) {
+        if (toRemove.has(headers[i])) headers.splice(i, 1);
+      }
     }
 
     worksheet.columns = headers.map(header => ({
@@ -2195,11 +2244,11 @@ exports.exportEquipmentXLSX = async (req, res) => {
     worksheet.spliceRows(1, 0, []);
 
     const groupRow = worksheet.getRow(1);
-    const zoneStartCol = isIndexTenant ? 22 : 19;
+    const zoneStartCol = includeProjectSkid ? 22 : 19;
     const zoneEndCol = zoneStartCol + 3;
-    const userStartCol = zoneStartCol + 4;
-    const userEndCol = userStartCol + 4;
-    const inspectionStartCol = userStartCol + 5;
+    const userStartCol = includeUserRequirement ? zoneStartCol + 4 : null;
+    const userEndCol = includeUserRequirement ? (userStartCol + 4) : null;
+    const inspectionStartCol = includeUserRequirement ? (userStartCol + 5) : (zoneEndCol + 1);
     const inspectionEndCol = inspectionStartCol + 4;
 
     groupRow.getCell(1).value = 'IDENTIFICATION';
@@ -2210,14 +2259,16 @@ exports.exportEquipmentXLSX = async (req, res) => {
     worksheet.mergeCells(1, 10, 1, 14);
     groupRow.getCell(15).value = 'CERTIFICATION';
     worksheet.mergeCells(1, 15, 1, 18);
-    if (isIndexTenant) {
+    if (includeProjectSkid) {
       groupRow.getCell(19).value = 'PROJECT / SKID';
       worksheet.mergeCells(1, 19, 1, 21);
     }
     groupRow.getCell(zoneStartCol).value = 'ZONE REQUIREMENTS';
     worksheet.mergeCells(1, zoneStartCol, 1, zoneEndCol);
-    groupRow.getCell(userStartCol).value = 'USER REQUIREMENT';
-    worksheet.mergeCells(1, userStartCol, 1, userEndCol);
+    if (includeUserRequirement) {
+      groupRow.getCell(userStartCol).value = 'USER REQUIREMENT';
+      worksheet.mergeCells(1, userStartCol, 1, userEndCol);
+    }
     groupRow.getCell(inspectionStartCol).value = 'INSPECTION DATA';
     worksheet.mergeCells(1, inspectionStartCol, 1, inspectionEndCol);
 
@@ -2227,14 +2278,20 @@ exports.exportEquipmentXLSX = async (req, res) => {
       { start: 10, end: 14, color: 'FF538DD5' },
       { start: 15, end: 18, color: 'FF00AA00' }
     ];
-    if (isIndexTenant) {
+    if (includeProjectSkid) {
       groupColorRanges.push({ start: 19, end: 21, color: 'FF80DEEA' });
     }
     groupColorRanges.push(
       { start: zoneStartCol, end: zoneEndCol, color: 'FFFFFF66' },
-      { start: userStartCol, end: userEndCol, color: 'FFB1A0C7' },
       { start: inspectionStartCol, end: inspectionEndCol, color: 'FFB0B0B0' }
     );
+    if (includeUserRequirement) {
+      groupColorRanges.splice(groupColorRanges.length - 1, 0, {
+        start: userStartCol,
+        end: userEndCol,
+        color: 'FFB1A0C7'
+      });
+    }
 
     groupRow.eachCell((cell, colNumber) => {
       const range = groupColorRanges.find(r => colNumber >= r.start && colNumber <= r.end);
@@ -2258,14 +2315,20 @@ exports.exportEquipmentXLSX = async (req, res) => {
       { start: 10, end: 14, color: 'FFDCE6F1' },
       { start: 15, end: 18, color: 'FFCCFFCC' }
     ];
-    if (isIndexTenant) {
+    if (includeProjectSkid) {
       headerColorRanges.push({ start: 19, end: 21, color: 'FFE0F7FA' });
     }
     headerColorRanges.push(
       { start: zoneStartCol, end: zoneEndCol, color: 'FFFFFFCC' },
-      { start: userStartCol, end: userEndCol, color: 'FFE4DFEC' },
       { start: inspectionStartCol, end: inspectionEndCol, color: 'FFE0E0E0' }
     );
+    if (includeUserRequirement) {
+      headerColorRanges.splice(headerColorRanges.length - 1, 0, {
+        start: userStartCol,
+        end: userEndCol,
+        color: 'FFE4DFEC'
+      });
+    }
 
     const headerRow = worksheet.getRow(2);
     headerRow.eachCell((cell, colNumber) => {
@@ -2298,13 +2361,15 @@ exports.exportEquipmentXLSX = async (req, res) => {
       'Gas / Dust Group',
       'Temp. Rating',
       'Ambient Temp',
-      'Req Zone',
-      'Req Gas / Dust Group',
-      'Req Temp Rating',
-      'Req Ambient Temp',
-      'Req IP Rating',
       'Status'
     ]);
+    if (includeUserRequirement) {
+      centerAlignedColumns.add('Req Zone');
+      centerAlignedColumns.add('Req Gas / Dust Group');
+      centerAlignedColumns.add('Req Temp Rating');
+      centerAlignedColumns.add('Req Ambient Temp');
+      centerAlignedColumns.add('Req IP Rating');
+    }
 
     // Sorok generálása – eszközök sorszáma (orderIndex) szerint
     let equipmentIndex = 0;
@@ -2352,39 +2417,46 @@ exports.exportEquipmentXLSX = async (req, res) => {
       }
       const ambientDisplay = ambientParts.join(' / ');
 
-      // ---- Client requirement (user requirement) derived from zone.clientReq[0] ----
-      const clientReq = Array.isArray(zone?.clientReq) && zone.clientReq.length
-        ? zone.clientReq[0]
-        : null;
+      let clientReqZoneNumber = '';
+      let clientReqGasDustGroup = '';
+      let clientReqTempDisplay = '';
+      let clientReqAmbientDisplay = '';
+      let clientReqIpRating = '';
+      if (includeUserRequirement) {
+        // ---- Client requirement (user requirement) derived from zone.clientReq[0] ----
+        const clientReq = Array.isArray(zone?.clientReq) && zone.clientReq.length
+          ? zone.clientReq[0]
+          : null;
 
-      const clientReqZoneNumber = Array.isArray(clientReq?.Zone)
-        ? clientReq.Zone.join(', ')
-        : (clientReq?.Zone != null ? String(clientReq.Zone) : '');
+        clientReqZoneNumber = Array.isArray(clientReq?.Zone)
+          ? clientReq.Zone.join(', ')
+          : (clientReq?.Zone != null ? String(clientReq.Zone) : '');
 
-      const clientReqGasDustGroup = Array.isArray(clientReq?.SubGroup)
-        ? clientReq.SubGroup.join(', ')
-        : (clientReq?.SubGroup != null ? String(clientReq.SubGroup) : '');
+        clientReqGasDustGroup = Array.isArray(clientReq?.SubGroup)
+          ? clientReq.SubGroup.join(', ')
+          : (clientReq?.SubGroup != null ? String(clientReq.SubGroup) : '');
 
-      // User requirement temp rating: same logic as zone (TempClass + MaxTemp)
-      const clientReqTempParts = [];
-      if (clientReq?.TempClass) {
-        clientReqTempParts.push(clientReq.TempClass);
+        // User requirement temp rating: same logic as zone (TempClass + MaxTemp)
+        const clientReqTempParts = [];
+        if (clientReq?.TempClass) {
+          clientReqTempParts.push(clientReq.TempClass);
+        }
+        if (typeof clientReq?.MaxTemp === 'number') {
+          clientReqTempParts.push(`${clientReq.MaxTemp}°C`);
+        }
+        clientReqTempDisplay = clientReqTempParts.join(' / ');
+
+        const clientReqAmbientParts = [];
+        if (clientReq?.AmbientTempMin != null) {
+          clientReqAmbientParts.push(`${clientReq.AmbientTempMin}°C`);
+        }
+        if (clientReq?.AmbientTempMax != null) {
+          clientReqAmbientParts.push(`+${clientReq.AmbientTempMax}°C`);
+        }
+        clientReqAmbientDisplay = clientReqAmbientParts.join(' / ');
+
+        clientReqIpRating = clientReq?.IpRating || '';
       }
-      if (typeof clientReq?.MaxTemp === 'number') {
-        clientReqTempParts.push(`${clientReq.MaxTemp}°C`);
-      }
-      const clientReqTempDisplay = clientReqTempParts.join(' / ');
-
-      const clientReqAmbientParts = [];
-      if (clientReq?.AmbientTempMin != null) {
-        clientReqAmbientParts.push(`${clientReq.AmbientTempMin}°C`);
-      }
-      if (clientReq?.AmbientTempMax != null) {
-        clientReqAmbientParts.push(`+${clientReq.AmbientTempMax}°C`);
-      }
-      const clientReqAmbientDisplay = clientReqAmbientParts.join(' / ');
-
-      const clientReqIpRating = clientReq?.IpRating || '';
 
       const cert = resolveCertificateFromCache(certMap, eq['Certificate No']);
       const hasSpecialCondition =
@@ -2433,11 +2505,6 @@ exports.exportEquipmentXLSX = async (req, res) => {
           'Gas / Dust Group': zoneSubGroup,
           'Temp Rating': zoneTempDisplay,
           'Ambient Temp': ambientDisplay,
-          'Req Zone': clientReqZoneNumber,
-          'Req Gas / Dust Group': clientReqGasDustGroup,
-          'Req Temp Rating': clientReqTempDisplay,
-          'Req Ambient Temp': clientReqAmbientDisplay,
-          'Req IP Rating': clientReqIpRating,
           'Status': eq['Compliance'] || '',
           'Inspection Date': inspectionDate
             ? new Date(inspectionDate)
@@ -2447,7 +2514,15 @@ exports.exportEquipmentXLSX = async (req, res) => {
           'Remarks': eq['Other Info'] || ''
         };
 
-        if (isIndexTenant) {
+        if (includeUserRequirement) {
+          rowData['Req Zone'] = clientReqZoneNumber;
+          rowData['Req Gas / Dust Group'] = clientReqGasDustGroup;
+          rowData['Req Temp Rating'] = clientReqTempDisplay;
+          rowData['Req Ambient Temp'] = clientReqAmbientDisplay;
+          rowData['Req IP Rating'] = clientReqIpRating;
+        }
+
+        if (includeProjectSkid) {
           rowData['Skid ID'] = zone?.SkidID || '';
           rowData['Skid Description'] = zone?.SkidDescription || '';
           rowData['Project ID'] = zone?.ProjectID || '';
