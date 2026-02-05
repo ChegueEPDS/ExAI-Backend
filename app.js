@@ -72,8 +72,22 @@ connectDB().then(() => console.log('Database connected successfully')).catch((er
   process.exit(1); // Exit if DB connection fails
 });
 
+function normalizeCorsToken(v) {
+  const s = String(v || '').trim();
+  if (!s) return '';
+  // Azure/App Service config values are often pasted with quotes; be tolerant.
+  // Examples:
+  //   "https://demo.epds.eu"
+  //   'https://demo.epds.eu'
+  // Keep inner spaces (none expected) but remove wrapping quotes.
+  return s.replace(/^['"]+/, '').replace(/['"]+$/, '').trim();
+}
+
 const rawCorsAllowedOrigins = process.env.CORS_ALLOWED_ORIGINS
-  ? process.env.CORS_ALLOWED_ORIGINS.split(',').map((origin) => origin.trim()).filter(Boolean)
+  ? process.env.CORS_ALLOWED_ORIGINS
+      .split(',')
+      .map(normalizeCorsToken)
+      .filter(Boolean)
   : [];
 
 // CORS allow list supports:
