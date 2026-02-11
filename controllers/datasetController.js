@@ -5,6 +5,7 @@ const DatasetFile = require('../models/datasetFile');
 const logger = require('../config/logger');
 const { ingestTabularFileBuffer, ingestDocumentFileBuffer, deleteDatasetFileArtifacts } = require('../services/datasetIngestionService');
 const azureBlob = require('../services/azureBlobService');
+const systemSettings = require('../services/systemSettingsStore');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024, files: 10 } });
 exports.uploadMulter = upload;
@@ -93,9 +94,7 @@ exports.uploadDatasetFiles = [
       const files = Array.isArray(req.files) ? req.files : [];
       if (!files.length) return res.status(400).json({ ok: false, error: 'no files uploaded' });
 
-      const debugEnabled =
-        String(process.env.DEBUG_GOVERNED || '').trim() === '1' ||
-        String(process.env.DEBUG_GOVERNED || '').trim().toLowerCase() === 'true';
+      const debugEnabled = systemSettings.getBoolean('DEBUG_GOVERNED');
       try {
         logger.info('dataset.upload.start', {
           requestId: req.requestId,
@@ -208,9 +207,7 @@ exports.uploadDatasetFilesStream = [
         return res.end();
       }
 
-      const debugEnabled =
-        String(process.env.DEBUG_GOVERNED || '').trim() === '1' ||
-        String(process.env.DEBUG_GOVERNED || '').trim().toLowerCase() === 'true';
+      const debugEnabled = systemSettings.getBoolean('DEBUG_GOVERNED');
 
       try {
         logger.info('dataset.upload.start', {

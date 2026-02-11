@@ -8,6 +8,7 @@ const Tenant = require('../models/tenant');
 const StandardSet = require('../models/standardSet');
 const azureBlob = require('./azureBlobService');
 const pinecone = require('./pineconeService');
+const systemSettings = require('./systemSettingsStore');
 const logger = require('../config/logger');
 
 const encoder = get_encoding('o200k_base');
@@ -244,14 +245,12 @@ async function ingestStandardFiles({
   const embeddingModel = process.env.RAG_EMBEDDING_MODEL || 'text-embedding-3-small';
   const pineconeEnabled = pinecone.isPineconeEnabled();
   const namespace = pineconeEnabled ? pinecone.resolveNamespace({ tenantId, projectId: 'standard-library' }) : null;
-  const standardChunkTokens = Number(process.env.STANDARD_CHUNK_TOKENS || 450);
-  const standardChunkOverlap = Number(process.env.STANDARD_CHUNK_OVERLAP || 80);
-  const standardClauseMaxTokens = Number(process.env.STANDARD_CLAUSE_MAX_TOKENS || 500);
+  const standardChunkTokens = Number(systemSettings.getNumber('STANDARD_CHUNK_TOKENS') || 450);
+  const standardChunkOverlap = Number(systemSettings.getNumber('STANDARD_CHUNK_OVERLAP') || 80);
+  const standardClauseMaxTokens = Number(systemSettings.getNumber('STANDARD_CLAUSE_MAX_TOKENS') || 500);
 
   try {
-    const debugEnabled =
-      String(process.env.DEBUG_GOVERNED || '').trim() === '1' ||
-      String(process.env.DEBUG_GOVERNED || '').trim().toLowerCase() === 'true';
+    const debugEnabled = systemSettings.getBoolean('DEBUG_GOVERNED');
     if (debugEnabled) {
       try {
         logger.info('standards.ingest.start', {
@@ -353,7 +352,7 @@ async function ingestStandardFiles({
       clauses.push(...parts);
     }
 
-    const maxClauses = Number(process.env.STANDARD_MAX_CLAUSES || 1200);
+    const maxClauses = Number(systemSettings.getNumber('STANDARD_MAX_CLAUSES') || 1200);
     const toIndex = ensureUniqueClauseIds(clauses).slice(0, maxClauses);
     if (debugEnabled) {
       try {

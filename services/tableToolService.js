@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const logger = require('../config/logger');
+const systemSettings = require('./systemSettingsStore');
 
 const DatasetTableCell = require('../models/datasetTableCell');
 const DatasetDerivedMetric = require('../models/datasetDerivedMetric');
@@ -62,9 +63,7 @@ async function computeAndStoreDefaultDerivedMetrics({
   schema,
   trace = null,
 }) {
-  const debugEnabled =
-    String(process.env.DEBUG_GOVERNED || '').trim() === '1' ||
-    String(process.env.DEBUG_GOVERNED || '').trim().toLowerCase() === 'true';
+  const debugEnabled = systemSettings.getBoolean('DEBUG_GOVERNED');
 
   const sheets = Array.isArray(schema?.sheets) ? schema.sheets : [];
   if (!sheets.length) return { ok: true, derived: 0, skipped: true };
@@ -224,7 +223,7 @@ async function computeAndStoreDefaultDerivedMetrics({
         }
 
         // Steady-state heuristic: last 3 points range (max-min) <= threshold. Store the range.
-        const steadyN = Math.max(3, Math.min(Number(process.env.TABLE_STEADY_N || 3), 6));
+        const steadyN = Math.max(3, Math.min(Number(systemSettings.getNumber('TABLE_STEADY_N') || 3), 6));
         if (sortedByCol.length >= steadyN) {
           const tail = sortedByCol.slice(-steadyN);
           const tailMax = pickMaxCell(tail);

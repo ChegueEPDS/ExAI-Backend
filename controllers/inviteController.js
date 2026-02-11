@@ -4,6 +4,7 @@ const User = require('../models/user');
 const bcrypt = require('bcrypt');
 const mailService = require('../services/mailService');
 const { tenantInviteEmailHtml } = require('../services/mailTemplates');
+const { assertValidProfessions } = require('../helpers/rbac');
 
 /** Erős ideiglenes jelszó (2-2 kis/nagy/ szám/ spec) */
 function generatePassword() {
@@ -46,13 +47,14 @@ exports.createInvite = async (req, res) => {
   const callerRole = (req.role || '').toString();
   const callerTenantId = req.scope?.tenantId || null;
 
-  const {
+ const {
     tenantId: bodyTenantId,
     email,
     role: targetRole = 'User',
     firstName: bodyFirstName,
     lastName: bodyLastName,
     nickname: bodyNickname,
+    professions: bodyProfessions,
   } = req.body || {};
 
   const tenantId = callerRole === 'SuperAdmin' ? (bodyTenantId || callerTenantId) : callerTenantId;
@@ -85,8 +87,21 @@ exports.createInvite = async (req, res) => {
   const nickname  = bodyNickname?.trim()  || null;
 
   // Tenant és seat meta
-  const t = await Tenant.findById(tenantId).select('seats plan name').lean();
+  const t = await Tenant.findById(tenantId).select('seats plan name professionRbacEnabled').lean();
   if (!t) return res.status(404).json({ error: 'Tenant nem található.' });
+
+  // If tenant has profession-RBAC enabled, professions become required for create/invite operations.
+  let professions = [];
+  if (t?.professionRbacEnabled) {
+    try {
+      professions = assertValidProfessions(bodyProfessions);
+    } catch (e) {
+      return res.status(400).json({ error: e.message || 'Invalid professions' });
+    }
+    if (!professions.length) {
+      return res.status(400).json({ error: 'professions kötelező ennél a tenantnál.' });
+    }
+  }
 
   let user = await User.findOne({ email: normalizedEmail });
   let createdNewUser = false;
@@ -113,6 +128,7 @@ exports.createInvite = async (req, res) => {
       nickname,
       role: targetRole === 'Admin' ? 'Admin' : 'User',
       tenantId,
+      ...(t?.professionRbacEnabled ? { professions } : {}),
       subscriptionTier: t.plan || 'free',
     });
     createdNewUser = true;
@@ -132,12 +148,19 @@ exports.createInvite = async (req, res) => {
       if (user.role !== 'SuperAdmin') {
         user.role = targetRole === 'Admin' ? 'Admin' : 'User';
       }
+      if (t?.professionRbacEnabled) {
+        user.professions = professions;
+      }
       if ((!user.firstName || !user.firstName.trim()) && firstName) user.firstName = firstName;
       if ((!user.lastName  || !user.lastName.trim())  && lastName)  user.lastName  = lastName;
       if ((!user.nickname  || !user.nickname.trim())  && nickname)  user.nickname  = nickname;
       await user.save();
     } else if (currentTenant === String(tenantId)) {
       // már tag → nincs seat módosítás
+      if (t?.professionRbacEnabled) {
+        user.professions = professions;
+        await user.save();
+      }
     } else {
       // másik tenant tagja → explicit flow
       return res.status(409).json({ error: 'A megadott e-mail már másik tenant tagja. Használd az áthelyezés folyamatot.' });

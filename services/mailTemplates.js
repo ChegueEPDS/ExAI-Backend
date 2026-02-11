@@ -315,6 +315,55 @@ function reportExportReadyEmail({ firstName, lastName, fileName, downloadUrl, jo
   });
 }
 
+function contributionRewardEmail({ firstName, lastName, milestone, code, expiresAt }, tenantName) {
+  const fullName = `${firstName || ''} ${lastName || ''}`.trim() || 'there';
+  const safeCode = escapeHtml(code || '');
+  const safeMilestone = Number(milestone) || 0;
+  const expText = expiresAt instanceof Date && !isNaN(expiresAt.getTime())
+    ? expiresAt.toISOString().slice(0, 10)
+    : null;
+
+  // Deep-link into "Team monthly" upgrade choice (frontend should read these query params).
+  const upgradeUrl = buildTenantUrl(tenantName, 'billing?product=team&billingPeriod=month');
+  const upgradeLabel = displayHost(upgradeUrl);
+
+  return baseTemplate({
+    title: 'Your Team discount code',
+    tenantName,
+    bodyHtml: `
+      <h2 style="color:#131313;">Dear ${escapeHtml(fullName)},</h2>
+      <p>Thank you for contributing to our certificate database — you have now uploaded <strong>${safeMilestone}</strong> certificates.</p>
+      <p>As a thank you, here is your <strong>100% discount code for 1 month</strong> on the <strong>Team (monthly)</strong> plan (one-time use):</p>
+
+      <div style="background:#ebebeb; padding:14px 16px; border-radius:8px; font-family:monospace; font-size:18px; text-align:center; letter-spacing:1px;">
+        ${safeCode || '—'}
+      </div>
+      ${
+        expText
+          ? `<p style="margin-top:10px; font-size:13px; color:#555;">This code expires on <strong>${escapeHtml(expText)}</strong>.</p>`
+          : ''
+      }
+
+      <p style="margin-top:18px; margin-bottom:10px;"><strong>Team plan highlights:</strong></p>
+      <ul style="margin:0 0 12px 18px; padding:0; color:#333;">
+        <li>Multi-user collaboration (seats)</li>
+        <li>Company workspace and shared certificate library</li>
+        <li>Centralized access for your team</li>
+      </ul>
+
+      <p style="margin:22px 0; text-align:center;">
+        <a href="${upgradeUrl}" target="_blank" rel="noopener noreferrer"
+           style="background:#f8d201; color:#131313; text-decoration:none; padding:12px 24px; border-radius:6px; font-size:16px; display:inline-block;">
+          Upgrade to Team (Monthly)
+        </a>
+      </p>
+
+      <p>Upgrade link: <a href="${upgradeUrl}" target="_blank" rel="noopener noreferrer">${upgradeLabel}</a></p>
+      <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team</p>
+    `
+  });
+}
+
 /** Simple HTML escape for safety */
 function escapeHtml(s) {
   return String(s)
@@ -333,4 +382,5 @@ module.exports = {
   uploadCompletedEmail,
   certificateRequestFulfilledEmail,
   reportExportReadyEmail,
+  contributionRewardEmail,
 };

@@ -2,6 +2,7 @@ const DatasetFile = require('../models/datasetFile');
 const DatasetRowChunk = require('../models/datasetRowChunk');
 const DatasetTableCell = require('../models/datasetTableCell');
 const logger = require('../config/logger');
+const systemSettings = require('./systemSettingsStore');
 
 function normalizeKey(s) {
   return String(s || '').trim().toLowerCase();
@@ -37,7 +38,7 @@ function tokenFromLabel(labelOrRowText) {
   if (!m) return '';
   const token = m[1].toUpperCase();
   const n = Number(token.slice(1));
-  const max = Math.max(5, Math.min(Number(process.env.MEAS_POINT_MAX || 25), 99));
+  const max = Math.max(5, Math.min(Number(systemSettings.getNumber('MEAS_POINT_MAX') || 25), 99));
   if (!Number.isInteger(n) || n <= 0 || n > max) return '';
   return token;
 }
@@ -53,11 +54,11 @@ function safeSlice(obj, maxChars) {
 }
 
 async function buildXlsxPreview({ tenantId, projectId, datasetVersion, filenames = [], trace = null }) {
-  const maxFiles = Math.max(1, Math.min(Number(process.env.XLSX_PLANNER_PREVIEW_MAX_FILES || 3), 10));
-  const maxSheets = Math.max(1, Math.min(Number(process.env.XLSX_PLANNER_PREVIEW_MAX_SHEETS || 12), 40));
-  const maxRows = Math.max(200, Math.min(Number(process.env.XLSX_PLANNER_PREVIEW_MAX_ROWS || 8000), 40000));
-  const maxLabelsPerSheet = Math.max(5, Math.min(Number(process.env.XLSX_PLANNER_PREVIEW_MAX_LABELS || 16), 60));
-  const maxChars = Math.max(4000, Math.min(Number(process.env.XLSX_PLANNER_PREVIEW_MAX_CHARS || 35000), 200000));
+  const maxFiles = Math.max(1, Math.min(Number(systemSettings.getNumber('XLSX_PLANNER_PREVIEW_MAX_FILES') || 3), 10));
+  const maxSheets = Math.max(1, Math.min(Number(systemSettings.getNumber('XLSX_PLANNER_PREVIEW_MAX_SHEETS') || 12), 40));
+  const maxRows = Math.max(200, Math.min(Number(systemSettings.getNumber('XLSX_PLANNER_PREVIEW_MAX_ROWS') || 8000), 40000));
+  const maxLabelsPerSheet = Math.max(5, Math.min(Number(systemSettings.getNumber('XLSX_PLANNER_PREVIEW_MAX_LABELS') || 16), 60));
+  const maxChars = Math.max(4000, Math.min(Number(systemSettings.getNumber('XLSX_PLANNER_PREVIEW_MAX_CHARS') || 35000), 200000));
 
   const xlsxFiles = (filenames || [])
     .filter(n => /\.xls(x)?$/i.test(String(n || '')))
@@ -242,4 +243,3 @@ async function buildXlsxPreview({ tenantId, projectId, datasetVersion, filenames
 module.exports = {
   buildXlsxPreview,
 };
-

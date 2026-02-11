@@ -3,6 +3,7 @@ const path = require('path');
 const Conversation = require('../models/conversation');
 const logger = require('../config/logger');
 const azureBlob = require('./azureBlobService');
+const systemSettings = require('./systemSettingsStore');
 
 exports.removeEmptyConversations = async () => {
   try {
@@ -14,58 +15,6 @@ exports.removeEmptyConversations = async () => {
     }
   } catch (error) {
     logger.error('Hiba az üres beszélgetések törlése során:', error.message);
-  }
-};
-
-exports.cleanupDxfResults = () => {
-  const resultDir = path.resolve('results');
-  let files;
-
-  try {
-    files = fs.readdirSync(resultDir);
-  } catch (err) {
-    logger.warn(`Nem található a results mappa: ${resultDir}`);
-    return;
-  }
-
-  const now = Date.now();
-  const maxAgeMs = 3 * 60 * 60 * 1000; // 3 óra
-
-  const groups = {
-    excel: [],
-    json: []
-  };
-
-  for (const file of files) {
-    const fullPath = path.join(resultDir, file);
-
-    if (file.startsWith('output_') && file.endsWith('.xlsx')) {
-      const { birthtimeMs } = fs.statSync(fullPath);
-      groups.excel.push({ path: fullPath, time: birthtimeMs });
-    }
-
-    if (file.startsWith('debug_unknowns_') && file.endsWith('.json')) {
-      const { birthtimeMs } = fs.statSync(fullPath);
-      groups.json.push({ path: fullPath, time: birthtimeMs });
-    }
-  }
-
-  for (const group of Object.values(groups)) {
-    if (group.length <= 1) continue;
-
-    group.sort((a, b) => b.time - a.time);
-    const [, ...oldFiles] = group;
-
-    for (const file of oldFiles) {
-      if ((now - file.time) > maxAgeMs) {
-        try {
-          fs.unlinkSync(file.path);
-          logger.info(`🧹 DXF fájl törölve: ${file.path}`);
-        } catch (err) {
-          logger.warn(`⚠️ Nem sikerült törölni: ${file.path} - ${err.message}`);
-        }
-      }
-    }
   }
 };
 
@@ -120,10 +69,7 @@ exports.cleanupUploadTempFiles = (maxAgeMsOverride) => {
 
 exports.cleanupEquipmentDocsImportErrorReports = async () => {
   try {
-    const retentionDays =
-      Number(process.env.EQUIP_DOCS_IMPORT_ERROR_XLS_RETENTION_DAYS) > 0
-        ? Number(process.env.EQUIP_DOCS_IMPORT_ERROR_XLS_RETENTION_DAYS)
-        : 30;
+    const retentionDays = Number(systemSettings.getNumber('EQUIP_DOCS_IMPORT_ERROR_XLS_RETENTION_DAYS') || 7);
     if (!retentionDays) return;
     const olderThanMs = retentionDays * 24 * 60 * 60 * 1000;
     const prefix = 'equipment-docs-import-errors/';

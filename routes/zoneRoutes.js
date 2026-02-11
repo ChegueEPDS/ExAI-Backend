@@ -3,11 +3,12 @@ const router = express.Router();
 const zoneController = require('../controllers/zoneController');
 const healthMetricsController = require('../controllers/healthMetricsController');
 const authMiddleware = require('../middlewares/authMiddleware');
+const { requirePermission } = require('../middlewares/permissionMiddleware');
 const multer = require('multer');
 const upload = multer({ dest: 'uploads/' });
 
 // Új projekt létrehozása
-router.post('/', authMiddleware(), zoneController.createZone);
+router.post('/', authMiddleware(), requirePermission('zone:write'), zoneController.createZone);
 
 // Összes projekt lekérdezése
 router.get('/', authMiddleware(), zoneController.getZones);
@@ -21,14 +22,15 @@ router.get('/:id/maintenance-severity-summary', authMiddleware(), zoneController
 router.get('/:id/health-metrics', authMiddleware(), healthMetricsController.getZoneHealthMetrics);
 
 // Projekt módosítása ID alapján
-router.put('/:id', authMiddleware(), zoneController.updateZone);
+router.put('/:id', authMiddleware(), requirePermission('zone:write'), zoneController.updateZone);
 
 // Projekt törlése ID alapján
-router.delete('/:id', authMiddleware(), zoneController.deleteZone);
+router.delete('/:id', authMiddleware(), requirePermission('zone:write'), zoneController.deleteZone);
 
 router.post(
     '/:id/upload-file',
     authMiddleware(),
+    requirePermission('zone:write'),
     upload.array('files'),
     zoneController.uploadFileToZone
   );
@@ -37,6 +39,7 @@ router.post(
 router.post(
   '/import-xlsx',
   authMiddleware(),
+  requirePermission('zone:write'),
   upload.single('file'),
   zoneController.importZonesFromXlsx
 );
@@ -50,6 +53,7 @@ router.post(
   router.delete(
     '/:zoneId/files/:fileId',
     authMiddleware(),
+    requirePermission('zone:write'),
     zoneController.deleteFileFromZone
   );
 
@@ -57,6 +61,7 @@ router.post(
   router.delete(
     '/:id/equipment-images',
     authMiddleware(),
+    requirePermission('zone:write'),
     zoneController.deleteEquipmentImagesInZone
   );
 

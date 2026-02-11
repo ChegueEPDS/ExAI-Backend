@@ -172,7 +172,7 @@ async function getReadSasUrl(blobName, opts = {}) {
 }
 
 /**
- * Delete all blobs under a given container-relative prefix (e.g. "dxf/<jobId>/").
+ * Delete all blobs under a given container-relative prefix (e.g. "jobs/<id>/").
  * Returns a summary with the number of deleted blobs.
  * @param {string} prefix
  * @returns {Promise<{ deleted: number }>}

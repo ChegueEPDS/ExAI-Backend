@@ -2,6 +2,13 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcrypt');
 
+const PROFESSIONS = Object.freeze([
+  'manager',
+  'operative',
+  'ex_inspector',
+  'technician',
+]);
+
 const UserSchema = new mongoose.Schema(
   {
     azureId: { type: String, unique: true, sparse: true },
@@ -24,6 +31,13 @@ const UserSchema = new mongoose.Schema(
 
 
     role:      { type: String, enum: ['User', 'Admin', 'SuperAdmin'], default: 'User', required: true },
+
+    // App-level RBAC (multi-role). If empty/missing, backend treats it as ['manager'] for backward compatibility.
+    professions: {
+      type: [{ type: String, enum: PROFESSIONS }],
+      default: undefined,
+      index: true,
+    },
 
     password:  {
       type: String,

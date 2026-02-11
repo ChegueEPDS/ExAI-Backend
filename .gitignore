@@ -1,5 +1,7 @@
 /.env
 /node_modules
+/KEYVAULT.md
+/TESTING*.md
 /uploads/*
 /logs/*
 !.gitkeep

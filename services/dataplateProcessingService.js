@@ -1,7 +1,10 @@
 const azureBlob = require('./azureBlobService');
 const { ocrImageBufferToDataplatePrompt } = require('../helpers/azureVisionOcr');
-const { runDataplateAssistant } = require('./assistantRunner');
-const { buildEquipmentFromDataplateTable } = require('../helpers/htmlTableParser');
+const { resolveAssistantIdByTenant } = require('./assistantRunner');
+const { getAssistantInfoCached } = require('./chatPromptService');
+const { extractDataplateFieldsFromOcrText } = require('../helpers/dataplateJsonExtractor');
+const { runDataplateAssistant } = require('./assistantRunner'); // fallback only
+const { buildEquipmentFromDataplateTable } = require('../helpers/htmlTableParser'); // fallback only
 const { normalizeProtectionTypes } = require('../helpers/protectionTypes');
 
 function pickFirstDataplateImage(equipmentDoc) {
@@ -62,12 +65,32 @@ async function processDataplateForEquipment({ equipmentDoc, tenantKey, userId })
   }
 
   const buffer = await azureBlob.downloadToBuffer(target.blobPath);
-  const { recognizedText } = await ocrImageBufferToDataplatePrompt(buffer);
-  const { html } = await runDataplateAssistant({ tenantKey, message: recognizedText });
+  const { formattedText, recognizedText } = await ocrImageBufferToDataplatePrompt(buffer);
 
-  const parsed = buildEquipmentFromDataplateTable(html);
+  // Prefer structured extraction (Responses json_schema) for accuracy + deterministic validation.
+  let parsed = null;
+  try {
+    const assistantId = resolveAssistantIdByTenant(String(tenantKey || '').toLowerCase());
+    const assistantInfo = assistantId ? await getAssistantInfoCached(assistantId) : { instructions: '', model: null };
+    const r = await extractDataplateFieldsFromOcrText({
+      ocrText: formattedText || recognizedText || '',
+      model: String(assistantInfo?.model || 'gpt-4o-mini'),
+      assistantInstructions: String(assistantInfo?.instructions || ''),
+    });
+    if (r.ok) {
+      parsed = r.fields;
+    }
+  } catch {
+    parsed = null;
+  }
+
+  // Fallback (legacy): ask for an HTML table then parse it.
   if (!parsed) {
-    return { processed: false, reason: 'assistant_table_parse_failed' };
+    const { html } = await runDataplateAssistant({ tenantKey, message: recognizedText });
+    parsed = buildEquipmentFromDataplateTable(html);
+    if (!parsed) {
+      return { processed: false, reason: 'assistant_table_parse_failed' };
+    }
   }
 
   // Normalize "Type of Protection" to the supported set used by questions/inspections.

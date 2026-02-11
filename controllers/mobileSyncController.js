@@ -154,10 +154,16 @@ exports.mobileSync = async (req, res) => {
     if (!fileKey) continue;
     const docs = Array.isArray(item?.documents) ? item.documents : Array.isArray(item?.images) ? item.images : [];
     const byName = new Map();
+    let sawDataplate = false;
     for (const doc of docs) {
       const name = String(doc?.name || doc?.fileName || '').trim();
       if (!name) continue;
-      byName.set(name, normalizeImageTag(doc?.tag, 'general'));
+      const normalized = normalizeImageTag(doc?.tag, 'general');
+      // Enforce at most one dataplate tag per equipment in the sync payload.
+      // This makes server-side selection deterministic and prevents "random" OCR quality swings.
+      const tag = normalized === 'dataplate' && sawDataplate ? 'general' : normalized;
+      if (tag === 'dataplate') sawDataplate = true;
+      byName.set(name, tag);
     }
     if (byName.size) tagLookup.set(fileKey, byName);
   }
@@ -313,6 +319,7 @@ exports.mobileSync = async (req, res) => {
     const eqIdForPrefix = saved.EqID || EqID;
     const eqPrefix = buildEquipmentPrefix(tenantName, tenantIdStr, siteName, zoneName, eqIdForPrefix);
 
+    let attachedDataplate = false;
     for (const file of matchingFiles) {
       const safeOriginalName = cleanFileName(stripFileKeyPrefix(file.originalname));
       const buf = fs.readFileSync(file.path);
@@ -329,7 +336,11 @@ exports.mobileSync = async (req, res) => {
 
       const perItemTagMap = tagLookup.get(tempId) || null;
       const tagFromPayload = perItemTagMap ? perItemTagMap.get(cleanName) || perItemTagMap.get(safeOriginalName) : null;
-      const tag = normalizeImageTag(tagFromPayload, 'general');
+      let tag = normalizeImageTag(tagFromPayload, 'general');
+      if (tag === 'dataplate') {
+        if (attachedDataplate) tag = 'general';
+        else attachedDataplate = true;
+      }
 
       saved.documents = [
         ...(saved.documents || []),

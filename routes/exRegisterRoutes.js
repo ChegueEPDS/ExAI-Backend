@@ -3,22 +3,24 @@ const router = express.Router();
 const exRegisterController = require('../controllers/exRegisterController');
 const maintenanceController = require('../controllers/maintenanceController');
 const authMiddleware = require('../middlewares/authMiddleware');
+const { requirePermission } = require('../middlewares/permissionMiddleware');
 const multer = require('multer'); 
 const upload = multer({ dest: 'uploads/' });
 
 
 
 // Létrehozás
-router.post('/exreg', authMiddleware(), upload.array('pictures'), exRegisterController.createEquipment);
+router.post('/exreg', authMiddleware(), requirePermission('asset:write'), upload.array('pictures'), exRegisterController.createEquipment);
 
-router.post('/exreg/import', authMiddleware(), express.json(), exRegisterController.createEquipment);
+router.post('/exreg/import', authMiddleware(), requirePermission('asset:write'), express.json(), exRegisterController.createEquipment);
 
-router.post('/exreg/:id/upload-images', authMiddleware(), upload.array('pictures'), exRegisterController.uploadImagesToEquipment);
+router.post('/exreg/:id/upload-images', authMiddleware(), requirePermission('asset:write'), upload.array('pictures'), exRegisterController.uploadImagesToEquipment);
 
 // Equipment documents (images + files) upload / list / delete
 router.post(
   '/exreg/:id/upload-documents',
   authMiddleware(),
+  requirePermission('asset:write'),
   upload.array('files'),
   exRegisterController.uploadDocumentsToEquipment
 );
@@ -26,6 +28,7 @@ router.post(
 router.post(
   '/exreg/import-xlsx',
   authMiddleware(),
+  requirePermission('asset:write'),
   upload.single('file'),
   exRegisterController.importEquipmentXLSX
 );
@@ -34,6 +37,7 @@ router.post(
 router.post(
   '/exreg/import-documents-zip',
   authMiddleware(),
+  requirePermission('asset:write'),
   upload.single('file'),
   exRegisterController.importEquipmentDocumentsZip
 );
@@ -42,6 +46,7 @@ router.post(
 router.post(
   '/exreg/import-documents-zip/cleanup-temp',
   authMiddleware(),
+  requirePermission('asset:write'),
   exRegisterController.cleanupTempUploadsNow
 );
 
@@ -88,6 +93,7 @@ router.get(
 router.delete(
   '/exreg/:id/documents/:docId',
   authMiddleware(),
+  requirePermission('asset:write'),
   exRegisterController.deleteDocumentFromEquipment
 );
 
@@ -105,18 +111,18 @@ router.get('/exreg/:id/versions/:versionId', authMiddleware(), exRegisterControl
 router.get('/exreg/:id/history', authMiddleware(), maintenanceController.getEquipmentHistory);
 
 // Maintenance actions
-router.post('/exreg/:id/maintenance/faults', authMiddleware(), maintenanceController.reportFault);
-router.post('/exreg/:id/maintenance/repairs/start', authMiddleware(), maintenanceController.startRepair);
-router.post('/exreg/:id/maintenance/repairs/:repairId/complete', authMiddleware(), maintenanceController.completeRepair);
+router.post('/exreg/:id/maintenance/faults', authMiddleware(), requirePermission(['maintenance:manage', 'maintenance:fault:report']), maintenanceController.reportFault);
+router.post('/exreg/:id/maintenance/repairs/start', authMiddleware(), requirePermission('maintenance:manage'), maintenanceController.startRepair);
+router.post('/exreg/:id/maintenance/repairs/:repairId/complete', authMiddleware(), requirePermission('maintenance:manage'), maintenanceController.completeRepair);
 
 // Módosítás
-router.put('/exreg/:id', authMiddleware(), upload.array('pictures'), exRegisterController.updateEquipment);
+router.put('/exreg/:id', authMiddleware(), requirePermission('asset:write'), upload.array('pictures'), exRegisterController.updateEquipment);
 
 // Törlés
-router.delete('/exreg/:id', authMiddleware(), exRegisterController.deleteEquipment);
+router.delete('/exreg/:id', authMiddleware(), requirePermission('asset:write'), exRegisterController.deleteEquipment);
 
 // Tömeges törlés
-router.post('/exreg/bulk-delete', authMiddleware(), express.json(), exRegisterController.bulkDeleteEquipment);
+router.post('/exreg/bulk-delete', authMiddleware(), requirePermission('asset:write'), express.json(), exRegisterController.bulkDeleteEquipment);
 
 // Gyártók lekérdezése
 router.get('/manufacturers', authMiddleware(), exRegisterController.getManufacturers);

@@ -39,7 +39,7 @@ exports.listTenants = async (req, res) => {
     }
 
     const tenants = await Tenant.find(query)
-      .select('_id name type plan seats seatsManaged ownerUserId createdAt updatedAt')
+      .select('_id name type plan seats seatsManaged ownerUserId professionRbacEnabled createdAt updatedAt')
       .lean();
 
     return res.json({ items: tenants, total: tenants.length });
@@ -63,7 +63,7 @@ exports.searchTenants = async (req, res) => {
     const items = await Tenant.find({
       name: { $regex: q, $options: 'i' }
     })
-      .select('_id name type plan seats')
+      .select('_id name type plan seats professionRbacEnabled')
       .limit(20)
       .lean();
 
@@ -152,7 +152,7 @@ exports.getTenantById = async (req, res) => {
     }
 
     const tenant = await Tenant.findById(id)
-      .select('_id name type plan seats seatsManaged ownerUserId createdAt updatedAt')
+      .select('_id name type plan seats seatsManaged ownerUserId professionRbacEnabled createdAt updatedAt')
       .lean();
 
     if (!tenant) {
@@ -188,7 +188,7 @@ exports.updateTenant = async (req, res) => {
       return res.status(404).json({ message: 'Tenant not found' });
     }
 
-    const { name, seatsMax, seatsManaged, plan } = req.body || {};
+    const { name, seatsMax, seatsManaged, plan, professionRbacEnabled } = req.body || {};
     const updates = {};
 
     // name (slug + ensure unique)
@@ -244,6 +244,14 @@ exports.updateTenant = async (req, res) => {
       }
 
       updates['seats.max'] = n;
+    }
+
+    // profession RBAC feature flag (SuperAdmin only)
+    if (professionRbacEnabled !== undefined) {
+      if (role !== 'SuperAdmin') {
+        return res.status(403).json({ message: 'Only SuperAdmin can change profession RBAC settings.' });
+      }
+      updates.professionRbacEnabled = Boolean(professionRbacEnabled);
     }
 
     // Végrehajtás

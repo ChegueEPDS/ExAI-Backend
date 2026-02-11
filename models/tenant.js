@@ -68,6 +68,9 @@ const TenantSchema = new mongoose.Schema(
       }
     }
     ,
+    // Feature toggle: profession-based RBAC enabled for this tenant (off => legacy behavior)
+    professionRbacEnabled: { type: Boolean, default: false, index: true },
+
     // Optional: per-tenant OpenAI assistant override (avoids hardcoding tenant names in config)
     assistantId: {
       type: String,

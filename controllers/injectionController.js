@@ -1,5 +1,6 @@
 const InjectionRule = require('../models/injectionRule');
 const axios = require('axios');
+const { createResponse, extractOutputTextFromResponse } = require('../helpers/openaiResponses');
 
 exports.createInjectionRule = async (req, res) => {
   try {
@@ -68,30 +69,30 @@ Return JSON:
   "injectedKnowledge": "..."
 }`;
 
-    const response = await axios.post('https://api.openai.com/v1/chat/completions', {
+    const schema = {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        pattern: { type: 'string' },
+        injectedKnowledge: { type: 'string' },
+      },
+      required: ['pattern', 'injectedKnowledge'],
+    };
+
+    const respObj = await createResponse({
       model: 'gpt-4o-mini',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.4
-    }, {
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      }
+      instructions: 'You generate regex patterns and injected knowledge. Return STRICT JSON only.',
+      input: [{ role: 'user', content: prompt }],
+      store: false,
+      temperature: 0.4,
+      maxOutputTokens: 600,
+      textFormat: { type: 'json_schema', name: 'injection_rule', strict: true, schema },
+      timeoutMs: 60_000,
     });
 
-    const raw = response.data.choices[0].message.content;
-
-    // 1. Eltávolítjuk a Markdown blokkot (```json és ```)
-    const jsonBlock = raw.replace(/```json|```/g, '').trim();
-
-    // 2. JSON biztonságos parse
-    try {
-      const parsed = JSON.parse(jsonBlock);
-      res.json(parsed);
-    } catch (jsonError) {
-      console.error('❌ Invalid JSON from OpenAI:\n', jsonBlock);
-      res.status(500).json({ error: 'Invalid JSON received from OpenAI', raw: jsonBlock });
-    }
+    const txt = String(extractOutputTextFromResponse(respObj) || '').trim();
+    const parsed = JSON.parse(txt);
+    res.json(parsed);
   } catch (error) {
     console.error('❌ OpenAI call failed:', error.message || error);
     res.status(500).json({ error: 'Failed to generate injection rule suggestion' });

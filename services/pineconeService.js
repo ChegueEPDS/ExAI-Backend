@@ -1,19 +1,17 @@
 const { Pinecone } = require('@pinecone-database/pinecone');
 const logger = require('../config/logger');
 const crypto = require('crypto');
+const systemSettings = require('./systemSettingsStore');
 
 function pineconeDebugEnabled() {
-  const v = String(process.env.DEBUG_PINECONE || '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'yes';
+  return systemSettings.getBoolean('DEBUG_PINECONE');
 }
 
 function isPineconeEnabled() {
-  const raw = process.env.PINECONE_ENABLED;
-  const enabled = String(raw || '').trim().toLowerCase();
+  const raw = systemSettings.getEffectiveValue('PINECONE_ENABLED');
   // Explicit flag wins (so you can disable Pinecone without unsetting secrets)
-  if (raw !== undefined) {
-    if (enabled === '1' || enabled === 'true' || enabled === 'yes') return true;
-    if (enabled === '0' || enabled === 'false' || enabled === 'no') return false;
+  if (raw !== undefined && raw !== null) {
+    return !!raw;
   }
   // Implicit enable if key+index are present
   return !!(process.env.PINECONE_API_KEY && process.env.PINECONE_INDEX);

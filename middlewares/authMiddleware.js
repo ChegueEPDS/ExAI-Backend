@@ -2,6 +2,7 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/user');
 const Tenant = require('../models/tenant');
+const { computePermissions, getEffectiveProfessions } = require('../helpers/rbac');
 
 /**
  * authMiddleware(roles?: string[])
@@ -26,31 +27,56 @@ const authMiddleware = (roles = []) => {
         return res.status(403).json({ error: 'Access denied: Insufficient role' });
       }
 
+      const decodedUserId = decoded.userId || decoded._id || decoded.sub;
+      let userDoc = null;
+
       // Tenant ID kötelező – ha hiányzik a régi tokenből, töltsük DB-ből
       let tenantId = decoded.tenantId;
       if (!tenantId) {
-        const u = await User.findById(decoded.userId || decoded._id || decoded.sub)
-          .select('tenantId role nickname')
-          .lean();
-        if (!u || !u.tenantId) return res.status(403).json({ error: 'No tenant assigned' });
-        tenantId = String(u.tenantId);
+        userDoc =
+          userDoc ||
+          (await User.findById(decodedUserId).select('tenantId role nickname professions').lean());
+        if (!userDoc || !userDoc.tenantId) return res.status(403).json({ error: 'No tenant assigned' });
+        tenantId = String(userDoc.tenantId);
+      }
+
+      // Professions: from token (v3+) or from DB fallback
+      let professions = decoded.professions;
+      if (!Array.isArray(professions)) {
+        userDoc =
+          userDoc ||
+          (await User.findById(decodedUserId).select('tenantId role nickname professions').lean());
+        professions = userDoc?.professions || undefined;
       }
 
       // Tenant meta (név, típus): tokenből, ha nincs akkor betöltjük
       let tenantName = decoded.tenantName || null;
       let tenantType = decoded.tenantType || null; // 'company' | 'personal' | stb.
+      let professionRbacEnabled =
+        typeof decoded.professionRbacEnabled === 'boolean' ? decoded.professionRbacEnabled : null;
 
-      if (!tenantName || !tenantType) {
+      if (!tenantName || !tenantType || professionRbacEnabled === null) {
         try {
-          const t = await Tenant.findById(tenantId).select('name type').lean();
+          const t = await Tenant.findById(tenantId).select('name type professionRbacEnabled').lean();
           if (t) {
             tenantName = tenantName || t.name || null;
             tenantType = tenantType || t.type || null;
+            if (professionRbacEnabled === null) {
+              professionRbacEnabled = Boolean(t.professionRbacEnabled);
+            }
           }
         } catch (_) {
           // swallow – nem blokkoljuk, csak meta hiányzik
         }
       }
+      if (professionRbacEnabled === null) professionRbacEnabled = false;
+
+      const effectiveProfessions = professionRbacEnabled
+        ? getEffectiveProfessions({ role: decoded.role, professions })
+        : ['manager'];
+      const permissions = professionRbacEnabled
+        ? computePermissions({ role: decoded.role, professions: effectiveProfessions })
+        : ['*:*'];
 
       // --- Attach full decoded JWT and normalize subscription/plan snapshot ---
       req.auth = decoded;
@@ -66,13 +92,16 @@ const authMiddleware = (roles = []) => {
 
       // egységes user objektum (company kivezetve – csak akkor adjuk vissza, ha a token tartalmazta)
       req.user = {
-        id: decoded.userId || decoded._id || decoded.sub,
+        id: decodedUserId,
         role: decoded.role,
         nickname: decoded.nickname || null,
         azureId: decoded.azureId || null,
         tenantId,
         tenantName,
         tenantType,
+        professionRbacEnabled: Boolean(professionRbacEnabled),
+        professions: effectiveProfessions,
+        permissions,
         tokenType: decoded.type || 'access',
         // normalized subscription snapshot from JWT (if present)
         subscription: subscriptionSnap || null,
@@ -95,6 +124,7 @@ const authMiddleware = (roles = []) => {
         tenantId,
         tenantName,
         tenantType,
+        professionRbacEnabled: Boolean(professionRbacEnabled),
         // expose plan so downstream controllers can quickly check entitlements
         plan: planFromToken || null,
       };

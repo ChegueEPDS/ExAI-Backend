@@ -176,36 +176,34 @@ async function chooseFailureTargetKey({ failureNote, candidates }) {
   }));
 
   try {
-    const resp = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: 'gpt-4o-mini',
-        temperature: 0,
-        messages: [
-          {
-            role: 'system',
-            content:
-              'You map a failure note to the single most relevant inspection question. ' +
-              'Return ONLY a JSON object like {"key":"..."} where key must be one of the provided keys.'
-          },
-          {
-            role: 'user',
-            content: JSON.stringify({ failureNote: note, candidates: list })
-          }
-        ]
+    const { createResponse, extractOutputTextFromResponse } = require('../helpers/openaiResponses');
+    const allowedKeys = candidates.map((c) => c.key);
+    const schema = {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        key: { type: 'string', enum: allowedKeys.slice(0, 200) },
       },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
-        },
-        timeout: 60_000
-      }
-    );
+      required: ['key'],
+    };
 
-    const txt = String(resp?.data?.choices?.[0]?.message?.content || '').trim();
-    const m = txt.match(/\{[\s\S]*\}/);
-    const json = m ? JSON.parse(m[0]) : JSON.parse(txt);
+    const respObj = await createResponse({
+      model: 'gpt-4o-mini',
+      instructions:
+        'You map a failure note to the single most relevant inspection question. Return STRICT JSON only.',
+      input: [{
+        role: 'user',
+        content: JSON.stringify({ failureNote: note, candidates: list }),
+      }],
+      store: false,
+      temperature: 0,
+      maxOutputTokens: 120,
+      textFormat: { type: 'json_schema', name: 'failure_key', strict: true, schema },
+      timeoutMs: 60_000,
+    });
+
+    const txt = String(extractOutputTextFromResponse(respObj) || '').trim();
+    const json = JSON.parse(txt);
     const key = typeof json?.key === 'string' ? json.key.trim() : '';
     if (!key) return null;
     const allowed = new Set(candidates.map((c) => c.key));

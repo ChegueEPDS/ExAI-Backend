@@ -96,39 +96,25 @@ const analyzeImages = async (req, res) => {
             return res.status(400).json({ status: 'error', message: 'Nincsenek kép URL-ek megadva.' });
         }
 
-        const userInput = user_input || "What is opn the image? Please explain!";
-        const apiUrl = 'https://api.openai.com/v1/chat/completions';
+        const { createResponse, extractOutputTextFromResponse } = require('../helpers/openaiResponses');
+        const userInput = user_input || "What is on the image? Please explain!";
 
-        const images = image_urls.map((url) => ({
-            type: 'image_url',
-            image_url: { url },
-        }));
+        const contentParts = [
+          { type: 'input_text', text: userInput },
+          ...(image_urls || []).map((url) => ({ type: 'input_image', image_url: String(url) })),
+        ];
 
-        const data = {
-            model: 'gpt-4o-mini',
-            messages: [
-                {
-                    role: 'user',
-                    content: [
-                        {
-                            type: 'text',
-                            text: userInput,
-                        },
-                        ...images,
-                    ],
-                },
-            ],
-            max_tokens: 4096,
-        };
-
-        const response = await axios.post(apiUrl, data, {
-            headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-            },
+        const respObj = await createResponse({
+          model: 'gpt-4o-mini',
+          instructions: '',
+          input: [{ role: 'user', content: contentParts }],
+          store: false,
+          temperature: 0,
+          maxOutputTokens: 4096,
+          timeoutMs: 120_000,
         });
 
-        const result = response.data.choices[0]?.message?.content || 'No result from API';
+        const result = String(extractOutputTextFromResponse(respObj) || '').trim() || 'No result from API';
 
         // Képek törlése az uploads mappából (tenant-alkönyvtárban)
         image_urls.forEach((urlStr) => {

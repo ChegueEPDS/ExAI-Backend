@@ -5,6 +5,7 @@ const StandardSet = require('../models/standardSet');
 const logger = require('../config/logger');
 const { ingestStandardFiles, deleteStandard } = require('../services/standardIngestionService');
 const azureBlob = require('../services/azureBlobService');
+const systemSettings = require('../services/systemSettingsStore');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024, files: 10 } });
 exports.uploadMulter = upload;
@@ -49,7 +50,7 @@ exports.getStandardPdfUrl = async (req, res) => {
     );
     if (!pdf?.blobPath) return res.status(404).json({ ok: false, error: 'no pdf source file' });
 
-    const ttlSeconds = Math.max(60, Math.min(Number(process.env.STANDARD_PDF_SAS_TTL_SECONDS || 600), 3600));
+    const ttlSeconds = Math.max(60, Math.min(Number(systemSettings.getNumber('STANDARD_PDF_SAS_TTL_SECONDS') || 600), 3600));
     const url = await azureBlob.getReadSasUrl(String(pdf.blobPath), {
       ttlSeconds,
       filename: String(pdf.filename || `${std.standardId || std.name || 'standard'}.pdf`),
@@ -97,9 +98,7 @@ exports.uploadStandard = [
       }
 
       const files = Array.isArray(req.files) ? req.files : [];
-      const debugEnabled =
-        String(process.env.DEBUG_GOVERNED || '').trim() === '1' ||
-        String(process.env.DEBUG_GOVERNED || '').trim().toLowerCase() === 'true';
+      const debugEnabled = systemSettings.getBoolean('DEBUG_GOVERNED');
       try {
         logger.info('standards.upload.start', {
           requestId: req.requestId,

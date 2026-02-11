@@ -27,7 +27,6 @@ const loginLimiter = rateLimit({
 
 // Feltöltős SSE végpontok (multipart + stream)
 const sseUploadPaths = new Set([
-  '/api/upload-and-summarize/stream',
   '/api/upload-and-ask/stream'
 ]);
 
@@ -35,8 +34,6 @@ module.exports = (req, res, next) => {
   // SSE kivételek
   if (
     req.path === '/api/notifications/stream' ||
-    /^\/api\/dxf\/stream\/[^/]+$/i.test(req.path) ||
-    req.path === '/api/upload-and-summarize/stream' ||   // <-- ÚJ
     req.path === '/api/upload-and-ask/stream'            // <-- ÚJ
   ) {
     return next();

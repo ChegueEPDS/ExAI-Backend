@@ -1,24 +1,29 @@
-const OpenAI = require('openai');
 const logger = require('../config/logger');
+const systemSettings = require('./systemSettingsStore');
+const { createResponse, extractOutputTextFromResponse } = require('../helpers/openaiResponses');
 
 function rerankEnabled() {
-  const v = String(process.env.RERANK_ENABLED || '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'yes';
+  return systemSettings.getBoolean('RERANK_ENABLED');
 }
 
 function rerankModelForKind(kind) {
   const k = String(kind || '').trim().toLowerCase();
   if (k === 'standard_clause') {
-    return process.env.RERANK_MODEL_STANDARD_CLAUSE || process.env.RERANK_MODEL || process.env.FILE_CHAT_COMPLETIONS_MODEL || 'gpt-5-mini';
+    return (
+      systemSettings.getString('RERANK_MODEL_STANDARD_CLAUSE') ||
+      systemSettings.getString('RERANK_MODEL') ||
+      systemSettings.getString('FILE_CHAT_COMPLETIONS_MODEL')
+    );
   }
-  return process.env.RERANK_MODEL || process.env.FILE_CHAT_COMPLETIONS_MODEL || 'gpt-5-mini';
+  return systemSettings.getString('RERANK_MODEL') || systemSettings.getString('FILE_CHAT_COMPLETIONS_MODEL');
 }
 
 function rerankMaxItemsForKind(kind) {
   const k = String(kind || '').trim().toLowerCase();
-  const raw = k === 'standard_clause'
-    ? (process.env.RERANK_MAX_ITEMS_STANDARD_CLAUSE ?? process.env.RERANK_MAX_ITEMS)
-    : process.env.RERANK_MAX_ITEMS;
+  const raw =
+    k === 'standard_clause'
+      ? systemSettings.getNumber('RERANK_MAX_ITEMS_STANDARD_CLAUSE')
+      : systemSettings.getNumber('RERANK_MAX_ITEMS');
   return Math.max(5, Math.min(Number(raw || 40), 80));
 }
 
@@ -38,7 +43,6 @@ async function rerankWithLLM({ query, kind = '', items, trace = null, model: mod
 
   if (!compact.length) return { ok: true, order: [] };
 
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   const model = String(modelOverride || rerankModelForKind(kind)).trim() || 'gpt-5-mini';
 
   const system = [
@@ -59,12 +63,28 @@ async function rerankWithLLM({ query, kind = '', items, trace = null, model: mod
     'The "order" must contain the same ids as input (each at most once).'
   ].join('\n');
 
-  const resp = await openai.chat.completions.create({
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      order: { type: 'array', items: { type: 'string' } },
+      notes: { type: 'string' },
+    },
+    required: ['order', 'notes'],
+  };
+
+  const respObj = await createResponse({
     model,
+    instructions: system,
+    input: [{ role: 'user', content: user }],
+    store: false,
     temperature: 0,
-    messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+    maxOutputTokens: 600,
+    textFormat: { type: 'json_schema', name: 'rerank_order', strict: true, schema },
+    timeoutMs: 60_000,
   });
-  const txt = String(resp?.choices?.[0]?.message?.content || '').trim();
+
+  const txt = String(extractOutputTextFromResponse(respObj) || '').trim();
   let parsed = null;
   try { parsed = JSON.parse(txt); } catch { parsed = null; }
   const order = Array.isArray(parsed?.order) ? parsed.order.map(x => String(x || '').trim()).filter(Boolean) : [];

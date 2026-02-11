@@ -15,6 +15,7 @@ const {
   buildCertificateCacheForTenant,
   resolveCertificateFromCache
 } = require('../helpers/certificateMatchHelper');
+const contributionRewardService = require('../services/contributionRewardService');
 
 const upload = multer({ dest: 'uploads/' });
 
@@ -317,6 +318,11 @@ exports.uploadCertificate = async (req, res) => {
       // Helyi ideiglenes fájlok törlése
       try { if (fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath); } catch {}
       try { if (fs.existsSync(docxTempPath)) fs.unlinkSync(docxTempPath); } catch {}
+
+      // Fire-and-forget reward check (do not block upload response)
+      contributionRewardService
+        .onCertificatesAdded({ userId: ownerUserId, added: 1 })
+        .catch(() => {});
 
       return res.json({
         message: '✅ Feltöltés sikeres! (Azure Blob)',

@@ -5,11 +5,13 @@ const multer = require('multer');
 const {
   getUserProfile,
   updateUserProfile,
+  updateUserProfessions,
   listUsers,
   getMyDownloadQuota,
   moveUserToTenant,
   deleteUser,
-  createPaidTenantUser
+  createPaidTenantUser,
+  manualSendContributionReward
 } = require('../controllers/userController');
 const authMiddleware = require('../middlewares/authMiddleware');
 
@@ -30,6 +32,9 @@ router.get('/user/:userId', authMiddleware(), getUserProfile);
 // Update user profile (basic fields + optional signature image)
 router.put('/user/:userId', authMiddleware(), upload.single('signature'), updateUserProfile);
 
+// Update user professions (RBAC) - Admin/SuperAdmin
+router.put('/users/:userId/professions', authMiddleware(['Admin', 'SuperAdmin']), updateUserProfessions);
+
 // Delete user profile
 router.delete('/user/:userId', authMiddleware (['Admin', 'SuperAdmin']), deleteUser)
 
@@ -44,6 +49,13 @@ router.post(
   '/admin/create-paid-tenant-user',
   authMiddleware(['Admin','SuperAdmin']),
   createPaidTenantUser
+);
+
+// Manual reward email (Admin/SuperAdmin) - also sets baseline for future auto rewards
+router.post(
+  '/users/:userId/contribution-reward/manual-send',
+  authMiddleware(['Admin', 'SuperAdmin']),
+  manualSendContributionReward
 );
 
 module.exports = router;

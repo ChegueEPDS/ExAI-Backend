@@ -12,6 +12,8 @@ const mailService = require('../services/mailService');
 const { tenantInviteEmailHtml } = require('../services/mailTemplates');
 const { migrateAllUserDataToTenant } = require('../services/tenantMigration');
 const azureBlob = require('../services/azureBlobService');
+const { computePermissions, getEffectiveProfessions, assertValidProfessions } = require('../helpers/rbac');
+const contributionRewardService = require('../services/contributionRewardService');
 
 // --- Daily download quota (Free plan) helpers ---
 const FREE_DAILY_LIMIT = 3;
@@ -244,6 +246,10 @@ exports.listUsers = async (req, res) => {
           firstName: 1,
           lastName: 1,
           email: 1,
+          role: 1,
+          nickname: 1,
+          position: 1,
+          positionInfo: 1,
           azureId: 1,
           tenantId: 1,
           tenantName: '$tenant.name',
@@ -251,6 +257,7 @@ exports.listUsers = async (req, res) => {
           subscriptionTier: '$subscription.tier',
           subscriptionStatus: '$subscription.status',
           subscriptionExpiresAt: '$subscription.expiresAt',
+          professions: 1,
           publicContributionCount: 1,
           pendingCount: 1
         }
@@ -383,6 +390,7 @@ exports.moveUserToTenant = async (req, res) => {
 
 // Update User Profile
 exports.updateUserProfile = async (req, res) => {
+  const body = req.body || {};
   const {
     firstName,
     lastName,
@@ -390,20 +398,42 @@ exports.updateUserProfile = async (req, res) => {
     billingName,
     billingAddress,
     position,
-    positionInfo
-  } = req.body;
+    positionInfo,
+    email,
+    role: targetRole,
+    professions: professionsInput,
+  } = body;
 
   try {
     const tenantId = req.scope?.tenantId;
     const role = req.role;
+    const callerUserId = req.user?.id || req.userId || null;
 
-    let query;
-    if (role === 'SuperAdmin') {
-      query = { _id: req.params.userId };
-    } else {
-      if (!tenantId) return res.status(403).json({ error: 'Missing tenantId' });
-      query = { _id: req.params.userId, tenantId };
+    const targetUserId = String(req.params.userId || '');
+    if (!targetUserId) return res.status(400).json({ error: 'Missing userId' });
+
+    const isAdminLike = role === 'Admin' || role === 'SuperAdmin';
+    const isSelf = callerUserId && String(callerUserId) === String(targetUserId);
+    if (!isAdminLike && !isSelf) {
+      return res.status(403).json({ error: 'Forbidden' });
     }
+
+    // Load target user with tenant for authorization + feature flag decisions
+    const targetUser = await User.findById(targetUserId);
+    if (!targetUser) return res.status(404).json({ error: 'User not found' });
+
+    // Tenant scoping: Admin and regular users are tenant-bound; SuperAdmin can cross-tenant.
+    if (role !== 'SuperAdmin') {
+      if (!tenantId) return res.status(403).json({ error: 'Missing tenantId' });
+      if (String(targetUser.tenantId || '') !== String(tenantId)) {
+        return res.status(403).json({ error: 'Forbidden: cross-tenant update' });
+      }
+    }
+
+    const tenantDoc = targetUser.tenantId
+      ? await Tenant.findById(targetUser.tenantId).select('professionRbacEnabled').lean()
+      : null;
+    const professionRbacEnabled = Boolean(tenantDoc?.professionRbacEnabled);
 
     // Aláírás kép feltöltése (opcionális)
     const signatureUpdate = {};
@@ -427,28 +457,122 @@ exports.updateUserProfile = async (req, res) => {
     }
 
     const updateFields = {
-      firstName,
-      lastName,
-      nickname,
-      billingName,
-      billingAddress,
-      position,
-      positionInfo,
+      ...(firstName !== undefined ? { firstName } : {}),
+      ...(lastName !== undefined ? { lastName } : {}),
+      ...(nickname !== undefined ? { nickname } : {}),
+      ...(billingName !== undefined ? { billingName } : {}),
+      ...(billingAddress !== undefined ? { billingAddress } : {}),
+      ...(position !== undefined ? { position } : {}),
+      ...(positionInfo !== undefined ? { positionInfo } : {}),
       ...signatureUpdate
     };
 
-    const user = await User.findOneAndUpdate(
-      query,
-      updateFields,
-      { new: true }
-    ).select('-password');
+    // Admin-only fields (never for normal users)
+    if (isAdminLike) {
+      if (email !== undefined) {
+        const normalizedEmail = String(email || '').trim().toLowerCase();
+        if (!normalizedEmail || !/\S+@\S+\.\S+/.test(normalizedEmail)) {
+          return res.status(400).json({ error: 'Invalid email' });
+        }
+        const exists = await User.findOne({ email: normalizedEmail, _id: { $ne: targetUser._id } })
+          .select('_id')
+          .lean();
+        if (exists) return res.status(400).json({ error: 'Email already in use' });
+        updateFields.email = normalizedEmail;
+      }
 
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+      if (targetRole !== undefined) {
+        const r = String(targetRole || '');
+        if (!['User', 'Admin'].includes(r) && role !== 'SuperAdmin') {
+          return res.status(400).json({ error: 'Invalid role' });
+        }
+        if (r === 'SuperAdmin') {
+          return res.status(403).json({ error: 'Cannot assign SuperAdmin role via this endpoint' });
+        }
+        // Admin cannot change a SuperAdmin's role
+        if (String(targetUser.role) === 'SuperAdmin' && role !== 'SuperAdmin') {
+          return res.status(403).json({ error: 'Forbidden: cannot modify SuperAdmin' });
+        }
+        updateFields.role = r;
+      }
+
+      if (professionsInput !== undefined) {
+        // Only relevant if feature is enabled for the tenant; otherwise ignore quietly.
+        if (professionRbacEnabled) {
+          let normalized = [];
+          try {
+            normalized = assertValidProfessions(professionsInput);
+          } catch (e) {
+            return res.status(400).json({ error: e.message || 'Invalid professions' });
+          }
+          if (!normalized.length) {
+            return res.status(400).json({ error: 'professions is required when profession RBAC is enabled for the tenant' });
+          }
+          updateFields.professions = normalized;
+        }
+      }
     }
-    res.json(user);
+
+    const user = await User.findByIdAndUpdate(targetUserId, updateFields, { new: true }).select('-password');
+    return res.json(user);
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// ---------------------------
+// Update User Professions (Admin/SuperAdmin)
+// PUT /api/users/:userId/professions
+// Body: { professions: string[] }
+// - Admin: only within same tenant
+// - SuperAdmin: any tenant
+// Notes:
+// - Empty/missing professions unsets the field (effective fallback becomes ['manager']).
+// ---------------------------
+exports.updateUserProfessions = async (req, res) => {
+  const role = (req.role || '').toString();
+  const callerTenantId = req.scope?.tenantId || null;
+  const { userId } = req.params || {};
+
+  if (!userId) return res.status(400).json({ error: 'userId is required' });
+  if (!['Admin', 'SuperAdmin'].includes(role)) return res.status(403).json({ error: 'Forbidden' });
+
+  const professionsInput = req.body?.professions;
+
+  let normalized = [];
+  try {
+    normalized = assertValidProfessions(professionsInput);
+  } catch (e) {
+    return res.status(400).json({ error: e.message || 'Invalid professions' });
+  }
+
+  try {
+    const user = await User.findById(userId).select('tenantId role email professions');
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (role !== 'SuperAdmin' && String(user.tenantId || '') !== String(callerTenantId || '')) {
+      return res.status(403).json({ error: 'Forbidden: cannot modify user from another tenant' });
+    }
+
+    if (normalized.length === 0) {
+      user.professions = undefined;
+    } else {
+      user.professions = normalized;
+    }
+
+    await user.save();
+
+    return res.json({
+      message: 'Professions updated.',
+      user: {
+        id: String(user._id),
+        email: user.email,
+        tenantId: user.tenantId ? String(user.tenantId) : null,
+        professions: user.professions || [],
+      }
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || 'Failed to update professions' });
   }
 };
 
@@ -739,6 +863,8 @@ exports.createPaidTenantUser = async (req, res) => {
 
     // 5) Token generálás (rövid életű access token)
     // A payload tükrözi a signAccessTokenWithSubscription logikáját:
+    const effectiveProfessions = getEffectiveProfessions({ role: user.role, professions: user.professions });
+    const permissions = computePermissions({ role: user.role, professions: effectiveProfessions });
     const payload = {
       sub: String(user._id),
       userId: String(user._id),
@@ -750,6 +876,9 @@ exports.createPaidTenantUser = async (req, res) => {
       firstName: user.firstName,
       lastName: user.lastName,
       azureId: user.azureId || null,
+      professionRbacEnabled: Boolean(tenant?.professionRbacEnabled),
+      professions: effectiveProfessions,
+      permissions,
       subscription: {
         tenantName: tenant.name,
         tenantType: tenant.type,
@@ -767,7 +896,7 @@ exports.createPaidTenantUser = async (req, res) => {
         }
       },
       type: 'access',
-      v: 2,
+      v: 3,
     };
     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '1h' });
 
@@ -803,6 +932,52 @@ exports.createPaidTenantUser = async (req, res) => {
   } catch (e) {
     console.error('createPaidTenantUser error', e);
     return res.status(500).json({ error: e.message || 'Internal server error' });
+  }
+};
+
+// ---------------------------
+// POST /api/users/:userId/contribution-reward/manual-send
+// Admin: only within same tenant; SuperAdmin: any tenant
+// Behavior:
+// - If user has >=20 certs: sends reward for floor(total/20)*20
+// - If user has <20 certs: sends reward for milestone 20 (early), so they won't get another at 20
+// Body: { forceResendEmail?: boolean }
+// ---------------------------
+exports.manualSendContributionReward = async (req, res) => {
+  try {
+    const role = (req.role || '').toString();
+    const callerTenantId = req.scope?.tenantId || null;
+    const { userId } = req.params || {};
+    const forceResendEmail =
+      req.body?.forceResendEmail === true ||
+      String(req.body?.forceResendEmail || '').toLowerCase() === 'true' ||
+      String(req.query?.forceResendEmail || '') === '1';
+
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+    const target = await User.findById(userId).select('_id tenantId email firstName lastName').lean();
+    if (!target) return res.status(404).json({ error: 'User not found' });
+
+    if (role !== 'SuperAdmin') {
+      if (!callerTenantId) return res.status(403).json({ error: 'Missing tenantId' });
+      if (String(target.tenantId || '') !== String(callerTenantId || '')) {
+        return res.status(403).json({ error: 'Forbidden: cannot reward user from another tenant' });
+      }
+    }
+
+    const out = await contributionRewardService.issueManualRewardForUser({
+      userId: String(target._id),
+      forceResendEmail,
+    });
+
+    return res.json({
+      ok: true,
+      user: { id: String(target._id), email: target.email || null },
+      ...out,
+    });
+  } catch (e) {
+    console.error('manualSendContributionReward error', e);
+    return res.status(500).json({ error: e?.message || 'Failed to send reward' });
   }
 };
 

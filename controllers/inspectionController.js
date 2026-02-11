@@ -329,6 +329,9 @@ exports.createInspection = async (req, res) => {
       equipment.lastInspectionValidUntil = status === 'Failed' ? null : inspection.validUntil;
       equipment.lastInspectionStatus = status;
       equipment.lastInspectionId = inspection._id;
+      // Any finalized inspection clears "pending review" flags (mobile-sync or post-maintenance).
+      equipment.pendingReview = false;
+      equipment.pendingInspectionId = null;
 
       const imageAttachments = normalizedAttachments.filter(att => att.type === 'image' && att.blobPath && att.blobUrl);
       if (imageAttachments.length) {

@@ -9,6 +9,7 @@ const QuestionTypeMapping = require('../models/questionTypeMapping');
 const mongoose = require('mongoose');
 const fs = require('fs');
 const azureBlob = require('../services/azureBlobService');
+const systemSettings = require('../services/systemSettingsStore');
 const mime = require('mime-types');
 const ExcelJS = require('exceljs');
 const sharp = require('sharp');
@@ -1861,7 +1862,7 @@ async function runEquipmentDocumentsZipImportJob({
           );
           try {
             errorReportDownloadUrl = await azureBlob.getReadSasUrl(blobPath, {
-              ttlSeconds: Number(process.env.EQUIP_DOCS_IMPORT_ERROR_XLS_TTL) || 24 * 60 * 60,
+              ttlSeconds: Number(systemSettings.getNumber('EQUIP_DOCS_IMPORT_ERROR_XLS_TTL') || 24 * 60 * 60),
               filename: `equipment-documents-import-errors-${jobId}.xlsx`,
               contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             });

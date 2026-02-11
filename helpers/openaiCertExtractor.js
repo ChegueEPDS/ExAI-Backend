@@ -352,119 +352,40 @@ function dumpRawIfParseFails(tag, raw) {
   } catch { }
 }
 
-async function createThread() {
+const { extractOutputTextFromResponse, createResponse: createResponseHelper } = require('./openaiResponses');
+
+async function fetchAssistantInfo(assistantId) {
+  if (!assistantId) return { instructions: '', model: null };
   try {
-    const r = await axios.post('https://api.openai.com/v1/threads', {}, {
+    const r = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {
       headers: {
         'Authorization': `Bearer ${OPENAI_KEY}`,
         'OpenAI-Beta': 'assistants=v2',
-        'Content-Type': 'application/json',
-      }
+      },
+      timeout: 60000
     });
-    return r.data.id;
+    return {
+      instructions: String(r.data?.instructions || ''),
+      model: r.data?.model ? String(r.data.model) : null,
+    };
   } catch (err) {
-    throw enhanceAxiosError('createThread', err);
+    throw enhanceAxiosError('getAssistant', err);
   }
 }
 
-async function addMessage(threadId, content) {
+async function createResponse({ model, instructions, input, previousResponseId = null, textFormat = null }) {
   try {
-    // A conversationService-ben stringet küldesz; itt is kompatibilisek maradunk a v2 API-val
-    await axios.post(`https://api.openai.com/v1/threads/${threadId}/messages`,
-      { role: 'user', content },
-      {
-        headers: {
-          'Authorization': `Bearer ${OPENAI_KEY}`,
-          'OpenAI-Beta': 'assistants=v2',
-          'Content-Type': 'application/json',
-        }
-      }
-    );
+    return await withRetry(() => createResponseHelper({
+      model,
+      instructions,
+      input,
+      previousResponseId,
+      textFormat,
+      store: true,
+      timeoutMs: 120_000,
+    }));
   } catch (err) {
-    throw enhanceAxiosError('addMessage', err);
-  }
-}
-
-async function runAndWait(threadId, payload, {
-  timeoutMs = 10 * 60 * 1000,    // 10 minutes total wait
-  pollBaseDelay = 1000,          // start polling at 1s
-  pollMaxDelay = 10000           // cap polling at 10s
-} = {}) {
-  let runId;
-  try {
-    const run = await withRetry(() => axios.post(
-      `https://api.openai.com/v1/threads/${threadId}/runs`,
-      payload,
-      {
-        headers: {
-          'Authorization': `Bearer ${OPENAI_KEY}`,
-          'OpenAI-Beta': 'assistants=v2',
-          'Content-Type': 'application/json',
-        },
-        timeout: 60000
-      }
-    ));
-    runId = run.data.id;
-  } catch (err) {
-    throw enhanceAxiosError('createRun', err);
-  }
-
-  const start = Date.now();
-  let delay = pollBaseDelay;
-
-  while ((Date.now() - start) < timeoutMs) {
-    await sleep(delay);
-    try {
-      const st = await withRetry(() => axios.get(
-        `https://api.openai.com/v1/threads/${threadId}/runs/${runId}`,
-        {
-          headers: {
-            'Authorization': `Bearer ${OPENAI_KEY}`,
-            'OpenAI-Beta': 'assistants=v2',
-          },
-          timeout: 30000
-        }
-      ));
-
-      const status = st.data.status;
-      if (status === 'completed') return;
-      if (['failed', 'cancelled', 'expired'].includes(status)) {
-        throw new Error(`Run failed: ${status}`);
-      }
-
-      // Exponential backoff for the next poll, capped at pollMaxDelay
-      delay = Math.min(pollMaxDelay, Math.floor(delay * 1.6));
-    } catch (err) {
-      if (isTransientError(err)) {
-        // transient issue while polling, increase delay and continue
-        delay = Math.min(pollMaxDelay, Math.floor(delay * 1.8));
-        continue;
-      }
-      throw enhanceAxiosError('pollRun', err);
-    }
-  }
-
-  throw new Error(`Run timeout after ${Math.floor(timeoutMs / 1000)}s`);
-}
-
-async function getLastAssistantText(threadId) {
-  try {
-    const r = await axios.get(`https://api.openai.com/v1/threads/${threadId}/messages`, {
-      headers: {
-        'Authorization': `Bearer ${OPENAI_KEY}`,
-        'OpenAI-Beta': 'assistants=v2',
-      }
-    });
-    const msgs = (r.data?.data || []).sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
-    const msg = msgs.find(m => m.role === 'assistant');
-    if (!msg) throw new Error('No assistant message');
-    let out = '';
-    for (const c of msg.content) {
-      if (c.type === 'text' && c.text?.value) out += c.text.value;
-    }
-    return out.trim();
-  } catch (err) {
-    throw enhanceAxiosError('getMessages', err);
+    throw enhanceAxiosError('createResponse', err);
   }
 }
 
@@ -658,26 +579,30 @@ async function extractCertFieldsFromOCR(ocrText) {
     "-----"
   ].join('\n');
 
-  const threadId = await createThread();
-  await addMessage(threadId, `${systemPrompt}\n\n${userPrompt}`);
+  const assistantInfo = await fetchAssistantInfo(ASSISTANT_ID);
+  const model = String(assistantInfo?.model || 'gpt-5-mini').trim() || 'gpt-5-mini';
+  const assistantInstructions = String(assistantInfo?.instructions || '');
 
   // Első kör: json_schema (strict) – kényszerített valid JSON; hiba esetén fallback json_object-ra
+  let mainResp = null;
   try {
-    await runAndWait(threadId, {
-      assistant_id: ASSISTANT_ID,
-      response_format: {
-        type: 'json_schema',
-        json_schema: { name: jsonSchema.name, schema: jsonSchema.schema, strict: true }
-      }
+    mainResp = await createResponse({
+      model,
+      instructions: `${assistantInstructions}\n\n${systemPrompt}`.trim(),
+      input: [{ role: 'user', content: userPrompt }],
+      textFormat: { type: 'json_schema', name: jsonSchema.name, strict: true, schema: jsonSchema.schema },
     });
   } catch (e) {
-    await runAndWait(threadId, {
-      assistant_id: ASSISTANT_ID,
-      response_format: { type: 'json_object' }
+    mainResp = await createResponse({
+      model,
+      instructions: `${assistantInstructions}\n\n${systemPrompt}`.trim(),
+      input: [{ role: 'user', content: userPrompt }],
+      textFormat: { type: 'json_object' },
     });
   }
 
-  const raw = await getLastAssistantText(threadId);
+  const mainResponseId = mainResp?.id || null;
+  const raw = extractOutputTextFromResponse(mainResp);
 
   // próbáljuk JSON-nek parse-olni (tűrő parserrel)
   let parsed = parseLLMJson(raw);
@@ -740,7 +665,7 @@ async function extractCertFieldsFromOCR(ocrText) {
         if (!headingHint.test(chunk)) continue;
 
         // adjunk világos "negatív" példát is, hogy ne kapja fel a 11)-es általános jogi szöveget
-        await addMessage(threadId, [
+        const followUpPrompt = [
           "Extract ONLY the 'Special/Specific conditions for safe use' text from the OCR CHUNK below.",
           "Look under headings like 'Special conditions for safe use', 'Specific conditions of use', 'Schedule of Limitations', or similar.",
           "Do NOT return generic legal disclaimers like 'This EU-Type Examination Certificate relates only to the design...'.",
@@ -754,17 +679,26 @@ async function extractCertFieldsFromOCR(ocrText) {
           "-----",
           chunk,
           "-----"
-        ].join('\n'));
-
-        await runAndWait(threadId, {
-          assistant_id: ASSISTANT_ID,
-          response_format: {
-            type: 'json_schema',
-            json_schema: { name: "spec_only", schema: { type: "object", additionalProperties: false, properties: { specCondition: { type: "string" } }, required: ["specCondition"] }, strict: true }
-          }
-        });
-
-        const raw2 = await getLastAssistantText(threadId);
+        ].join('\n');
+        let followUpResp = null;
+        try {
+          followUpResp = await createResponse({
+            model,
+            instructions: `${assistantInstructions}\n\n${systemPrompt}`.trim(),
+            input: [{ role: 'user', content: followUpPrompt }],
+            previousResponseId: mainResponseId,
+            textFormat: { type: 'json_schema', name: specOnlySchema.name, strict: true, schema: specOnlySchema.schema },
+          });
+        } catch {
+          followUpResp = await createResponse({
+            model,
+            instructions: `${assistantInstructions}\n\n${systemPrompt}`.trim(),
+            input: [{ role: 'user', content: followUpPrompt }],
+            previousResponseId: mainResponseId,
+            textFormat: { type: 'json_object' },
+          });
+        }
+        const raw2 = extractOutputTextFromResponse(followUpResp);
         const parsed2 = parseLLMJson(raw2);
         if (parsed2 && typeof parsed2.specCondition === 'string' && parsed2.specCondition.trim()) {
           parsed.specCondition = parsed2.specCondition.trim();

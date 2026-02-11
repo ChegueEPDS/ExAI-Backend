@@ -2,10 +2,10 @@ const DatasetFile = require('../models/datasetFile');
 const DatasetRowChunk = require('../models/datasetRowChunk');
 const DatasetTableCell = require('../models/datasetTableCell');
 const logger = require('../config/logger');
+const systemSettings = require('./systemSettingsStore');
 
 function enabled() {
-  const v = String(process.env.MEAS_EVAL_ENABLED || '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'yes';
+  return systemSettings.getBoolean('MEAS_EVAL_ENABLED');
 }
 
 function parseCsvList(v) {
@@ -47,7 +47,7 @@ function tokenFromLabel(labelOrRowText) {
   if (!m) return '';
   const token = m[1].toUpperCase();
   const n = Number(token.slice(1));
-  const max = Math.max(5, Math.min(Number(process.env.MEAS_POINT_MAX || 25), 99));
+  const max = Math.max(5, Math.min(Number(systemSettings.getNumber('MEAS_POINT_MAX') || 25), 99));
   // Avoid false matches from sheet names like "T50"/"T55" etc.
   if (!Number.isInteger(n) || n <= 0 || n > max) return '';
   return token;
@@ -251,14 +251,14 @@ function pickCellByCol(cells, colIndex) {
 async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, allowedFilenames = [], trace = null }) {
   if (!enabled()) return { ok: false, skipped: true, reason: 'MEAS_EVAL_ENABLED is off' };
 
-  const maxFiles = Math.max(1, Math.min(Number(process.env.MEAS_EVAL_MAX_FILES || 3), 10));
-  const maxTablesPerSheet = Math.max(1, Math.min(Number(process.env.MEAS_EVAL_MAX_TABLES || 8), 30));
-  const maxSheets = Math.max(1, Math.min(Number(process.env.MEAS_EVAL_MAX_SHEETS || 12), 30));
-  const extPoints = parseCsvList(process.env.MEAS_EXT_POINTS || 'T10,T11,T4').map(s => s.toUpperCase());
+  const maxFiles = Math.max(1, Math.min(Number(systemSettings.getNumber('MEAS_EVAL_MAX_FILES') || 3), 10));
+  const maxTablesPerSheet = Math.max(1, Math.min(Number(systemSettings.getNumber('MEAS_EVAL_MAX_TABLES') || 8), 30));
+  const maxSheets = Math.max(1, Math.min(Number(systemSettings.getNumber('MEAS_EVAL_MAX_SHEETS') || 12), 30));
+  const extPoints = parseCsvList(systemSettings.getString('MEAS_EXT_POINTS') || 'T10,T11,T4').map(s => s.toUpperCase());
 
   const limits = {
-    gas_T4_C: Number(process.env.MEAS_LIMIT_GAS_T4_C || '') || null,
-    dust_surface_C: Number(process.env.MEAS_LIMIT_DUST_SURFACE_C || '') || null,
+    gas_T4_C: Number(systemSettings.getString('MEAS_LIMIT_GAS_T4_C') || '') || null,
+    dust_surface_C: Number(systemSettings.getString('MEAS_LIMIT_DUST_SURFACE_C') || '') || null,
   };
 
   const xlsxFiles = (allowedFilenames || [])
@@ -545,14 +545,14 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
 async function analyzeMeasurementTables({ tenantId, projectId, datasetVersion, allowedFilenames = [], message = '', options = null, trace = null }) {
   if (!enabled()) return { ok: false, skipped: true, reason: 'MEAS_EVAL_ENABLED is off' };
 
-  const maxFiles = Math.max(1, Math.min(Number(process.env.MEAS_EVAL_MAX_FILES || 3), 10));
-  const maxSheets = Math.max(1, Math.min(Number(process.env.MEAS_EVAL_MAX_SHEETS || 12), 30));
-  const lastN = Math.max(1, Math.min(Number(process.env.MEAS_STEADY_LAST_N || 3), 10));
+  const maxFiles = Math.max(1, Math.min(Number(systemSettings.getNumber('MEAS_EVAL_MAX_FILES') || 3), 10));
+  const maxSheets = Math.max(1, Math.min(Number(systemSettings.getNumber('MEAS_EVAL_MAX_SHEETS') || 12), 30));
+  const lastN = Math.max(1, Math.min(Number(systemSettings.getNumber('MEAS_STEADY_LAST_N') || 3), 10));
 
   const thresholds = {
-    noise_C: Number(process.env.MEAS_DIFF_NOISE_C || 2) || 2,
-    noteworthy_C: Number(process.env.MEAS_DIFF_NOTE_C || 3) || 3,
-    critical_C: Number(process.env.MEAS_DIFF_CRITICAL_C || 5) || 5,
+    noise_C: Number(systemSettings.getNumber('MEAS_DIFF_NOISE_C') || 2) || 2,
+    noteworthy_C: Number(systemSettings.getNumber('MEAS_DIFF_NOTE_C') || 3) || 3,
+    critical_C: Number(systemSettings.getNumber('MEAS_DIFF_CRITICAL_C') || 5) || 5,
   };
 
   const colHint = String(options?.column_range || options?.columns || '').trim();
@@ -944,11 +944,11 @@ async function analyzeMeasurementTables({ tenantId, projectId, datasetVersion, a
 async function compareTablesColumns({ tenantId, projectId, datasetVersion, allowedFilenames = [], message = '', options = null, trace = null }) {
   if (!enabled()) return { ok: false, skipped: true, reason: 'MEAS_EVAL_ENABLED is off' };
 
-  const maxFiles = Math.max(1, Math.min(Number(process.env.MEAS_EVAL_MAX_FILES || 3), 10));
-  const maxSheets = Math.max(1, Math.min(Number(process.env.MEAS_EVAL_MAX_SHEETS || 12), 30));
+  const maxFiles = Math.max(1, Math.min(Number(systemSettings.getNumber('MEAS_EVAL_MAX_FILES') || 3), 10));
+  const maxSheets = Math.max(1, Math.min(Number(systemSettings.getNumber('MEAS_EVAL_MAX_SHEETS') || 12), 30));
   const maxTablesPerSheet = 4; // Table 1..4
   const deltaThreshold =
-    Number(options?.delta_threshold_C ?? options?.deltaThreshold_C ?? process.env.MEAS_COMPARE_DELTA_C ?? 3) || 3;
+    Number(options?.delta_threshold_C ?? options?.deltaThreshold_C ?? systemSettings.getNumber('MEAS_COMPARE_DELTA_C') ?? 3) || 3;
 
   const colHint = String(options?.column_range || options?.columns || '').trim();
   const { from: colFrom, to: colTo, label: colLabel } = colHint ? parseColumnRangeFromMessage(colHint) : parseColumnRangeFromMessage(message);

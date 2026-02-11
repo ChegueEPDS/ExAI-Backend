@@ -27,7 +27,12 @@ function formatDataplateText(rawText) {
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&#x2F;/g, '/')
+    // Normalize Celsius symbols and common OCR artifacts
     .replace(/℃/gi, '°C')
+    .replace(/°\s*°\s*C/gi, '°C')
+    .replace(/°\s*C/gi, '°C')
+    .replace(/\bA\s*TEX\b/gi, 'ATEX')
+    .replace(/\bIEC\s*EX\b/gi, 'IECEx')
     .replace(/(Ex)\s*([MN1il|]{2,3})(A|B|C)/gi, (match, ex, roman, letter) => {
       const correctedRoman = String(roman).replace(/[MN1il|]/g, 'I');
       return `${ex} ${correctedRoman}${letter}`;
@@ -35,13 +40,21 @@ function formatDataplateText(rawText) {
     .replace(/(Ex)\s*([a-z]+)([A-Z]{3})/g, '$1 $2 $3')
     .replace(/(Ex)\s*([a-z]+)/g, '$1 $2')
     .replace(/(Ex)(?!\s)(IIA|IIB|IIC|IIIA|IIIB|IIIC)/g, '$1 $2')
+    .replace(/\bEx\s*-\s*(d|de|e|h|nA|p|q|ia|ib|ic|ma|mb|mc|o|s|tb|t)\b/gi, 'Ex $1')
     .replace(/(Ex)(?!\s)/gm, '$1 ')
     .replace(/\b[l1]\b/gi, 'I')
     .replace(/\b(1I|iI|Il|lI|ll)\b/gi, 'II')
+    .replace(/\bI1\b/g, 'II')
+    .replace(/I[1l](?=\d)/g, 'II')
     .replace(/\b(1II|IlI|lll|lIl)\b/gi, 'III')
-    .replace(/\b(MA|NA)\b/gi, 'IIA')
-    .replace(/\b(MB|NB)\b/gi, 'IIB')
-    .replace(/\b(MC|NC)\b/gi, 'IIC')
+    // Important: keep protection type "nA" (do NOT map it to IIA).
+    // Only map uppercase OCR tokens (gas group confusions) without case-insensitive matching.
+    .replace(/\bMA\b/g, 'IIA')
+    .replace(/\bNA\b/g, 'IIA')
+    .replace(/\bMB\b/g, 'IIB')
+    .replace(/\bNB\b/g, 'IIB')
+    .replace(/\bMC\b/g, 'IIC')
+    .replace(/\bNC\b/g, 'IIC')
     .replace(/\b(NIIIA|MIIIA|MIIA)\b/gi, 'IIIA')
     .replace(/\b(NIIIB|MIIIB|MIIB)\b/gi, 'IIIB')
     .replace(/\b(NIC|MIC)\b/gi, 'IIIC')
@@ -53,9 +66,12 @@ function formatDataplateText(rawText) {
     .replace(/\b111\b/g, 'III')
     .replace(/\b1\b/g, 'I')
     .replace(/([A-Za-z])(\d{3,4})C/g, '$1 $2°C')
-    .replace(/(\d+)\s*([VAKWHz])/g, '$1$2')
+    // Join known units only when they are standalone units (avoid "1998 ANN" -> "1998ANN")
+    .replace(/(\d+)\s*([VAKWHz])\b/g, '$1$2')
     .replace(/IP\s*(\d[X\d])/g, 'IP$1')
     .replace(/\|T\|(\d)\|/g, 'T$1')
+    .replace(/\bT\|(\d{1,3})\|/g, 'T$1')
+    .replace(/\bT\|(\d{1,3})\b/g, 'T$1')
     .replace(/(Tamb .*?to .*?C)/g, '$1\n')
     .replace(/(S\/N \d+)/g, '$1\n')
     .replace(/([A-Za-z]+):\n(\d+.*)/g, '$1: $2')
@@ -105,4 +121,3 @@ async function ocrImageBufferToDataplatePrompt(buffer) {
 }
 
 module.exports = { ocrImageBufferToDataplatePrompt, formatDataplateText };
-

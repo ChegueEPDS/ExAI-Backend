@@ -68,7 +68,15 @@ const PROTECTION_TYPE_VALUES = [
   'NA'
 ];
 
-const CANONICAL_BY_LOWER = new Map(PROTECTION_TYPE_VALUES.map((v) => [v.toLowerCase(), v]));
+// Build canonical mapping while preserving distinct codes like "nA" vs placeholder "NA".
+// We must not let placeholder "NA" overwrite the real protection type "nA".
+const CANONICAL_BY_LOWER = new Map();
+for (const v of PROTECTION_TYPE_VALUES) {
+  const key = String(v || '').toLowerCase();
+  if (!key) continue;
+  if (CANONICAL_BY_LOWER.has(key)) continue; // first occurrence wins (keeps nA)
+  CANONICAL_BY_LOWER.set(key, v);
+}
 const KNOWN_SET_LOWER = new Set(PROTECTION_TYPE_VALUES.map((v) => v.toLowerCase()));
 
 const NOISE_TOKENS = new Set([
@@ -80,6 +88,26 @@ const NOISE_TOKENS = new Set([
   'protection'
 ]);
 
+const NON_PROTECTION_TOKENS = new Set([
+  // Gas/dust groups
+  'iia',
+  'iib',
+  'iic',
+  'iiia',
+  'iiib',
+  'iiic',
+  // EPL
+  'ga',
+  'gb',
+  'gc',
+  'da',
+  'db',
+  'dc',
+  // Common noise in Ex lines (environment)
+  'gd',
+  'dg'
+]);
+
 function looksLikeProtectionCode(token) {
   // Allow unknown-but-code-like short tokens such as "tg"
   return /^[a-z]{1,5}[0-9]{0,2}$/.test(token);
@@ -89,19 +117,28 @@ function normalizeProtectionTypes(input) {
   const raw = Array.isArray(input) ? input.join(' ') : String(input || '');
   const s = raw
     .replace(/[“”"']/g, ' ')
+    .replace(/°\s*C/gi, ' ')
+    .replace(/℃/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
-    .toLowerCase();
 
   if (!s) return [];
 
-  const words = s.match(/[a-z0-9]+/g) || [];
+  // Keep original token casing so we can treat placeholder "NA" differently from "nA".
+  const wordsRaw = s.match(/[A-Za-z0-9]+/g) || [];
   const found = [];
-  for (let i = 0; i < words.length; i += 1) {
-    const w = words[i];
+  for (let i = 0; i < wordsRaw.length; i += 1) {
+    const original = String(wordsRaw[i] || '');
+    if (!original) continue;
+    // Treat "NA" (all-caps) as a placeholder, not a protection type.
+    if (original === 'NA') continue;
+
+    const w = original.toLowerCase();
     if (NOISE_TOKENS.has(w)) continue;
-    if (w === 'op' && i + 1 < words.length) {
-      const next = words[i + 1];
+    if (NON_PROTECTION_TOKENS.has(w)) continue;
+    if (/^t[1-6]$/.test(w) || /^t\d{2,3}$/.test(w)) continue;
+    if (w === 'op' && i + 1 < wordsRaw.length) {
+      const next = String(wordsRaw[i + 1] || '').toLowerCase();
       const phrase = `op ${next}`;
       if (CANONICAL_BY_LOWER.has(phrase)) {
         found.push(CANONICAL_BY_LOWER.get(phrase));
@@ -129,7 +166,7 @@ function normalizeProtectionTypes(input) {
   }
 
   if (out.length > 1) {
-    return out.filter((v) => v.toLowerCase() !== 'na');
+    return out;
   }
   return out;
 }

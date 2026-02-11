@@ -22,6 +22,7 @@ const {
   buildCertificateCacheForTenant,
   resolveCertificateFromCache
 } = require('../helpers/certificateMatchHelper');
+const systemSettings = require('../services/systemSettingsStore');
 
 const EXCEL_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const DEFAULT_COLUMNS = [
@@ -67,10 +68,10 @@ const REPORT_JOB_TYPES = {
   LATEST_INSPECTIONS: 'latest_inspections'
 };
 const REPORT_BLOB_PREFIX = 'report-exports';
-const REPORT_EXPORT_RETENTION_DAYS =
-  Number(process.env.REPORT_EXPORT_RETENTION_DAYS) > 0
-    ? Number(process.env.REPORT_EXPORT_RETENTION_DAYS)
-    : 90;
+function getReportExportRetentionDays() {
+  const n = Number(systemSettings.getNumber('REPORT_EXPORT_RETENTION_DAYS'));
+  return Number.isFinite(n) && n > 0 ? n : 7;
+}
 const PROJECT_REPORT_DIRS = {
   INSPECTIONS: 'Inspection Reports',
   IMAGES: 'Images',
@@ -2784,7 +2785,10 @@ async function serializeReportJob(job, { includeDownloadUrl = false, downloadUrl
   if (includeDownloadUrl && job.status === 'succeeded' && job.blobPath) {
     try {
       payload.downloadUrl = await azureBlob.getReadSasUrl(job.blobPath, {
-        ttlSeconds: downloadUrlTtlSeconds || Number(process.env.REPORT_EXPORT_DOWNLOAD_URL_TTL) || 600,
+        ttlSeconds:
+          downloadUrlTtlSeconds ||
+          Number(systemSettings.getNumber('REPORT_EXPORT_DOWNLOAD_URL_TTL') || 86400) ||
+          600,
         filename: job.meta?.downloadName || `${job.jobId}.zip`,
         contentType: 'application/zip'
       });
@@ -2805,7 +2809,7 @@ async function notifyReportExportReady(job) {
   try {
     payload = await serializeReportJob(job, {
       includeDownloadUrl: true,
-      downloadUrlTtlSeconds: Number(process.env.REPORT_EXPORT_EMAIL_LINK_TTL) || 24 * 60 * 60
+      downloadUrlTtlSeconds: Number(systemSettings.getNumber('REPORT_EXPORT_EMAIL_LINK_TTL') || 86400) || 24 * 60 * 60
     });
   } catch (err) {
     console.warn('⚠️ Failed to serialize report job for notification', err?.message || err);
@@ -3259,7 +3263,7 @@ exports.listInspectionExportJobs = async (req, res) => {
 
     return res.json({
       scope,
-      retentionDays: REPORT_EXPORT_RETENTION_DAYS,
+      retentionDays: getReportExportRetentionDays(),
       items: payloads
     });
   } catch (err) {

@@ -1,10 +1,9 @@
-const OpenAI = require('openai');
 const logger = require('../config/logger');
+const systemSettings = require('./systemSettingsStore');
+const { createResponse, extractOutputTextFromResponse } = require('../helpers/openaiResponses');
 
 function enabled() {
-  const raw = String(process.env.XLSX_PLANNER_ENABLED ?? '').trim().toLowerCase();
-  if (raw === '0' || raw === 'false' || raw === 'no') return false;
-  // default: enabled when key exists
+  if (!systemSettings.getBoolean('XLSX_PLANNER_ENABLED')) return false;
   return !!process.env.OPENAI_API_KEY;
 }
 
@@ -124,8 +123,10 @@ async function buildPlan({ message, xlsxHints = null, trace = null }) {
     return { ok: true, plan };
   }
 
-  const model = process.env.XLSX_PLANNER_MODEL || process.env.FILE_CHAT_COMPLETIONS_MODEL || 'gpt-5-mini';
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const model =
+    systemSettings.getString('XLSX_PLANNER_MODEL') ||
+    systemSettings.getString('FILE_CHAT_COMPLETIONS_MODEL') ||
+    'gpt-5-mini';
 
   const sys = [
     'You are a planner for an audit-grade spreadsheet analysis system.',
@@ -157,13 +158,41 @@ async function buildPlan({ message, xlsxHints = null, trace = null }) {
     '}',
   ].join('\n');
 
-  const resp = await openai.chat.completions.create({
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      steps: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            tool: { type: 'string' },
+            args: { type: 'object', additionalProperties: true },
+          },
+          required: ['tool', 'args'],
+        }
+      },
+      needs_clarification: { type: 'boolean' },
+      clarifying_question: { type: 'string' },
+      assumptions: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['steps', 'needs_clarification', 'clarifying_question', 'assumptions'],
+  };
+
+  const respObj = await createResponse({
     model,
-    response_format: { type: 'json_object' },
-    messages: [{ role: 'system', content: sys }, { role: 'user', content: user }],
+    instructions: sys,
+    input: [{ role: 'user', content: user }],
+    store: false,
+    temperature: 0,
+    maxOutputTokens: 900,
+    textFormat: { type: 'json_schema', name: 'xlsx_plan', strict: true, schema },
+    timeoutMs: 60_000,
   });
 
-  const txt = String(resp?.choices?.[0]?.message?.content || '').trim();
+  const txt = String(extractOutputTextFromResponse(respObj) || '').trim();
   const parsed = safeJsonParse(txt);
   const plan = sanitizePlan(parsed);
 

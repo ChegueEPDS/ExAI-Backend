@@ -4,6 +4,7 @@ const sanitizeHtml = require('sanitize-html');
 const { marked } = require('marked');
 const { get_encoding } = require('tiktoken');
 const logger = require('../config/logger');
+const { initSse } = require('../services/sseService');
 const { notifyAndStore } = require('../lib/notifications/notifier');
 
 const Conversation = require('../models/conversation');
@@ -23,40 +24,10 @@ const { rerankWithLLM } = require('../services/rerankService');
 const measEval = require('../services/measurementEvaluatorService');
 const xlsxPlanner = require('../services/xlsxPlannerService');
 const xlsxPreview = require('../services/xlsxPreviewService');
+const systemSettings = require('../services/systemSettingsStore');
 
 const encoder = get_encoding('o200k_base');
 
-function sseInit(req, res) {
-  const headersAlreadySent = res.headersSent || req?.isSSE;
-  if (!headersAlreadySent) {
-    res.status(200);
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    if (typeof res.flushHeaders === 'function') res.flushHeaders();
-  }
-  if (res.socket && typeof res.socket.setTimeout === 'function') res.socket.setTimeout(0);
-
-  const heartbeat = setInterval(() => {
-    try { res.write(`: ping ${Date.now()}\n\n`); } catch { }
-  }, 15000);
-
-  const send = (event, payload) => {
-    try {
-      res.write(`event: ${event}\n`);
-      res.write(`data: ${JSON.stringify(payload)}\n\n`);
-    } catch { }
-  };
-
-  res.on('close', () => {
-    clearInterval(heartbeat);
-    req.sseClosed = true;
-    try { logger.warn('governed.sse.closed', { requestId: req?.requestId, path: req?.originalUrl }); } catch { }
-    try { res.end(); } catch { }
-  });
-  return send;
-}
 
 async function setConversationJob(conversation, patch) {
   if (!conversation) return;
@@ -364,7 +335,7 @@ function asNumber(x) {
 }
 
 function hybridScoreValue({ query, text, vectorScore }) {
-  const alpha = Math.max(0, Math.min(Number(process.env.HYBRID_ALPHA || 0.25), 2));
+  const alpha = Math.max(0, Math.min(Number(systemSettings.getNumber('HYBRID_ALPHA') || 0.25), 2));
   const k = keywordScore({ query, text });
   return asNumber(vectorScore) + alpha * k;
 }
@@ -374,8 +345,8 @@ async function applyRerank({ query, kind, items, trace }) {
   const maxForRerank = (() => {
     const k = String(kind || '').trim().toLowerCase();
     const raw = k === 'standard_clause'
-      ? (process.env.RERANK_MAX_ITEMS_STANDARD_CLAUSE ?? process.env.RERANK_MAX_ITEMS)
-      : process.env.RERANK_MAX_ITEMS;
+      ? systemSettings.getNumber('RERANK_MAX_ITEMS_STANDARD_CLAUSE')
+      : systemSettings.getNumber('RERANK_MAX_ITEMS');
     return Math.max(5, Math.min(Number(raw || 40), 80));
   })();
   const slice = (items || []).slice(0, maxForRerank);
@@ -384,7 +355,9 @@ async function applyRerank({ query, kind, items, trace }) {
     kind,
     items: slice.map(x => ({ id: x.id, kind, title: x.title, loc: x.loc, text: x.text })),
     trace,
-    model: String(kind || '').trim().toLowerCase() === 'standard_clause' ? (process.env.RERANK_MODEL_STANDARD_CLAUSE || null) : null,
+    model: String(kind || '').trim().toLowerCase() === 'standard_clause'
+      ? (systemSettings.getString('RERANK_MODEL_STANDARD_CLAUSE') || null)
+      : null,
     maxItems: maxForRerank,
   });
   const order = Array.isArray(r?.order) ? r.order : [];
@@ -449,9 +422,7 @@ function isDefinitionLikeQuestion(message) {
 }
 
 function numericEvidenceRequired() {
-  const raw = String(process.env.GOVERNED_REQUIRE_NUMERIC_EVIDENCE ?? '1').trim().toLowerCase();
-  if (raw === '0' || raw === 'false' || raw === 'no') return false;
-  return true;
+  return systemSettings.getBoolean('GOVERNED_REQUIRE_NUMERIC_EVIDENCE');
 }
 
 function detectAnswerMode(message = '') {
@@ -516,7 +487,10 @@ function quickScoreSet({ set, message, evidenceText }) {
 }
 
 async function selectStandardSetsWithLLM({ openai, sets, message, evidenceMode, evidenceSnippets, language }) {
-  const model = process.env.STANDARD_ROUTER_MODEL || process.env.FILE_CHAT_COMPLETIONS_MODEL || 'gpt-5-mini';
+  const model =
+    systemSettings.getString('STANDARD_ROUTER_MODEL') ||
+    systemSettings.getString('FILE_CHAT_COMPLETIONS_MODEL') ||
+    'gpt-5-mini';
   const lang = String(language || 'en').toLowerCase() === 'hu' ? 'hu' : 'en';
   const sys = [
     'You are a routing component for an engineering compliance assistant.',
@@ -550,8 +524,31 @@ async function selectStandardSetsWithLLM({ openai, sets, message, evidenceMode, 
     '{ "selected_keys": string[], "ask_clarify": boolean, "clarifying_question_hu": string, "confidence": number }'
   ].join('\n');
 
-  const resp = await openai.chat.completions.create({ model, messages: [{ role: 'system', content: sys }, { role: 'user', content: user }] });
-  const txt = String(resp?.choices?.[0]?.message?.content || '').trim();
+  const { createResponse, extractOutputTextFromResponse } = require('../helpers/openaiResponses');
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      selected_keys: { type: 'array', items: { type: 'string' } },
+      ask_clarify: { type: 'boolean' },
+      clarifying_question_hu: { type: 'string' },
+      confidence: { type: 'number' },
+    },
+    required: ['selected_keys', 'ask_clarify', 'clarifying_question_hu', 'confidence'],
+  };
+
+  const respObj = await createResponse({
+    model,
+    instructions: sys,
+    input: [{ role: 'user', content: user }],
+    store: false,
+    temperature: 0,
+    maxOutputTokens: 700,
+    textFormat: { type: 'json_schema', name: 'standard_router', strict: true, schema },
+    timeoutMs: 60_000,
+  });
+
+  const txt = String(extractOutputTextFromResponse(respObj) || '').trim();
   let parsed = null;
   try { parsed = JSON.parse(txt); } catch { parsed = null; }
   return parsed;
@@ -564,8 +561,8 @@ async function resolveStandardSelection({ tenantId, message, evidenceText, opena
   const lang = detectLanguage(message);
 
   const q = normalizeHint(message);
-  const fuzzyEnabled = !['false', '0', 'no'].includes(String(process.env.STANDARD_SET_FUZZY_ENABLED || 'true').trim().toLowerCase());
-  const fuzzyThreshold = Math.max(0.6, Math.min(0.98, Number(process.env.STANDARD_SET_FUZZY_THRESHOLD || 0.86)));
+  const fuzzyEnabled = systemSettings.getBoolean('STANDARD_SET_FUZZY_ENABLED');
+  const fuzzyThreshold = Math.max(0.6, Math.min(0.98, Number(systemSettings.getNumber('STANDARD_SET_FUZZY_THRESHOLD') || 0.86)));
 
   const explicit = sets.filter(s => {
     const keys = [s.key, s.name, ...(s.aliases || [])].filter(Boolean);
@@ -607,7 +604,7 @@ async function resolveStandardSelection({ tenantId, message, evidenceText, opena
     .sort((a, b) => b.score - a.score);
   const top = ranked.slice(0, 6).map(x => x.s);
 
-  const llmEnabled = String(process.env.STANDARD_ROUTER_LLM || '1') !== '0';
+  const llmEnabled = systemSettings.getBoolean('STANDARD_ROUTER_LLM');
   const evidenceMode = detectModeFromEvidence(`${message}\n\n${evidenceText || ''}`);
 
   if (llmEnabled && openai) {
@@ -720,7 +717,7 @@ function parseClarifyNumericSelection(conversation, message) {
   if (setId) return setId;
 
   // 4) Fuzzy match by name/key (diacritics + small typos)
-  const threshold = Math.max(0.6, Math.min(0.98, Number(process.env.STANDARD_SET_FUZZY_THRESHOLD || 0.86)));
+  const threshold = Math.max(0.6, Math.min(0.98, Number(systemSettings.getNumber('STANDARD_SET_FUZZY_THRESHOLD') || 0.86)));
   const best = bestFuzzyMatch({
     message: raw,
     candidates: opts.flatMap(o => [o?.name, o?.key].filter(Boolean)),
@@ -735,16 +732,19 @@ function parseClarifyNumericSelection(conversation, message) {
 // POST /api/chat/governed/stream
 // body: { threadId, projectId, datasetVersion?, message }
 exports.chatGovernedStream = async (req, res) => {
-  const send = sseInit(req, res);
+  const send = initSse(req, res, {
+      setClosedFlag: 'sseClosed',
+      onClose: ({ req }) => {
+        try { logger.warn('governed.sse.closed', { requestId: req?.requestId, path: req?.originalUrl }); } catch { }
+      }
+    });
   try {
     const userId = req.userId;
     const tenantId = req.scope?.tenantId;
     const { threadId, message, standardRef: requestedStandardRef0 } = req.body || {};
     const requestedVersion = req.body?.datasetVersion;
 
-    const debugEnabled =
-      String(process.env.DEBUG_GOVERNED || '').trim() === '1' ||
-      String(process.env.DEBUG_GOVERNED || '').trim().toLowerCase() === 'true';
+    const debugEnabled = systemSettings.getBoolean('DEBUG_GOVERNED');
 
     if (!userId || !tenantId) {
       send('error', { message: 'Missing auth/tenant.' });
@@ -1020,17 +1020,17 @@ exports.chatGovernedStream = async (req, res) => {
     }
 
     if (pineconeEnabled && Array.isArray(qEmbedding) && qEmbedding.length) {
-      const finalTables = Number(process.env.GOVERNED_RAG_TOPK || 14);
-      const finalDocs = Number(process.env.GOVERNED_RAG_DOC_TOPK || 10);
-      const finalStd = Number(process.env.GOVERNED_RAG_STD_TOPK || 12);
+      const finalTables = Number(systemSettings.getNumber('GOVERNED_RAG_TOPK') || 14);
+      const finalDocs = Number(systemSettings.getNumber('GOVERNED_RAG_DOC_TOPK') || 10);
+      const finalStd = Number(systemSettings.getNumber('GOVERNED_RAG_STD_TOPK') || 12);
 
-      const candTables = Number(process.env.GOVERNED_RAG_TABLE_CANDIDATES || 50);
-      const candDocs = Number(process.env.GOVERNED_RAG_DOC_CANDIDATES || 40);
-      const candStd = Number(process.env.GOVERNED_RAG_STD_CANDIDATES || 60);
+      const candTables = Number(systemSettings.getNumber('GOVERNED_RAG_TABLE_CANDIDATES') || 50);
+      const candDocs = Number(systemSettings.getNumber('GOVERNED_RAG_DOC_CANDIDATES') || 40);
+      const candStd = Number(systemSettings.getNumber('GOVERNED_RAG_STD_CANDIDATES') || 60);
 
-      const perFileTables = Number(process.env.GOVERNED_RAG_TABLE_PER_FILE || 3);
-      const perFileDocs = Number(process.env.GOVERNED_RAG_DOC_PER_FILE || 3);
-      const perStdRef = Number(process.env.GOVERNED_RAG_STD_PER_STANDARD || 6);
+      const perFileTables = Number(systemSettings.getNumber('GOVERNED_RAG_TABLE_PER_FILE') || 3);
+      const perFileDocs = Number(systemSettings.getNumber('GOVERNED_RAG_DOC_PER_FILE') || 3);
+      const perStdRef = Number(systemSettings.getNumber('GOVERNED_RAG_STD_PER_STANDARD') || 6);
 
       const baseFilter = {
         tenantId: String(tenantId),
@@ -1051,7 +1051,7 @@ exports.chatGovernedStream = async (req, res) => {
         topK: candDocs,
         filter: { ...baseFilter, kind: 'doc_chunk' },
       }) : [];
-      const candImg = Number(process.env.GOVERNED_RAG_IMG_CANDIDATES || 20);
+      const candImg = Number(systemSettings.getNumber('GOVERNED_RAG_IMG_CANDIDATES') || 20);
       const imgMatches = allowedFilenames.length ? await pinecone.queryVectors({
         namespace,
         vector: qEmbedding,
@@ -1074,7 +1074,10 @@ exports.chatGovernedStream = async (req, res) => {
         stdMatches = await pinecone.queryVectors({ namespace: stdNamespace, vector: qEmbedding, topK: candStd, filter: primaryFilter });
 
         // Fallback expansion (still keep primary hits first).
-        const minMatches = Math.max(4, Math.min(Number(process.env.STANDARD_EXPLORER_FALLBACK_MIN_MATCHES || 10), candStd));
+        const minMatches = Math.max(
+          4,
+          Math.min(Number(systemSettings.getNumber('STANDARD_EXPLORER_FALLBACK_MIN_MATCHES') || 10), candStd)
+        );
         if (standardExplorerEnabled && (stdMatches || []).length < minMatches) {
           const extra = await pinecone.queryVectors({ namespace: stdNamespace, vector: qEmbedding, topK: candStd, filter: stdFilter });
           const seen = new Set((stdMatches || []).map(m => String(m?.id || '')));
@@ -1102,7 +1105,7 @@ exports.chatGovernedStream = async (req, res) => {
       }
 
       // Fetch all candidates (bounded), then apply hybrid keyword boosts + optional LLM rerank, then per-file/per-standard caps.
-      const maxCand = Math.max(10, Math.min(Number(process.env.HYBRID_MAX_CANDIDATES || 80), 250));
+      const maxCand = Math.max(10, Math.min(Number(systemSettings.getNumber('HYBRID_MAX_CANDIDATES') || 80), 250));
 
       const tableCand = (tableMatches || []).slice(0, maxCand).map(m => ({
         id: String(m?.id || '').replace(/^row:/, ''),
@@ -1237,8 +1240,8 @@ exports.chatGovernedStream = async (req, res) => {
         perKey: perFileTables,
         keyFn: (m) => String(m?.metadata?.filename || 'file:unknown'),
       });
-      const finalImg = Number(process.env.GOVERNED_RAG_IMG_TOPK || 6);
-      const perFileImgs = Number(process.env.GOVERNED_RAG_IMG_PER_FILE || 1);
+      const finalImg = Number(systemSettings.getNumber('GOVERNED_RAG_IMG_TOPK') || 6);
+      const perFileImgs = Number(systemSettings.getNumber('GOVERNED_RAG_IMG_PER_FILE') || 1);
       const selectedDoc = pickByKey(docRanked.map(it => ({ id: `doc:${it.id}`, metadata: { filename: it.filename } })), {
         maxTotal: finalDocs,
         perKey: perFileDocs,
@@ -1355,14 +1358,14 @@ exports.chatGovernedStream = async (req, res) => {
         try {
           logger.info('governed.retrieval.mongo', {
             requestId: req.requestId,
-            maxCandidates: Number(process.env.GOVERNED_RAG_MAX_CANDIDATES || 3500),
-            maxDocCandidates: Number(process.env.GOVERNED_RAG_MAX_DOC_CANDIDATES || 2500),
+            maxCandidates: Number(systemSettings.getNumber('GOVERNED_RAG_MAX_CANDIDATES') || 3500),
+            maxDocCandidates: Number(systemSettings.getNumber('GOVERNED_RAG_MAX_DOC_CANDIDATES') || 2500),
           });
         } catch { }
       }
       // Fallback: local Mongo embedding arrays (legacy)
-      const maxCandidates = Number(process.env.GOVERNED_RAG_MAX_CANDIDATES || 3500);
-      const maxDocCandidates = Number(process.env.GOVERNED_RAG_MAX_DOC_CANDIDATES || 2500);
+      const maxCandidates = Number(systemSettings.getNumber('GOVERNED_RAG_MAX_CANDIDATES') || 3500);
+      const maxDocCandidates = Number(systemSettings.getNumber('GOVERNED_RAG_MAX_DOC_CANDIDATES') || 2500);
 
       const tableCandidates = await DatasetRowChunk.find({
         tenantId,
@@ -1381,12 +1384,12 @@ exports.chatGovernedStream = async (req, res) => {
       scoredTables = (tableCandidates || [])
         .map(c => ({ ...c, _score: cosineSimilarity(qEmbedding, c.embedding || []) }))
         .sort((a, b) => b._score - a._score)
-        .slice(0, Number(process.env.GOVERNED_RAG_TOPK || 14));
+        .slice(0, Number(systemSettings.getNumber('GOVERNED_RAG_TOPK') || 14));
 
       scoredDocs = (docCandidates || [])
         .map(c => ({ ...c, _score: cosineSimilarity(qEmbedding, c.embedding || []) }))
         .sort((a, b) => b._score - a._score)
-        .slice(0, Number(process.env.GOVERNED_RAG_DOC_TOPK || 10));
+        .slice(0, Number(systemSettings.getNumber('GOVERNED_RAG_DOC_TOPK') || 10));
 
       // Fallback standard retrieval from Mongo embeddings (if stored)
       const stdCandidates = await StandardClause.find({
@@ -1396,7 +1399,7 @@ exports.chatGovernedStream = async (req, res) => {
       scoredStandards = (stdCandidates || [])
         .map(c => ({ ...c, _score: cosineSimilarity(qEmbedding, c.embedding || []) }))
         .sort((a, b) => b._score - a._score)
-        .slice(0, Number(process.env.GOVERNED_RAG_STD_TOPK || 12));
+        .slice(0, Number(systemSettings.getNumber('GOVERNED_RAG_STD_TOPK') || 12));
     }
 
     const contextParts = [];
@@ -1696,7 +1699,7 @@ exports.chatGovernedStream = async (req, res) => {
       try {
         logger.info('governed.assistant.call', {
           requestId: req.requestId,
-          model: process.env.FILE_CHAT_COMPLETIONS_MODEL || 'gpt-5-mini',
+          model: systemSettings.getString('FILE_CHAT_COMPLETIONS_MODEL') || 'gpt-5-mini',
           contextChars: user.length,
           standards: scoredStandards.length,
           docs: scoredDocs.length,
@@ -1704,18 +1707,35 @@ exports.chatGovernedStream = async (req, res) => {
         });
       } catch { }
     }
-    const resp = await openai.chat.completions.create({
-      model: process.env.FILE_CHAT_COMPLETIONS_MODEL || 'gpt-5-mini',
-      response_format: { type: 'json_object' },
-      ...(standardExplorerEnabled
-        ? {
-            temperature: 0,
-            max_tokens: Math.max(600, Math.min(Number(process.env.STANDARD_EXPLORER_MAX_OUTPUT_TOKENS || 2500), 10000)),
-          }
-        : {}),
-      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+    const model = standardExplorerEnabled
+      ? (systemSettings.getString('STANDARD_EXPLORER_MODEL') || 'gpt-4o-mini')
+      : (systemSettings.getString('FILE_CHAT_COMPLETIONS_MODEL') || 'gpt-5-mini');
+    const maxOut = Math.max(600, Math.min(Number(systemSettings.getNumber('STANDARD_EXPLORER_MAX_OUTPUT_TOKENS') || 2500), 10000));
+    const { createResponse, extractOutputTextFromResponse } = require('../helpers/openaiResponses');
+
+    const outSchema = {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        answer: { type: 'string' },
+        numericEvidence: { type: 'array', items: { type: 'object' } },
+        quotes: { type: 'array', items: { type: 'object' } },
+      },
+      required: ['answer', 'numericEvidence', 'quotes'],
+    };
+
+    const respObj = await createResponse({
+      model,
+      instructions: system,
+      input: [{ role: 'user', content: user }],
+      store: false,
+      temperature: 0,
+      maxOutputTokens: standardExplorerEnabled ? maxOut : null,
+      textFormat: { type: 'json_schema', name: 'governed_answer', strict: true, schema: outSchema },
+      timeoutMs: 120_000,
     });
-    const txt = String(resp?.choices?.[0]?.message?.content || '').trim();
+
+    const txt = String(extractOutputTextFromResponse(respObj) || '').trim();
 
     let parsed = null;
     try {
@@ -1730,7 +1750,7 @@ exports.chatGovernedStream = async (req, res) => {
         try {
           logger.warn('governed.assistant.json_parse_failed', {
             requestId: req.requestId,
-            model: process.env.FILE_CHAT_COMPLETIONS_MODEL || 'gpt-5-mini',
+            model: systemSettings.getString('FILE_CHAT_COMPLETIONS_MODEL') || 'gpt-5-mini',
             sample: txt.slice(0, 500),
           });
         } catch { }

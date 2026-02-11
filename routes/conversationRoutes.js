@@ -9,11 +9,8 @@ const {
   getConversations,
   getConversationById,
   searchAndRespond,
-  uploadAndSummarizeStream,
   uploadAndAskStream,
   sendMessageStream,
-  chatWithFilesStream,
-  chatWithFilesCompletionsStream,
   setStandardExplorer
 } = require('../controllers/conversationController');
 const { chatGovernedStream } = require('../controllers/governedChatController');
@@ -64,31 +61,9 @@ router.get('/conversation', authMiddleware(), getConversationById);
 router.post('/conversation/standard-explorer', authMiddleware(), setStandardExplorer);
 
 router.post(
-  '/upload-and-summarize/stream',
-  authMiddleware(),
-  safeUploadArray('files', 10),
-  uploadAndSummarizeStream
-);
-
-router.post(
   '/upload-and-ask/stream',
   authMiddleware(),
   uploadAndAskStream
-);
-
-router.post(
-  '/chat/with-files/stream',
-  authMiddleware(),
-  safeUploadArray('files', 10), // ugyanaz a Busboy/Multer safe wrapper mint máshol
-  chatWithFilesStream
-);
-
-// Chat-with-files via Chat Completions (gpt-5 capable), without Assistants vector stores
-router.post(
-  '/chat/with-files-completions/stream',
-  authMiddleware(),
-  safeUploadArray('files', 10),
-  chatWithFilesCompletionsStream
 );
 
 // Governed RAG (project + dataset version + approval + numeric traceability)

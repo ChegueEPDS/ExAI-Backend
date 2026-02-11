@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const planner = require('../services/xlsxPlannerService');
+const systemSettings = require('../services/systemSettingsStore');
 
 test('xlsx planner normalizes tool aliases', () => {
   assert.equal(planner.__test.normalizeTool('analyze'), 'analyze_measurement_tables');
@@ -23,9 +24,9 @@ test('xlsx planner sanitizes plan args safely', () => {
 
 test('xlsx planner hard-rules engineering compare (no stats)', async () => {
   const prevKey = process.env.OPENAI_API_KEY;
-  const prevEnabled = process.env.XLSX_PLANNER_ENABLED;
   process.env.OPENAI_API_KEY = 'test';
-  process.env.XLSX_PLANNER_ENABLED = '1';
+  systemSettings._resetInMemoryForTests();
+  systemSettings._setInMemoryForTests({ XLSX_PLANNER_ENABLED: true });
   try {
     const msg = 'You have at your disposal the file MIN measurement data. Perform a comparative analysis of Table 1 to Table 4 to find significant differences in temperatures, in columns C to K';
     const r = await planner.buildPlan({ message: msg, xlsxHints: { xlsxFiles: ['MIN.xlsx'] } });
@@ -35,6 +36,6 @@ test('xlsx planner hard-rules engineering compare (no stats)', async () => {
     assert.equal(r.plan.steps[0].args.column_range, 'C-K');
   } finally {
     process.env.OPENAI_API_KEY = prevKey;
-    process.env.XLSX_PLANNER_ENABLED = prevEnabled;
+    systemSettings._resetInMemoryForTests();
   }
 });

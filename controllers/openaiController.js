@@ -211,7 +211,7 @@ exports.uploadAssistantFile = async (req, res) => {
       logger.warn(`Nem sikerült törölni a feltöltött fájlt: ${file.path}`);
     }
 
-    res.status(201).json({ message: 'Fájl sikeresen feltöltve és hozzárendelve.', fileId });
+    res.status(201).json({ message: 'Fájl sikeresen feltöltve és hozzárendelve.', fileId, vectorStoreId });
   } catch (err) {
     logger.error('❌ Fájl feltöltési hiba:', err.message);
     logger.error('❌ Stacktrace:', err);

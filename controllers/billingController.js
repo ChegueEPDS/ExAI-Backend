@@ -296,26 +296,54 @@ exports.createCheckoutSession = async (req, res) => {
 
             return res.json({ url: session.url });
         } else if (normalizedPlan === 'team' || normalizedPlan === 'team_yearly') {
+            const allowPromoCodes = normalizedPlan !== 'team_yearly'; // reward codes are meant for monthly only
             if (!tenantId) {
                 // TEAM: free-first flow (no tenant yet)
-                const newCustomer = await stripe.customers.create({
-                    name: (companyName || 'Company').toString(),
-                    email: req.user?.email || undefined,
-                    metadata: {
-                        intent: 'team',
-                        userId: (req.user?.id || req.user?._id || userId || '').toString(),
-                        companyName: (companyName || '').toString()
+                // Prefer re-using the user's existing Stripe customer (so customer-restricted promo codes work).
+                let customerId = null;
+                let shouldBrevoSync = false;
+                try {
+                  const fallbackTenantId = req.user?.tenantId || req.scope?.tenantId || null;
+                  if (fallbackTenantId) {
+                    const t = await Tenant.findById(fallbackTenantId);
+                    if (t) {
+                      customerId = t.stripeCustomerId;
+                      if (!customerId) {
+                        customerId = await ensureStripeCustomerForTenant({
+                          stripe,
+                          tenantDoc: t,
+                          user: req.user || null
+                        });
+                        shouldBrevoSync = !!customerId;
+                      }
                     }
-                });
-                const customerId = newCustomer.id;
-                // Fire-and-forget Brevo sync on Stripe customer creation (no tenant yet)
-                brevoService.onStripeCustomerCreated({
-                  email: req.user?.email || null,
-                  firstName: req.user?.firstName || '',
-                  lastName: req.user?.lastName || '',
-                  stripeCustomerId: customerId,
-                  tenant: { name: (companyName || '').toString(), plan: 'team', type: 'company' },
-                });
+                  }
+                } catch (_) {}
+
+                if (!customerId) {
+                  const newCustomer = await stripe.customers.create({
+                      name: (companyName || 'Company').toString(),
+                      email: req.user?.email || undefined,
+                      metadata: {
+                          intent: 'team',
+                          userId: (req.user?.id || req.user?._id || userId || '').toString(),
+                          companyName: (companyName || '').toString()
+                      }
+                  });
+                  customerId = newCustomer.id;
+                  shouldBrevoSync = true;
+                }
+
+                if (shouldBrevoSync) {
+                  // Fire-and-forget Brevo sync on Stripe customer creation (no tenant yet)
+                  brevoService.onStripeCustomerCreated({
+                    email: req.user?.email || null,
+                    firstName: req.user?.firstName || '',
+                    lastName: req.user?.lastName || '',
+                    stripeCustomerId: customerId,
+                    tenant: { name: (companyName || '').toString(), plan: 'team', type: 'company' },
+                  });
+                }
                 const clientRef = `team|${(req.user?.id || req.user?._id || userId || '').toString()}`;
                 const meta = {
                     intent: 'team',
@@ -352,7 +380,7 @@ exports.createCheckoutSession = async (req, res) => {
                     automatic_tax: { enabled: true },
                     // Copy name & address from Checkout to the Customer automatically
                     customer_update: { address: 'auto', name: 'auto' },
-                    allow_promotion_codes: true,
+                    allow_promotion_codes: allowPromoCodes,
                     client_reference_id: clientRef,
                     success_url: SUCCESS_URL + '?session_id={CHECKOUT_SESSION_ID}',
                     cancel_url: CANCEL_URL,
@@ -410,7 +438,7 @@ exports.createCheckoutSession = async (req, res) => {
                     automatic_tax: { enabled: true },
                     // Copy name & address from Checkout to the Customer automatically
                     customer_update: { address: 'auto', name: 'auto' },
-                    allow_promotion_codes: true,
+                    allow_promotion_codes: allowPromoCodes,
                     client_reference_id: String(tenant._id),
                     success_url: SUCCESS_URL + '?session_id={CHECKOUT_SESSION_ID}',
                     cancel_url: CANCEL_URL,

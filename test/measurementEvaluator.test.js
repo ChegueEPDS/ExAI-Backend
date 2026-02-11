@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { enabled, detectIntent } = require('../services/measurementEvaluatorService');
+const systemSettings = require('../services/systemSettingsStore');
 
 test('measurement evaluator intent detection', () => {
   assert.equal(detectIntent('Evaluate Excel measurement data and compare to limits'), true);
@@ -10,11 +11,10 @@ test('measurement evaluator intent detection', () => {
 });
 
 test('measurement evaluator enabled flag parsing', () => {
-  const prev = process.env.MEAS_EVAL_ENABLED;
-  process.env.MEAS_EVAL_ENABLED = '1';
+  systemSettings._resetInMemoryForTests();
+  systemSettings._setInMemoryForTests({ MEAS_EVAL_ENABLED: true });
   assert.equal(enabled(), true);
-  process.env.MEAS_EVAL_ENABLED = '0';
+  systemSettings._setInMemoryForTests({ MEAS_EVAL_ENABLED: false });
   assert.equal(enabled(), false);
-  process.env.MEAS_EVAL_ENABLED = prev;
+  systemSettings._resetInMemoryForTests();
 });
-

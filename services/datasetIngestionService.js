@@ -13,6 +13,7 @@ const { inferTableSchemaWithLLM } = require('./tableSchemaService');
 const { computeAndStoreDefaultDerivedMetrics } = require('./tableToolService');
 const { extractPdfImageTexts } = require('./pdfVisionService');
 const pinecone = require('./pineconeService');
+const systemSettings = require('./systemSettingsStore');
 const logger = require('../config/logger');
 
 const encoder = get_encoding('o200k_base');
@@ -162,9 +163,7 @@ async function ingestTabularFileBuffer({
   const namespace = pineconeEnabled ? pinecone.resolveNamespace({ tenantId, projectId }) : null;
 
   try {
-    const debugEnabled =
-      String(process.env.DEBUG_GOVERNED || '').trim() === '1' ||
-      String(process.env.DEBUG_GOVERNED || '').trim().toLowerCase() === 'true';
+    const debugEnabled = systemSettings.getBoolean('DEBUG_GOVERNED');
     if (debugEnabled) {
       try {
         logger.info('dataset.ingest.tabular.start', {
@@ -213,8 +212,8 @@ async function ingestTabularFileBuffer({
     } catch { }
 
     // Build a small workbook preview for schema inference (first N rows/cols with cell coords).
-    const previewMaxRows = Math.max(5, Math.min(Number(process.env.TABLE_SCHEMA_PREVIEW_ROWS || 60), 120));
-    const previewMaxCols = Math.max(5, Math.min(Number(process.env.TABLE_SCHEMA_PREVIEW_COLS || 20), 50));
+    const previewMaxRows = Math.max(5, Math.min(Number(systemSettings.getNumber('TABLE_SCHEMA_PREVIEW_ROWS') || 60), 120));
+    const previewMaxCols = Math.max(5, Math.min(Number(systemSettings.getNumber('TABLE_SCHEMA_PREVIEW_COLS') || 20), 50));
     const workbookPreview = { sheets: [] };
     for (const sheetName of sheetNames.slice(0, 8)) {
       const ws = wb.Sheets[sheetName];
@@ -273,8 +272,8 @@ async function ingestTabularFileBuffer({
         return s || `col_${idx}`;
       });
 
-      const maxRows = Math.min(rows.length, Number(process.env.DATASET_MAX_ROWS || 5000));
-      const maxCols = Math.min(Math.max(headers.length, 1), Number(process.env.DATASET_MAX_COLS || 80));
+      const maxRows = Math.min(rows.length, Number(systemSettings.getNumber('DATASET_MAX_ROWS') || 5000));
+      const maxCols = Math.min(Math.max(headers.length, 1), Number(systemSettings.getNumber('DATASET_MAX_COLS') || 80));
 
       const vectorsToUpsert = [];
       for (let r = 1; r < maxRows; r += 1) {
@@ -324,7 +323,7 @@ async function ingestTabularFileBuffer({
       }
 
       // Capture numeric cells with real addresses (A1) from worksheet cells.
-      const maxCells = Number(process.env.DATASET_MAX_NUMERIC_CELLS || 200000);
+      const maxCells = Number(systemSettings.getNumber('DATASET_MAX_NUMERIC_CELLS') || 200000);
       try {
         const keys = Object.keys(ws).filter(k => k && k[0] !== '!' && /^[A-Z]+[0-9]+$/.test(k));
         for (const addr of keys) {
@@ -403,10 +402,7 @@ async function ingestTabularFileBuffer({
       { _id: fileDoc._id },
       { $set: { indexingStatus: 'done', indexingError: '', meta: { ...fileDoc.meta, kind: 'tabular', totalRows, totalNumericCells: totalCells } } }
     );
-    if (
-      String(process.env.DEBUG_GOVERNED || '').trim() === '1' ||
-      String(process.env.DEBUG_GOVERNED || '').trim().toLowerCase() === 'true'
-    ) {
+    if (systemSettings.getBoolean('DEBUG_GOVERNED')) {
       try {
         logger.info('dataset.ingest.tabular.done', {
           requestId: trace?.requestId,
@@ -464,9 +460,7 @@ async function ingestDocumentFileBuffer({
   const baseUrl = (process.env.BASE_URL || 'http://localhost:3000').replace(/\/+$/, '');
 
   try {
-    const debugEnabled =
-      String(process.env.DEBUG_GOVERNED || '').trim() === '1' ||
-      String(process.env.DEBUG_GOVERNED || '').trim().toLowerCase() === 'true';
+    const debugEnabled = systemSettings.getBoolean('DEBUG_GOVERNED');
     if (debugEnabled) {
       try {
         logger.info('dataset.ingest.document.start', {
@@ -487,8 +481,8 @@ async function ingestDocumentFileBuffer({
     const safeText = (typeof extracted === 'object' && extracted !== null)
       ? String(extracted.text || '').replace(/\u0000/g, '').trim()
       : String(extracted || '').replace(/\u0000/g, '').trim();
-    const docChunkTokens = Number(process.env.DOCUMENT_CHUNK_TOKENS || 450);
-    const docChunkOverlap = Number(process.env.DOCUMENT_CHUNK_OVERLAP || 80);
+    const docChunkTokens = Number(systemSettings.getNumber('DOCUMENT_CHUNK_TOKENS') || 450);
+    const docChunkOverlap = Number(systemSettings.getNumber('DOCUMENT_CHUNK_OVERLAP') || 80);
     const pagesText = (typeof extracted === 'object' && extracted !== null && Array.isArray(extracted.pagesText))
       ? extracted.pagesText.map(t => String(t || '').replace(/\u0000/g, '').trim()).filter(Boolean)
       : [];
@@ -514,7 +508,7 @@ async function ingestDocumentFileBuffer({
       }
     }
 
-    const limited = locatedChunks.slice(0, Number(process.env.DATASET_MAX_DOC_CHUNKS || 120));
+    const limited = locatedChunks.slice(0, Number(systemSettings.getNumber('DATASET_MAX_DOC_CHUNKS') || 120));
 
     const vectorsToUpsert = [];
     for (let i = 0; i < limited.length; i += 1) {
@@ -563,7 +557,7 @@ async function ingestDocumentFileBuffer({
     // Optional: image/figure extraction from PDFs via Vision (stored as separate chunks).
     let imageChunkCount = 0;
     if (isPdf) {
-      const maxPages = Math.max(0, Math.min(Number(process.env.PDF_VISION_MAX_PAGES || 2), 10));
+      const maxPages = Math.max(0, Math.min(Number(systemSettings.getNumber('PDF_VISION_MAX_PAGES') || 2), 10));
       let pages = imagePages;
       if (!pages.length && maxPages > 0) {
         try {

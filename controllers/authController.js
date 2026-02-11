@@ -10,6 +10,7 @@ const mailService = require('../services/mailService');
 const { registrationEmailHtml, emailVerificationEmailHtml, forgotPasswordEmailHtml } = require('../services/mailTemplates');
 const Stripe = require('stripe');
 const { ensureStripeCustomerForTenant } = require('../services/stripeCustomerProvisioning');
+const { computePermissions, getEffectiveProfessions } = require('../helpers/rbac');
 
 let stripe = null;
 const stripeKey = process.env.STRIPE_SECRET_KEY;
@@ -193,10 +194,19 @@ async function ensureTenantForUserFromName(user, tenantName) {
 async function signAccessTokenWithSubscription(user, opts = {}) {
   const meta = await getTenantMeta(user.tenantId);
   const subscription = await getSubscriptionSnapshot(user.tenantId);
+  const tenantDoc = await Tenant.findById(user.tenantId).select('professionRbacEnabled').lean();
+  const professionRbacEnabled = Boolean(tenantDoc?.professionRbacEnabled);
   const expiresIn =
     (opts && opts.expiresIn) ||
     process.env.JWT_EXPIRES_IN ||
     '1h';
+
+  const effectiveProfessions = professionRbacEnabled
+    ? getEffectiveProfessions({ role: user.role, professions: user.professions })
+    : ['manager'];
+  const permissions = professionRbacEnabled
+    ? computePermissions({ role: user.role, professions: effectiveProfessions })
+    : ['*:*'];
 
   const payload = {
     sub: String(user._id),
@@ -209,9 +219,12 @@ async function signAccessTokenWithSubscription(user, opts = {}) {
     firstName: user.firstName,
     lastName: user.lastName,
     azureId: user.azureId || null,
+    professionRbacEnabled,
+    professions: effectiveProfessions,
+    permissions,
     subscription,     // 🔹 new snapshot field
     type: 'access',
-    v: 2,
+    v: 3,
   };
   return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn });
 }

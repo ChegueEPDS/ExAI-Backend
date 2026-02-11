@@ -8,6 +8,7 @@ const limiter = require('./middlewares/rateLimiter');
 const cleanupService = require('./services/cleanupService');
 const subscriptionSweeper = require('./services/subscriptionSweeper');
 const reportExportCleanup = require('./services/reportExportCleanup');
+const systemSettingsStore = require('./services/systemSettingsStore');
 const path = require('path');
 const fs = require('fs');
 
@@ -26,10 +27,8 @@ const certificateRoutes = require('./routes/certificateRoutes');
 const questionsRoutes = require('./routes/questionsRoutes');
 const zoneRoutes = require('./routes/zoneRoutes');
 const siteRoutes = require('./routes/siteRoutes');
-const xlsCompareRoutes = require('./routes/xlsCompareRoutes')
 const graphRoutes = require('./routes/graphRoutes');
 const injectionRoutes = require('./routes/injectionRoutes');
-const dxfRoute = require('./routes/dxfRoutes');
 const certificateDraftRoutes = require('./routes/certificateDraftRoutes');
 const notificationsRoutes = require('./routes/notificationsRoutes');
 const billingRoutes = require('./routes/billing');
@@ -53,6 +52,7 @@ const maintenanceSeverityRoutes = require('./routes/maintenanceSeverityRoutes');
 const dashboardSettingsRoutes = require('./routes/dashboardSettingsRoutes');
 const dashboardAnalyticsRoutes = require('./routes/dashboardAnalyticsRoutes');
 const plannedInspectionRoutes = require('./routes/plannedInspectionRoutes');
+const systemSettingsRoutes = require('./routes/systemSettingsRoutes');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -71,6 +71,9 @@ connectDB().then(() => console.log('Database connected successfully')).catch((er
   console.error('Database connection failed:', err);
   process.exit(1); // Exit if DB connection fails
 });
+
+// Start global system settings loader (DB-backed overrides with code defaults)
+systemSettingsStore.start();
 
 function normalizeCorsToken(v) {
   const s = String(v || '').trim();
@@ -260,7 +263,6 @@ app.use((req, res, next) => {
 // SSE hardening for the stream endpoints – SKIP for multipart/form-data uploads
 app.use((req, res, next) => {
   const ssePaths = new Set([
-    '/api/upload-and-summarize/stream',
     '/api/upload-and-ask/stream'
   ]);
 
@@ -293,7 +295,6 @@ app.use((req, res, next) => {
 });
 
 // (opcionális) explicit OPTIONS a streamre – a globális CORS amúgy is kezeli
-app.options('/api/upload-and-summarize/stream', cors({ origin: true, credentials: true }));
 app.options('/api/upload-and-ask/stream', cors({ origin: true, credentials: true }));
 
 // Use routes
@@ -313,10 +314,8 @@ app.use('/api/cert-requests', certificateRequestRoutes);
 app.use('/api/questions', questionsRoutes);
 app.use('/api/zones', zoneRoutes);
 app.use('/api/sites', siteRoutes);
-app.use('/api/xls', xlsCompareRoutes);
 app.use('/api/graph', graphRoutes);
 app.use('/api', injectionRoutes);
-app.use('/api/dxf', dxfRoute);
 app.use('/api', notificationsRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api', upgradeRoutes);
@@ -336,6 +335,7 @@ app.use('/api', downloadRoutes);
 app.use('/api', mobileSyncRoutes);
 app.use('/api', datasetRoutes);
 app.use('/api', standardRoutes);
+app.use('/api', systemSettingsRoutes);
 
 const backgroundJobsDisabled =
   process.env.DISABLE_BACKGROUND_JOBS === '1' ||
@@ -389,7 +389,6 @@ if (fs.existsSync(frontendDist)) {
 if (!backgroundJobsDisabled) {
   // Periodikus tisztítás
   setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum
-  setInterval(cleanupService.cleanupDxfResults, 3 * 60 * 60 * 1000);
   setInterval(() => cleanupService.cleanupUploadTempFiles(), 3 * 60 * 60 * 1000);
   setInterval(cleanupService.cleanupEquipmentDocsImportErrorReports, 24 * 60 * 60 * 1000); // napi egyszer
   setInterval(subscriptionSweeper.sweepExpiredSubscriptions, 60 * 60 * 1000);

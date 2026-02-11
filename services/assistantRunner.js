@@ -1,42 +1,24 @@
 const axios = require('axios');
 const { marked } = require('marked');
+const { resolveAssistantIdByTenantKey } = require('./assistantResolver');
+const { extractOutputTextFromResponse } = require('../helpers/openaiResponses');
+const { createResponse } = require('../helpers/openaiResponses');
 
 marked.setOptions({ mangle: false, headerIds: false });
-
-const axiosInst = axios.create({
-  baseURL: 'https://api.openai.com/v1',
-  headers: {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    'OpenAI-Beta': 'assistants=v2'
-  },
-  timeout: 60_000
-});
-
-const { resolveAssistantIdByTenantKey } = require('./assistantResolver');
 
 function resolveAssistantIdByTenant(tenantKey) {
   return resolveAssistantIdByTenantKey(tenantKey) || '';
 }
 
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function waitForRun(threadId, runId, { maxMs = 60_000 } = {}) {
-  const start = Date.now();
-  let delayMs = 500;
-  while (Date.now() - start < maxMs) {
-    const { data } = await axiosInst.get(`/threads/${threadId}/runs/${runId}`);
-    const s = data.status;
-    if (s === 'completed') return data;
-    if (s === 'requires_action') throw new Error('Assistant run requires_action (tool calls not handled).');
-    if (s === 'failed' || s === 'cancelled' || s === 'expired') {
-      const errMsg = data?.last_error?.message ? ` - ${data.last_error.message}` : '';
-      throw new Error(`Assistant run ended with status: ${s}${errMsg}`);
-    }
-    await wait(delayMs);
-    delayMs = Math.min(delayMs * 1.5, 3000);
-  }
-  throw new Error('Assistant run polling timeout.');
+async function fetchAssistantInfo(assistantId) {
+  if (!assistantId) return { instructions: '', model: null };
+  const resp = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {
+    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2' }
+  });
+  return {
+    instructions: String(resp.data?.instructions || ''),
+    model: resp.data?.model ? String(resp.data.model) : null,
+  };
 }
 
 async function runDataplateAssistant({ tenantKey, message }) {
@@ -48,50 +30,29 @@ async function runDataplateAssistant({ tenantKey, message }) {
     throw new Error('ASSISTANT_ID is not configured for this tenant.');
   }
 
-  const threadResp = await axiosInst.post('/threads', {});
-  const threadId = threadResp.data.id;
+  const assistantInfo = await fetchAssistantInfo(assistantId);
+  const model = String(assistantInfo?.model || 'gpt-5-mini').trim() || 'gpt-5-mini';
 
-  try {
-    await axiosInst.post(`/threads/${threadId}/messages`, {
-      role: 'user',
-      content: message
-    });
+  const payload = {
+    model,
+    store: true,
+    instructions: String(assistantInfo?.instructions || ''),
+    input: [{ role: 'user', content: String(message || '') }],
+  };
+  const respObj = await createResponse({
+    model: payload.model,
+    instructions: payload.instructions,
+    input: payload.input,
+    store: true,
+    temperature: 0,
+    maxOutputTokens: 1200,
+    timeoutMs: 120_000,
+  });
 
-    const runResp = await axiosInst.post(`/threads/${threadId}/runs`, {
-      assistant_id: assistantId
-    });
-
-    await waitForRun(threadId, runResp.data.id, { maxMs: 120_000 });
-
-    const messagesResp = await axiosInst.get(`/threads/${threadId}/messages`, {
-      params: { order: 'desc', limit: 10 }
-    });
-
-    const assistantMessage = (messagesResp.data?.data || []).find((m) => m.role === 'assistant');
-    if (!assistantMessage) throw new Error('Assistant response missing.');
-
-    let assistantContent = '';
-    if (Array.isArray(assistantMessage.content)) {
-      assistantMessage.content.forEach((item) => {
-        if (item.type === 'text' && item.text && item.text.value) {
-          assistantContent += item.text.value;
-        }
-      });
-    } else {
-      assistantContent = assistantMessage.content;
-    }
-
-    assistantContent = String(assistantContent || '').replace(/【[^【】\n\r]{0,200}】/g, '');
-    const html = marked(assistantContent);
-    return { html, assistantId };
-  } finally {
-    // best-effort cleanup to avoid thread buildup
-    try {
-      await axiosInst.delete(`/threads/${threadId}`);
-    } catch {
-      // ignore
-    }
-  }
+  const txt = extractOutputTextFromResponse(respObj);
+  const cleaned = String(txt || '').replace(/【[^【】\n\r]{0,200}】/g, '');
+  const html = marked(cleaned);
+  return { html, assistantId, model, responseId: respObj?.id || null };
 }
 
 module.exports = { runDataplateAssistant, resolveAssistantIdByTenant };

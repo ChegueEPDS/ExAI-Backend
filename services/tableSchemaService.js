@@ -1,14 +1,14 @@
-const OpenAI = require('openai');
 const crypto = require('crypto');
 const logger = require('../config/logger');
+const systemSettings = require('./systemSettingsStore');
+const { createResponse, extractOutputTextFromResponse } = require('../helpers/openaiResponses');
 
 function tableSchemaEnabled() {
-  const v = String(process.env.TABLE_SCHEMA_LLM_ENABLED || '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'yes';
+  return systemSettings.getBoolean('TABLE_SCHEMA_LLM_ENABLED');
 }
 
 function getModel() {
-  return process.env.TABLE_SCHEMA_MODEL || process.env.FILE_CHAT_COMPLETIONS_MODEL || 'gpt-5-mini';
+  return systemSettings.getString('TABLE_SCHEMA_MODEL') || systemSettings.getString('FILE_CHAT_COMPLETIONS_MODEL');
 }
 
 function normalizeColLetter(s) {
@@ -109,7 +109,6 @@ function basicValidateSchema(schema) {
 async function inferTableSchemaWithLLM({ filename, workbookPreview, trace = null }) {
   if (!tableSchemaEnabled()) return { ok: false, skipped: true, error: 'TABLE_SCHEMA_LLM_ENABLED is off' };
 
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   const model = getModel();
 
   const system = [
@@ -136,12 +135,38 @@ async function inferTableSchemaWithLLM({ filename, workbookPreview, trace = null
     '] } ] }'
   ].join('\n');
 
-  const resp = await openai.chat.completions.create({
+  const outputSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      sheets: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            sheet: { type: 'string' },
+            tables: { type: 'array', items: { type: 'object' } },
+          },
+          required: ['sheet', 'tables'],
+        },
+      },
+    },
+    required: ['sheets'],
+  };
+
+  const respObj = await createResponse({
     model,
-    messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+    instructions: system,
+    input: [{ role: 'user', content: user }],
+    store: false,
     temperature: 0,
+    maxOutputTokens: 1400,
+    textFormat: { type: 'json_schema', name: 'table_schema', strict: true, schema: outputSchema },
+    timeoutMs: 60_000,
   });
-  const txt = String(resp?.choices?.[0]?.message?.content || '').trim();
+
+  const txt = String(extractOutputTextFromResponse(respObj) || '').trim();
 
   let parsed = null;
   try { parsed = JSON.parse(txt); } catch { parsed = null; }
@@ -182,4 +207,3 @@ module.exports = {
   inferTableSchemaWithLLM,
   tableSchemaEnabled,
 };
-

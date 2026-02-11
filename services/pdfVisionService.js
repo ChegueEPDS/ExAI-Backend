@@ -1,42 +1,44 @@
-const OpenAI = require('openai');
 const { fromBuffer } = require('pdf2pic');
 const logger = require('../config/logger');
+const systemSettings = require('./systemSettingsStore');
+const { createResponse, extractOutputTextFromResponse } = require('../helpers/openaiResponses');
 
 function pdfVisionEnabled() {
-  const v = String(process.env.PDF_VISION_ENABLED || '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'yes';
+  return systemSettings.getBoolean('PDF_VISION_ENABLED');
 }
 
 function visionModel() {
-  return process.env.VISION_MODEL || 'gpt-4o-mini';
+  return systemSettings.getString('VISION_MODEL') || 'gpt-4o-mini';
 }
 
 async function analyzeImageBase64({ base64Png, prompt }) {
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   const dataUrl = `data:image/png;base64,${base64Png}`;
-  const resp = await openai.chat.completions.create({
+  const respObj = await createResponse({
     model: visionModel(),
-    messages: [
+    instructions: '',
+    input: [
       {
         role: 'user',
         content: [
-          { type: 'text', text: String(prompt || 'Extract all readable text. If a diagram/table is present, describe it precisely.') },
-          { type: 'image_url', image_url: { url: dataUrl } },
+          { type: 'input_text', text: String(prompt || 'Extract all readable text. If a diagram/table is present, describe it precisely.') },
+          { type: 'input_image', image_url: dataUrl },
         ],
       }
     ],
+    store: false,
     temperature: 0,
-    max_tokens: 2000,
+    maxOutputTokens: 2000,
+    timeoutMs: 120_000,
   });
-  return String(resp?.choices?.[0]?.message?.content || '').trim();
+  return String(extractOutputTextFromResponse(respObj) || '').trim();
 }
 
 async function extractPdfImageTexts({ pdfBuffer, maxPages = 2, trace = null }) {
   if (!pdfVisionEnabled()) return { ok: true, skipped: true, pages: [] };
   const pages = [];
 
-  const density = Math.max(72, Math.min(Number(process.env.PDF_VISION_DENSITY || 150), 300));
-  const width = Math.max(600, Math.min(Number(process.env.PDF_VISION_WIDTH || 1400), 2400));
+  const density = Math.max(72, Math.min(Number(systemSettings.getNumber('PDF_VISION_DENSITY') || 150), 300));
+  const width = Math.max(600, Math.min(Number(systemSettings.getNumber('PDF_VISION_WIDTH') || 1400), 2400));
 
   // NOTE: pdf2pic requires GraphicsMagick / ImageMagick in the runtime environment.
   const converter = fromBuffer(Buffer.from(pdfBuffer), {
@@ -81,4 +83,3 @@ module.exports = {
   extractPdfImageTexts,
   pdfVisionEnabled,
 };
-

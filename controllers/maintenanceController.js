@@ -171,6 +171,12 @@ exports.completeRepair = async (req, res) => {
       equipment.operationalStatus = 'operating';
       equipment.operationalStatusChangedAt = occurredAt;
       equipment.operationalStatusChangedBy = actorId;
+
+      // After maintenance, EX compliance must be treated as non-compliant until a new detailed review/inspection is done.
+      // We keep lastInspection* fields intact (audit/history), and use these flags to drive UX reminders.
+      equipment.Compliance = 'Failed';
+      equipment.pendingReview = true;
+      equipment.pendingInspectionId = null;
     }
     equipment.ModifiedBy = actorId;
     await equipment.save();

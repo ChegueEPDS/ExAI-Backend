@@ -20,6 +20,7 @@ const UploadBatch = require('../models/uploadBatch');
 const mailService = require('../services/mailService');
 const mailTemplates = require('../services/mailTemplates');
 const CertificateRequest = require('../models/certificateRequest');
+const systemSettings = require('../services/systemSettingsStore');
 
 async function ensureLinkForTenant(tenantId, certId, userId, session) {
   if (!tenantId || !certId) return;
@@ -409,7 +410,7 @@ async function _processDraftsInternal(uploadId) {
       throw new Error('No drafts found for this uploadId');
     }
     // max párhuzamos feldolgozás (környezeti változóval felülírható)
-    const FILE_CONCURRENCY = parseInt(process.env.CERT_FILE_CONCURRENCY || '4', 10);
+    const FILE_CONCURRENCY = Math.max(1, Math.min(Number(systemSettings.getNumber('CERT_FILE_CONCURRENCY') || 4), 32));
 
     await promisePool(drafts, FILE_CONCURRENCY, async (draft) => {
       try {
@@ -593,6 +594,7 @@ exports.getDraftsByUploadId = async (req, res) => {
 };
 
 const Certificate = require('../models/certificate');
+const contributionRewardService = require('../services/contributionRewardService');
 
 // Allowed keys we accept from the UI for inline edits
 const ALLOWED_EXTRACTED_KEYS = new Set([
@@ -727,6 +729,7 @@ exports.finalizeDrafts = async (req, res) => {
 
     const overridesMap = (req.body && req.body.overrides) || {};
     const resultsSaved = [];            // IDs of drafts successfully finalized
+    const createdByCounts = new Map();  // userId -> saved cert count (for reward milestones)
     const conflicts = [];               // [{ company, certNo, issueDate }]
     const otherErrors = [];             // [{ id, error }]
     const cleanupItems = [];            // FS cleanup for saved docs only
@@ -857,6 +860,10 @@ exports.finalizeDrafts = async (req, res) => {
           }
 
           resultsSaved.push(draft._id.toString());
+          try {
+            const k = String(draft.createdBy || '');
+            if (k) createdByCounts.set(k, (createdByCounts.get(k) || 0) + 1);
+          } catch {}
           cleanupItems.push({
             pdfPath: draft.originalPdfPath,
             docxPath: draft.docxPath,
@@ -915,6 +922,13 @@ exports.finalizeDrafts = async (req, res) => {
 
     // If the whole upload has no more pending drafts, send one-off email
     finishCheckAndNotify(uploadId).catch(() => { });
+
+    // Fire-and-forget: reward milestones per original uploader (do not block finalize response)
+    for (const [createdBy, count] of createdByCounts.entries()) {
+      contributionRewardService
+        .onCertificatesAdded({ userId: createdBy, added: count })
+        .catch(() => {});
+    }
 
     // Build response
     const payload = {
@@ -1155,6 +1169,11 @@ exports.finalizeSingleDraftById = async (req, res) => {
     } catch (e) {
       try { console.warn('finalizeSingle: failed to bump UploadBatch.saved:', e?.message || e); } catch { }
     }
+
+    // Fire-and-forget reward check (do not block finalize response)
+    contributionRewardService
+      .onCertificatesAdded({ userId: draft.createdBy, added: 1 })
+      .catch(() => {});
 
     return res.json({
       message: '✅ Certificate finalized',

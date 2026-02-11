@@ -2,9 +2,8 @@
 
 This backend can use Pinecone for vector search in the governed dataset flow.
 
-## Environment variables
+## Environment variables (secrets / wiring)
 
-- `PINECONE_ENABLED` (optional): `1|true` to force-enable Pinecone. If omitted, Pinecone is enabled when both `PINECONE_API_KEY` and `PINECONE_INDEX` are set.
 - `PINECONE_API_KEY` (required when enabled)
 - `PINECONE_INDEX` (required when enabled)
 - `PINECONE_HOST` (optional): Pinecone index host (recommended for serverless).
@@ -13,7 +12,9 @@ This backend can use Pinecone for vector search in the governed dataset flow.
   - Default namespace (if neither is set): `t:{tenantId}:p:{projectId}`
 - `PINECONE_UPSERT_BATCH` (optional): upsert batch size (default `100`).
 
-## Chunking / retrieval tuning (compliance-friendly defaults)
+## System settings (chunking / retrieval tuning)
+
+These tuning knobs are configured via the UI (Admin → System settings, SuperAdmin only) and stored in MongoDB (global, applies to all tenants).
 
 Document chunking (project uploads):
 - `DOCUMENT_CHUNK_TOKENS` (default `450`)
