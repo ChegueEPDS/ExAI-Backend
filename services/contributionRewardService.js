@@ -13,6 +13,25 @@ const mailTemplates = require('./mailTemplates');
 const { createOneTimeTeamPromoCode, buildPromoCode } = require('./stripeContributionDiscountService');
 const { ensureStripeCustomerForTenant } = require('./stripeCustomerProvisioning');
 const systemSettings = require('./systemSettingsStore');
+const jwt = require('jsonwebtoken');
+
+function isIndexTenantName(name) {
+  return String(name || '').toLowerCase() === 'index';
+}
+
+function tenantBaseUrl(tenantName) {
+  return isIndexTenantName(tenantName) ? 'https://exai.ind-ex.ae' : 'https://certs.atexdb.eu';
+}
+
+function buildRedeemToken({ rewardId, userId }, expiresIn = '30d') {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) throw new Error('Missing JWT_SECRET');
+  return jwt.sign(
+    { type: 'contrib_reward_redeem', rewardId: String(rewardId), userId: String(userId) },
+    secret,
+    { expiresIn }
+  );
+}
 
 function log(level, message, meta) {
   try {
@@ -94,6 +113,12 @@ async function issueMilestoneReward({ userId, milestone, forceResendEmail = fals
         return { skipped: true, reason: 'already_emailed' };
       }
 
+      const base = tenantBaseUrl(tenantDoc?.name);
+      const redeemToken = buildRedeemToken({ rewardId: rewardDoc._id, userId });
+      const redeemUrl = `${base.replace(/\/+$/g, '')}/api/billing/contribution-reward/redeem?token=${encodeURIComponent(redeemToken)}`;
+      const copyUrl = `${base.replace(/\/+$/g, '')}/api/billing/contribution-reward/copy?code=${encodeURIComponent(rewardDoc.promoCode)}`;
+      const accountUrl = `${base.replace(/\/+$/g, '')}/account`;
+
       const subject = 'Thank you — your 100% Team discount code';
       const html = mailTemplates.contributionRewardEmail(
         {
@@ -102,6 +127,9 @@ async function issueMilestoneReward({ userId, milestone, forceResendEmail = fals
           milestone,
           code: rewardDoc.promoCode,
           expiresAt: rewardDoc.expiresAt || null,
+          redeemUrl,
+          copyUrl,
+          accountUrl,
         },
         tenantDoc?.name || undefined
       );
@@ -158,6 +186,11 @@ async function issueMilestoneReward({ userId, milestone, forceResendEmail = fals
     );
 
     const subject = 'Thank you — your 100% Team discount code';
+    const base = tenantBaseUrl(tenantDoc?.name);
+    const redeemToken = buildRedeemToken({ rewardId: rewardDoc._id, userId });
+    const redeemUrl = `${base.replace(/\/+$/g, '')}/api/billing/contribution-reward/redeem?token=${encodeURIComponent(redeemToken)}`;
+    const copyUrl = `${base.replace(/\/+$/g, '')}/api/billing/contribution-reward/copy?code=${encodeURIComponent(promo.code)}`;
+    const accountUrl = `${base.replace(/\/+$/g, '')}/account`;
     const html = mailTemplates.contributionRewardEmail(
       {
         firstName: user.firstName || '',
@@ -165,6 +198,9 @@ async function issueMilestoneReward({ userId, milestone, forceResendEmail = fals
         milestone,
         code: promo.code,
         expiresAt: promo.expiresAt,
+        redeemUrl,
+        copyUrl,
+        accountUrl,
       },
       tenantDoc?.name || undefined
     );

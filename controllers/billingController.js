@@ -4,6 +4,7 @@ const Tenant = require('../models/tenant');
 const Subscription = require('../models/subscription');
 const jwt = require('jsonwebtoken');
 const User = require('../models/user');
+const ContributionReward = require('../models/contributionReward');
 
 let stripe = null;
 const stripeKey = process.env.STRIPE_SECRET_KEY;
@@ -703,6 +704,165 @@ exports.resumeSubscription = async (req, res) => {
         console.error('[billing] resumeSubscription error', e);
         res.status(500).json({ message: e.message });
     }
+};
+
+// GET /api/billing/contribution-reward/redeem?token=...
+// Public endpoint (no auth) protected by a short-lived signed token sent in email.
+exports.redeemContributionReward = async (req, res) => {
+  if (!requireStripeOrFail(res)) return;
+  try {
+    const token = String(req.query?.token || '').trim();
+    if (!token) return res.status(400).send('Missing token');
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch (e) {
+      return res.status(400).send('Invalid or expired token');
+    }
+
+    if (decoded?.type !== 'contrib_reward_redeem') {
+      return res.status(400).send('Invalid token type');
+    }
+
+    const rewardId = decoded.rewardId;
+    const userId = decoded.userId;
+    if (!rewardId || !userId) return res.status(400).send('Invalid token payload');
+
+    const reward = await ContributionReward.findById(rewardId).lean();
+    if (!reward) return res.status(404).send('Reward not found');
+    if (String(reward.userId || '') !== String(userId)) return res.status(403).send('Forbidden');
+    if (!reward.stripeCustomerId || !reward.stripeCouponId) return res.status(400).send('Reward is not ready');
+    if (!reward.stripePromotionCodeId) return res.status(400).send('Promotion code is missing');
+    if (reward.expiresAt && new Date(reward.expiresAt) < new Date()) return res.status(410).send('Reward expired');
+
+    const tenant = reward.tenantId ? await Tenant.findById(reward.tenantId) : null;
+    const portalBase = (tenant?.name || '').toLowerCase() === 'index' ? 'https://exai.ind-ex.ae' : 'https://certs.atexdb.eu';
+    const successUrl = ensureAbsUrl(process.env.BILLING_SUCCESS_URL || `${portalBase}/billing/success`, `${portalBase}/billing/success`);
+    const cancelUrl = ensureAbsUrl(process.env.BILLING_CANCEL_URL || `${portalBase}/billing`, `${portalBase}/billing`);
+
+    // If there is an existing subscription, apply coupon to it and redirect to Billing Portal
+    const subId = tenant?.stripeSubscriptionId || null;
+    if (subId) {
+      try {
+        await stripe.subscriptions.update(subId, { coupon: String(reward.stripeCouponId) });
+      } catch (e) {
+        console.warn('[reward] failed to apply coupon to subscription:', e?.message || e);
+      }
+
+      const portal = await stripe.billingPortal.sessions.create({
+        customer: String(reward.stripeCustomerId),
+        return_url: `${portalBase}/account`,
+      });
+      return res.redirect(303, portal.url);
+    }
+
+    // Otherwise create a Team monthly checkout with the promotion code pre-applied
+    const priceId = String(process.env.STRIPE_PRICE_TEAM || '').trim();
+    if (!priceId) return res.status(500).send('Missing STRIPE_PRICE_TEAM');
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: String(reward.stripeCustomerId),
+      line_items: [{ price: priceId, quantity: 5 }],
+      discounts: [{ promotion_code: String(reward.stripePromotionCodeId) }],
+      // keep the flow strict: we pre-apply the promo code
+      allow_promotion_codes: false,
+      billing_address_collection: 'required',
+      tax_id_collection: { enabled: true },
+      phone_number_collection: { enabled: COLLECT_PHONE },
+      automatic_tax: { enabled: true },
+      customer_update: { address: 'auto', name: 'auto' },
+      success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: cancelUrl,
+      metadata: {
+        source: 'certificate-contribution',
+        rewardId: String(reward._id),
+        userId: String(userId),
+        plan: 'team',
+        billingPeriod: 'month',
+      },
+      subscription_data: {
+        metadata: {
+          source: 'certificate-contribution',
+          rewardId: String(reward._id),
+          userId: String(userId),
+          plan: 'team',
+          billingPeriod: 'month',
+        },
+      },
+    });
+
+    return res.redirect(303, session.url);
+  } catch (e) {
+    console.error('[reward] redeemContributionReward error', e);
+    return res.status(500).send('Failed to redeem reward');
+  }
+};
+
+// GET /api/billing/contribution-reward/copy?code=...
+// Minimal helper page to copy code to clipboard (email clients can't run JS, browsers can).
+exports.copyContributionRewardCodePage = async (req, res) => {
+  try {
+    const code = String(req.query?.code || '').trim();
+    if (!code) return res.status(400).send('Missing code');
+    const safe = code.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+    return res.status(200).send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Copy promotion code</title>
+  <style>
+    body{font-family:Arial, sans-serif; background:#f5f6f8; margin:0; padding:24px;}
+    .card{max-width:520px; margin:0 auto; background:#fff; border-radius:10px; padding:20px; box-shadow:0 6px 24px rgba(0,0,0,.08);}
+    .code{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size:18px; background:#ebebeb; padding:12px 14px; border-radius:8px; word-break:break-all; text-align:center;}
+    button{background:#f8d201; color:#131313; border:0; padding:12px 16px; border-radius:8px; font-size:16px; width:100%; cursor:pointer;}
+    .muted{color:#666; font-size:13px; margin-top:10px;}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2 style="margin:0 0 12px 0; color:#131313;">Promotion code</h2>
+    <div id="code" class="code">${safe}</div>
+    <p style="margin:14px 0 10px 0;">
+      <button id="copyBtn" type="button">Copy to clipboard</button>
+    </p>
+    <div id="status" class="muted"></div>
+    <div class="muted">If copying is blocked, select the code and copy manually.</div>
+  </div>
+  <script>
+    const code = ${JSON.stringify(code)};
+    const status = document.getElementById('status');
+    async function doCopy() {
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(code);
+          status.textContent = 'Copied.';
+          return;
+        }
+      } catch {}
+      try {
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(document.getElementById('code'));
+        sel.removeAllRanges(); sel.addRange(range);
+        document.execCommand('copy');
+        status.textContent = 'Copied.';
+      } catch {
+        status.textContent = 'Copy failed.';
+      }
+    }
+    document.getElementById('copyBtn').addEventListener('click', doCopy);
+    // Try once on load (best-effort)
+    doCopy();
+  </script>
+</body>
+</html>`);
+  } catch (e) {
+    return res.status(500).send('Failed');
+  }
 };
 
 /**

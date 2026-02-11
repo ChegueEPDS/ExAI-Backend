@@ -315,7 +315,7 @@ function reportExportReadyEmail({ firstName, lastName, fileName, downloadUrl, jo
   });
 }
 
-function contributionRewardEmail({ firstName, lastName, milestone, code, expiresAt }, tenantName) {
+function contributionRewardEmail({ firstName, lastName, milestone, code, expiresAt, redeemUrl, copyUrl, accountUrl }, tenantName) {
   const fullName = `${firstName || ''} ${lastName || ''}`.trim() || 'there';
   const safeCode = escapeHtml(code || '');
   const safeMilestone = Number(milestone) || 0;
@@ -323,9 +323,11 @@ function contributionRewardEmail({ firstName, lastName, milestone, code, expires
     ? expiresAt.toISOString().slice(0, 10)
     : null;
 
-  // Deep-link into "Team monthly" upgrade choice (frontend should read these query params).
-  const upgradeUrl = buildTenantUrl(tenantName, 'billing?product=team&billingPeriod=month');
-  const upgradeLabel = displayHost(upgradeUrl);
+  const safeRedeemUrl = redeemUrl && String(redeemUrl).startsWith('http') ? String(redeemUrl) : buildTenantUrl(tenantName, 'billing?product=team&billingPeriod=month');
+  const redeemLabel = displayHost(safeRedeemUrl);
+  const safeCopyUrl = copyUrl && String(copyUrl).startsWith('http') ? String(copyUrl) : null;
+  const safeAccountUrl = accountUrl && String(accountUrl).startsWith('http') ? String(accountUrl) : buildTenantUrl(tenantName, 'account');
+  const accountLabel = displayHost(safeAccountUrl);
 
   return baseTemplate({
     title: 'Your Team discount code',
@@ -339,6 +341,16 @@ function contributionRewardEmail({ firstName, lastName, milestone, code, expires
         ${safeCode || '—'}
       </div>
       ${
+        safeCopyUrl
+          ? `<p style="margin:14px 0 4px 0; text-align:center;">
+              <a href="${safeCopyUrl}" target="_blank" rel="noopener noreferrer"
+                 style="background:#fff; border:1px solid #ddd; color:#131313; text-decoration:none; padding:10px 18px; border-radius:6px; font-size:14px; display:inline-block;">
+                Copy code
+              </a>
+            </p>`
+          : ''
+      }
+      ${
         expText
           ? `<p style="margin-top:10px; font-size:13px; color:#555;">This code expires on <strong>${escapeHtml(expText)}</strong>.</p>`
           : ''
@@ -346,19 +358,28 @@ function contributionRewardEmail({ firstName, lastName, milestone, code, expires
 
       <p style="margin-top:18px; margin-bottom:10px;"><strong>Team plan highlights:</strong></p>
       <ul style="margin:0 0 12px 18px; padding:0; color:#333;">
-        <li>Multi-user collaboration (seats)</li>
-        <li>Company workspace and shared certificate library</li>
-        <li>Centralized access for your team</li>
+        <li><strong>5 team members</strong> (seats)</li>
+        <li><strong>Unlimited certificates download</strong></li>
+        <li>Certificate Reader</li>
+        <li>Dataplate reader</li>
+        <li>Own Certificate Database</li>
+        <li>ExAI Projects to manage your assets</li>
+        <li>Reports</li>
       </ul>
 
+      <p style="margin:0 0 10px 0; font-size:13px; color:#555;">
+        To activate: click <strong>Subscribe / Upgrade</strong>, choose <strong>Team (monthly)</strong>, then enter the promotion code at checkout if it isn’t already applied.
+      </p>
+
       <p style="margin:22px 0; text-align:center;">
-        <a href="${upgradeUrl}" target="_blank" rel="noopener noreferrer"
+        <a href="${safeRedeemUrl}" target="_blank" rel="noopener noreferrer"
            style="background:#f8d201; color:#131313; text-decoration:none; padding:12px 24px; border-radius:6px; font-size:16px; display:inline-block;">
-          Upgrade to Team (Monthly)
+          Subscribe / Upgrade (Team Monthly)
         </a>
       </p>
 
-      <p>Upgrade link: <a href="${upgradeUrl}" target="_blank" rel="noopener noreferrer">${upgradeLabel}</a></p>
+      <p style="margin:0;">Account: <a href="${safeAccountUrl}" target="_blank" rel="noopener noreferrer">${accountLabel}</a></p>
+      <p style="margin:6px 0 0 0;">Upgrade link: <a href="${safeRedeemUrl}" target="_blank" rel="noopener noreferrer">${redeemLabel}</a></p>
       <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team</p>
     `
   });

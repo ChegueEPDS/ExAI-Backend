@@ -12,6 +12,8 @@ const {
   grantCredit,
   pauseSubscription,
   resumeSubscription,
+  redeemContributionReward,
+  copyContributionRewardCodePage,
   grantManualLicense,
   revokeManualLicense
 } = require('../controllers/billingController');
@@ -112,6 +114,10 @@ router.post('/portal', requireAuth, createBillingPortal);
 
 // Portalból visszatérés kezelése
 router.get('/portal/return', handleBillingPortalReturn);
+
+// Contribution reward helpers (public; token-protected redeem)
+router.get('/contribution-reward/redeem', redeemContributionReward);
+router.get('/contribution-reward/copy', copyContributionRewardCodePage);
 
 // Számlák lekérdezése
 router.get('/invoices', requireAuth, listInvoicesForMe);
