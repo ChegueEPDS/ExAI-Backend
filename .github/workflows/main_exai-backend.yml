@@ -12,16 +12,18 @@ on:
 jobs:
   build_and_deploy:
     runs-on: ubuntu-latest
+    env:
+      AZURE_WEBAPP_NAME: ExAI-Backend
     environment:
       name: 'Production'
       url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
     permissions:
       contents: read
       id-token: write #This is required for requesting the JWT
-    timeout-minutes: 25
+    timeout-minutes: 45
     concurrency:
       group: exai-backend-production
-      cancel-in-progress: true
+      cancel-in-progress: false
 
     steps:
       - uses: actions/checkout@v4
@@ -30,12 +32,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20.x'
-          cache: 'npm'
-
-      - name: Install production dependencies (skip ngrok download)
-        run: npm ci --omit=dev --no-audit --no-fund
-        env:
-          NGROK_SKIP_DOWNLOAD: "true"
 
       - name: Create deployment package (exclude large/runtime folders)
         run: |
@@ -43,6 +39,7 @@ jobs:
           zip -r release.zip . \
             -x ".git/**" ".github/**" \
             -x "logs/**" "uploads/**" "results/**" ".venv/**" \
+            -x "node_modules/**" \
             -x "test/**" "sample_project/**" \
             -x ".env" "KEYVAULT.md" "TESTING*.md"
 
@@ -56,11 +53,41 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_96F0BB1F2AD7461885DC02C30A07BBE5 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_BA60CDCFDC714CDCBB986598A7F05135 }}
 
+      - name: Resolve Azure resource group
+        id: azure-info
+        shell: bash
+        run: |
+          set -euo pipefail
+          RG="$(az webapp show --name "$AZURE_WEBAPP_NAME" --query resourceGroup -o tsv)"
+          echo "rg=$RG" >> "$GITHUB_OUTPUT"
+
+      - name: Configure App Service build (Oryx)
+        shell: bash
+        run: |
+          set -euo pipefail
+          az webapp config appsettings set \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "${{ steps.azure-info.outputs.rg }}" \
+            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true ENABLE_ORYX_BUILD=true
+
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
-          app-name: 'ExAI-Backend'
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
           slot-name: 'Production'
           package: release.zip
+
+      - name: Show deployment logs (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          az webapp log deployment list \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "${{ steps.azure-info.outputs.rg }}" \
+            -o table || true
+          az webapp log deployment show \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "${{ steps.azure-info.outputs.rg }}" || true
           
