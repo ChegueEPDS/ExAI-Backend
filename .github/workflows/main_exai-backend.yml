@@ -58,7 +58,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          RG="$(az webapp show --name "$AZURE_WEBAPP_NAME" --query resourceGroup -o tsv)"
+          RG="$(az webapp list --query \"[?name=='$AZURE_WEBAPP_NAME'].resourceGroup\" -o tsv | head -n 1)"
+          if [ -z "${RG:-}" ]; then
+            echo "Could not resolve resource group for $AZURE_WEBAPP_NAME" >&2
+            az webapp list --query \"[].{name:name,resourceGroup:resourceGroup}\" -o table >&2 || true
+            exit 1
+          fi
           echo "rg=$RG" >> "$GITHUB_OUTPUT"
 
       - name: Configure App Service build (Oryx)
