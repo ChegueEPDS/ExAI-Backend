@@ -1,11 +1,8 @@
 const azureBlob = require('./azureBlobService');
 const { ocrImageBufferToDataplatePrompt } = require('../helpers/azureVisionOcr');
-const { resolveAssistantIdByTenant } = require('./assistantRunner');
-const { getAssistantInfoCached } = require('./chatPromptService');
 const { extractDataplateFieldsFromOcrText } = require('../helpers/dataplateJsonExtractor');
-const { runDataplateAssistant } = require('./assistantRunner'); // fallback only
-const { buildEquipmentFromDataplateTable } = require('../helpers/htmlTableParser'); // fallback only
 const { normalizeProtectionTypes } = require('../helpers/protectionTypes');
+const tenantSettingsStore = require('./tenantSettingsStore');
 
 function pickFirstDataplateImage(equipmentDoc) {
   const docs = Array.isArray(equipmentDoc?.documents) ? equipmentDoc.documents : [];
@@ -58,7 +55,7 @@ function setNestedIfEmpty(doc, field, value) {
   return false;
 }
 
-async function processDataplateForEquipment({ equipmentDoc, tenantKey, userId }) {
+async function processDataplateForEquipment({ equipmentDoc, tenantId, tenantKey, userId }) {
   const target = pickFirstDataplateImage(equipmentDoc);
   if (!target) {
     return { processed: false, reason: 'no_dataplate_image' };
@@ -70,12 +67,14 @@ async function processDataplateForEquipment({ equipmentDoc, tenantKey, userId })
   // Prefer structured extraction (Responses json_schema) for accuracy + deterministic validation.
   let parsed = null;
   try {
-    const assistantId = resolveAssistantIdByTenant(String(tenantKey || '').toLowerCase());
-    const assistantInfo = assistantId ? await getAssistantInfoCached(assistantId) : { instructions: '', model: null };
+    const cfg = tenantId
+      ? await tenantSettingsStore.getDataplateExtractConfig(tenantId)
+      : { model: 'gpt-4o-mini', extraInstructions: '' };
+    const mergedInstructions = String(cfg?.extraInstructions || '').trim();
     const r = await extractDataplateFieldsFromOcrText({
       ocrText: formattedText || recognizedText || '',
-      model: String(assistantInfo?.model || 'gpt-4o-mini'),
-      assistantInstructions: String(assistantInfo?.instructions || ''),
+      model: String(cfg?.model || 'gpt-4o-mini'),
+      assistantInstructions: mergedInstructions,
     });
     if (r.ok) {
       parsed = r.fields;
@@ -84,14 +83,7 @@ async function processDataplateForEquipment({ equipmentDoc, tenantKey, userId })
     parsed = null;
   }
 
-  // Fallback (legacy): ask for an HTML table then parse it.
-  if (!parsed) {
-    const { html } = await runDataplateAssistant({ tenantKey, message: recognizedText });
-    parsed = buildEquipmentFromDataplateTable(html);
-    if (!parsed) {
-      return { processed: false, reason: 'assistant_table_parse_failed' };
-    }
-  }
+  if (!parsed) return { processed: false, reason: 'llm_extract_failed' };
 
   // Normalize "Type of Protection" to the supported set used by questions/inspections.
   if (Array.isArray(parsed['Ex Marking'])) {

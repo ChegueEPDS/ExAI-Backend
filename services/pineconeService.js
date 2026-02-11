@@ -89,12 +89,20 @@ async function upsertVectors({ namespace, vectors }) {
 async function queryVectors({ namespace, vector, topK = 10, filter = null, includeMetadata = true }) {
   const index = getIndex();
   const ns = namespace || '';
+  const topKMax = Math.max(1, Math.min(Number(systemSettings.getNumber('PINECONE_QUERY_TOPK_MAX') || 200), 1000));
+  const requestedTopK = Number(topK) || 10;
+  const effectiveTopK = Math.max(1, Math.min(requestedTopK, topKMax));
   if (pineconeDebugEnabled()) {
-    try { logger.info('pinecone.query', { index: process.env.PINECONE_INDEX, host: process.env.PINECONE_HOST || null, namespace: ns, topK, hasFilter: !!filter }); } catch { }
+    try {
+      logger.info('pinecone.query', { index: process.env.PINECONE_INDEX, host: process.env.PINECONE_HOST || null, namespace: ns, topK: effectiveTopK, requestedTopK, topKMax, hasFilter: !!filter });
+    } catch { }
+    if (requestedTopK !== effectiveTopK) {
+      try { logger.info('pinecone.query.clamped', { namespace: ns, requestedTopK, effectiveTopK, topKMax }); } catch { }
+    }
   }
   const r = await index.namespace(ns).query({
     vector,
-    topK: Math.max(1, Math.min(Number(topK) || 10, 50)),
+    topK: effectiveTopK,
     filter: filter || undefined,
     includeMetadata: !!includeMetadata,
   });

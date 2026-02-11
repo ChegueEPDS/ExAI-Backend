@@ -47,6 +47,17 @@ function cleanFileName(filename) {
     .replace(/[^a-zA-Z0-9.\-_ ]/g, '_');
 }
 
+function normalizeNameKey(name) {
+  const raw = String(name || '').trim();
+  const cleaned = cleanFileName(raw).trim();
+  return {
+    raw,
+    cleaned,
+    rawLower: raw.toLowerCase(),
+    cleanedLower: cleaned.toLowerCase()
+  };
+}
+
 function normalizeImageTag(tag, fallback = 'general') {
   const allowed = ['dataplate', 'general', 'fault'];
   const value = typeof tag === 'string' ? tag.trim().toLowerCase() : '';
@@ -124,6 +135,7 @@ async function convertHeicBufferIfNeeded(inputBuffer, originalName, originalMime
 // - payload: JSON string
 // - files[]: each file originalname must be "<fileKey>__<originalName>", where fileKey matches item.tempId
 exports.mobileSync = async (req, res) => {
+  const startedAt = Date.now();
   const tenantIdStr = req.scope?.tenantId;
   const tenantId = toObjectId(tenantIdStr);
   const tenantName = req.scope?.tenantName || '';
@@ -132,6 +144,15 @@ exports.mobileSync = async (req, res) => {
   if (!tenantId || !userId) {
     return res.status(401).json({ message: 'Missing tenantId or userId from auth.' });
   }
+
+  try {
+    console.info('[mobile-sync] request', {
+      requestId: req.requestId || null,
+      tenantId: tenantIdStr,
+      userId: String(userId),
+      ip: req.ip || null
+    });
+  } catch {}
 
   let payload = null;
   try {
@@ -147,7 +168,7 @@ exports.mobileSync = async (req, res) => {
 
   const files = Array.isArray(req.files) ? req.files : [];
 
-  // Build tag lookup: fileKey -> (cleanOriginalName -> tag)
+  // Build tag lookup: fileKey -> (name variants -> tag)
   const tagLookup = new Map();
   for (const item of items) {
     const fileKey = String(item?.tempId || item?.fileKey || '').trim();
@@ -163,7 +184,11 @@ exports.mobileSync = async (req, res) => {
       // This makes server-side selection deterministic and prevents "random" OCR quality swings.
       const tag = normalized === 'dataplate' && sawDataplate ? 'general' : normalized;
       if (tag === 'dataplate') sawDataplate = true;
-      byName.set(name, tag);
+      const key = normalizeNameKey(name);
+      byName.set(key.raw, tag);
+      byName.set(key.cleaned, tag);
+      byName.set(key.rawLower, tag);
+      byName.set(key.cleanedLower, tag);
     }
     if (byName.size) tagLookup.set(fileKey, byName);
   }
@@ -196,7 +221,21 @@ exports.mobileSync = async (req, res) => {
       return res.status(400).json({ message: 'Each item must have a tempId.' });
     }
 
-    const existingEquipmentId = toObjectId(item?.equipmentId || item?.serverId || item?._id);
+    let existingEquipmentId = toObjectId(item?.equipmentId || item?.serverId || item?._id);
+    if (!existingEquipmentId) {
+      // Best-effort idempotency: if the client retries the same tempId after a network failure,
+      // re-use the already created equipment instead of creating duplicates.
+      try {
+        const existingByTemp = await Equipment.findOne({
+          tenantId,
+          CreatedBy: userId,
+          'mobileSync.tempId': tempId
+        }).select('_id').lean();
+        if (existingByTemp?._id) existingEquipmentId = toObjectId(existingByTemp._id);
+      } catch {
+        // ignore lookup failures
+      }
+    }
     const siteId = toObjectId(item?.Site || item?.siteId);
     const zoneId = toObjectId(item?.Zone || item?.zoneId);
     if (!siteId || !zoneId) {
@@ -238,6 +277,8 @@ exports.mobileSync = async (req, res) => {
       existing.ModifiedBy = userId;
       existing.Site = siteId;
       existing.Zone = zoneId;
+      if (!existing.mobileSync || typeof existing.mobileSync !== 'object') existing.mobileSync = {};
+      if (!existing.mobileSync.tempId) existing.mobileSync.tempId = tempId;
       if (eqIdRaw) existing.EqID = EqID;
       if (equipmentTypeRaw) existing['Equipment Type'] = equipmentTypeRaw;
       existing.Compliance = compliance;
@@ -263,7 +304,7 @@ exports.mobileSync = async (req, res) => {
         Compliance: compliance,
         'Other Info': otherInfo,
         isProcessed: false,
-        mobileSync: { status: 'queued' },
+        mobileSync: { status: 'queued', tempId },
         CreatedBy: userId,
         ModifiedBy: userId,
         tenantId,
@@ -332,30 +373,63 @@ exports.mobileSync = async (req, res) => {
       const cleanName = convertedName || safeOriginalName || 'image';
       const blobPath = `${eqPrefix}/${cleanName}`;
       const guessedType = contentType || 'application/octet-stream';
-      await azureBlob.uploadBuffer(blobPath, buffer, guessedType);
+      const alreadyHas = (saved.documents || []).some((d) => {
+        const n = String(d?.name || '');
+        const p = String(d?.blobPath || d?.blobUrl || '');
+        return (n && n === cleanName) || (p && azureBlob.toBlobPath(p) === azureBlob.toBlobPath(blobPath));
+      });
+      if (!alreadyHas) {
+        await azureBlob.uploadBuffer(blobPath, buffer, guessedType);
+      }
 
       const perItemTagMap = tagLookup.get(tempId) || null;
-      const tagFromPayload = perItemTagMap ? perItemTagMap.get(cleanName) || perItemTagMap.get(safeOriginalName) : null;
+      const lookupKeys = [
+        normalizeNameKey(cleanName).raw,
+        normalizeNameKey(cleanName).cleaned,
+        normalizeNameKey(cleanName).rawLower,
+        normalizeNameKey(cleanName).cleanedLower,
+        normalizeNameKey(safeOriginalName).raw,
+        normalizeNameKey(safeOriginalName).cleaned,
+        normalizeNameKey(safeOriginalName).rawLower,
+        normalizeNameKey(safeOriginalName).cleanedLower
+      ];
+      const tagFromPayload = perItemTagMap
+        ? lookupKeys.map((k) => perItemTagMap.get(k)).find((v) => typeof v === 'string' && v.trim())
+        : null;
       let tag = normalizeImageTag(tagFromPayload, 'general');
       if (tag === 'dataplate') {
         if (attachedDataplate) tag = 'general';
         else attachedDataplate = true;
       }
 
-      saved.documents = [
-        ...(saved.documents || []),
-        {
-          name: cleanName,
-          alias: '',
-          type: 'image',
-          blobPath,
-          blobUrl: azureBlob.getBlobUrl(blobPath),
-          contentType: guessedType,
-          size: buffer.length,
-          uploadedAt: new Date(),
-          tag
+      if (alreadyHas) {
+        // Best-effort: if this is a retry and the tag became known later (e.g. filename normalization),
+        // update the existing doc tag (without duplicating the blob).
+        try {
+          const idx = (saved.documents || []).findIndex((d) => String(d?.name || '') === cleanName);
+          if (idx >= 0 && tag && saved.documents[idx] && saved.documents[idx].tag !== tag) {
+            saved.documents[idx].tag = tag;
+            if (saved.markModified) saved.markModified('documents');
+          }
+        } catch {
+          // ignore
         }
-      ];
+      } else {
+        saved.documents = [
+          ...(saved.documents || []),
+          {
+            name: cleanName,
+            alias: '',
+            type: 'image',
+            blobPath,
+            blobUrl: azureBlob.getBlobUrl(blobPath),
+            contentType: guessedType,
+            size: buffer.length,
+            uploadedAt: new Date(),
+            tag
+          }
+        ];
+      }
       try {
         fs.unlinkSync(file.path);
       } catch {}

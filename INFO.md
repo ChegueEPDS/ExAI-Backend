@@ -27,7 +27,7 @@ Key groups (see `.env.example` for the full, commented list):
 - Server / URLs / CORS: `NODE_ENV`, `HOST`, `PORT`, `BASE_URL`, `FRONTEND_BASE_URL`, `CORS_ALLOWED_ORIGINS`
 - Database / Auth: `MONGO_URI`, `JWT_SECRET`, `JWT_EXPIRES_IN_*`
 - OpenAI: `OPENAI_API_KEY` (model/dataset/rerank tuning is configured via **System settings** in the UI; SuperAdmin only)
-- Assistants (tenant overrides): `ASSISTANT_ID_*`
+- OpenAI (tenant AI profile): configured in **Admin → AI settings** (no Assistants API dependency)
 - Governed RAG: dataset limits, chunking, rerank, standard explorer settings
 - Pinecone (optional): `PINECONE_*`
 - Azure: Blob, Document Intelligence, OCR, Custom Vision, Search, Entra ID

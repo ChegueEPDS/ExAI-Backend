@@ -1,7 +1,6 @@
 const Conversation = require('../models/conversation');
 const Tenant = require('../models/tenant');
 const User = require('../models/user');
-const { resolveAssistantContext } = require('../services/assistantResolver');
 
 function makeError(status, message) {
   const err = new Error(message);
@@ -28,15 +27,23 @@ async function resolveUserAndTenant(req) {
 }
 
 async function resolveAssistantForTenant(tenantId, logTag = 'CHAT') {
-  const tenantDoc = await Tenant.findById(tenantId).select('name assistantId');
+  // Backward-compatible name:
+  // This used to resolve an OpenAI assistantId (Assistants API). We no longer rely on Assistants API.
+  // It now only resolves tenant metadata (name -> tenantKey) for logging and per-tenant behavior.
+  const tenantDoc = await Tenant.findById(tenantId).select('name');
   if (!tenantDoc) {
     throw makeError(404, 'Tenant nem található.');
   }
-  const { assistantId, tenantKey, source } = await resolveAssistantContext({ tenantId, tenantDoc, logTag });
-  if (!assistantId) {
-    throw makeError(500, 'Nincs beállítva asszisztens ehhez a tenant-hoz (ASSISTANT_ID_DEFAULT/tenant.assistantId).');
+  const tenantKey = String(tenantDoc?.name || '').toLowerCase() || null;
+  const source = 'tenantDoc.name';
+  if (logTag) {
+    try {
+      // best-effort debug log (keeps existing log shape, but no Assistants API dependency)
+      const logger = require('../config/logger');
+      logger.debug(`[ASSISTANT PICK][${logTag}]`, { tenantId: String(tenantId), tenantKey, assistantId: null, source });
+    } catch {}
   }
-  return { tenantDoc, assistantId, tenantKey, source };
+  return { tenantDoc, assistantId: null, tenantKey, source };
 }
 
 async function ensureConversationOwnership({ threadId, userId, tenantId }) {

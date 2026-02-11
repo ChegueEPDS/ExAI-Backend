@@ -168,8 +168,23 @@ async function buildPlan({ message, xlsxHints = null, trace = null }) {
           type: 'object',
           additionalProperties: false,
           properties: {
-            tool: { type: 'string' },
-            args: { type: 'object', additionalProperties: true },
+            tool: {
+              type: 'string',
+              enum: ['analyze_measurement_tables', 'compare_tables', 'evaluate_measurements', 'none'],
+            },
+            // Strict schema note:
+            // In Responses strict JSON schema, optional keys are not supported the usual way.
+            // We require all keys and allow null when a specific tool does not use a field.
+            args: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                column_range: { type: ['string', 'null'] },
+                delta_threshold_C: { type: ['number', 'null'] },
+                tables: { type: ['array', 'null'], items: { type: 'number' } },
+              },
+              required: ['column_range', 'delta_threshold_C', 'tables'],
+            },
           },
           required: ['tool', 'args'],
         }

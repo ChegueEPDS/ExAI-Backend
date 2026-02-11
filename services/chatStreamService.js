@@ -1,18 +1,27 @@
 const sanitizeHtml = require('sanitize-html');
 const { marked } = require('marked');
+const crypto = require('crypto');
 const logger = require('../config/logger');
 const InjectionRule = require('../models/injectionRule');
-const assistants = require('../config/assistants');
 const { resolveUserAndTenant, resolveAssistantForTenant, ensureConversationOwnership } = require('../services/chatAccessService');
 const { resolveUserPlan } = require('../services/chatContextService');
 const { initSse } = require('../services/sseService');
-const { getStyleInstructions, buildTabularHint, buildRollingSummary, getAssistantInfoCached } = require('../services/chatPromptService');
+const { getStyleInstructions, buildTabularHint, buildRollingSummary, getTenantAiProfileCached } = require('../services/chatPromptService');
 const { categorizeMessageUsingAI } = require('../helpers/categorizeMessage');
 const { extractOutputTextFromResponse } = require('../helpers/openaiResponses');
 const { createResponseStream } = require('../helpers/openaiResponses');
+const tenantSettingsStore = require('../services/tenantSettingsStore');
 
 // Best-effort concurrency guard (single process). Prevents overlapping model calls per conversation.
 const inFlightByThreadId = new Set();
+
+function sha256Short(text) {
+  try {
+    return crypto.createHash('sha256').update(String(text || ''), 'utf8').digest('hex').slice(0, 12);
+  } catch {
+    return null;
+  }
+}
 
 async function handleSendMessageStream(req, res) {
   const send = initSse(req, res);
@@ -43,7 +52,6 @@ async function handleSendMessageStream(req, res) {
     // ---- Resolve user & assistant ----
     let user;
     let tenantId;
-    let assistantId;
     let tenantKey;
     let source;
     try {
@@ -51,7 +59,6 @@ async function handleSendMessageStream(req, res) {
       user = resolved.user;
       tenantId = resolved.tenantId;
       const assistantCtx = await resolveAssistantForTenant(tenantId, 'STREAM');
-      assistantId = assistantCtx.assistantId;
       tenantKey = assistantCtx.tenantKey;
       source = assistantCtx.source;
     } catch (e) {
@@ -64,21 +71,19 @@ async function handleSendMessageStream(req, res) {
       userTenantId: user?.tenantId ? String(user.tenantId) : null,
       tenantId,
       tenantKey,
-      assistantId,
       source,
-      assistantsByTenantKeys: Object.keys(assistants.byTenant || {}),
-      defaultAssistantId: assistants.default || assistants['default'] || null
+      assistantId: null
     });
 
     // ---- Determine user plan (best-effort) ----
     const userPlan = await resolveUserPlan(req, tenantId, logger);
     logger.info(
-      `[STREAM] Context: thread=${threadId} tenant=${tenantKey} plan=${userPlan} assistantId=${assistantId}`
+      `[STREAM] Context: thread=${threadId} tenant=${tenantKey} plan=${userPlan}`
     );
 
     // ---- Optional injection rules (Wolff) ----
     let applicableInjection = null;
-    if (tenantKey === 'wolff' || assistantId === process.env.ASSISTANT_ID_WOLFF) {
+    if (tenantKey === 'wolff') {
       const allRules = await InjectionRule.find();
       const scoredMatches = allRules
         .map(rule => {
@@ -141,8 +146,8 @@ async function handleSendMessageStream(req, res) {
     // IMPORTANT:
     // With Responses API + previous_response_id, instructions from a previous response are not carried over.
     // So we must send the assistant persona (instructions) every time.
-    const assistantInfo = await getAssistantInfoCached(assistantId);
-    const assistantPrompt = String(assistantInfo?.instructions || '');
+    const tenantAi = await getTenantAiProfileCached(tenantId);
+    const assistantPrompt = String(tenantAi?.instructions || '');
     const baseInstructions = `${assistantPrompt}\n\n${styleForPlain}${convBlock}`.trim();
 
     let finalInstructions = baseInstructions;
@@ -155,7 +160,7 @@ async function handleSendMessageStream(req, res) {
         `"${applicableInjection}"`;
     }
 
-    const model = String(assistantInfo?.model || conversation?.lastModel || 'gpt-5-mini').trim() || 'gpt-5-mini';
+    const model = String(tenantAi?.model || conversation?.lastModel || 'gpt-5-mini').trim() || 'gpt-5-mini';
 
     const payload = {
       model,
@@ -166,8 +171,48 @@ async function handleSendMessageStream(req, res) {
       ...(conversation?.lastResponseId ? { previous_response_id: String(conversation.lastResponseId) } : {}),
       ...(vectorStoreId && typeof vectorStoreId === 'string' && vectorStoreId.trim()
         ? { tools: [{ type: 'file_search', vector_store_ids: [vectorStoreId.trim()] }] }
-        : {}),
+        : (tenantAi?.kbVectorStoreId
+          ? { tools: [{ type: 'file_search', vector_store_ids: [String(tenantAi.kbVectorStoreId)] }] }
+          : {})),
     };
+
+    const chatTuning = await tenantSettingsStore.getChatTuning(tenantId).catch(() => ({
+      temperature: 0,
+      topP: null,
+      maxOutputTokens: 2500,
+      truncation: null,
+      reasoningEffort: null,
+    }));
+
+    const usedVectorStoreId =
+      (vectorStoreId && typeof vectorStoreId === 'string' && vectorStoreId.trim())
+        ? vectorStoreId.trim()
+        : (tenantAi?.kbVectorStoreId ? String(tenantAi.kbVectorStoreId) : null);
+    const vectorStoreSource =
+      (vectorStoreId && typeof vectorStoreId === 'string' && vectorStoreId.trim())
+        ? 'request'
+        : (tenantAi?.kbVectorStoreId ? 'tenant' : 'none');
+
+    logger.info('chat.responses.applied_settings', {
+      requestId: req.requestId || null,
+      threadId,
+      tenantId,
+      tenantKey,
+      plan: userPlan,
+      model,
+      previousResponseId: conversation?.lastResponseId ? String(conversation.lastResponseId) : null,
+      vectorStoreId: usedVectorStoreId,
+      vectorStoreSource,
+      temperature: chatTuning.temperature,
+      topP: chatTuning.topP,
+      maxOutputTokens: chatTuning.maxOutputTokens,
+      truncation: chatTuning.truncation,
+      reasoningEffort: chatTuning.reasoningEffort,
+      assistantInstructionsChars: assistantPrompt.length,
+      assistantInstructionsSha: sha256Short(assistantPrompt),
+      finalInstructionsChars: finalInstructions.length,
+      finalInstructionsSha: sha256Short(finalInstructions),
+    });
 
     // ---- OpenAI SSE stream (Responses API) ----
     const openaiStream = await createResponseStream({
@@ -177,6 +222,11 @@ async function handleSendMessageStream(req, res) {
       previousResponseId: payload.previous_response_id || null,
       tools: payload.tools || null,
       store: true,
+      temperature: chatTuning.temperature,
+      topP: chatTuning.topP,
+      maxOutputTokens: chatTuning.maxOutputTokens,
+      truncation: chatTuning.truncation,
+      reasoningEffort: chatTuning.reasoningEffort,
       timeoutMs: 0,
     });
     logger.info(`[STREAM] Responses stream started: thread=${threadId} model=${model} previous=${conversation?.lastResponseId || 'none'}`);
@@ -309,7 +359,7 @@ async function handleSendMessageStream(req, res) {
         conversation.messages.push({ role: 'user', content: message, ...(finalCategory && { category: finalCategory }) });
         conversation.messages.push({ role: 'assistant', content: finalHtml });
         conversation.lastResponseId = lastResponseId || conversation.lastResponseId || null;
-        conversation.lastAssistantId = assistantId || conversation.lastAssistantId || null;
+        conversation.lastAssistantId = null;
         conversation.lastModel = (lastSeenModel || model || conversation.lastModel || null);
         await conversation.save();
         const savedAssistant = conversation.messages.slice().reverse().find(m => m.role === 'assistant');

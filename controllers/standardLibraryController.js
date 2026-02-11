@@ -3,12 +3,47 @@ const Standard = require('../models/standard');
 const StandardClause = require('../models/standardClause');
 const StandardSet = require('../models/standardSet');
 const logger = require('../config/logger');
+const mongoose = require('mongoose');
 const { ingestStandardFiles, deleteStandard } = require('../services/standardIngestionService');
 const azureBlob = require('../services/azureBlobService');
 const systemSettings = require('../services/systemSettingsStore');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024, files: 10 } });
 exports.uploadMulter = upload;
+
+async function resolveStandardIdForTenant({ tenantId, standardRef }) {
+  const ref = String(standardRef || '').trim();
+  if (!ref) return null;
+
+  // If it's already a Mongo ObjectId, use it.
+  if (mongoose.Types.ObjectId.isValid(ref)) return ref;
+
+  // Otherwise, treat it as a human-readable standard identifier (e.g. "IEC 60079-7", "60079-7")
+  // and resolve to the standard's _id.
+  const candidates = await Standard.find({
+    tenantId,
+    $or: [
+      { standardId: ref },
+      { aliases: ref },
+    ],
+  })
+    .select('_id standardId name')
+    .limit(5)
+    .lean();
+
+  if (candidates.length === 1) return String(candidates[0]._id);
+
+  // Try a looser match: suffix match on standardId, e.g. "60079-7" should match "IEC 60079-7"
+  const loose = await Standard.find({ tenantId })
+    .select('_id standardId name')
+    .lean();
+  const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const needle = norm(ref);
+  const suffixHits = loose.filter(s => norm(s.standardId).endsWith(needle)).slice(0, 5);
+  if (suffixHits.length === 1) return String(suffixHits[0]._id);
+
+  return { ambiguous: true, candidates: [...candidates, ...suffixHits].slice(0, 5) };
+}
 
 exports.listStandards = async (req, res) => {
   try {
@@ -24,7 +59,16 @@ exports.getStandard = async (req, res) => {
   try {
     const tenantId = req.scope?.tenantId;
     const { standardRef } = req.params;
-    const std = await Standard.findOne({ _id: standardRef, tenantId }).lean();
+    const resolved = await resolveStandardIdForTenant({ tenantId, standardRef });
+    if (!resolved) return res.status(400).json({ ok: false, error: 'missing standardRef' });
+    if (typeof resolved === 'object' && resolved.ambiguous) {
+      return res.status(409).json({
+        ok: false,
+        error: 'Ambiguous standardRef. Use the Mongo _id instead.',
+        candidates: resolved.candidates || [],
+      });
+    }
+    const std = await Standard.findOne({ _id: resolved, tenantId }).lean();
     if (!std) return res.status(404).json({ ok: false, error: 'not found' });
     return res.json({ ok: true, standard: std });
   } catch (e) {
@@ -39,7 +83,17 @@ exports.getStandardPdfUrl = async (req, res) => {
     const tenantId = req.scope?.tenantId;
     const { standardRef } = req.params;
 
-    const std = await Standard.findOne({ _id: standardRef, tenantId }).lean();
+    const resolved = await resolveStandardIdForTenant({ tenantId, standardRef });
+    if (!resolved) return res.status(400).json({ ok: false, error: 'missing standardRef' });
+    if (typeof resolved === 'object' && resolved.ambiguous) {
+      return res.status(409).json({
+        ok: false,
+        error: 'Ambiguous standardRef. Use the Mongo _id instead.',
+        candidates: resolved.candidates || [],
+      });
+    }
+
+    const std = await Standard.findOne({ _id: resolved, tenantId }).lean();
     if (!std) return res.status(404).json({ ok: false, error: 'not found' });
 
     const files = Array.isArray(std?.sourceFiles) ? std.sourceFiles : [];
@@ -143,7 +197,16 @@ exports.deleteStandard = async (req, res) => {
     const tenantId = req.scope?.tenantId;
     const { standardRef } = req.params;
     try { logger.info('standards.delete.start', { requestId: req.requestId, tenantId: String(tenantId || ''), standardRef: String(standardRef || '') }); } catch { }
-    await deleteStandard({ tenantId, standardRef });
+    const resolved = await resolveStandardIdForTenant({ tenantId, standardRef });
+    if (!resolved) return res.status(400).json({ ok: false, error: 'missing standardRef' });
+    if (typeof resolved === 'object' && resolved.ambiguous) {
+      return res.status(409).json({
+        ok: false,
+        error: 'Ambiguous standardRef. Use the Mongo _id instead.',
+        candidates: resolved.candidates || [],
+      });
+    }
+    await deleteStandard({ tenantId, standardRef: resolved });
     try { logger.info('standards.delete.done', { requestId: req.requestId, standardRef: String(standardRef || '') }); } catch { }
     return res.json({ ok: true });
   } catch (e) {
@@ -216,7 +279,16 @@ exports.listStandardClauses = async (req, res) => {
     const tenantId = req.scope?.tenantId;
     const { standardRef } = req.params;
     const limit = Math.max(1, Math.min(Number(req.query.limit || 50), 200));
-    const items = await StandardClause.find({ tenantId, standardRef })
+    const resolved = await resolveStandardIdForTenant({ tenantId, standardRef });
+    if (!resolved) return res.status(400).json({ ok: false, error: 'missing standardRef' });
+    if (typeof resolved === 'object' && resolved.ambiguous) {
+      return res.status(409).json({
+        ok: false,
+        error: 'Ambiguous standardRef. Use the Mongo _id instead.',
+        candidates: resolved.candidates || [],
+      });
+    }
+    const items = await StandardClause.find({ tenantId, standardRef: resolved })
       .select('standardId edition clauseId title pageOrLoc quoteId')
       .sort({ clauseId: 1 })
       .limit(limit)

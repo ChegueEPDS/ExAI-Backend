@@ -138,9 +138,14 @@ const SETTINGS = [
   { key: 'STANDARD_EXPLORER_FALLBACK_MIN_MATCHES', group: 'Standard Explorer', type: 'number', defaultValue: 10, description: 'Min matches threshold before broader standard set fallback.' },
   { key: 'STANDARD_PDF_SAS_TTL_SECONDS', group: 'Standard Explorer', type: 'number', defaultValue: 600, description: 'Signed URL TTL for standard PDFs (seconds).' },
 
+  // Embeddings
+  { key: 'EMBEDDING_CONTEXT_HEADER_ENABLED', group: 'Embeddings', type: 'boolean', defaultValue: true, description: 'Prepend a small context header to embedding input (files/clauses metadata) to improve retrieval. Changing this requires reindexing existing datasets/standards for consistent results.' },
+  { key: 'EMBEDDING_CONTEXT_HEADER_VERSION', group: 'Embeddings', type: 'number', defaultValue: 1, description: 'Embedding input format version for context header. Bump only when changing header layout. Requires reindexing existing datasets/standards.' },
+
   // Pinecone
   { key: 'DEBUG_PINECONE', group: 'Pinecone', type: 'boolean', defaultValue: false, description: 'Verbose Pinecone request logging.' },
   { key: 'PINECONE_ENABLED', group: 'Pinecone', type: 'boolean', defaultValue: false, description: 'Enable/disable Pinecone (optional; key+index may still auto-enable).' },
+  { key: 'PINECONE_QUERY_TOPK_MAX', group: 'Pinecone', type: 'number', defaultValue: 200, description: 'Safety cap for Pinecone query topK (prevents accidental huge queries). Must be >= 1.' },
 
   // Misc tuning knobs
   { key: 'CERT_FILE_CONCURRENCY', group: 'Misc', type: 'number', defaultValue: 4, description: 'Concurrent certificate-file processing.' },

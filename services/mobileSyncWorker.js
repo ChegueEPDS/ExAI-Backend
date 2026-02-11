@@ -426,7 +426,26 @@ async function processOneJob(job) {
 
       // Dataplate reader: OCR -> assistant table -> fill fields (only if empty).
       try {
-        await processDataplateForEquipment({ equipmentDoc, tenantKey, userId });
+        const r = await processDataplateForEquipment({ equipmentDoc, tenantId, tenantKey, userId });
+        if (!r?.processed) {
+          hadErrors = true;
+          const reason = String(r?.reason || 'unknown');
+          const message =
+            reason === 'no_dataplate_image'
+              ? 'No dataplate-tagged image found. Tag one photo as "dataplate" in the mobile app.'
+              : `Dataplate processing skipped/failed: ${reason}`;
+          await ProcessingJob.updateOne(
+            { _id: job._id },
+            {
+              $push: {
+                errorItems: {
+                  equipmentId,
+                  message
+                }
+              }
+            }
+          );
+        }
       } catch (e) {
         hadErrors = true;
         await ProcessingJob.updateOne(
@@ -507,6 +526,14 @@ async function tick() {
     );
     if (!job) return;
 
+    try {
+      console.info('[mobile-sync-worker] job picked', {
+        jobId: String(job._id),
+        tenantId: String(job.tenantId || ''),
+        total: job.total || (Array.isArray(job.equipmentIds) ? job.equipmentIds.length : 0)
+      });
+    } catch {}
+
     // Best-effort: mark all equipment in this job as "processing" (hidden).
     try {
       await Equipment.updateMany(
@@ -525,6 +552,17 @@ async function tick() {
       { _id: job._id },
       { $set: { status: hasErrors ? 'error' : 'done', finishedAt: new Date() } }
     );
+
+    try {
+      console.info('[mobile-sync-worker] job finished', {
+        jobId: String(job._id),
+        tenantId: String(refreshed?.tenantId || ''),
+        status: hasErrors ? 'error' : 'done',
+        processed: refreshed?.processed || 0,
+        total: refreshed?.total || 0,
+        errors: Array.isArray(refreshed?.errorItems) ? refreshed.errorItems.length : 0
+      });
+    } catch {}
 
     // Notify user about completion (mobile can show this via notifications list)
     try {

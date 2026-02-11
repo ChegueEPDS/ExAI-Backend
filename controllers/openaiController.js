@@ -1,102 +1,158 @@
-/**********************************************************************************/ 
-/*** Az OpenAI beállítások lekérdezése, és módosítása. Asszisztens választása a userhez ***/
+/**********************************************************************************/
+/*** Tenant AI profile + Knowledge Base (Vector Stores) management (NO Assistants API) ***/
 /**********************************************************************************/
 
 const axios = require('axios');
 const logger = require('../config/logger');
-const User = require('../models/user'); // Felhasználói modell
+const User = require('../models/user');
 const fs = require('fs');
 const FormData = require('form-data');
-const { resolveAssistantContext } = require('../services/assistantResolver');
+const tenantSettingsStore = require('../services/tenantSettingsStore');
 
-// Segédfüggvény: asszisztenshez tartozó vector store ID lekérése
-async function getVectorStoreId(assistantId) {
-  const response = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      'OpenAI-Beta': 'assistants=v2'
-    }
-  });
-  return response.data.tool_resources?.file_search?.vector_store_ids?.[0];
-}
-
-async function resolveAssistantIdOrThrow(tenantId) {
-  const { assistantId } = await resolveAssistantContext({ tenantId, logTag: 'INSTR' });
-  if (!assistantId) {
-    throw new Error('ASSISTANT_ID not configured (no tenant override and no default).');
+function getAuthHeaders() {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY missing');
   }
-  return assistantId;
+  return { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` };
 }
 
-// 📥 Fájlok listázása a vector store-ból – névvel együtt
-// 📥 Fájlok listázása a vector store-ból – LAPOZÁSSAL (20/db), visszafelé kompatibilisen
+async function getTenantIdFromReq(req) {
+  const t = req.scope?.tenantId || req.user?.tenantId || null;
+  if (t) return String(t);
+  // Backward-compat fallback (should not happen with authMiddleware)
+  const user = req.userId ? await User.findById(req.userId).select('tenantId').lean() : null;
+  return user?.tenantId ? String(user.tenantId) : null;
+}
+
+async function getKbVectorStoreIdOrThrow(req) {
+  const tenantId = await getTenantIdFromReq(req);
+  if (!tenantId) {
+    const err = new Error('Missing tenant');
+    err.status = 403;
+    throw err;
+  }
+  const v = await tenantSettingsStore.getEffectiveValue(tenantId, 'KB_VECTOR_STORE_ID');
+  const id = typeof v === 'string' ? v.trim() : '';
+  if (!id) {
+    const err = new Error('No KB vector store configured for this tenant.');
+    err.status = 404;
+    throw err;
+  }
+  return id;
+}
+
+// --- Vector stores (admin) ---
+exports.listVectorStores = async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(Number(req.query.limit || 100), 100));
+    const order = String(req.query.order || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc';
+    const after = req.query.after ? String(req.query.after) : undefined;
+
+    const resp = await axios.get('https://api.openai.com/v1/vector_stores', {
+      params: { limit, order, ...(after ? { after } : {}) },
+      headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+      timeout: 60_000,
+    });
+
+    const { data, has_more, first_id, last_id } = resp.data || {};
+    const items = Array.isArray(data)
+      ? data.map((vs) => ({
+          id: vs.id,
+          name: vs.name || '',
+          created_at: vs.created_at,
+          file_counts: vs.file_counts || null,
+        }))
+      : [];
+
+    return res.json({
+      items,
+      paging: {
+        limit,
+        order,
+        has_more: !!has_more,
+        first_id: first_id || null,
+        last_id: last_id || null,
+        next_after: last_id || null,
+      },
+    });
+  } catch (err) {
+    logger.error('openai.vector_stores.list failed', {
+      message: err?.message || String(err),
+      status: err?.response?.status || null,
+      data: err?.response?.data || null,
+    });
+    return res.status(500).json({ ok: false, error: 'Failed to list vector stores' });
+  }
+};
+
+exports.createVectorStore = async (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim();
+    if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
+
+    const resp = await axios.post(
+      'https://api.openai.com/v1/vector_stores',
+      { name },
+      { headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' }, timeout: 60_000 }
+    );
+
+    return res.status(201).json({ ok: true, vectorStore: resp.data });
+  } catch (err) {
+    logger.error('openai.vector_stores.create failed', {
+      message: err?.message || String(err),
+      status: err?.response?.status || null,
+      data: err?.response?.data || null,
+    });
+    return res.status(500).json({ ok: false, error: 'Failed to create vector store' });
+  }
+};
+
+// --- Knowledge base files (vector store files) ---
 exports.listAssistantFiles = async (req, res) => {
   try {
-    const user = await User.findById(req.userId).select('tenantId');
-    if (!user) return res.status(404).json({ error: 'Felhasználó nem található.' });
+    const vectorStoreId = await getKbVectorStoreIdOrThrow(req);
 
-    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-    const assistantId = await resolveAssistantIdOrThrow(tenantId);
-    logger.info(`Vector store list – assistant: ${assistantId} (tenant=${tenantId})`);
-
-    const vectorStoreId = await getVectorStoreId(assistantId);
-    if (!vectorStoreId) {
-      return res.status(404).json({ error: 'Nincs vector store társítva az asszisztenshez.' });
-    }
-
-    // --- Lapozó beállítások (20/db) ---
     const PAGE_SIZE = 20;
     const order = (String(req.query.order || 'desc').toLowerCase() === 'asc') ? 'asc' : 'desc';
-
-    // Két működési mód:
-    // 1) Paged mód: ha van page / after / before => csak 1 oldalt ad vissza, meta adatokkal
-    // 2) Legacy (no params): összes oldalt összegyűjti és sima tömböt ad vissza (visszafelé kompatibilis)
     const hasPagingParam = !!(req.query.page || req.query.after || req.query.before || req.query.paged);
 
-    // ---- Helper: kérjünk egy OLDALT az OpenAI API-tól ----
     async function fetchOnePage(opts = {}) {
       const params = { limit: PAGE_SIZE, order };
       if (opts.after) params.after = opts.after;
       if (opts.before) params.before = opts.before;
 
-      const resp = await axios.get(
-        `https://api.openai.com/v1/vector_stores/${vectorStoreId}/files`,
-        {
-          params,
-          headers: {
-            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-            'OpenAI-Beta': 'assistants=v2'
-          }
-        }
-      );
+      const resp = await axios.get(`https://api.openai.com/v1/vector_stores/${vectorStoreId}/files`, {
+        params,
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        timeout: 60_000,
+      });
 
       const { data, has_more, first_id, last_id } = resp.data || {};
       return { items: data || [], has_more: !!has_more, first_id: first_id || null, last_id: last_id || null };
     }
 
-    // ---- Helper: feloldjuk a fájlnevet/bytes-t a /files/{id} végponttal ----
     async function enrich(items) {
       return Promise.all(
         (items || []).map(async (file) => {
           try {
             const detailRes = await axios.get(`https://api.openai.com/v1/files/${file.id}`, {
-              headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
+              headers: getAuthHeaders(),
+              timeout: 60_000,
             });
             return {
               id: file.id,
               filename: detailRes.data.filename,
               status: detailRes.data.status,
               bytes: detailRes.data.bytes,
-              created_at: file.created_at
+              created_at: file.created_at,
             };
-          } catch (e) {
-            logger.warn(`Nem sikerült lekérni a fájl részleteit: ${file.id}`);
+          } catch {
             return {
               id: file.id,
               filename: file.filename || '(unknown)',
               status: file.status || 'unknown',
               bytes: file.bytes || 0,
-              created_at: file.created_at
+              created_at: file.created_at,
             };
           }
         })
@@ -104,7 +160,6 @@ exports.listAssistantFiles = async (req, res) => {
     }
 
     if (hasPagingParam) {
-      // ======= 1) PAGED mód =======
       const page = Math.max(parseInt(String(req.query.page || '1'), 10), 1);
       const afterQP = req.query.after ? String(req.query.after) : null;
       const beforeQP = req.query.before ? String(req.query.before) : null;
@@ -112,7 +167,6 @@ exports.listAssistantFiles = async (req, res) => {
       let cursorAfter = afterQP;
       let cursorBefore = beforeQP;
 
-      // Ha page számot kaptunk (és nincs explicit after/before), akkor "átlépkedünk" addig a page-ig
       if (!cursorAfter && !cursorBefore && page > 1) {
         let tmpAfter = null;
         let hasMore = true;
@@ -138,12 +192,12 @@ exports.listAssistantFiles = async (req, res) => {
           first_id,
           last_id,
           next_after: last_id || null,
-          prev_before: first_id || null
-        }
+          prev_before: first_id || null,
+        },
       });
     }
 
-    // ======= 2) LEGACY mód (nincs query param) – ÖSSZES OLDAL LEHÚZÁSA =======
+    // Legacy mode: pull multiple pages (backward compatible)
     const MAX_PAGES = parseInt(process.env.OPENAI_VS_MAX_PAGES || '50', 10);
     let all = [];
     let after = null;
@@ -153,41 +207,35 @@ exports.listAssistantFiles = async (req, res) => {
       if (!has_more || !last_id) break;
       after = last_id;
     }
-
     const detailedAll = await enrich(all);
     return res.status(200).json(detailedAll);
   } catch (err) {
-    logger.error('❌ Fájlok listázási hiba:', err?.response?.data || err?.message || err);
-    res.status(500).json({ error: 'Nem sikerült lekérni a fájlokat.' });
+    const status = err?.status || err?.response?.status || 500;
+    logger.error('openai.vector_store.files.list failed', {
+      message: err?.message || String(err),
+      status,
+      data: err?.response?.data || null,
+    });
+    return res.status(status).json({ ok: false, error: err?.message || 'Failed to list vector store files' });
   }
 };
 
-// 📤 Fájl feltöltése és hozzárendelése a vector store-hoz
 exports.uploadAssistantFile = async (req, res) => {
   try {
-    const user = await User.findById(req.userId).select('tenantId');
-    if (!user) return res.status(404).json({ error: 'Felhasználó nem található.' });
-
-    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-    const assistantId = await resolveAssistantIdOrThrow(tenantId);
-    logger.info(`Vector store upload – assistant: ${assistantId} (tenant=${tenantId})`);
-
-    const vectorStoreId = await getVectorStoreId(assistantId);
-    if (!vectorStoreId) return res.status(404).json({ error: 'Nincs vector store társítva az asszisztenshez.' });
+    const vectorStoreId = await getKbVectorStoreIdOrThrow(req);
 
     const file = req.file;
     if (!file || !file.path) return res.status(400).json({ error: 'Nem érkezett fájl a kérésben vagy hiányzik az útvonal.' });
 
     const form = new FormData();
-    form.append('purpose', 'assistants'); // Ez előzze meg a fájlt
+    // Note: purpose value still applies to file_search/vector_store ingestion.
+    form.append('purpose', 'assistants');
     form.append('file', fs.createReadStream(file.path), file.originalname);
 
     const uploadRes = await axios.post('https://api.openai.com/v1/files', form, {
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        ...form.getHeaders()
-      },
-      maxBodyLength: Infinity // nagy fájlokhoz is engedélyezve
+      headers: { ...getAuthHeaders(), ...form.getHeaders() },
+      maxBodyLength: Infinity,
+      timeout: 120_000,
     });
 
     const fileId = uploadRes.data.id;
@@ -195,146 +243,78 @@ exports.uploadAssistantFile = async (req, res) => {
     await axios.post(
       `https://api.openai.com/v1/vector_stores/${vectorStoreId}/files`,
       { file_id: fileId },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          'Content-Type': 'application/json',
-          'OpenAI-Beta': 'assistants=v2'
-        }
-      }
+      { headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' }, timeout: 120_000 }
     );
 
     try {
       fs.unlinkSync(file.path);
-      logger.info(`Fájl sikeresen törölve: ${file.path}`);
-    } catch (err) {
-      logger.warn(`Nem sikerült törölni a feltöltött fájlt: ${file.path}`);
-    }
+    } catch {}
 
-    res.status(201).json({ message: 'Fájl sikeresen feltöltve és hozzárendelve.', fileId, vectorStoreId });
+    return res.status(201).json({ message: 'Fájl sikeresen feltöltve és hozzárendelve.', fileId, vectorStoreId });
   } catch (err) {
-    logger.error('❌ Fájl feltöltési hiba:', err.message);
-    logger.error('❌ Stacktrace:', err);
-    res.status(500).json({ error: 'Nem sikerült feltölteni a fájlt.' });
+    const status = err?.status || err?.response?.status || 500;
+    logger.error('openai.vector_store.files.upload failed', {
+      message: err?.message || String(err),
+      status,
+      data: err?.response?.data || null,
+    });
+    return res.status(status).json({ ok: false, error: err?.message || 'Nem sikerült feltölteni a fájlt.' });
   }
 };
 
-// 📤 Fájl törlése a vector store-ból és az OpenAI fájltárból
 exports.deleteAssistantFile = async (req, res) => {
   try {
-    const user = await User.findById(req.userId).select('tenantId');
-    if (!user) return res.status(404).json({ error: 'Felhasználó nem található.' });
-
-    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-    const assistantId = await resolveAssistantIdOrThrow(tenantId);
-    logger.info(`Vector store delete – assistant: ${assistantId} (tenant=${tenantId})`);
-
-    const vectorStoreId = await getVectorStoreId(assistantId);
-    if (!vectorStoreId) return res.status(404).json({ error: 'Nincs vector store társítva az asszisztenshez.' });
+    const vectorStoreId = await getKbVectorStoreIdOrThrow(req);
 
     const { fileId } = req.params;
     if (!fileId) return res.status(400).json({ error: 'Hiányzó fileId paraméter.' });
 
-    // 1️⃣ Fájl törlése a vector store-ból
-    await axios.delete(
-      `https://api.openai.com/v1/vector_stores/${vectorStoreId}/files/${fileId}`,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          'OpenAI-Beta': 'assistants=v2'
-        }
-      }
-    );
-
-    // 2️⃣ Fájl törlése az OpenAI fájltárból
-    await axios.delete(`https://api.openai.com/v1/files/${fileId}`, {
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
-      }
+    await axios.delete(`https://api.openai.com/v1/vector_stores/${vectorStoreId}/files/${fileId}`, {
+      headers: getAuthHeaders(),
+      timeout: 60_000,
     });
 
-    res.status(200).json({ message: 'Fájl sikeresen törölve.' });
+    // Best-effort: delete the underlying OpenAI file too.
+    try {
+      await axios.delete(`https://api.openai.com/v1/files/${fileId}`, { headers: getAuthHeaders(), timeout: 60_000 });
+    } catch {}
+
+    return res.status(200).json({ message: 'Fájl sikeresen törölve.' });
   } catch (err) {
-    logger.error('❌ Fájl törlési hiba:', err.message);
-    res.status(500).json({ error: 'Nem sikerült törölni a fájlt.' });
+    const status = err?.status || err?.response?.status || 500;
+    logger.error('openai.vector_store.files.delete failed', {
+      message: err?.message || String(err),
+      status,
+      data: err?.response?.data || null,
+    });
+    return res.status(status).json({ ok: false, error: err?.message || 'Nem sikerült törölni a fájlt.' });
   }
 };
 
-// Lekérdezi az asszisztens utasításait
+// --- Tenant AI profile (compat endpoint for EPDS UI) ---
 exports.getAssistantInstructions = async (req, res) => {
   try {
-    const userId = req.userId;
-    if (!userId) {
-      logger.error('Hiányzó userId a kérésből.');
-      return res.status(400).json({ error: 'Bejelentkezett felhasználó azonosítója hiányzik.' });
-    }
-
-    // Felhasználói adatok lekérése az adatbázisból
-    const user = await User.findById(userId).select('tenantId');
-    if (!user) {
-      logger.error('Felhasználó nem található.');
-      return res.status(404).json({ error: 'Felhasználó nem található.' });
-    }
-
-    // Az asszisztens azonosító kiválasztása tenant alapján
-    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-    const assistantId = await resolveAssistantIdOrThrow(tenantId);
-    logger.info(`Lekérdezett asszisztens ID: ${assistantId} (Tenant: ${tenantId})`);
-
-    // OpenAI API hívás az asszisztens utasításaiért
-    const response = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'assistants=v2',
-      },
+    const tenantId = await getTenantIdFromReq(req);
+    if (!tenantId) return res.status(403).json({ error: 'Missing tenant' });
+    const profile = await tenantSettingsStore.getTenantAiProfile(tenantId);
+    return res.status(200).json({
+      model: profile.model || '',
+      instructions: profile.instructions || '',
     });
-
-    // Asszisztens teljes objektum a válaszból
-    const asst = response.data;
-    logger.info('Asszisztens info lekérdezve:', { id: asst.id, name: asst.name, model: asst.model });
-
-    // Csak a frontend által elvárt mezőket adjuk vissza
-    res.status(200).json({
-      name: asst.name || '',
-      model: asst.model || '',
-      instructions: asst.instructions || '',
-      temperature: typeof asst.temperature === 'number' ? asst.temperature : 1,
-      top_p: typeof asst.top_p === 'number' ? asst.top_p : 1
-    });
-  } catch (error) {
-    if (error.response) {
-      // Az API válaszolt, de hibás státuszkódot adott
-      logger.error('OpenAI API válasz hiba:', {
-        status: error.response.status,
-        data: error.response.data,
-      });
-      res.status(error.response.status).json({
-        error: error.response.data.error || 'Hiba történt az API lekérdezése során.',
-      });
-    } else if (error.request) {
-      // A kérés elment, de nem érkezett válasz
-      logger.error('OpenAI API válasz nem érkezett:', error.request);
-      res.status(500).json({ error: 'Az OpenAI API nem érhető el.' });
-    } else {
-      // Valami más hiba történt a kérés beállításában
-      logger.error('Kérés beállítási hiba:', error.message);
-      res.status(500).json({ error: 'Belső szerver hiba történt.' });
-    }
+  } catch (err) {
+    logger.error('tenant.ai_profile.get failed', { message: err?.message || String(err) });
+    return res.status(500).json({ error: 'Belső szerver hiba történt.' });
   }
 };
 
 exports.updateAssistantConfig = async (req, res) => {
   try {
-    const userId = req.userId;
-    if (!userId) {
-      logger.error('Hiányzó userId a kérésből.');
-      return res.status(400).json({ error: 'Bejelentkezett felhasználó azonosítója hiányzik.' });
-    }
+    const tenantId = await getTenantIdFromReq(req);
+    if (!tenantId) return res.status(403).json({ error: 'Missing tenant' });
 
-    const { instructions, model, temperature, top_p } = req.body;
+    const instructions = req.body?.instructions;
+    const model = req.body?.model;
 
-    // Normalizáljuk az esetleges human label model értékeket API-kompatibilis ID-vá
     const modelMap = {
       'GPT 4.1': 'gpt-4.1',
       'GPT 4.1 mini': 'gpt-4.1-mini',
@@ -344,57 +324,19 @@ exports.updateAssistantConfig = async (req, res) => {
       'o3 mini': 'o3-mini',
       'o1': 'o1',
       'GPT 4': 'gpt-4',
-      'GPT 4 turbo': 'gpt-4-turbo'
+      'GPT 4 turbo': 'gpt-4-turbo',
     };
     const normalizedModel = (typeof model === 'string' && modelMap[model]) ? modelMap[model] : model;
 
-    // Felhasználói adatok lekérése az adatbázisból
-    const user = await User.findById(userId).select('tenantId');
-    if (!user) {
-      logger.error('Felhasználó nem található.');
-      return res.status(404).json({ error: 'Felhasználó nem található.' });
-    }
+    const settings = {};
+    if (instructions !== undefined) settings.AI_INSTRUCTIONS = String(instructions || '');
+    if (normalizedModel !== undefined) settings.AI_MODEL = String(normalizedModel || '');
 
-    // Az asszisztens azonosító kiválasztása tenant alapján
-    const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-    const assistantId = await resolveAssistantIdOrThrow(tenantId);
-    logger.info(`Asszisztens konfiguráció frissítése – assistant: ${assistantId} (tenant=${tenantId})`);
-
-    // Összeállítjuk a frissítendő adatokat csak a megadott mezőkkel
-    const payload = {};
-    if (instructions !== undefined) payload.instructions = instructions;
-    if (normalizedModel !== undefined) payload.model = normalizedModel;
-    if (temperature !== undefined) payload.temperature = temperature;
-    if (top_p !== undefined) payload.top_p = top_p;
-
-    const response = await axios.post(
-      `https://api.openai.com/v1/assistants/${assistantId}`,
-      payload,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          'Content-Type': 'application/json',
-          'OpenAI-Beta': 'assistants=v2'
-        }
-      }
-    );
-
-    res.status(200).json(response.data);
-  } catch (error) {
-    if (error.response) {
-      logger.error('OpenAI API frissítési hiba:', {
-        status: error.response.status,
-        data: error.response.data,
-      });
-      res.status(error.response.status).json({
-        error: error.response.data.error || 'Hiba történt az API frissítése során.',
-      });
-    } else if (error.request) {
-      logger.error('OpenAI API frissítés nem érhető el:', error.request);
-      res.status(500).json({ error: 'Az OpenAI API nem érhető el.' });
-    } else {
-      logger.error('Kérés beállítási hiba frissítéskor:', error.message);
-      res.status(500).json({ error: 'Belső szerver hiba történt.' });
-    }
+    await tenantSettingsStore.setMany(tenantId, settings, { updatedBy: req.user?.id || req.userId || null });
+    const profile = await tenantSettingsStore.getTenantAiProfile(tenantId);
+    return res.status(200).json({ ok: true, profile });
+  } catch (err) {
+    logger.error('tenant.ai_profile.update failed', { message: err?.message || String(err), data: err?.response?.data || null });
+    return res.status(500).json({ error: 'Belső szerver hiba történt.' });
   }
 };

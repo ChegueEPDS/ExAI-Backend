@@ -9,6 +9,7 @@ const StandardSet = require('../models/standardSet');
 const azureBlob = require('./azureBlobService');
 const pinecone = require('./pineconeService');
 const systemSettings = require('./systemSettingsStore');
+const embeddingContext = require('./embeddingContext');
 const logger = require('../config/logger');
 
 const encoder = get_encoding('o200k_base');
@@ -381,9 +382,20 @@ async function ingestStandardFiles({
       if (modeHint === 'unknown') modeHint = mode;
       else if (modeHint !== mode && mode !== 'unknown') modeHint = 'both';
 
-      const emb = await createEmbeddingVector(openai, c.text, embeddingModel);
-      const tokens = encoder.encode(String(c.text || '')).length;
       const pageOrLoc = String(c.pageOrLoc || `chunk:${i + 1}`);
+      const embeddingText = embeddingContext.buildEmbeddingText({
+        kind: 'standard_clause',
+        fields: {
+          standardId,
+          edition,
+          clauseId: c.clauseId,
+          title: c.title || '',
+          pageOrLoc,
+        },
+        text: c.text,
+      });
+      const emb = await createEmbeddingVector(openai, embeddingText, embeddingModel);
+      const tokens = encoder.encode(String(c.text || '')).length;
       const doc = await StandardClause.create({
         tenantId,
         standardRef: std._id,
@@ -431,6 +443,7 @@ async function ingestStandardFiles({
           status: 'ready',
           error: '',
           modeHint,
+          meta: { ...(std.meta || {}), embeddingFormatVersion: embeddingContext.getEmbeddingFormatVersion() },
           sourceFiles,
           aliases: Array.from(new Set([
             standardId,

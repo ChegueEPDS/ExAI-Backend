@@ -1,6 +1,8 @@
 const systemSettingsStore = require('../services/systemSettingsStore');
 const { getDefinition } = require('../config/systemSettingsRegistry');
 const axios = require('axios');
+const Standard = require('../models/standard');
+const DatasetFile = require('../models/datasetFile');
 
 let modelsCache = {
   chat: { ts: 0, items: [], recommended: [] },
@@ -38,10 +40,51 @@ function collectUnknownKeys(valuesByKey) {
   return unknown;
 }
 
+async function computeEmbeddingReindexNotices() {
+  try {
+    const enabled = !!systemSettingsStore.getBoolean('EMBEDDING_CONTEXT_HEADER_ENABLED');
+    const version = Math.max(1, Number(systemSettingsStore.getNumber('EMBEDDING_CONTEXT_HEADER_VERSION') || 1));
+    if (!enabled) return [];
+
+    const [outdatedStandards, outdatedFiles] = await Promise.all([
+      Standard.countDocuments({
+        status: 'ready',
+        $or: [
+          { 'meta.embeddingFormatVersion': { $exists: false } },
+          { 'meta.embeddingFormatVersion': { $ne: version } },
+        ],
+      }),
+      DatasetFile.countDocuments({
+        indexingStatus: 'done',
+        approvalStatus: { $ne: 'rejected' },
+        $or: [
+          { 'meta.embeddingFormatVersion': { $exists: false } },
+          { 'meta.embeddingFormatVersion': { $ne: version } },
+        ],
+      }),
+    ]);
+
+    if (!outdatedStandards && !outdatedFiles) return [];
+
+    return [
+      {
+        level: 'warn',
+        code: 'REINDEX_REQUIRED',
+        message:
+          `Embedding context header is enabled (v${version}), but some items are still indexed with the previous format. ` +
+          `Reindex recommended: standards=${outdatedStandards}, datasetFiles=${outdatedFiles}.`,
+      },
+    ];
+  } catch {
+    return [];
+  }
+}
+
 const getSystemSettings = async (req, res) => {
   try {
     return res.json({
       items: systemSettingsStore.getAllEffective(),
+      notices: await computeEmbeddingReindexNotices(),
     });
   } catch (e) {
     return res.status(500).json({ error: e?.message || 'Failed to get system settings' });
@@ -68,7 +111,7 @@ const updateSystemSettings = async (req, res) => {
     }
 
     await systemSettingsStore.setMany(valuesByKey, { updatedBy: req.user?.id || req.userId || null });
-    return res.json({ items: systemSettingsStore.getAllEffective() });
+    return res.json({ items: systemSettingsStore.getAllEffective(), notices: await computeEmbeddingReindexNotices() });
   } catch (e) {
     const code = e?.code || null;
     if (code === 'DB_NOT_READY') return res.status(503).json({ error: 'Database not connected yet' });
@@ -88,7 +131,7 @@ const resetSystemSettingsToDefault = async (req, res) => {
     }
 
     await systemSettingsStore.resetToDefault(keys, { updatedBy: req.user?.id || req.userId || null });
-    return res.json({ items: systemSettingsStore.getAllEffective() });
+    return res.json({ items: systemSettingsStore.getAllEffective(), notices: await computeEmbeddingReindexNotices() });
   } catch (e) {
     const code = e?.code || null;
     if (code === 'DB_NOT_READY') return res.status(503).json({ error: 'Database not connected yet' });

@@ -135,6 +135,55 @@ async function inferTableSchemaWithLLM({ filename, workbookPreview, trace = null
     '] } ] }'
   ].join('\n');
 
+  const keyValueTableSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      type: { type: 'string', enum: ['key_value'] },
+      name: { type: 'string' },
+      rowStart: { type: 'number' },
+      rowEnd: { type: 'number' },
+      keyCol: { type: 'string' },
+      valueCol: { type: 'string' },
+    },
+    required: ['type', 'name', 'rowStart', 'rowEnd', 'keyCol', 'valueCol'],
+  };
+
+  const seriesSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      name: { type: 'string' },
+      row: { type: 'number' },
+      unit: { type: 'string' },
+      colStart: { type: 'string' },
+      colEnd: { type: 'string' },
+    },
+    required: ['name', 'row', 'unit', 'colStart', 'colEnd'],
+  };
+
+  const timeSeriesTableSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      type: { type: 'string', enum: ['time_series'] },
+      name: { type: 'string' },
+      time: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          row: { type: 'number' },
+          unit: { type: 'string' },
+          colStart: { type: 'string' },
+          colEnd: { type: 'string' },
+        },
+        required: ['row', 'unit', 'colStart', 'colEnd'],
+      },
+      series: { type: 'array', items: seriesSchema },
+    },
+    required: ['type', 'name', 'time', 'series'],
+  };
+
   const outputSchema = {
     type: 'object',
     additionalProperties: false,
@@ -146,7 +195,8 @@ async function inferTableSchemaWithLLM({ filename, workbookPreview, trace = null
           additionalProperties: false,
           properties: {
             sheet: { type: 'string' },
-            tables: { type: 'array', items: { type: 'object' } },
+            // Structured Outputs supports `anyOf` (not `oneOf`) for unions.
+            tables: { type: 'array', items: { anyOf: [keyValueTableSchema, timeSeriesTableSchema] } },
           },
           required: ['sheet', 'tables'],
         },

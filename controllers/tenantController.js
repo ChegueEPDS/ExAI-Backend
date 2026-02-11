@@ -1,5 +1,14 @@
 // controllers/tenantController.js
 const Tenant = require('../models/tenant');
+const Stripe = require('stripe');
+
+let stripe = null;
+try {
+  const key = process.env.STRIPE_SECRET_KEY;
+  if (key) stripe = new Stripe(key, { apiVersion: '2024-06-20' });
+} catch (_) {
+  stripe = null;
+}
 
 function slugify(name) {
   return String(name || '')
@@ -193,8 +202,27 @@ exports.updateTenant = async (req, res) => {
 
     // name (slug + ensure unique)
     if (typeof name === 'string' && name.trim()) {
-      const uniqueName = await ensureUniqueTenantName(name);
-      updates.name = uniqueName;
+      // Protect special tenant naming conventions
+      if (String(tenant.name || '').toLowerCase() === 'index') {
+        return res.status(403).json({ message: 'This tenant name cannot be changed.' });
+      }
+      // Only allow Admins to rename TEAM/company tenants (company name semantics)
+      if (role !== 'SuperAdmin') {
+        const tier = String(tenant.plan || '').toLowerCase();
+        const type = String(tenant.type || '').toLowerCase();
+        if (!(tier === 'team' && type === 'company')) {
+          return res.status(403).json({ message: 'Only team tenant admins can change the tenant name.' });
+        }
+      }
+      const nextName = slugify(name);
+      if (!nextName) {
+        return res.status(400).json({ message: 'Invalid tenant name.' });
+      }
+      const clash = await Tenant.findOne({ name: nextName, _id: { $ne: tenant._id } }).select('_id').lean();
+      if (clash) {
+        return res.status(409).json({ message: 'Tenant name is already taken.' });
+      }
+      updates.name = nextName;
     }
 
     // seatsManaged
@@ -256,6 +284,19 @@ exports.updateTenant = async (req, res) => {
 
     // Végrehajtás
     const updated = await Tenant.findByIdAndUpdate(id, updates, { new: true });
+
+    // Best-effort: keep Stripe Customer name in sync (if configured)
+    if (updates.name && stripe && updated?.stripeCustomerId) {
+      try {
+        await stripe.customers.update(String(updated.stripeCustomerId), {
+          name: String(updated.name),
+          metadata: { tenantName: String(updated.name) },
+        });
+      } catch (e) {
+        try { console.warn('[tenants/update] stripe customer update failed:', e?.message || e); } catch {}
+      }
+    }
+
     return res.json(updated);
   } catch (e) {
     console.error('[tenants/update] error', e);

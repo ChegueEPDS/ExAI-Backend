@@ -737,6 +737,14 @@ exports.redeemContributionReward = async (req, res) => {
     if (reward.expiresAt && new Date(reward.expiresAt) < new Date()) return res.status(410).send('Reward expired');
 
     const tenant = reward.tenantId ? await Tenant.findById(reward.tenantId) : null;
+    const buyer = await User.findById(userId).select('email').lean();
+    const emailLocal = buyer?.email && String(buyer.email).includes('@') ? String(buyer.email).split('@')[0] : '';
+    const companyNameGuessRaw =
+      (tenant?.type === 'company' && tenant?.name ? String(tenant.name) : '') ||
+      (tenant?.name ? String(tenant.name) : '') ||
+      emailLocal ||
+      'company';
+    const companyNameGuess = companyNameGuessRaw.replace(/^u-+/i, '').trim() || 'company';
     const portalBase = (tenant?.name || '').toLowerCase() === 'index' ? 'https://exai.ind-ex.ae' : 'https://certs.atexdb.eu';
     const successUrl = ensureAbsUrl(process.env.BILLING_SUCCESS_URL || `${portalBase}/billing/success`, `${portalBase}/billing/success`);
     const cancelUrl = ensureAbsUrl(process.env.BILLING_CANCEL_URL || `${portalBase}/billing`, `${portalBase}/billing`);
@@ -779,6 +787,7 @@ exports.redeemContributionReward = async (req, res) => {
         source: 'certificate-contribution',
         rewardId: String(reward._id),
         userId: String(userId),
+        companyName: companyNameGuess,
         plan: 'team',
         billingPeriod: 'month',
       },
@@ -787,6 +796,7 @@ exports.redeemContributionReward = async (req, res) => {
           source: 'certificate-contribution',
           rewardId: String(reward._id),
           userId: String(userId),
+          companyName: companyNameGuess,
           plan: 'team',
           billingPeriod: 'month',
         },

@@ -436,8 +436,9 @@ async function _processDraftsInternal(uploadId) {
         }
 
         // 2) OpenAI kivonat (backoff + hosszabb timeout a helperben)
+        const tenantId = req.scope?.tenantId || (draft?.tenantId ? String(draft.tenantId) : null);
         const extractedData = await retryWithBackoff(
-          () => extractCertFieldsFromOCR(recognizedText),
+          () => extractCertFieldsFromOCR(recognizedText, { tenantId }),
           { label: 'extractCertFieldsFromOCR' }
         );
 

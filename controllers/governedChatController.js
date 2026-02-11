@@ -66,6 +66,46 @@ function sanitizeEmbeddingInput(s) {
   return v.length ? v : '';
 }
 
+function validateStructuredOutputsJsonSchema(schema) {
+  const issues = [];
+
+  function walk(node, path) {
+    if (!node || typeof node !== 'object') return;
+
+    if (Object.prototype.hasOwnProperty.call(node, 'oneOf')) {
+      issues.push(`${path}: oneOf is not permitted (use anyOf)`);
+    }
+
+    const type = node.type;
+    if (type === 'object' || (Array.isArray(type) && type.includes('object'))) {
+      const props = node.properties && typeof node.properties === 'object' ? node.properties : null;
+      if (props) {
+        if (node.additionalProperties !== false) {
+          issues.push(`${path}: additionalProperties must be false`);
+        }
+        const keys = Object.keys(props);
+        const req = Array.isArray(node.required) ? node.required : null;
+        if (!req) {
+          issues.push(`${path}: required must be supplied and include all keys in properties`);
+        } else {
+          for (const k of keys) {
+            if (!req.includes(k)) issues.push(`${path}: required missing "${k}"`);
+          }
+        }
+        for (const [k, v] of Object.entries(props)) walk(v, `${path}.properties.${k}`);
+      }
+    }
+
+    if (node.items) walk(node.items, `${path}.items`);
+    if (Array.isArray(node.anyOf)) node.anyOf.forEach((x, i) => walk(x, `${path}.anyOf[${i}]`));
+    if (Array.isArray(node.allOf)) node.allOf.forEach((x, i) => walk(x, `${path}.allOf[${i}]`));
+    if (Array.isArray(node.oneOf)) node.oneOf.forEach((x, i) => walk(x, `${path}.oneOf[${i}]`));
+  }
+
+  walk(schema, '$');
+  return issues;
+}
+
 function tokenTrim(str, maxTokens) {
   const ids = encoder.encode(String(str || ''));
   if (ids.length <= maxTokens) return String(str || '');
@@ -1604,7 +1644,7 @@ exports.chatGovernedStream = async (req, res) => {
       '{ "answer": string, "numericEvidence": [',
       '  { "kind": "cell", "fileName": string, "sheet": string, "rowIndex": number, "colIndex": number, "cell": string, "value": string },',
       '  { "kind": "computed", "op": "delta|range|sum|avg", "value": string, "unit": string, "sources": [ { "fileName": string, "sheet": string, "rowIndex": number, "colIndex": number, "cell": string, "value": string } ] }',
-      '], "quotes": [ { "fileName": string, "standardRef": string?, "clauseId": string?, "pageOrLoc": string, "quote": string, "sourceType": "standard|document|image" } ] }',
+	      '], "quotes": [ { "fileName": string, "standardRef": string|null, "clauseId": string|null, "pageOrLoc": string, "quote": string, "sourceType": "standard|document|image" } ] }',
       'A "numericEvidence" lista: XLSX cellák + (opcionális) számolt értékek forrás cellákkal. A "cell" mezőt töltsd ki, ha elérhető (pl. "C15").',
       'A "quotes" listában legyen rövid idézet (1-3 mondat) a releváns dokumentum/standard részről (fileName + pageOrLoc).',
       'Válasz struktúra javaslat: "Projekt összefoglaló", "Fő megállapítások", "Compliance mátrix" (Markdown táblázat), "Kockázatok / hiányok", "Következő lépések".'
@@ -1645,7 +1685,7 @@ exports.chatGovernedStream = async (req, res) => {
       '{ "answer": string, "numericEvidence": [',
       '  { "kind": "cell", "fileName": string, "sheet": string, "rowIndex": number, "colIndex": number, "cell": string, "value": string },',
       '  { "kind": "computed", "op": "delta|range|sum|avg", "value": string, "unit": string, "sources": [ { "fileName": string, "sheet": string, "rowIndex": number, "colIndex": number, "cell": string, "value": string } ] }',
-      '], "quotes": [ { "fileName": string, "standardRef": string?, "clauseId": string?, "pageOrLoc": string, "quote": string, "sourceType": "standard|document|image" } ] }',
+	      '], "quotes": [ { "fileName": string, "standardRef": string|null, "clauseId": string|null, "pageOrLoc": string, "quote": string, "sourceType": "standard|document|image" } ] }',
       'The "numericEvidence" list must contain XLSX cells and (optionally) computed values with source cells. Fill "cell" if available (e.g., "C15").',
       'The "quotes" list must include short excerpts (1-3 sentences) from the relevant document/standard (fileName + pageOrLoc).',
       'Suggested structure: "Project summary", "Key findings", "Compliance matrix" (Markdown table), "Risks / gaps", "Next actions".'
@@ -1713,22 +1753,93 @@ exports.chatGovernedStream = async (req, res) => {
     const maxOut = Math.max(600, Math.min(Number(systemSettings.getNumber('STANDARD_EXPLORER_MAX_OUTPUT_TOKENS') || 2500), 10000));
     const { createResponse, extractOutputTextFromResponse } = require('../helpers/openaiResponses');
 
-    const outSchema = {
+    // Strict JSON schema requirement (Responses API):
+    // - every object schema must explicitly set additionalProperties:false
+    // - and list all allowed properties.
+    const numericCellSchema = {
       type: 'object',
-      additionalProperties: true,
+      additionalProperties: false,
       properties: {
-        answer: { type: 'string' },
-        numericEvidence: { type: 'array', items: { type: 'object' } },
-        quotes: { type: 'array', items: { type: 'object' } },
+        kind: { type: 'string', enum: ['cell'] },
+        fileName: { type: 'string' },
+        sheet: { type: 'string' },
+        rowIndex: { type: 'number' },
+        colIndex: { type: 'number' },
+        cell: { type: 'string' },
+        value: { type: 'string' },
       },
-      required: ['answer', 'numericEvidence', 'quotes'],
+      required: ['kind', 'fileName', 'sheet', 'rowIndex', 'colIndex', 'cell', 'value'],
     };
 
-    const respObj = await createResponse({
-      model,
-      instructions: system,
-      input: [{ role: 'user', content: user }],
-      store: false,
+    const numericComputedSourceSchema = {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        fileName: { type: 'string' },
+        sheet: { type: 'string' },
+        rowIndex: { type: 'number' },
+        colIndex: { type: 'number' },
+        cell: { type: 'string' },
+        value: { type: 'string' },
+      },
+      required: ['fileName', 'sheet', 'rowIndex', 'colIndex', 'cell', 'value'],
+    };
+
+    const numericComputedSchema = {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        kind: { type: 'string', enum: ['computed'] },
+        op: { type: 'string', enum: ['delta', 'range', 'sum', 'avg'] },
+        value: { type: 'string' },
+        unit: { type: 'string' },
+        sources: { type: 'array', items: numericComputedSourceSchema },
+      },
+      required: ['kind', 'op', 'value', 'unit', 'sources'],
+    };
+
+	    const quoteSchema = {
+	      type: 'object',
+	      additionalProperties: false,
+	      properties: {
+	        fileName: { type: 'string' },
+	        // Structured Outputs requires every key in `properties` to be listed in `required`.
+	        // Optional fields must still be present (use null when unknown).
+	        standardRef: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+	        clauseId: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+	        pageOrLoc: { type: 'string' },
+	        quote: { type: 'string' },
+	        sourceType: { type: 'string', enum: ['standard', 'document', 'image'] },
+	      },
+	      required: ['fileName', 'standardRef', 'clauseId', 'pageOrLoc', 'quote', 'sourceType'],
+	    };
+
+	    const outSchema = {
+	      type: 'object',
+	      additionalProperties: false,
+	      properties: {
+	        answer: { type: 'string' },
+	        // Structured Outputs supports `anyOf` (not `oneOf`) for unions.
+	        numericEvidence: { type: 'array', items: { anyOf: [numericCellSchema, numericComputedSchema] } },
+	        quotes: { type: 'array', items: quoteSchema },
+	      },
+	      required: ['answer', 'numericEvidence', 'quotes'],
+	    };
+
+	    const schemaIssues = validateStructuredOutputsJsonSchema(outSchema);
+	    if (schemaIssues.length) {
+	      logger.error('governed.output_schema.invalid', {
+	        requestId: req.requestId || null,
+	        issues: schemaIssues.slice(0, 50),
+	      });
+	      return res.status(500).json({ ok: false, error: 'Governed output schema is invalid. Check server logs.' });
+	    }
+
+	    const respObj = await createResponse({
+	      model,
+	      instructions: system,
+	      input: [{ role: 'user', content: user }],
+	      store: false,
       temperature: 0,
       maxOutputTokens: standardExplorerEnabled ? maxOut : null,
       textFormat: { type: 'json_schema', name: 'governed_answer', strict: true, schema: outSchema },
@@ -1962,11 +2073,11 @@ exports.chatGovernedStream = async (req, res) => {
       } catch { }
     }
 
-    let answerForDisplay = answer;
-    if (String(answer).trim() !== 'NOT FOUND') {
-      const md = buildCitationsMarkdown(quotes, lang);
-      if (md) answerForDisplay = `${answerForDisplay}${md}`;
-    }
+	    let answerForDisplay = answer;
+	    if (!standardExplorerEnabled && String(answer).trim() !== 'NOT FOUND') {
+	      const md = buildCitationsMarkdown(quotes, lang);
+	      if (md) answerForDisplay = `${answerForDisplay}${md}`;
+	    }
 
     const finalHtml = finalizeHtml(answerForDisplay);
     conversation.messages.push({

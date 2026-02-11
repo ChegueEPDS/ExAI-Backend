@@ -32,6 +32,10 @@ const EquipmentSchema = new mongoose.Schema({
   // Mobile sync: hide newly created equipment until async processing finishes.
   isProcessed: { type: Boolean, default: true, index: true },
   mobileSync: {
+    // Client-side temp id used for best-effort idempotency on retries.
+    // Helps avoid duplicate equipment when the upload succeeds on the server
+    // but the mobile client does not receive the response.
+    tempId: { type: String, default: null, index: true },
     jobId: { type: String, default: null, index: true },
     status: { type: String, enum: ['queued', 'processing', 'done', 'error', null], default: null },
     finishedAt: { type: Date, default: null }
@@ -96,6 +100,9 @@ const EquipmentSchema = new mongoose.Schema({
   operationalStatusChangedAt: { type: Date, default: null },
   operationalStatusChangedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }
 }, { timestamps: true }); // ⏳ Timestamps (createdAt, updatedAt)
+
+// Lookup helper for mobile sync retries (not unique to avoid migration issues if old duplicates exist).
+EquipmentSchema.index({ tenantId: 1, 'mobileSync.tempId': 1 });
 
 // 🔹 Pre-save middleware: kezeli a tenantId és Company mezőket mentéskor
 EquipmentSchema.pre('save', async function (next) {

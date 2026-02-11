@@ -1,6 +1,6 @@
-const axios = require('axios');
 const systemSettings = require('./systemSettingsStore');
 const { createResponse, extractOutputTextFromResponse } = require('../helpers/openaiResponses');
+const tenantSettingsStore = require('./tenantSettingsStore');
 
 // === ChatGPT-like formatting instructions (Markdown-first) ===
 function getStyleInstructions(mode = 'plain') {
@@ -93,27 +93,31 @@ async function buildRollingSummary(conversation) {
 }
 
 
-// Cache assistant instructions for reuse in streaming runs
-const assistantInfoCache = new Map();
+// Cache tenant AI profile for reuse in streaming runs (no Assistants API dependency).
+const tenantAiCache = new Map(); // tenantId -> { ts, value }
 
-async function getAssistantInfoCached(assistantId) {
-  if (!assistantId) return { instructions: '', model: null };
-  const cached = assistantInfoCache.get(assistantId);
-  if (cached && (Date.now() - cached.ts) < 5 * 60 * 1000) {
-    return cached.value || { instructions: '', model: null };
+async function getTenantAiProfileCached(tenantId) {
+  const t = String(tenantId || '').trim();
+  if (!t) return { instructions: '', model: null, kbVectorStoreId: null };
+
+  const cached = tenantAiCache.get(t);
+  if (cached && (Date.now() - cached.ts) < 30_000) {
+    return cached.value || { instructions: '', model: null, kbVectorStoreId: null };
   }
+
   try {
-    const resp = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'assistants=v2' }
-    });
+    const v = await tenantSettingsStore.getTenantAiProfile(t);
     const val = {
-      instructions: String(resp.data?.instructions || ''),
-      model: resp.data?.model ? String(resp.data.model) : null,
+      instructions: String(v?.instructions || ''),
+      model: v?.model ? String(v.model) : null,
+      kbVectorStoreId: v?.kbVectorStoreId ? String(v.kbVectorStoreId) : null,
     };
-    assistantInfoCache.set(assistantId, { value: val, ts: Date.now() });
+    tenantAiCache.set(t, { value: val, ts: Date.now() });
     return val;
   } catch {
-    return { instructions: '', model: null };
+    const val = { instructions: '', model: null, kbVectorStoreId: null };
+    tenantAiCache.set(t, { value: val, ts: Date.now() });
+    return val;
   }
 }
 
@@ -124,5 +128,5 @@ module.exports = {
   buildTabularHint,
   stripHtml,
   buildRollingSummary,
-  getAssistantInfoCached,
+  getTenantAiProfileCached,
 };

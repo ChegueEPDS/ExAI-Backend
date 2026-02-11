@@ -1,14 +1,24 @@
 const sanitizeHtml = require('sanitize-html');
 const { marked } = require('marked');
+const crypto = require('crypto');
 const logger = require('../config/logger');
 const InjectionRule = require('../models/injectionRule');
 const { resolveUserAndTenant, resolveAssistantForTenant, ensureConversationOwnership } = require('../services/chatAccessService');
 const { resolveUserPlan } = require('../services/chatContextService');
 const { categorizeMessageUsingAI } = require('../helpers/categorizeMessage');
 const { validationResult } = require('express-validator');
-const { getStyleInstructions, buildTabularHint, buildRollingSummary, getAssistantInfoCached } = require('../services/chatPromptService');
+const { getStyleInstructions, buildTabularHint, buildRollingSummary, getTenantAiProfileCached } = require('../services/chatPromptService');
 const { extractOutputTextFromResponse } = require('../helpers/openaiResponses');
 const { createResponse } = require('../helpers/openaiResponses');
+const tenantSettingsStore = require('../services/tenantSettingsStore');
+
+function sha256Short(text) {
+  try {
+    return crypto.createHash('sha256').update(String(text || ''), 'utf8').digest('hex').slice(0, 12);
+  } catch {
+    return null;
+  }
+}
 
 const imageMapping = {
   "építési hely": ["KESZ_7_MELL-1.png", "KESZ_7_MELL-7.png"],
@@ -49,13 +59,11 @@ async function handleSendMessage(req, res) {
       logger.info(`Üzenet fogadva a szálhoz: ${threadId}, Üzenet: ${message}`);
 
       let tenantId;
-      let assistantId;
       let tenantKey;
       try {
         const resolved = await resolveUserAndTenant(req);
         tenantId = resolved.tenantId;
         const assistantCtx = await resolveAssistantForTenant(tenantId, 'CHAT');
-        assistantId = assistantCtx.assistantId;
         tenantKey = assistantCtx.tenantKey;
       } catch (e) {
         return res.status(e?.status || 500).json({ error: e?.message || 'Váratlan hiba történt.' });
@@ -63,10 +71,10 @@ async function handleSendMessage(req, res) {
 
       // Determine user plan (best effort) and log context
       const userPlan = await resolveUserPlan(req, tenantId, logger);
-      logger.info(`[CHAT] Context: thread=${threadId} tenant=${tenantKey} plan=${userPlan} assistantId=${assistantId}`);
+      logger.info(`[CHAT] Context: thread=${threadId} tenant=${tenantKey} plan=${userPlan}`);
 
       let applicableInjection = null;
-      if (tenantKey === 'wolff' || assistantId === process.env.ASSISTANT_ID_WOLFF) {
+      if (tenantKey === 'wolff') {
         const allRules = await InjectionRule.find();
         // Kiválasztjuk azt a szabályt, ami a legtöbb kulcsszót találja meg
         const scoredMatches = allRules
@@ -115,8 +123,8 @@ async function handleSendMessage(req, res) {
       const styleForPlain = getStyleInstructions('plain');
       const tabularHint = buildTabularHint(message);
 
-      const assistantInfo = await getAssistantInfoCached(assistantId);
-      const assistantPrompt = String(assistantInfo?.instructions || '');
+      const tenantAi = await getTenantAiProfileCached(tenantId);
+      const assistantPrompt = String(tenantAi?.instructions || '');
       const baseInstructions = `${assistantPrompt}\n\n${styleForPlain}${convBlock}`.trim();
 
       let finalInstructions = baseInstructions;
@@ -129,7 +137,7 @@ async function handleSendMessage(req, res) {
           `"${applicableInjection}"`;
       }
 
-      const model = String(assistantInfo?.model || conversation?.lastModel || 'gpt-5-mini').trim() || 'gpt-5-mini';
+      const model = String(tenantAi?.model || conversation?.lastModel || 'gpt-5-mini').trim() || 'gpt-5-mini';
       const payload = {
         model,
         store: true,
@@ -138,8 +146,48 @@ async function handleSendMessage(req, res) {
         ...(conversation?.lastResponseId ? { previous_response_id: String(conversation.lastResponseId) } : {}),
         ...(vectorStoreId && typeof vectorStoreId === 'string' && vectorStoreId.trim()
           ? { tools: [{ type: 'file_search', vector_store_ids: [vectorStoreId.trim()] }] }
-          : {}),
+          : (tenantAi?.kbVectorStoreId
+            ? { tools: [{ type: 'file_search', vector_store_ids: [String(tenantAi.kbVectorStoreId)] }] }
+            : {})),
       };
+
+      const chatTuning = await tenantSettingsStore.getChatTuning(tenantId).catch(() => ({
+        temperature: 0,
+        topP: null,
+        maxOutputTokens: 2500,
+        truncation: null,
+        reasoningEffort: null,
+      }));
+
+      const usedVectorStoreId =
+        (vectorStoreId && typeof vectorStoreId === 'string' && vectorStoreId.trim())
+          ? vectorStoreId.trim()
+          : (tenantAi?.kbVectorStoreId ? String(tenantAi.kbVectorStoreId) : null);
+      const vectorStoreSource =
+        (vectorStoreId && typeof vectorStoreId === 'string' && vectorStoreId.trim())
+          ? 'request'
+          : (tenantAi?.kbVectorStoreId ? 'tenant' : 'none');
+
+      logger.info('chat.responses.applied_settings', {
+        requestId: req.requestId || null,
+        threadId,
+        tenantId,
+        tenantKey,
+        plan: userPlan,
+        model: payload.model,
+        previousResponseId: payload.previous_response_id ? String(payload.previous_response_id) : null,
+        vectorStoreId: usedVectorStoreId,
+        vectorStoreSource,
+        temperature: chatTuning.temperature,
+        topP: chatTuning.topP,
+        maxOutputTokens: chatTuning.maxOutputTokens,
+        truncation: chatTuning.truncation,
+        reasoningEffort: chatTuning.reasoningEffort,
+        assistantInstructionsChars: assistantPrompt.length,
+        assistantInstructionsSha: sha256Short(assistantPrompt),
+        finalInstructionsChars: finalInstructions.length,
+        finalInstructionsSha: sha256Short(finalInstructions),
+      });
 
       const respObj = await createResponse({
         model: payload.model,
@@ -148,8 +196,11 @@ async function handleSendMessage(req, res) {
         previousResponseId: payload.previous_response_id || null,
         tools: payload.tools || null,
         store: true,
-        temperature: 0,
-        maxOutputTokens: 2500,
+        temperature: chatTuning.temperature,
+        topP: chatTuning.topP,
+        maxOutputTokens: chatTuning.maxOutputTokens,
+        truncation: chatTuning.truncation,
+        reasoningEffort: chatTuning.reasoningEffort,
         timeoutMs: 60_000,
       });
       let assistantContent = extractOutputTextFromResponse(respObj);
@@ -193,7 +244,7 @@ async function handleSendMessage(req, res) {
       conversation.messages.push({ role: 'user', content: message, ...(finalCategory && { category: finalCategory }) });
       conversation.messages.push(assistantEntry);
       conversation.lastResponseId = responseId || conversation.lastResponseId || null;
-      conversation.lastAssistantId = assistantId || conversation.lastAssistantId || null;
+      conversation.lastAssistantId = null;
       conversation.lastModel = usedModel || conversation.lastModel || null;
 
       await conversation.save();

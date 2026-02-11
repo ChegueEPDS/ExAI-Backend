@@ -14,6 +14,7 @@ const { computeAndStoreDefaultDerivedMetrics } = require('./tableToolService');
 const { extractPdfImageTexts } = require('./pdfVisionService');
 const pinecone = require('./pineconeService');
 const systemSettings = require('./systemSettingsStore');
+const embeddingContext = require('./embeddingContext');
 const logger = require('../config/logger');
 
 const encoder = get_encoding('o200k_base');
@@ -155,7 +156,7 @@ async function ingestTabularFileBuffer({
     storage: { provider: 'azure_blob', blobPath: blobPath || '' },
     approvalStatus: 'pending',
     indexingStatus: 'processing',
-    meta: { uploadedBy: userId },
+    meta: { uploadedBy: userId, embeddingFormatVersion: embeddingContext.getEmbeddingFormatVersion() },
   });
 
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -281,7 +282,12 @@ async function ingestTabularFileBuffer({
         const rowIndex = rangeRow0 + r + 1; // 1-based Excel row number (best-effort)
         const text = buildRowText({ filename, sheet: sheetName, rowIndex, headers, row });
         const tokens = encoder.encode(text).length;
-        const embedding = await createEmbeddingVector(openai, text, embeddingModel);
+        const embeddingText = embeddingContext.buildEmbeddingText({
+          kind: 'table_row',
+          fields: { filename, sheet: sheetName, rowIndex: String(rowIndex) },
+          text,
+        });
+        const embedding = await createEmbeddingVector(openai, embeddingText, embeddingModel);
 
         const rowDoc = await DatasetRowChunk.create({
           tenantId,
@@ -451,7 +457,7 @@ async function ingestDocumentFileBuffer({
     storage: { provider: 'azure_blob', blobPath: blobPath || '' },
     approvalStatus: 'pending',
     indexingStatus: 'processing',
-    meta: { uploadedBy: userId, kind: 'document' },
+    meta: { uploadedBy: userId, kind: 'document', embeddingFormatVersion: embeddingContext.getEmbeddingFormatVersion() },
   });
 
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -516,7 +522,12 @@ async function ingestDocumentFileBuffer({
       const pageOrLoc = String(limited[i]?.pageOrLoc || `chunk:${i + 1}`);
       const pageNumber = Number.isInteger(limited[i]?.pageNumber) ? Number(limited[i].pageNumber) : null;
       const tokens = encoder.encode(chunkText).length;
-      const embedding = await createEmbeddingVector(openai, chunkText, embeddingModel);
+      const embeddingText = embeddingContext.buildEmbeddingText({
+        kind: 'doc_chunk',
+        fields: { filename, pageOrLoc },
+        text: chunkText,
+      });
+      const embedding = await createEmbeddingVector(openai, embeddingText, embeddingModel);
       const docChunk = await DatasetDocChunk.create({
         tenantId,
         projectId,
@@ -572,7 +583,12 @@ async function ingestDocumentFileBuffer({
           const text = String(pages[i]?.text || '').replace(/\u0000/g, '').trim();
           if (!text) continue;
           const tokens = encoder.encode(text).length;
-          const embedding = await createEmbeddingVector(openai, text, embeddingModel);
+          const embeddingText = embeddingContext.buildEmbeddingText({
+            kind: 'image_chunk',
+            fields: { filename, pageOrLoc },
+            text,
+          });
+          const embedding = await createEmbeddingVector(openai, embeddingText, embeddingModel);
           const pageOrLoc = `page:${pageNo} image:1`;
           const imgChunk = await DatasetImageChunk.create({
             tenantId,

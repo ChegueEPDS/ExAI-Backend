@@ -2,8 +2,7 @@ const multer = require('multer');
 const logger = require('../config/logger');
 const { ocrImageBufferToDataplatePrompt, formatDataplateText } = require('../helpers/azureVisionOcr');
 const { extractDataplateFieldsFromOcrText } = require('../helpers/dataplateJsonExtractor');
-const { resolveUserAndTenant, resolveAssistantForTenant } = require('../services/chatAccessService');
-const { getAssistantInfoCached } = require('../services/chatPromptService');
+const { resolveUserAndTenant } = require('../services/chatAccessService');
 const systemSettings = require('../services/systemSettingsStore');
 
 const upload = multer({
@@ -100,16 +99,16 @@ exports.uploadExtract = [
         });
       }
 
-      // 2) Resolve assistant persona/model best-effort (only when auth context exists)
+      // 2) Resolve tenant persona/model best-effort (only when auth context exists)
       let assistantInstructions = '';
       let model = 'gpt-4o-mini';
       try {
         if (req.userId) {
           const { tenantId } = await resolveUserAndTenant(req);
-          const assistantCtx = await resolveAssistantForTenant(tenantId, 'DATAPLATE_EXTRACT');
-          const info = await getAssistantInfoCached(assistantCtx.assistantId);
-          assistantInstructions = String(info?.instructions || '');
-          model = String(info?.model || model).trim() || model;
+          const tenantSettingsStore = require('../services/tenantSettingsStore');
+          const cfg = await tenantSettingsStore.getDataplateExtractConfig(tenantId);
+          assistantInstructions = String(cfg?.extraInstructions || '').trim();
+          model = String(cfg?.model || model).trim() || model;
         }
       } catch {
         // keep defaults

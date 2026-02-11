@@ -1,13 +1,10 @@
 // helpers/openaiCertExtractor.js
-const axios = require('axios');
 const { jsonrepair } = require('jsonrepair');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const certificate = require('../models/certificate');
-
-// Global axios request timeout (per HTTP call)
-axios.defaults.timeout = 60000; // 60s
+const tenantSettingsStore = require('../services/tenantSettingsStore');
 
 // --- transient error helpers + retry wrapper ---
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -40,7 +37,7 @@ async function withRetry(fn, { retries = 5, baseDelay = 500, maxDelay = 5000 } =
 }
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
-const ASSISTANT_ID = process.env.ASSISTANT_ID_CERT || process.env.ASSISTANT_ID || process.env.ASSISTANT_ID_DEFAULT; // dedikált asszisztens ajánlott
+// NOTE: Assistants API is not used anymore (Responses API only).
 
 // JSON schema - kényszerítjük a kimenetet (fallbackként is használható)
 const jsonSchema = {
@@ -128,7 +125,7 @@ function detectDocTypeHeuristic(ocr) {
 
 function assertEnv() {
   if (!OPENAI_KEY) throw new Error("OPENAI_API_KEY is missing");
-  if (!ASSISTANT_ID) throw new Error("ASSISTANT_ID_CERT/ASSISTANT_ID/ASSISTANT_ID_DEFAULT is missing");
+  // No Assistants API dependency.
 }
 
 function enhanceAxiosError(phase, err) {
@@ -354,23 +351,16 @@ function dumpRawIfParseFails(tag, raw) {
 
 const { extractOutputTextFromResponse, createResponse: createResponseHelper } = require('./openaiResponses');
 
-async function fetchAssistantInfo(assistantId) {
-  if (!assistantId) return { instructions: '', model: null };
-  try {
-    const r = await axios.get(`https://api.openai.com/v1/assistants/${assistantId}`, {
-      headers: {
-        'Authorization': `Bearer ${OPENAI_KEY}`,
-        'OpenAI-Beta': 'assistants=v2',
-      },
-      timeout: 60000
-    });
-    return {
-      instructions: String(r.data?.instructions || ''),
-      model: r.data?.model ? String(r.data.model) : null,
-    };
-  } catch (err) {
-    throw enhanceAxiosError('getAssistant', err);
+async function getCertExtractionConfig({ tenantId } = {}) {
+  const t = tenantId ? String(tenantId) : null;
+  if (!t) {
+    return { model: 'gpt-5-mini', instructions: '' };
   }
+  const cfg = await tenantSettingsStore.getCertificateExtractConfig(t);
+  return {
+    model: String(cfg?.model || 'gpt-5-mini').trim() || 'gpt-5-mini',
+    instructions: String(cfg?.extraInstructions || '').trim(),
+  };
 }
 
 async function createResponse({ model, instructions, input, previousResponseId = null, textFormat = null }) {
@@ -519,7 +509,7 @@ if (m) {
 /**
  * OCR → JSON mezők (Assistant v2)
  */
-async function extractCertFieldsFromOCR(ocrText) {
+async function extractCertFieldsFromOCR(ocrText, { tenantId = null } = {}) {
   assertEnv();
 
   // We keep a generous limit for the main run (to stay within model context),
@@ -579,9 +569,9 @@ async function extractCertFieldsFromOCR(ocrText) {
     "-----"
   ].join('\n');
 
-  const assistantInfo = await fetchAssistantInfo(ASSISTANT_ID);
-  const model = String(assistantInfo?.model || 'gpt-5-mini').trim() || 'gpt-5-mini';
-  const assistantInstructions = String(assistantInfo?.instructions || '');
+  const cfg = await getCertExtractionConfig({ tenantId });
+  const model = cfg.model;
+  const assistantInstructions = String(cfg.instructions || '');
 
   // Első kör: json_schema (strict) – kényszerített valid JSON; hiba esetén fallback json_object-ra
   let mainResp = null;

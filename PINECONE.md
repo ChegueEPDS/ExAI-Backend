@@ -16,6 +16,10 @@ This backend can use Pinecone for vector search in the governed dataset flow.
 
 These tuning knobs are configured via the UI (Admin → System settings, SuperAdmin only) and stored in MongoDB (global, applies to all tenants).
 
+Embedding quality (applies to newly ingested content; changing requires reindexing existing content):
+- `EMBEDDING_CONTEXT_HEADER_ENABLED` (default `1`) – prepends a small metadata header to embedding input to improve clause/page retrieval.
+- `EMBEDDING_CONTEXT_HEADER_VERSION` (default `1`) – bump only when changing header layout.
+
 Document chunking (project uploads):
 - `DOCUMENT_CHUNK_TOKENS` (default `450`)
 - `DOCUMENT_CHUNK_OVERLAP` (default `80`)

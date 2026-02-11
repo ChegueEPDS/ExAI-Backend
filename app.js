@@ -53,6 +53,7 @@ const dashboardSettingsRoutes = require('./routes/dashboardSettingsRoutes');
 const dashboardAnalyticsRoutes = require('./routes/dashboardAnalyticsRoutes');
 const plannedInspectionRoutes = require('./routes/plannedInspectionRoutes');
 const systemSettingsRoutes = require('./routes/systemSettingsRoutes');
+const tenantSettingsRoutes = require('./routes/tenantSettingsRoutes');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -243,22 +244,23 @@ app.use((req, res, next) => {
     (req.headers.accept && req.headers.accept.includes('text/event-stream')) ||
     (req.headers['content-type'] && req.headers['content-type'].includes('text/event-stream'));
 
-  if (acceptsSSE) {
+	  if (acceptsSSE) {
     // Extra SSE headers for proxy compatibility and to avoid transforms/buffering
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     // Mark request for downstream handlers (controllers) if needed
     req.isSSE = true;
 
-    if (res.socket && typeof res.socket.setTimeout === 'function') {
-      res.socket.setTimeout(0); // disable idle socket timeout for SSE
-    }
-    req.on('aborted', () => logger.warn('SSE client aborted the connection'));
-    req.on('close',   () => logger.warn('SSE connection closed by client'));
-    res.on('error',   (err) => logger.error('SSE response stream error', err));
-  }
-  next();
-});
+	    if (res.socket && typeof res.socket.setTimeout === 'function') {
+	      res.socket.setTimeout(0); // disable idle socket timeout for SSE
+	    }
+	    req.on('aborted', () => logger.warn('SSE client aborted the connection', { requestId: req.requestId, path: req.originalUrl }));
+	    // Normal behavior for EventSource / stream consumers; keep at debug to avoid log spam.
+	    req.on('close',   () => logger.debug('SSE connection closed by client', { requestId: req.requestId, path: req.originalUrl }));
+	    res.on('error',   (err) => logger.error('SSE response stream error', err));
+	  }
+	  next();
+	});
 
 // SSE hardening for the stream endpoints – SKIP for multipart/form-data uploads
 app.use((req, res, next) => {
@@ -336,6 +338,7 @@ app.use('/api', mobileSyncRoutes);
 app.use('/api', datasetRoutes);
 app.use('/api', standardRoutes);
 app.use('/api', systemSettingsRoutes);
+app.use('/api', tenantSettingsRoutes);
 
 const backgroundJobsDisabled =
   process.env.DISABLE_BACKGROUND_JOBS === '1' ||

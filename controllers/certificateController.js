@@ -1060,7 +1060,8 @@ exports.previewAtex = async (req, res) => {
 
       // 2) OpenAI field extraction (ATEX profile inside the helper)
       console.info(JSON.stringify({ level: 'info', message: '🧠 [ATEX preview] Extracting fields with OpenAI...' }));
-      const aiData = await extractCertFieldsFromOCR(recognizedText || '');
+      const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
+      const aiData = await extractCertFieldsFromOCR(recognizedText || '', { tenantId });
       console.info(JSON.stringify({ level: 'info', message: '✅ [ATEX preview] Field extraction done.', extracted: aiData }));
 
       // 3) Normalize keys for the frontend (expects lower-case keys like in IECEx path)
