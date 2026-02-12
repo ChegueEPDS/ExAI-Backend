@@ -1751,6 +1751,12 @@ exports.chatGovernedStream = async (req, res) => {
       ? (systemSettings.getString('STANDARD_EXPLORER_MODEL') || 'gpt-4o-mini')
       : (systemSettings.getString('FILE_CHAT_COMPLETIONS_MODEL') || 'gpt-5-mini');
     const maxOut = Math.max(600, Math.min(Number(systemSettings.getNumber('STANDARD_EXPLORER_MAX_OUTPUT_TOKENS') || 2500), 10000));
+    const stdTempRaw = Number(systemSettings.getNumber('STANDARD_EXPLORER_TEMPERATURE'));
+    const stdTopPRaw = Number(systemSettings.getNumber('STANDARD_EXPLORER_TOP_P'));
+    const stdTemp = Number.isFinite(stdTempRaw) ? Math.max(0, Math.min(stdTempRaw, 2)) : 0.4;
+    const stdTopP = Number.isFinite(stdTopPRaw) ? Math.max(0, Math.min(stdTopPRaw, 1)) : 0.9;
+    const stdVerbosityRaw = String(systemSettings.getString('STANDARD_EXPLORER_VERBOSITY') || 'medium').toLowerCase();
+    const stdVerbosity = ['low', 'medium', 'high'].includes(stdVerbosityRaw) ? stdVerbosityRaw : 'medium';
     const { createResponse, extractOutputTextFromResponse } = require('../helpers/openaiResponses');
 
     // Strict JSON schema requirement (Responses API):
@@ -1840,7 +1846,9 @@ exports.chatGovernedStream = async (req, res) => {
 	      instructions: system,
 	      input: [{ role: 'user', content: user }],
 	      store: false,
-      temperature: 0,
+      temperature: standardExplorerEnabled ? stdTemp : 0,
+      topP: standardExplorerEnabled ? stdTopP : null,
+      textVerbosity: standardExplorerEnabled ? stdVerbosity : null,
       maxOutputTokens: standardExplorerEnabled ? maxOut : null,
       textFormat: { type: 'json_schema', name: 'governed_answer', strict: true, schema: outSchema },
       timeoutMs: 120_000,
@@ -1948,6 +1956,15 @@ exports.chatGovernedStream = async (req, res) => {
     }
 
     if (standardExplorerEnabled) {
+      function escapeHtml(s) {
+        return String(s || '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
       function sanitizeStandardQuoteForDisplay(q) {
         // Keep line breaks (better for "exact text") but normalize noisy whitespace.
         return String(q || '')
@@ -1975,6 +1992,66 @@ exports.chatGovernedStream = async (req, res) => {
 
         // Fallback: treat whole answer as explanation (we will rebuild the quote-block from quotes[] anyway).
         return txt;
+      }
+
+      function normalizeForCompare(s) {
+        return String(s || '')
+          .toLowerCase()
+          .replace(/\u00A0/g, ' ')
+          .replace(/[\u00AD]/g, '')
+          .replace(/[^a-z0-9\u00C0-\u024F\u1E00-\u1EFF]+/gi, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+
+      function dedupeExplanationAgainstQuotes(expl, quoteBlock) {
+        const explanation = String(expl || '').trim();
+        if (!explanation) return '';
+        const quoteText = String(quoteBlock || '').trim();
+        if (!quoteText) return explanation;
+
+        const quoteNorm = normalizeForCompare(quoteText);
+        const quoteSentences = new Set(
+          quoteText
+            .split(/[\n\.!\?]+/)
+            .map(s => normalizeForCompare(s))
+            .filter(Boolean),
+        );
+
+        const sentences = explanation
+          .split(/(?:[.!?])\s+/)
+          .map(s => s.trim())
+          .filter(Boolean);
+
+        const filtered = sentences.filter(s => {
+          const n = normalizeForCompare(s);
+          if (!n) return false;
+          if (quoteNorm.includes(n)) return false;
+          if (quoteSentences.has(n)) return false;
+          return true;
+        });
+
+        return filtered.join(' ').trim();
+      }
+
+      function buildFallbackExplanation(lang0, stds) {
+        const isHu = String(lang0 || '').toLowerCase() === 'hu';
+        const first = Array.isArray(stds) ? stds.find(Boolean) : null;
+        const clause = String(first?.clauseId || '').trim();
+        const stdRef = String(first?.standardRef || first?.standardId || '').trim();
+        if (isHu) {
+          if (clause || stdRef) return `Röviden: a hivatkozott szakasz (${[stdRef, clause].filter(Boolean).join(', ')}) a kérdéshez tartozó követelményt írja le.`;
+          return 'Röviden: a hivatkozott szakasz a kérdéshez tartozó követelményt írja le.';
+        }
+        if (clause || stdRef) return `In short: the cited section (${[stdRef, clause].filter(Boolean).join(', ')}) states the requirement relevant to the question.`;
+        return 'In short: the cited section states the requirement relevant to the question.';
+      }
+
+      function formatExplanationHtml(expl) {
+        const text = String(expl || '').trim();
+        if (!text) return '';
+        const paragraphs = text.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+        return paragraphs.map(p => `<p>${escapeHtml(p).replace(/\n/g, '<br/>')}</p>`).join('\n');
       }
 
       // In Standard Explorer mode we prefer deterministic, verbatim quotes from the retrieved clauses
@@ -2043,10 +2120,25 @@ exports.chatGovernedStream = async (req, res) => {
           .filter(Boolean);
 
         if (stdQuotes.length) {
-          const explanation = extractExplanationText(answer, lang).trim();
           const quoteBlock = stdQuotes.join('\n\n');
+          let explanation = extractExplanationText(answer, lang).trim();
+          explanation = dedupeExplanationAgainstQuotes(explanation, quoteBlock);
+          if (!explanation) explanation = buildFallbackExplanation(lang, scoredStandards);
+
+          const formattedQuotes = stdQuotes
+            .map(q => {
+              const match = q.match(/\((Source|Forrás):[^\n]*\)\s*$/);
+              const sourceLine = match ? match[0] : '';
+              const body = match ? q.slice(0, q.length - sourceLine.length).trim() : q;
+              const bodyHtml = escapeHtml(body).replace(/\n/g, '<br/>');
+              const sourceHtml = sourceLine ? `<div class="std-quote-source">${escapeHtml(sourceLine)}</div>` : '';
+              return `<blockquote class="std-quote"><p>${bodyHtml}</p>${sourceHtml}</blockquote>`;
+            })
+            .join('\n');
+
+          const explanationHtml = formatExplanationHtml(explanation) || `<p>${escapeHtml(explanation || '')}</p>`;
           // Keep explanation even if empty (UI splitting depends on the tag).
-          answer = `${quoteBlock}\n\n<h3>Explanation:</h3>\n\n${explanation}`.trim();
+          answer = `${formattedQuotes}\n\n<h3>Explanation:</h3>\n\n${explanationHtml}`.trim();
         }
       } catch { }
     }

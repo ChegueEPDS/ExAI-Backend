@@ -135,6 +135,20 @@ const SETTINGS = [
   // Standard Explorer
   { key: 'STANDARD_EXPLORER_MODEL', group: 'Standard Explorer', type: 'string', defaultValue: 'gpt-4o-mini', description: 'Model for Standard Explorer mode.' },
   { key: 'STANDARD_EXPLORER_MAX_OUTPUT_TOKENS', group: 'Standard Explorer', type: 'number', defaultValue: 2500, description: 'Output token budget in Standard Explorer mode.' },
+  { key: 'STANDARD_EXPLORER_TEMPERATURE', group: 'Standard Explorer', type: 'number', defaultValue: 0.4, description: 'Sampling temperature for Standard Explorer (0–2). Lower = more deterministic.' },
+  { key: 'STANDARD_EXPLORER_TOP_P', group: 'Standard Explorer', type: 'number', defaultValue: 0.9, description: 'Nucleus sampling for Standard Explorer (0–1). Use with temperature.' },
+  {
+    key: 'STANDARD_EXPLORER_VERBOSITY',
+    group: 'Standard Explorer',
+    type: 'string',
+    defaultValue: 'medium',
+    description: 'Verbosity for Standard Explorer text output: low | medium | high.',
+    options: [
+      { value: 'low', label: 'low' },
+      { value: 'medium', label: 'medium' },
+      { value: 'high', label: 'high' },
+    ],
+  },
   { key: 'STANDARD_EXPLORER_FALLBACK_MIN_MATCHES', group: 'Standard Explorer', type: 'number', defaultValue: 10, description: 'Min matches threshold before broader standard set fallback.' },
   { key: 'STANDARD_PDF_SAS_TTL_SECONDS', group: 'Standard Explorer', type: 'number', defaultValue: 600, description: 'Signed URL TTL for standard PDFs (seconds).' },
   { key: 'STANDARD_EXPLORER_MAX_QUOTES', group: 'Standard Explorer', type: 'number', defaultValue: 2, description: 'Max number of verbatim standard quotes to include in Standard Explorer mode (kept small to preserve readability and PDF highlighting).' },

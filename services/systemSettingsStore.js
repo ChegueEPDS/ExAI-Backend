@@ -125,6 +125,7 @@ function getAllEffective() {
       type: def.type,
       description: def.description,
       defaultValue: def.defaultValue,
+      options: def.options,
       value,
       overridden,
     };
@@ -205,4 +206,3 @@ module.exports = {
   _resetInMemoryForTests,
   _debug: () => ({ started, lastLoadedAt, size: overrides.size }),
 };
-

@@ -42,6 +42,12 @@ function stripUnsupportedParam(payload, param) {
   if (p === 'max_output_tokens') delete next.max_output_tokens;
   if (p === 'truncation') delete next.truncation;
   if (p === 'reasoning') delete next.reasoning;
+  if (p === 'verbosity' || p === 'text.verbosity') {
+    if (next.text && typeof next.text === 'object') {
+      delete next.text.verbosity;
+      if (!Object.keys(next.text).length) delete next.text;
+    }
+  }
   return next;
 }
 
@@ -52,6 +58,10 @@ function stripAllOptionals(payload) {
   delete next.max_output_tokens;
   delete next.truncation;
   delete next.reasoning;
+  if (next.text && typeof next.text === 'object') {
+    delete next.text.verbosity;
+    if (!Object.keys(next.text).length) delete next.text;
+  }
   return next;
 }
 
@@ -70,6 +80,7 @@ async function createResponse({
   previousResponseId = null,
   tools = null,
   textFormat = null,
+  textVerbosity = null,
   temperature = null,
   topP = null,
   maxOutputTokens = null,
@@ -88,7 +99,12 @@ async function createResponse({
     store: !!store,
     ...(previousResponseId ? { previous_response_id: String(previousResponseId) } : {}),
     ...(Array.isArray(tools) && tools.length ? { tools } : {}),
-    ...(textFormat ? { text: { format: textFormat } } : {}),
+    ...(() => {
+      const text = {};
+      if (textFormat) text.format = textFormat;
+      if (textVerbosity) text.verbosity = textVerbosity;
+      return Object.keys(text).length ? { text } : {};
+    })(),
     ...(temperature === null || temperature === undefined ? {} : { temperature }),
     ...(topP === null || topP === undefined ? {} : { top_p: topP }),
     ...(maxOutputTokens === null || maxOutputTokens === undefined ? {} : { max_output_tokens: maxOutputTokens }),
@@ -101,7 +117,8 @@ async function createResponse({
     Object.prototype.hasOwnProperty.call(basePayload, 'top_p') ||
     Object.prototype.hasOwnProperty.call(basePayload, 'max_output_tokens') ||
     Object.prototype.hasOwnProperty.call(basePayload, 'truncation') ||
-    Object.prototype.hasOwnProperty.call(basePayload, 'reasoning');
+    Object.prototype.hasOwnProperty.call(basePayload, 'reasoning') ||
+    (basePayload.text && Object.prototype.hasOwnProperty.call(basePayload.text, 'verbosity'));
 
   try {
     const resp = await axios.post('https://api.openai.com/v1/responses', basePayload, {
@@ -167,6 +184,7 @@ async function createResponseStream({
   previousResponseId = null,
   tools = null,
   textFormat = null,
+  textVerbosity = null,
   temperature = null,
   topP = null,
   maxOutputTokens = null,
@@ -186,7 +204,12 @@ async function createResponseStream({
     stream: true,
     ...(previousResponseId ? { previous_response_id: String(previousResponseId) } : {}),
     ...(Array.isArray(tools) && tools.length ? { tools } : {}),
-    ...(textFormat ? { text: { format: textFormat } } : {}),
+    ...(() => {
+      const text = {};
+      if (textFormat) text.format = textFormat;
+      if (textVerbosity) text.verbosity = textVerbosity;
+      return Object.keys(text).length ? { text } : {};
+    })(),
     ...(temperature === null || temperature === undefined ? {} : { temperature }),
     ...(topP === null || topP === undefined ? {} : { top_p: topP }),
     ...(maxOutputTokens === null || maxOutputTokens === undefined ? {} : { max_output_tokens: maxOutputTokens }),
@@ -199,7 +222,8 @@ async function createResponseStream({
     Object.prototype.hasOwnProperty.call(basePayload, 'top_p') ||
     Object.prototype.hasOwnProperty.call(basePayload, 'max_output_tokens') ||
     Object.prototype.hasOwnProperty.call(basePayload, 'truncation') ||
-    Object.prototype.hasOwnProperty.call(basePayload, 'reasoning');
+    Object.prototype.hasOwnProperty.call(basePayload, 'reasoning') ||
+    (basePayload.text && Object.prototype.hasOwnProperty.call(basePayload.text, 'verbosity'));
 
   try {
     const resp = await axios({
