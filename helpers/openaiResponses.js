@@ -17,6 +17,52 @@ function extractOutputTextFromResponse(responseObj) {
   return text;
 }
 
+function safeJsonStringify(v, maxLen = 2000) {
+  try {
+    const s = JSON.stringify(v);
+    return s.length > maxLen ? s.slice(0, maxLen) : s;
+  } catch {
+    try {
+      const s = String(v);
+      return s.length > maxLen ? s.slice(0, maxLen) : s;
+    } catch {
+      return '';
+    }
+  }
+}
+
+function stripUnsupportedParam(payload, param) {
+  const p = String(param || '').trim();
+  if (!p) return payload;
+  const next = { ...(payload || {}) };
+
+  // Only strip safe, optional knobs. Do NOT strip core request fields.
+  if (p === 'temperature') delete next.temperature;
+  if (p === 'top_p') delete next.top_p;
+  if (p === 'max_output_tokens') delete next.max_output_tokens;
+  if (p === 'truncation') delete next.truncation;
+  if (p === 'reasoning') delete next.reasoning;
+  return next;
+}
+
+function stripAllOptionals(payload) {
+  const next = { ...(payload || {}) };
+  delete next.temperature;
+  delete next.top_p;
+  delete next.max_output_tokens;
+  delete next.truncation;
+  delete next.reasoning;
+  return next;
+}
+
+function detectUnsupportedParamFromError(data) {
+  const param = data?.error?.param ? String(data.error.param) : '';
+  if (param) return param;
+  const msg = data?.error?.message ? String(data.error.message) : '';
+  const m = msg.match(/Unsupported parameter:\s*'([^']+)'/i);
+  return m?.[1] ? String(m[1]) : '';
+}
+
 async function createResponse({
   model,
   instructions = '',
@@ -50,13 +96,10 @@ async function createResponse({
     ...(reasoningEffort ? { reasoning: { effort: String(reasoningEffort) } } : {}),
   };
 
-  const strippedPayload = { ...basePayload };
-  delete strippedPayload.top_p;
-  delete strippedPayload.truncation;
-  delete strippedPayload.reasoning;
-
   const hasOptionals =
+    Object.prototype.hasOwnProperty.call(basePayload, 'temperature') ||
     Object.prototype.hasOwnProperty.call(basePayload, 'top_p') ||
+    Object.prototype.hasOwnProperty.call(basePayload, 'max_output_tokens') ||
     Object.prototype.hasOwnProperty.call(basePayload, 'truncation') ||
     Object.prototype.hasOwnProperty.call(basePayload, 'reasoning');
 
@@ -69,37 +112,43 @@ async function createResponse({
   } catch (e) {
     const status = e?.response?.status;
     const data = e?.response?.data;
-    const detail =
-      data && typeof data === 'object'
-        ? JSON.stringify(data).slice(0, 2000)
-        : data
-          ? String(data).slice(0, 2000)
-          : '';
+    const detail = (data && typeof data === 'object') ? safeJsonStringify(data) : (data ? String(data).slice(0, 2000) : '');
+
     // Best-effort fallback: if optional knobs aren't supported by the chosen model,
-    // retry once without them to avoid hard failures in prod.
+    // retry a few times stripping only the unsupported parameter(s).
     if (status === 400 && hasOptionals) {
-      try {
-        const resp2 = await axios.post('https://api.openai.com/v1/responses', strippedPayload, {
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-          timeout: timeoutMs,
-        });
-        return resp2.data;
-      } catch (e2) {
-        const status2 = e2?.response?.status;
-        const data2 = e2?.response?.data;
-        const detail2 =
-          data2 && typeof data2 === 'object'
-            ? JSON.stringify(data2).slice(0, 2000)
-            : data2
-              ? String(data2).slice(0, 2000)
-              : '';
-        const msg2 = status2
-          ? `OpenAI Responses API error ${status2}: ${detail2 || e2?.message || 'request_failed'}`
-          : (e2?.message || 'request_failed');
-        const err2 = new Error(msg2);
-        err2.status = status2;
-        err2.detail = detail2;
-        throw err2;
+      let payload = { ...basePayload };
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const unsupported = detectUnsupportedParamFromError(data);
+        const next = stripUnsupportedParam(payload, unsupported);
+        // If we couldn't strip anything, abort retries.
+        if (next === payload || safeJsonStringify(next) === safeJsonStringify(payload)) {
+          // Fallback: drop all optional knobs in one go.
+          payload = stripAllOptionals(payload);
+        } else {
+          payload = next;
+        }
+        try {
+          const resp2 = await axios.post('https://api.openai.com/v1/responses', payload, {
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+            timeout: timeoutMs,
+          });
+          return resp2.data;
+        } catch (e2) {
+          const status2 = e2?.response?.status;
+          const data2 = e2?.response?.data;
+          // Only continue retry loop on 400; otherwise rethrow as final.
+          if (status2 !== 400) {
+            const detail2 = (data2 && typeof data2 === 'object') ? safeJsonStringify(data2) : (data2 ? String(data2).slice(0, 2000) : '');
+            const msg2 = status2
+              ? `OpenAI Responses API error ${status2}: ${detail2 || e2?.message || 'request_failed'}`
+              : (e2?.message || 'request_failed');
+            const err2 = new Error(msg2);
+            err2.status = status2;
+            err2.detail = detail2;
+            throw err2;
+          }
+        }
       }
     }
 
@@ -145,12 +194,10 @@ async function createResponseStream({
     ...(reasoningEffort ? { reasoning: { effort: String(reasoningEffort) } } : {}),
   };
 
-  const strippedPayload = { ...basePayload };
-  delete strippedPayload.top_p;
-  delete strippedPayload.truncation;
-  delete strippedPayload.reasoning;
   const hasOptionals =
+    Object.prototype.hasOwnProperty.call(basePayload, 'temperature') ||
     Object.prototype.hasOwnProperty.call(basePayload, 'top_p') ||
+    Object.prototype.hasOwnProperty.call(basePayload, 'max_output_tokens') ||
     Object.prototype.hasOwnProperty.call(basePayload, 'truncation') ||
     Object.prototype.hasOwnProperty.call(basePayload, 'reasoning');
 
@@ -171,21 +218,37 @@ async function createResponseStream({
     return resp.data; // node stream
   } catch (e) {
     const status = e?.response?.status;
+    const data = e?.response?.data;
     if (status === 400 && hasOptionals) {
-      const resp2 = await axios({
-        method: 'post',
-        url: 'https://api.openai.com/v1/responses',
-        data: strippedPayload,
-        responseType: 'stream',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'text/event-stream',
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          Connection: 'keep-alive'
-        },
-        timeout: timeoutMs,
-      });
-      return resp2.data;
+      let payload = { ...basePayload };
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const unsupported = detectUnsupportedParamFromError(data);
+        const next = stripUnsupportedParam(payload, unsupported);
+        if (next === payload || safeJsonStringify(next) === safeJsonStringify(payload)) {
+          payload = stripAllOptionals(payload);
+        } else {
+          payload = next;
+        }
+        try {
+          const resp2 = await axios({
+            method: 'post',
+            url: 'https://api.openai.com/v1/responses',
+            data: payload,
+            responseType: 'stream',
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'text/event-stream',
+              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+              Connection: 'keep-alive'
+            },
+            timeout: timeoutMs,
+          });
+          return resp2.data;
+        } catch (e2) {
+          const status2 = e2?.response?.status;
+          if (status2 !== 400) throw e2;
+        }
+      }
     }
     throw e;
   }

@@ -1949,13 +1949,12 @@ exports.chatGovernedStream = async (req, res) => {
 
     if (standardExplorerEnabled) {
       function sanitizeStandardQuoteForDisplay(q) {
+        // Keep line breaks (better for "exact text") but normalize noisy whitespace.
         return String(q || '')
-          .replace(/\s*\[(?:SOURCE|Source):[^\]]+\]\s*/g, ' ')
-          .replace(/\s*\((?:SOURCE|Source):[^)]+\)\s*/g, ' ')
-          .replace(/\s*SOURCE:\s*.+$/gmi, ' ')
           .replace(/\u00A0/g, ' ')
           .replace(/\u00AD/g, '') // soft hyphen
-          .replace(/\s+/g, ' ')
+          .replace(/[ \t]+/g, ' ')
+          .replace(/\n{3,}/g, '\n\n')
           .trim();
       }
 
@@ -1978,8 +1977,62 @@ exports.chatGovernedStream = async (req, res) => {
         return txt;
       }
 
-      answer = stripStandardExplorerScaffolding(answer);
-      quotes = enrichQuotesWithStandardRef(quotes);
+      // In Standard Explorer mode we prefer deterministic, verbatim quotes from the retrieved clauses
+      // (model-generated excerpts can drift, which breaks PDF highlighting and "exact quote" requirements).
+      function stripStdIngestHeaders(t) {
+        const s = String(t || '').replace(/\u0000/g, '').trim();
+        if (!s) return '';
+        const lines = s.split('\n');
+        const kept = [];
+        for (let i = 0; i < lines.length; i += 1) {
+          const ln = String(lines[i] || '').trim();
+          // Drop ingestion headers that are not part of the standard text.
+          if (/^(FILE|PAGE)\s*=\s*/i.test(ln)) continue;
+          kept.push(lines[i]);
+        }
+        return kept.join('\n').trim();
+      }
+
+      function buildForcedStandardExplorerQuotes() {
+        const out = [];
+        const maxQuotes = Math.max(1, Math.min(Number(systemSettings.getNumber('STANDARD_EXPLORER_MAX_QUOTES') || 2), 6));
+        const stds = Array.isArray(scoredStandards) ? scoredStandards : [];
+        for (const s of stds) {
+          if (!s) continue;
+          const quoteTextRaw = stripStdIngestHeaders(s.text);
+          if (!quoteTextRaw) continue;
+          const fileName = `${String(s.standardId || '').trim()}${s.edition ? `:${String(s.edition).trim()}` : ''}`.trim() || String(s.standardId || '').trim();
+          const clauseId = String(s.clauseId || '').trim() || null;
+          const pageOrLoc = String(s.pageOrLoc || '').trim() || '';
+          const sourceLabel = String(lang || '').toLowerCase() === 'hu' ? 'Forrás' : 'Source';
+          const sourceParts = [fileName];
+          if (clauseId) sourceParts.push(clauseId);
+          if (pageOrLoc) sourceParts.push(pageOrLoc);
+          const sourceLine = sourceParts.length ? `(${sourceLabel}: ${sourceParts.join(', ')})` : '';
+          const quote = sourceLine ? `${quoteTextRaw}\n\n${sourceLine}` : quoteTextRaw;
+          out.push({
+            fileName,
+            standardRef: s.standardRef ? String(s.standardRef) : null,
+            clauseId,
+            pageOrLoc,
+            quote,
+            sourceType: 'standard',
+          });
+          if (out.length >= maxQuotes) break;
+        }
+        return out;
+      }
+
+      const forcedQuotes = buildForcedStandardExplorerQuotes();
+      if (forcedQuotes.length) {
+        quotes = forcedQuotes;
+        numericEvidence = [];
+        const expl = extractExplanationText(answer, lang).trim();
+        answer = `<h3>Explanation:</h3>\n\n${expl}`.trim();
+      } else {
+        answer = stripStandardExplorerScaffolding(answer);
+        quotes = enrichQuotesWithStandardRef(quotes);
+      }
 
       // Hard-enforce the legacy format using the structured quotes[]:
       // - verbatim quotes first (no labels), then the exact <h3>Explanation:</h3>, then explanation.

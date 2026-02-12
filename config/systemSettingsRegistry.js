@@ -137,6 +137,7 @@ const SETTINGS = [
   { key: 'STANDARD_EXPLORER_MAX_OUTPUT_TOKENS', group: 'Standard Explorer', type: 'number', defaultValue: 2500, description: 'Output token budget in Standard Explorer mode.' },
   { key: 'STANDARD_EXPLORER_FALLBACK_MIN_MATCHES', group: 'Standard Explorer', type: 'number', defaultValue: 10, description: 'Min matches threshold before broader standard set fallback.' },
   { key: 'STANDARD_PDF_SAS_TTL_SECONDS', group: 'Standard Explorer', type: 'number', defaultValue: 600, description: 'Signed URL TTL for standard PDFs (seconds).' },
+  { key: 'STANDARD_EXPLORER_MAX_QUOTES', group: 'Standard Explorer', type: 'number', defaultValue: 2, description: 'Max number of verbatim standard quotes to include in Standard Explorer mode (kept small to preserve readability and PDF highlighting).' },
 
   // Embeddings
   { key: 'EMBEDDING_CONTEXT_HEADER_ENABLED', group: 'Embeddings', type: 'boolean', defaultValue: true, description: 'Prepend a small context header to embedding input (files/clauses metadata) to improve retrieval. Changing this requires reindexing existing datasets/standards for consistent results.' },
