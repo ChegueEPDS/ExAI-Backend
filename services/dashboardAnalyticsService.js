@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const Equipment = require('../models/dataplate');
+const Unit = require('../models/unit');
 const Inspection = require('../models/inspection');
 const MaintenanceEvent = require('../models/maintenanceEvent');
 const Tenant = require('../models/tenant');
@@ -92,9 +93,16 @@ async function resolveEquipments({ tenantId, siteId = null, zoneId = null }) {
 
   const filter = { tenantId: tenantObjectId };
   if (siteObjectId) filter.Site = siteObjectId;
-  if (zoneObjectId) filter.Zone = zoneObjectId;
+  if (zoneObjectId) {
+    const unitIds = await Unit.find({
+      tenantId: tenantObjectId,
+      $or: [{ _id: zoneObjectId }, { ancestors: zoneObjectId }]
+    }).select('_id').lean();
+    const ids = unitIds.map(u => u._id);
+    filter.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
+  }
 
-  const equipments = await Equipment.find(filter).select('_id EqID TagNo Site Zone').lean();
+  const equipments = await Equipment.find(filter).select('_id EqID TagNo Site Unit Zone').lean();
   return equipments || [];
 }
 

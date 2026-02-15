@@ -301,7 +301,7 @@ exports.createInspection = async (req, res) => {
       eqId: eqIdString,
       tenantId,
       siteId: equipment.Site || null,
-      zoneId: equipment.Zone || null,
+      zoneId: equipment.Unit || equipment.Zone || null,
       inspectionDate: new Date(inspectionDate),
       validUntil: new Date(validUntil),
       inspectionType,
@@ -557,7 +557,7 @@ exports.getInspectionById = async (req, res) => {
     }
 
     const inspection = await Inspection.findOne({ _id: id, tenantId })
-      .populate('equipmentId', 'EqID Manufacturer "Model/Type" Zone Site')
+      .populate('equipmentId', 'EqID Manufacturer "Model/Type" Unit Zone Site')
       .populate('inspectorId', 'name email');
 
     if (!inspection) {

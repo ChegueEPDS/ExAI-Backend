@@ -9,6 +9,7 @@ const Inspection = require('../models/inspection');
 const Dataplate = require('../models/dataplate');
 const Site = require('../models/site');
 const Zone = require('../models/zone');
+const Unit = require('../models/unit');
 const Certificate = require('../models/certificate');
 const User = require('../models/user');
 const ReportExportJob = require('../models/reportExportJob');
@@ -280,6 +281,16 @@ async function getZoneCached(zoneId, cache) {
   const zone = await Zone.findById(zoneId).lean();
   if (cache) cache.set(key, zone);
   return zone;
+}
+
+async function addZoneScopeToEquipmentFilter({ tenantId, zoneId, equipmentFilter }) {
+  if (!zoneId) return;
+  const unitIds = await Unit.find({
+    tenantId,
+    $or: [{ _id: zoneId }, { ancestors: zoneId }]
+  }).select('_id').lean();
+  const ids = unitIds.map(u => u._id);
+  equipmentFilter.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
 }
 
 async function resolveSchemeFromEquipment(equipment, certificateCache) {
@@ -1821,7 +1832,7 @@ function buildProjectExRegisterWorkbook(equipments, {
   let equipmentIndex = 0;
   for (const eq of equipments) {
     equipmentIndex += 1;
-    const zone = eq.Zone ? zoneMap.get(eq.Zone.toString()) : null;
+    const zone = (eq.Unit || eq.Zone) ? zoneMap.get(String(eq.Unit || eq.Zone)) : null;
 
     let inspection = null;
     if (eq.lastInspectionId) {
@@ -2369,7 +2380,7 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName, requ
       inspectionByEquipment.get(eqIdStr);
     if (!inspection) continue;
 
-    const zoneId = eq.Zone ? eq.Zone.toString() : null;
+    const zoneId = (eq.Unit || eq.Zone) ? String(eq.Unit || eq.Zone) : null;
     const zone = zoneId ? zoneMap.get(zoneId) : null;
 
     const identifier =
@@ -2528,7 +2539,9 @@ async function generateLatestInspectionArchive(
   }
 
   const equipmentFilter = { tenantId };
-  if (zoneId) equipmentFilter.Zone = zoneId;
+  if (zoneId) {
+    await addZoneScopeToEquipmentFilter({ tenantId, zoneId, equipmentFilter });
+  }
   if (siteId) equipmentFilter.Site = siteId;
 
   const equipments = await Dataplate.find(equipmentFilter).lean();
@@ -2973,7 +2986,9 @@ exports.exportPunchlistXLSX = async (req, res) => {
 
     const equipmentFilter = { tenantId };
     if (siteId) equipmentFilter.Site = siteId;
-    if (zoneId) equipmentFilter.Zone = zoneId;
+    if (zoneId) {
+      await addZoneScopeToEquipmentFilter({ tenantId, zoneId, equipmentFilter });
+    }
 
     const equipments = await Dataplate.find(equipmentFilter).lean();
     if (!equipments || equipments.length === 0) {

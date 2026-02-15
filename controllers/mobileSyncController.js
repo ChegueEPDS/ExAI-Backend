@@ -5,7 +5,7 @@ const heicConvert = require('heic-convert');
 
 const Equipment = require('../models/dataplate');
 const Site = require('../models/site');
-const Zone = require('../models/zone');
+const Unit = require('../models/unit');
 const ProcessingJob = require('../models/processingJob');
 const azureBlob = require('../services/azureBlobService');
 const { createEquipmentDataVersion } = require('../services/equipmentVersioningService');
@@ -32,10 +32,10 @@ function buildTenantRoot(tenantName, tenantId) {
   return `${tn}`;
 }
 
-function buildEquipmentPrefix(tenantName, tenantId, siteName, zoneName, eqId) {
+function buildEquipmentPrefix(tenantName, tenantId, siteId, unitId, eqId) {
   const root = buildTenantRoot(tenantName, tenantId);
-  if (siteName && zoneName) {
-    return `${root}/projects/${slug(siteName)}/${slug(zoneName)}/${slug(eqId)}`;
+  if (siteId && unitId) {
+    return `${root}/projects/${siteId}/${unitId}/${slug(eqId)}`;
   }
   return `${root}/equipment/${slug(eqId)}`;
 }
@@ -84,7 +84,7 @@ function normalizeSeverity(input) {
 async function getNextOrderIndex(tenantId, siteId = null, zoneId = null) {
   const filter = { tenantId };
   if (siteId) filter.Site = siteId;
-  if (zoneId) filter.Zone = zoneId;
+  if (zoneId) filter.$or = [{ Unit: zoneId }, { Zone: zoneId }];
 
   const maxDoc = await Equipment.find(filter).sort({ orderIndex: -1 }).select('orderIndex').limit(1).lean();
   const currentMax =
@@ -198,17 +198,15 @@ exports.mobileSync = async (req, res) => {
   const zoneIds = new Set();
   for (const item of items) {
     const siteId = toObjectId(item?.Site || item?.siteId);
-    const zoneId = toObjectId(item?.Zone || item?.zoneId);
+    const zoneId = toObjectId(item?.Unit || item?.unitId || item?.Zone || item?.zoneId);
     if (siteId) siteIds.add(siteId.toString());
     if (zoneId) zoneIds.add(zoneId.toString());
   }
 
-  const [sites, zones] = await Promise.all([
-    Site.find({ _id: { $in: Array.from(siteIds) }, tenantId }).select('_id Name').lean(),
-    Zone.find({ _id: { $in: Array.from(zoneIds) }, tenantId }).select('_id Name').lean()
+  await Promise.all([
+    Site.find({ _id: { $in: Array.from(siteIds) }, tenantId }).select('_id').lean(),
+    Unit.find({ _id: { $in: Array.from(zoneIds) }, tenantId }).select('_id').lean()
   ]);
-  const siteNameById = new Map(sites.map((s) => [String(s._id), s.Name]));
-  const zoneNameById = new Map(zones.map((z) => [String(z._id), z.Name]));
 
   const tempIdToEquipmentId = {};
   // Only newly created equipment should be post-processed (OCR + auto inspection).
@@ -237,7 +235,7 @@ exports.mobileSync = async (req, res) => {
       }
     }
     const siteId = toObjectId(item?.Site || item?.siteId);
-    const zoneId = toObjectId(item?.Zone || item?.zoneId);
+    const zoneId = toObjectId(item?.Unit || item?.unitId || item?.Zone || item?.zoneId);
     if (!siteId || !zoneId) {
       return res.status(400).json({ message: `Item ${tempId}: missing Site/Zone.` });
     }
@@ -277,6 +275,7 @@ exports.mobileSync = async (req, res) => {
       existing.ModifiedBy = userId;
       existing.Site = siteId;
       existing.Zone = zoneId;
+      existing.Unit = zoneId;
       if (!existing.mobileSync || typeof existing.mobileSync !== 'object') existing.mobileSync = {};
       if (!existing.mobileSync.tempId) existing.mobileSync.tempId = tempId;
       if (eqIdRaw) existing.EqID = EqID;
@@ -301,6 +300,7 @@ exports.mobileSync = async (req, res) => {
         EqID: EqID,
         Site: siteId,
         Zone: zoneId,
+        Unit: zoneId,
         Compliance: compliance,
         'Other Info': otherInfo,
         isProcessed: false,
@@ -355,10 +355,8 @@ exports.mobileSync = async (req, res) => {
     const matchingFiles = files.filter((f) => parseFileKeyFromOriginalName(f.originalname) === tempId);
     if (!matchingFiles.length) continue;
 
-    const siteName = siteNameById.get(String(siteId)) || `Site_${siteId}`;
-    const zoneName = zoneNameById.get(String(zoneId)) || `Zone_${zoneId}`;
     const eqIdForPrefix = saved.EqID || EqID;
-    const eqPrefix = buildEquipmentPrefix(tenantName, tenantIdStr, siteName, zoneName, eqIdForPrefix);
+    const eqPrefix = buildEquipmentPrefix(tenantName, tenantIdStr, String(siteId), String(zoneId), eqIdForPrefix);
 
     let attachedDataplate = false;
     for (const file of matchingFiles) {

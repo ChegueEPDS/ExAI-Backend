@@ -366,7 +366,7 @@ async function ensureAutoInspectionFromMobileSync({
     eqId: equipmentDoc.EqID || String(equipmentDoc._id),
     tenantId,
     siteId: equipmentDoc.Site || null,
-    zoneId: equipmentDoc.Zone || null,
+    zoneId: equipmentDoc.Unit || equipmentDoc.Zone || null,
     inspectionDate,
     validUntil,
     inspectionType,

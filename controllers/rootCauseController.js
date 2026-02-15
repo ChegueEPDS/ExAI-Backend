@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const Equipment = require('../models/dataplate');
 const MaintenanceEvent = require('../models/maintenanceEvent');
 const Inspection = require('../models/inspection');
+const Unit = require('../models/unit');
 
 function toObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
@@ -30,7 +31,14 @@ async function resolveEquipmentIds({ tenantId, siteId = null, zoneId = null }) {
 
   const filter = { tenantId: tenantObjectId };
   if (siteObjectId) filter.Site = siteObjectId;
-  if (zoneObjectId) filter.Zone = zoneObjectId;
+  if (zoneObjectId) {
+    const unitIds = await Unit.find({
+      tenantId: tenantObjectId,
+      $or: [{ _id: zoneObjectId }, { ancestors: zoneObjectId }]
+    }).select('_id').lean();
+    const ids = unitIds.map(u => u._id);
+    filter.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
+  }
 
   const equipments = await Equipment.find(filter).select('_id').lean();
   return (equipments || []).map((e) => e._id).filter(Boolean);

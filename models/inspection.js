@@ -69,7 +69,7 @@ const InspectionSchema = new Schema(
 
     tenantId: { type: Schema.Types.ObjectId, ref: 'Tenant', required: false },
     siteId: { type: Schema.Types.ObjectId, ref: 'Site', required: false },
-    zoneId: { type: Schema.Types.ObjectId, ref: 'Zone', required: false },
+    zoneId: { type: Schema.Types.ObjectId, ref: 'Unit', required: false },
 
     // 1. Metaadatok a vizsgálatról
     inspectionDate: { type: Date, required: true },  // mikor végezték (user adja meg)

@@ -124,8 +124,4 @@ router.delete('/exreg/:id', authMiddleware(), requirePermission('asset:write'), 
 // Tömeges törlés
 router.post('/exreg/bulk-delete', authMiddleware(), requirePermission('asset:write'), express.json(), exRegisterController.bulkDeleteEquipment);
 
-// Gyártók lekérdezése
-router.get('/manufacturers', authMiddleware(), exRegisterController.getManufacturers);
-
-
 module.exports = router;

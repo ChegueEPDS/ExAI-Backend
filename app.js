@@ -54,6 +54,7 @@ const dashboardAnalyticsRoutes = require('./routes/dashboardAnalyticsRoutes');
 const plannedInspectionRoutes = require('./routes/plannedInspectionRoutes');
 const systemSettingsRoutes = require('./routes/systemSettingsRoutes');
 const tenantSettingsRoutes = require('./routes/tenantSettingsRoutes');
+const manufacturerRoutes = require('./routes/manufacturerRoutes');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -315,6 +316,7 @@ app.use('/api', certificateDraftRoutes);
 app.use('/api/cert-requests', certificateRequestRoutes);
 app.use('/api/questions', questionsRoutes);
 app.use('/api/zones', zoneRoutes);
+app.use('/api/units', zoneRoutes);
 app.use('/api/sites', siteRoutes);
 app.use('/api/graph', graphRoutes);
 app.use('/api', injectionRoutes);
@@ -339,6 +341,7 @@ app.use('/api', datasetRoutes);
 app.use('/api', standardRoutes);
 app.use('/api', systemSettingsRoutes);
 app.use('/api', tenantSettingsRoutes);
+app.use('/api', manufacturerRoutes);
 
 const backgroundJobsDisabled =
   process.env.DISABLE_BACKGROUND_JOBS === '1' ||

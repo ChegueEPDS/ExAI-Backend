@@ -154,7 +154,7 @@ function buildTenantRoot(tenantName, tenantId) {
 // 🔢 Következő sorszám kiszámítása az adott zónán/projekten belül
 async function getNextOrderIndex(tenantId, siteId, zoneId) {
   const filter = { tenantId };
-  if (zoneId) filter.Zone = zoneId;
+  if (zoneId) filter.$or = [{ Unit: zoneId }, { Zone: zoneId }];
   if (siteId) filter.Site = siteId;
 
   const maxDoc = await Equipment.find(filter)
@@ -176,10 +176,10 @@ function normalizeImageTag(tag, fallback = 'general') {
   const value = typeof tag === 'string' ? tag.trim().toLowerCase() : '';
   return allowed.includes(value) ? value : fallback;
 }
-function buildEquipmentPrefix(tenantName, tenantId, siteName, zoneName, eqId) {
+function buildEquipmentPrefix(tenantName, tenantId, siteId, unitId, eqId) {
   const root = buildTenantRoot(tenantName, tenantId);
-  if (siteName && zoneName) {
-    return `${root}/projects/${slug(siteName)}/${slug(zoneName)}/${slug(eqId)}`;
+  if (siteId && unitId) {
+    return `${root}/projects/${siteId}/${unitId}/${slug(eqId)}`;
   }
   return `${root}/equipment/${slug(eqId)}`;
 }
@@ -689,15 +689,9 @@ exports.createEquipment = async (req, res) => {
         existingEquipment = await Equipment.findOne({ _id, tenantId });
       }
 
-      let zoneDoc = null;
-      let siteDoc = null;
-      if (equipment.Zone && equipment.Site) {
-        zoneDoc = await Zone.findById(equipment.Zone).lean();
-        siteDoc = await Site.findById(equipment.Site).lean();
-      }
-      const zoneName = zoneDoc?.Name || (equipment.Zone ? `Zone_${equipment.Zone}` : null);
-      const siteName = siteDoc?.Name || (equipment.Site ? `Site_${equipment.Site}` : null);
-      const eqPrefix = buildEquipmentPrefix(tenantName, tenantId, siteName, zoneName, eqIdForBlob);
+      const siteIdForPrefix = equipment.Site ? String(equipment.Site) : null;
+      const unitIdForPrefix = equipment.Unit || equipment.Zone ? String(equipment.Unit || equipment.Zone) : null;
+      const eqPrefix = buildEquipmentPrefix(tenantName, tenantId, siteIdForPrefix, unitIdForPrefix, eqIdForBlob);
 
       const equipmentFiles = files.filter(file => {
         const eqIdInName = file.originalname.split('__')[0];
@@ -752,6 +746,9 @@ exports.createEquipment = async (req, res) => {
         tenantId,
         Pictures: [...(existingEquipment?.Pictures || []), ...pictures]
       };
+      if (!updateFields.Unit && updateFields.Zone) {
+        updateFields.Unit = updateFields.Zone;
+      }
 
       // Ha az UI nem ad meg orderIndex-et, automatikusan kiosztjuk a következő szabad sorszámot
       if (updateFields.orderIndex == null) {
@@ -831,15 +828,9 @@ exports.uploadImagesToEquipment = async (req, res) => {
     if (!equipment) return res.status(404).json({ message: "Equipment not found" });
 
     const tenantName = req.scope?.tenantName || '';
-    let zoneDoc = null;
-    let siteDoc = null;
-    if (equipment.Zone && equipment.Site) {
-      zoneDoc = await Zone.findById(equipment.Zone);
-      siteDoc = await Site.findById(equipment.Site);
-    }
-    const zoneName = zoneDoc?.Name || (equipment.Zone ? `Zone_${equipment.Zone}` : null);
-    const siteName = siteDoc?.Name || (equipment.Site ? `Site_${equipment.Site}` : null);
-    const eqPrefix = buildEquipmentPrefix(tenantName, tenantId, siteName, zoneName, equipment.EqID);
+    const siteIdForPrefix = equipment.Site ? String(equipment.Site) : null;
+    const unitIdForPrefix = equipment.Unit || equipment.Zone ? String(equipment.Unit || equipment.Zone) : null;
+    const eqPrefix = buildEquipmentPrefix(tenantName, tenantId, siteIdForPrefix, unitIdForPrefix, equipment.EqID);
 
     console.log('📥 Képfeltöltési kérés érkezett:', {
       equipmentId: req.params.id,
@@ -903,19 +894,13 @@ exports.uploadDocumentsToEquipment = async (req, res) => {
 
     const tenantName = req.scope?.tenantName || '';
 
-    let zoneDoc = null;
-    let siteDoc = null;
-    if (equipment.Zone && equipment.Site) {
-      zoneDoc = await Zone.findById(equipment.Zone);
-      siteDoc = await Site.findById(equipment.Site);
-    }
-    const zoneName = zoneDoc?.Name || (equipment.Zone ? `Zone_${equipment.Zone}` : null);
-    const siteName = siteDoc?.Name || (equipment.Site ? `Site_${equipment.Site}` : null);
+    const siteIdForPrefix = equipment.Site ? String(equipment.Site) : null;
+    const unitIdForPrefix = equipment.Unit || equipment.Zone ? String(equipment.Unit || equipment.Zone) : null;
     const eqPrefix = buildEquipmentPrefix(
       tenantName,
       tenantId,
-      siteName,
-      zoneName,
+      siteIdForPrefix,
+      unitIdForPrefix,
       equipment.EqID || equipment._id.toString()
     );
 
@@ -1246,6 +1231,7 @@ exports.importEquipmentXLSX = async (req, res) => {
       try {
         const payload = { ...entry.base };
         payload.Zone = zone._id;
+        payload.Unit = zone._id;
         payload.Site = zone.Site || null;
         if (entry.orderIndex != null) {
           payload.orderIndex = entry.orderIndex;
@@ -1687,7 +1673,7 @@ async function runEquipmentDocumentsZipImportJob({
     for (const [equipmentId, items] of docsByEquipment.entries()) {
       const eqFilter = { _id: equipmentId, tenantId: tenantObjectId };
       if (zoneObjectId) {
-        Object.assign(eqFilter, { Zone: zoneObjectId });
+        Object.assign(eqFilter, { $or: [{ Unit: zoneObjectId }, { Zone: zoneObjectId }] });
       }
 
       const equipment = await Equipment.findOne(eqFilter);
@@ -1712,19 +1698,13 @@ async function runEquipmentDocumentsZipImportJob({
         continue;
       }
 
-      let zoneDoc = null;
-      let siteDoc = null;
-      if (equipment.Zone && equipment.Site) {
-        zoneDoc = await Zone.findById(equipment.Zone);
-        siteDoc = await Site.findById(equipment.Site);
-      }
-      const zoneName = zoneDoc?.Name || (equipment.Zone ? `Zone_${equipment.Zone}` : null);
-      const siteName = siteDoc?.Name || (equipment.Site ? `Site_${equipment.Site}` : null);
+      const siteIdForPrefix = equipment.Site ? String(equipment.Site) : null;
+      const unitIdForPrefix = equipment.Unit || equipment.Zone ? String(equipment.Unit || equipment.Zone) : null;
       const eqPrefix = buildEquipmentPrefix(
         tenantNameSafe,
         tenantId,
-        siteName,
-        zoneName,
+        siteIdForPrefix,
+        unitIdForPrefix,
         equipment.EqID || equipment._id.toString()
       );
 
@@ -4034,15 +4014,20 @@ exports.updateEquipment = async (req, res) => {
       const eqIdChanged = (updatedEquipment.EqID && updatedEquipment.EqID !== oldEqID);
 
       if (siteChanged || zoneChanged || eqIdChanged) {
-        // fetch names for prefixes
-        let oldSiteName = null, oldZoneName = null, newSiteName = null, newZoneName = null;
-        if (oldSiteId) { const s = await Site.findById(oldSiteId).select('Name'); oldSiteName = s?.Name || null; }
-        if (oldZoneId) { const z = await Zone.findById(oldZoneId).select('Name'); oldZoneName = z?.Name || null; }
-        if (newSiteId) { const s2 = await Site.findById(newSiteId).select('Name'); newSiteName = s2?.Name || null; }
-        if (newZoneId) { const z2 = await Zone.findById(newZoneId).select('Name'); newZoneName = z2?.Name || null; }
-
-        const oldPrefix = buildEquipmentPrefix(tenantName, req.scope?.tenantId, oldSiteName, oldZoneName, oldEqID);
-        const newPrefix = buildEquipmentPrefix(tenantName, req.scope?.tenantId, newSiteName, newZoneName, updatedEquipment.EqID);
+        const oldPrefix = buildEquipmentPrefix(
+          tenantName,
+          req.scope?.tenantId,
+          oldSiteId ? String(oldSiteId) : null,
+          oldZoneId ? String(oldZoneId) : null,
+          oldEqID
+        );
+        const newPrefix = buildEquipmentPrefix(
+          tenantName,
+          req.scope?.tenantId,
+          newSiteId ? String(newSiteId) : null,
+          newZoneId ? String(newZoneId) : null,
+          updatedEquipment.EqID
+        );
 
         // ensure destination prefix exists
         try {
@@ -4078,15 +4063,9 @@ exports.updateEquipment = async (req, res) => {
     const files = Array.isArray(req.files) ? req.files : [];
     if (files.length > 0) {
       const tenantName = req.scope?.tenantName || '';
-      let zoneDoc = null;
-      let siteDoc = null;
-      if (updatedEquipment.Zone && updatedEquipment.Site) {
-        siteDoc = await Site.findById(updatedEquipment.Site).lean();
-        zoneDoc = await Zone.findById(updatedEquipment.Zone).lean();
-      }
-      const zoneName = zoneDoc?.Name || (updatedEquipment.Zone ? `Zone_${updatedEquipment.Zone}` : null);
-      const siteName = siteDoc?.Name || (updatedEquipment.Site ? `Site_${updatedEquipment.Site}` : null);
-      const eqPrefix = buildEquipmentPrefix(tenantName, tenantId, siteName, zoneName, updatedEquipment.EqID);
+      const siteIdForPrefix = updatedEquipment.Site ? String(updatedEquipment.Site) : null;
+      const unitIdForPrefix = updatedEquipment.Unit || updatedEquipment.Zone ? String(updatedEquipment.Unit || updatedEquipment.Zone) : null;
+      const eqPrefix = buildEquipmentPrefix(tenantName, tenantId, siteIdForPrefix, unitIdForPrefix, updatedEquipment.EqID);
       // Make sure target prefix exists (for brand new destinations)
       try {
         await azureBlob.uploadBuffer(`${eqPrefix}/.keep`, Buffer.alloc(0), 'application/octet-stream', {
@@ -4186,15 +4165,9 @@ exports.getEquipmentDataVersion = async (req, res) => {
 
 // Törlés (DELETE /exreg/:id)
 async function deleteEquipmentInternal(equipment, tenantId, tenantName) {
-  let zoneDoc = null;
-  let siteDoc = null;
-  if (equipment.Zone && equipment.Site) {
-    zoneDoc = await Zone.findById(equipment.Zone).lean();
-    siteDoc = await Site.findById(equipment.Site).lean();
-  }
-  const zoneName = zoneDoc?.Name || (equipment.Zone ? `Zone_${equipment.Zone}` : null);
-  const siteName = siteDoc?.Name || (equipment.Site ? `Site_${equipment.Site}` : null);
-  const eqPrefix = buildEquipmentPrefix(tenantName, tenantId, siteName, zoneName, equipment.EqID);
+  const siteIdForPrefix = equipment.Site ? String(equipment.Site) : null;
+  const unitIdForPrefix = equipment.Unit || equipment.Zone ? String(equipment.Unit || equipment.Zone) : null;
+  const eqPrefix = buildEquipmentPrefix(tenantName, tenantId, siteIdForPrefix, unitIdForPrefix, equipment.EqID);
   try { await azureBlob.deletePrefix(`${eqPrefix}/`); } catch (e) { console.warn('⚠️ deletePrefix failed:', e?.message); }
   // Kapcsolódó inspectionök és azok blob képeinek törlése
   try {

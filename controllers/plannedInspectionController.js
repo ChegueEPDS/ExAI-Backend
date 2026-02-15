@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const Equipment = require('../models/dataplate');
+const Unit = require('../models/unit');
 
 function parseLimit(raw) {
   const n = Number(raw);
@@ -45,12 +46,18 @@ exports.getPlannedInspections = async (req, res) => {
       if (!isValidObjectId(siteId)) return res.status(400).json({ error: 'Invalid siteId' });
       if (!isValidObjectId(zoneId)) return res.status(400).json({ error: 'Invalid zoneId' });
       query.Site = siteId;
-      query.Zone = zoneId;
+      const unitIds = await Unit.find({
+        tenantId,
+        $or: [{ _id: zoneId }, { ancestors: zoneId }]
+      }).select('_id').lean();
+      const ids = unitIds.map(u => u._id);
+      query.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
     }
 
     const rows = await Equipment.find(query)
-      .select('_id EqID TagNo lastInspectionValidUntil Site Zone')
+      .select('_id EqID TagNo lastInspectionValidUntil Site Unit Zone')
       .populate({ path: 'Site', select: 'Name', options: { lean: true } })
+      .populate({ path: 'Unit', select: 'Name', options: { lean: true } })
       .populate({ path: 'Zone', select: 'Name', options: { lean: true } })
       .sort({ lastInspectionValidUntil: 1, _id: 1 })
       .limit(limit)
@@ -67,7 +74,7 @@ exports.getPlannedInspections = async (req, res) => {
         dueAt,
         pastDue: dueMs != null ? now > dueMs : false,
         siteName: r.Site?.Name || null,
-        zoneName: r.Zone?.Name || null
+        zoneName: r.Unit?.Name || r.Zone?.Name || null
       };
     });
 
@@ -81,4 +88,3 @@ exports.getPlannedInspections = async (req, res) => {
     return res.status(500).json({ error: 'Server error' });
   }
 };
-

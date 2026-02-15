@@ -76,8 +76,8 @@ function buildTenantRoot(tenantName, tenantId) {
   const tn = slug(tenantName) || `TENANT_${tenantId}`;
   return `${tn}`;
 }
-function buildSitePrefix(tenantName, tenantId, siteName) {
-  return `${buildTenantRoot(tenantName, tenantId)}/projects/${slug(siteName)}`;
+function buildSitePrefix(tenantName, tenantId, siteId) {
+  return `${buildTenantRoot(tenantName, tenantId)}/projects/${siteId}`;
 }
 
 // 🔹 Új site létrehozása
@@ -106,7 +106,7 @@ exports.createSite = async (req, res) => {
     await newSite.save();
 
     // 2) Azure Blob „mappa” létrehozása (.keep üres blob)
-    const sitePrefix = buildSitePrefix(tenantName, tenantIdStr, newSite.Name);
+    const sitePrefix = buildSitePrefix(tenantName, tenantIdStr, String(newSite._id));
     try {
       await azureBlob.uploadBuffer(`${sitePrefix}/.keep`, Buffer.alloc(0), 'application/octet-stream', {
         metadata: { createdAt: new Date().toISOString(), kind: 'folder-keep' }
@@ -370,44 +370,7 @@ exports.updateSite = async (req, res) => {
       return res.status(404).json({ message: "Site not found" });
     }
 
-    const oldName = site.Name;
-    const newName = Name;
-
-    // Blob „átköltöztetés” ha a név változott
-    if (newName && newName !== oldName) {
-      const oldPrefix = buildSitePrefix(tenantName, tenantIdStr, oldName);
-      const newPrefix = buildSitePrefix(tenantName, tenantIdStr, newName);
-      try {
-        await azureBlob.renameFile(`${oldPrefix}/.keep`, `${newPrefix}/.keep`);
-      } catch (_) {}
-      if (Array.isArray(site.documents) && site.documents.length) {
-        for (const doc of site.documents) {
-          // prefer new blobPath, fall back to legacy oneDriveId if present
-          const legacyPath = doc.oneDriveId || '';
-          const currentPath = doc.blobPath || legacyPath || '';
-          if (!currentPath || !currentPath.startsWith(oldPrefix + '/')) continue;
-          const fileName = path.posix.basename(currentPath);
-          const newBlobPath = `${newPrefix}/${fileName}`;
-          try {
-            await azureBlob.renameFile(currentPath, newBlobPath);
-            // set new fields
-            doc.blobPath = newBlobPath;
-            doc.blobUrl = azureBlob.getBlobUrl(newBlobPath);
-            // cleanup legacy if present
-            if (doc.oneDriveId) delete doc.oneDriveId;
-            if (doc.oneDriveUrl) delete doc.oneDriveUrl;
-            if (doc.sharePointId) delete doc.sharePointId;
-            if (doc.sharePointUrl) delete doc.sharePointUrl;
-          } catch (e) {
-            console.warn('⚠️ Blob move failed:', currentPath, '→', newBlobPath, e?.message);
-          }
-        }
-      }
-      // update site's stored blob prefix
-      site.blobPrefix = newPrefix;
-    }
-
-    site.Name = newName || site.Name;
+    site.Name = Name || site.Name;
     site.Client = Client || site.Client;
     if (Note !== undefined) {
       site.Note = Note;
@@ -471,7 +434,7 @@ exports.deleteSite = async (req, res) => {
     await Zone.deleteMany({ Site: siteId, tenantId: tenantObjectId });
 
     // Blob prefix törlése
-    const sitePrefix = buildSitePrefix(tenantName, tenantIdStr, site.Name);
+    const sitePrefix = buildSitePrefix(tenantName, tenantIdStr, String(site._id));
     try {
       await azureBlob.deletePrefix(`${sitePrefix}/`);
     } catch (e) {
@@ -515,7 +478,7 @@ exports.uploadFileToSite = async (req, res) => {
       return res.status(400).json({ message: "No files provided" });
     }
 
-    const sitePrefix = buildSitePrefix(tenantName, tenantIdStr, site.Name);
+    const sitePrefix = buildSitePrefix(tenantName, tenantIdStr, String(site._id));
     const uploadedFiles = [];
 
     for (const file of files) {

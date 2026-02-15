@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const Equipment = require('../models/dataplate');
+const Unit = require('../models/unit');
 const MaintenanceEvent = require('../models/maintenanceEvent');
 
 function toObjectId(id) {
@@ -72,7 +73,14 @@ async function computeOperationalSummary({ tenantId, siteId = null, zoneId = nul
 
   const eqFilter = { tenantId: tenantObjectId };
   if (siteObjectId) eqFilter.Site = siteObjectId;
-  if (zoneObjectId) eqFilter.Zone = zoneObjectId;
+  if (zoneObjectId) {
+    const unitIds = await Unit.find({
+      tenantId: tenantObjectId,
+      $or: [{ _id: zoneObjectId }, { ancestors: zoneObjectId }]
+    }).select('_id').lean();
+    const ids = unitIds.map(u => u._id);
+    eqFilter.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
+  }
 
   const equipments = await Equipment.find(eqFilter).select('_id operationalStatus').lean();
   const equipmentIds = (equipments || []).map((e) => e._id).filter(Boolean);
@@ -114,7 +122,14 @@ async function computeOverallStatusSummary({ tenantId, siteId = null, zoneId = n
 
   const eqFilter = { tenantId: tenantObjectId };
   if (siteObjectId) eqFilter.Site = siteObjectId;
-  if (zoneObjectId) eqFilter.Zone = zoneObjectId;
+  if (zoneObjectId) {
+    const unitIds = await Unit.find({
+      tenantId: tenantObjectId,
+      $or: [{ _id: zoneObjectId }, { ancestors: zoneObjectId }]
+    }).select('_id').lean();
+    const ids = unitIds.map(u => u._id);
+    eqFilter.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
+  }
 
   const equipments = await Equipment.find(eqFilter).select('_id operationalStatus Compliance').lean();
   const equipmentIds = (equipments || []).map((e) => e._id).filter(Boolean);
@@ -176,7 +191,14 @@ async function computeMaintenanceSeveritySummary({ tenantId, siteId = null, zone
 
   const eqFilter = { tenantId: tenantObjectId };
   if (siteObjectId) eqFilter.Site = siteObjectId;
-  if (zoneObjectId) eqFilter.Zone = zoneObjectId;
+  if (zoneObjectId) {
+    const unitIds = await Unit.find({
+      tenantId: tenantObjectId,
+      $or: [{ _id: zoneObjectId }, { ancestors: zoneObjectId }]
+    }).select('_id').lean();
+    const ids = unitIds.map(u => u._id);
+    eqFilter.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
+  }
 
   const equipments = await Equipment.find(eqFilter).select('_id operationalStatus').lean();
   const equipmentIds = (equipments || []).map((e) => e._id).filter(Boolean);

@@ -24,6 +24,9 @@ router.get('/:id/health-metrics', authMiddleware(), healthMetricsController.getZ
 // Projekt módosítása ID alapján
 router.put('/:id', authMiddleware(), requirePermission('zone:write'), zoneController.updateZone);
 
+// Projekt áthelyezése (parent váltás)
+router.patch('/:id/move', authMiddleware(), requirePermission('zone:write'), zoneController.moveZone);
+
 // Projekt törlése ID alapján
 router.delete('/:id', authMiddleware(), requirePermission('zone:write'), zoneController.deleteZone);
 

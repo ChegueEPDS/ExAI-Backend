@@ -52,6 +52,7 @@ const EquipmentSchema = new mongoose.Schema({
   "CreatedBy": { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   "ModifiedBy": { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // 🆕 Módosító felhasználó
   "tenantId": { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', required: true, index: true },
+  "Unit": { type: mongoose.Schema.Types.ObjectId, ref: 'Unit' },
   "Zone": { type: mongoose.Schema.Types.ObjectId, ref: 'Zone' },
   "Site": { type: mongoose.Schema.Types.ObjectId, ref: 'Site' },
   "Pictures": [
@@ -111,6 +112,10 @@ EquipmentSchema.pre('save', async function (next) {
     }
 
     try {
+        if (!this.Unit && this.Zone) {
+            this.Unit = this.Zone;
+        }
+
         const user = await mongoose.model('User').findById(this.CreatedBy).select('company tenantId');
         if (!user) {
             return next(new Error('Invalid CreatedBy user.'));
@@ -131,6 +136,10 @@ EquipmentSchema.pre('save', async function (next) {
 EquipmentSchema.pre('findOneAndUpdate', async function (next) {
     const update = this.getUpdate();
     if (!update) return next();
+
+    if (update.$set && update.$set.Zone && !update.$set.Unit) {
+        update.$set.Unit = update.$set.Zone;
+    }
 
     if (update.$set && update.$set.ModifiedBy) {
         return next(); // Ha már megadott egy ModifiedBy értéket, nem kell változtatni
