@@ -265,6 +265,42 @@ exports.mobileSync = async (req, res) => {
     const protectionTypesRaw = Array.isArray(item?.protectionTypes) ? item.protectionTypes : null;
     const normalizedProtectionTypes = protectionTypesRaw ? normalizeProtectionTypes(protectionTypesRaw) : [];
 
+    // Optional: manual overrides from mobile "Edit all data".
+    const manual = item?.manual && typeof item.manual === 'object' ? item.manual : null;
+    const manualFields = manual?.fields && typeof manual.fields === 'object' ? manual.fields : null;
+    const manualExMarking = manual?.exMarking && typeof manual.exMarking === 'object' ? manual.exMarking : null;
+
+    const hasOwn = (obj, key) => !!obj && typeof obj === 'object' && Object.prototype.hasOwnProperty.call(obj, key);
+    const pickManualString = (obj, key) => {
+      if (!hasOwn(obj, key)) return { present: false, value: '' };
+      return { present: true, value: String(obj[key] ?? '').trim() };
+    };
+
+    const allowedFieldKeys = [
+      'TagNo',
+      'Manufacturer',
+      'Model/Type',
+      'Serial Number',
+      'Certificate No',
+      'IP rating',
+      'Max Ambient Temp'
+    ];
+    const allowedExKeys = [
+      'Marking',
+      'Equipment Group',
+      'Equipment Category',
+      'Environment',
+      'Gas / Dust Group',
+      'Temperature Class',
+      'Equipment Protection Level'
+    ];
+
+    const exUpdates = {};
+    for (const k of allowedExKeys) {
+      const { present, value } = pickManualString(manualExMarking, k);
+      if (present) exUpdates[k] = value;
+    }
+
     let saved = null;
     if (existingEquipmentId) {
       const existing = await Equipment.findOne({ _id: existingEquipmentId, tenantId });
@@ -282,6 +318,15 @@ exports.mobileSync = async (req, res) => {
       if (equipmentTypeRaw) existing['Equipment Type'] = equipmentTypeRaw;
       existing.Compliance = compliance;
       existing['Other Info'] = otherInfo;
+
+      // Apply manual field edits (including clearing to '').
+      for (const k of allowedFieldKeys) {
+        const { present, value } = pickManualString(manualFields, k);
+        if (!present) continue;
+        if (existing.set) existing.set(k, value);
+        else existing[k] = value;
+      }
+
       saved = await existing.save();
       tempIdToEquipmentId[tempId] = String(saved._id);
       try {
@@ -312,6 +357,13 @@ exports.mobileSync = async (req, res) => {
       };
       if (equipmentTypeRaw) equipmentPayload['Equipment Type'] = equipmentTypeRaw;
 
+      // Apply manual field edits (including clearing to '').
+      for (const k of allowedFieldKeys) {
+        const { present, value } = pickManualString(manualFields, k);
+        if (!present) continue;
+        equipmentPayload[k] = value;
+      }
+
       const equipmentDoc = new Equipment(equipmentPayload);
 
       saved = await equipmentDoc.save();
@@ -339,12 +391,23 @@ exports.mobileSync = async (req, res) => {
 
     // Manual protection selection from mobile (applies to existing + new).
     // If empty, we leave it untouched (OCR may fill for newly created equipment later).
-    if (normalizedProtectionTypes.length && saved) {
+    if ((normalizedProtectionTypes.length || Object.keys(exUpdates).length) && saved) {
       try {
         const marks = Array.isArray(saved['Ex Marking']) ? saved['Ex Marking'] : [];
         if (!marks.length) marks.push({});
-        marks[0] = { ...(marks[0] || {}), 'Type of Protection': normalizedProtectionTypes.join('; ') };
+        const first = marks[0] && typeof marks[0] === 'object' ? marks[0] : {};
+        const nextFirst = { ...(first || {}) };
+        if (Object.keys(exUpdates).length) {
+          Object.keys(exUpdates).forEach((k) => {
+            nextFirst[k] = exUpdates[k];
+          });
+        }
+        if (normalizedProtectionTypes.length) {
+          nextFirst['Type of Protection'] = normalizedProtectionTypes.join('; ');
+        }
+        marks[0] = nextFirst;
         saved['Ex Marking'] = marks;
+        if (saved.markModified) saved.markModified('Ex Marking');
         await saved.save();
       } catch {
         // ignore
