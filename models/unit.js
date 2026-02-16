@@ -1,8 +1,20 @@
 const mongoose = require('mongoose');
 
+function normalizeUnitNameKey(name) {
+  const raw = String(name || '').trim();
+  if (!raw) return '';
+  const noDiacritics = raw.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+  return noDiacritics
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
 const UnitSchema = new mongoose.Schema(
   {
     Name: { type: String, required: true },
+    nameKey: { type: String, index: true },
     Description: { type: String },
     Environment: {
       type: String,
@@ -73,6 +85,11 @@ const UnitSchema = new mongoose.Schema(
       type: Number,
       default: 0
     },
+    mobileSync: {
+      tempId: { type: String, trim: true },
+      deviceId: { type: String, trim: true },
+      createdAt: { type: Date }
+    },
     documents: [
       {
         name: { type: String },
@@ -116,6 +133,17 @@ const UnitSchema = new mongoose.Schema(
   { timestamps: true, collection: 'zones' }
 );
 
+UnitSchema.pre('validate', function (next) {
+  try {
+    if (this.isNew || this.isModified('Name')) {
+      this.nameKey = normalizeUnitNameKey(this.Name);
+    }
+    next();
+  } catch (e) {
+    next(e);
+  }
+});
+
 UnitSchema.pre('save', async function (next) {
   try {
     const user = await mongoose.model('User').findById(this.CreatedBy).select('tenantId');
@@ -134,14 +162,28 @@ UnitSchema.pre('findOneAndUpdate', async function (next) {
   const update = this.getUpdate();
   if (!update) return next();
 
-  if (update.$set && update.$set.ModifiedBy) {
-    this.setUpdate({ ...update, $set: { ModifiedBy: update.$set.ModifiedBy } });
+  const nextUpdate = { ...update };
+  const set = { ...(nextUpdate.$set || {}) };
+
+  const nextName = set.Name ?? nextUpdate.Name;
+  if (nextName !== undefined) {
+    set.nameKey = normalizeUnitNameKey(nextName);
   }
+
+  nextUpdate.$set = set;
+  this.setUpdate(nextUpdate);
 
   next();
 });
 
 UnitSchema.index({ tenantId: 1, Site: 1, parentUnitId: 1 });
 UnitSchema.index({ tenantId: 1, Site: 1, ancestors: 1 });
+UnitSchema.index({ tenantId: 1, 'mobileSync.tempId': 1 }, { unique: true, sparse: true });
+UnitSchema.index(
+  { tenantId: 1, Site: 1, parentUnitId: 1, nameKey: 1 },
+  { unique: true, partialFilterExpression: { nameKey: { $type: 'string' } } }
+);
+
+UnitSchema.statics.normalizeNameKey = normalizeUnitNameKey;
 
 module.exports = mongoose.model('Unit', UnitSchema);

@@ -283,13 +283,11 @@ async function getZoneCached(zoneId, cache) {
   return zone;
 }
 
-async function addZoneScopeToEquipmentFilter({ tenantId, zoneId, equipmentFilter }) {
+async function addZoneScopeToEquipmentFilter({ tenantId, zoneId, equipmentFilter, includeDescendants = false }) {
   if (!zoneId) return;
-  const unitIds = await Unit.find({
-    tenantId,
-    $or: [{ _id: zoneId }, { ancestors: zoneId }]
-  }).select('_id').lean();
-  const ids = unitIds.map(u => u._id);
+  const ids = includeDescendants
+    ? (await Unit.find({ tenantId, $or: [{ _id: zoneId }, { ancestors: zoneId }] }).select('_id').lean()).map(u => u._id)
+    : [zoneId];
   equipmentFilter.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
 }
 
@@ -364,6 +362,36 @@ function sanitizeFileNameSegment(value, fallback = 'item') {
     .replace(/_+/g, '_')
     .replace(/^_+|_+$/g, '');
   return safe || fallback;
+}
+
+function buildLegacyBlobPathFromMeta(meta) {
+  if (!meta?.blobPath) return null;
+  const siteName = meta.legacySiteName;
+  const zoneName = meta.legacyZoneName;
+  const eqId = meta.legacyEqId;
+  if (!siteName || !zoneName || !eqId) return null;
+  const normalized = azureBlob.toBlobPath(meta.blobPath);
+  const parts = normalized.split('/').filter(Boolean);
+  const idx = parts.indexOf('projects');
+  if (idx === -1) return null;
+  const root = parts.slice(0, idx).join('/');
+  const fileName = parts[parts.length - 1];
+  const safeSite = sanitizeFileNameSegment(siteName, 'site');
+  const safeZone = sanitizeFileNameSegment(zoneName, 'zone');
+  const safeEq = sanitizeFileNameSegment(eqId, 'equipment');
+  return `${root}/projects/${safeSite}/${safeZone}/${safeEq}/${fileName}`;
+}
+
+async function downloadWithLegacyFallback(meta) {
+  const primary = meta?.blobPath;
+  if (!primary) return null;
+  try {
+    return await azureBlob.downloadToBuffer(primary);
+  } catch {
+    const legacyPath = buildLegacyBlobPathFromMeta(meta);
+    if (!legacyPath) throw new Error('blob download failed');
+    return await azureBlob.downloadToBuffer(legacyPath);
+  }
 }
 
 function setDownloadHeaders(res, fileName, contentType) {
@@ -517,7 +545,7 @@ function buildResultKeys(result) {
   return keys;
 }
 
-function buildInspectionAttachmentLookup(inspection, eqId, identifier = null) {
+function buildInspectionAttachmentLookup(inspection, eqId, identifier = null, legacyContext = null) {
   const eqFolder = sanitizeFileNameSegment(
     identifier || eqId || inspection?.eqId || inspection?.equipmentId || 'equipment'
   );
@@ -542,6 +570,11 @@ function buildInspectionAttachmentLookup(inspection, eqId, identifier = null) {
     const padded = seq.toString().padStart(2, '0');
     const fileName = `${eqFolder}_${sanitizedKey}_${padded}${ext}`;
     const meta = { ...att, fileName, keys, eqFolder };
+    if (legacyContext) {
+      meta.legacySiteName = legacyContext.siteName || null;
+      meta.legacyZoneName = legacyContext.zoneName || null;
+      meta.legacyEqId = legacyContext.eqId || null;
+    }
     metas.push(meta);
     keys.forEach(key => {
       if (!byKey.has(key)) byKey.set(key, []);
@@ -580,7 +613,7 @@ async function appendImagesToArchive(archive, attachments, imagesRoot = 'images'
   for (const meta of attachments) {
     if (!meta?.blobPath) continue;
     try {
-      const buffer = await azureBlob.downloadToBuffer(meta.blobPath);
+    const buffer = await downloadWithLegacyFallback(meta);
       const folder = sanitizeFileNameSegment(meta.eqFolder || 'equipment');
       const zipPath = path.posix.join(imagesRoot, folder, meta.fileName);
       archive.append(buffer, { name: zipPath });
@@ -606,7 +639,7 @@ function normalizeDocumentMeta(doc = {}, eqFolder, fallbackPrefix, defaultExt = 
   };
 }
 
-function collectEquipmentDocuments(equipment, eqFolder) {
+function collectEquipmentDocuments(equipment, eqFolder, legacyContext = null) {
   const docs = Array.isArray(equipment?.documents) ? equipment.documents : [];
   const documentMetas = [];
   const imageMetas = [];
@@ -615,6 +648,11 @@ function collectEquipmentDocuments(equipment, eqFolder) {
     const fallback = `doc_${idx + 1}`;
     const meta = normalizeDocumentMeta(doc, eqFolder, fallback, '.bin');
     if (!meta) return;
+    if (legacyContext) {
+      meta.legacySiteName = legacyContext.siteName || null;
+      meta.legacyZoneName = legacyContext.zoneName || null;
+      meta.legacyEqId = legacyContext.eqId || null;
+    }
     if (String(doc.type || '').toLowerCase() === 'image') {
       imageMetas.push(meta);
     } else {
@@ -624,7 +662,7 @@ function collectEquipmentDocuments(equipment, eqFolder) {
   return { documentMetas, imageMetas };
 }
 
-function collectInspectionDocumentAttachments(inspection, eqFolder) {
+function collectInspectionDocumentAttachments(inspection, eqFolder, legacyContext = null) {
   const attachments = Array.isArray(inspection?.attachments) ? inspection.attachments : [];
   const docs = [];
   attachments.forEach((att, idx) => {
@@ -632,6 +670,11 @@ function collectInspectionDocumentAttachments(inspection, eqFolder) {
     if (att.type && att.type !== 'document') return;
     const fallback = `inspection_doc_${idx + 1}`;
     const meta = normalizeDocumentMeta(att, eqFolder, fallback, '.pdf');
+    if (meta && legacyContext) {
+      meta.legacySiteName = legacyContext.siteName || null;
+      meta.legacyZoneName = legacyContext.zoneName || null;
+      meta.legacyEqId = legacyContext.eqId || null;
+    }
     if (meta) docs.push(meta);
   });
   return docs;
@@ -642,7 +685,7 @@ async function appendDocumentsToArchive(archive, docs, documentsRoot = 'document
   for (const doc of docs) {
     if (!doc?.blobPath) continue;
     try {
-      const buffer = await azureBlob.downloadToBuffer(doc.blobPath);
+    const buffer = await downloadWithLegacyFallback(doc);
       const folder = sanitizeFileNameSegment(doc.eqFolder || 'equipment');
       const zipPath = path.posix.join(documentsRoot, folder, doc.fileName);
       archive.append(buffer, { name: zipPath });
@@ -652,7 +695,7 @@ async function appendDocumentsToArchive(archive, docs, documentsRoot = 'document
   }
 }
 
-function orderEquipmentPicturesForItr(equipment) {
+function orderEquipmentPicturesForItr(equipment, legacyContext = null) {
   const ordered = [];
   const seen = new Set();
   if (!equipment) return ordered;
@@ -662,6 +705,11 @@ function orderEquipmentPicturesForItr(equipment) {
     const key = pic.blobPath || pic.blobUrl || pic.fileName || pic._id?.toString();
     if (!key || seen.has(key)) return;
     seen.add(key);
+    if (legacyContext) {
+      pic.legacySiteName = legacyContext.siteName || null;
+      pic.legacyZoneName = legacyContext.zoneName || null;
+      pic.legacyEqId = legacyContext.eqId || null;
+    }
     ordered.push(pic);
   };
 
@@ -731,7 +779,12 @@ async function prepareEquipmentImageForWorksheet(picture, workbook, targetWidthP
   const sourcePath = picture.blobPath || picture.blobUrl;
   if (!sourcePath) return null;
   try {
-    const buffer = await azureBlob.downloadToBuffer(sourcePath);
+    const buffer = await downloadWithLegacyFallback({
+      blobPath: sourcePath,
+      legacySiteName: picture.legacySiteName,
+      legacyZoneName: picture.legacyZoneName,
+      legacyEqId: picture.legacyEqId
+    });
     let metadata = {};
     try {
       metadata = await sharp(buffer).metadata();
@@ -770,9 +823,13 @@ async function prepareEquipmentImageForWorksheet(picture, workbook, targetWidthP
   }
 }
 
-async function appendItrEquipmentImagesSection(ws, workbook, equipment, attachmentLookup) {
+async function appendItrEquipmentImagesSection(ws, workbook, equipment, attachmentLookup, context = {}) {
   if (!equipment && !attachmentLookup) return;
-  const orderedPictures = orderEquipmentPicturesForItr(equipment);
+  const orderedPictures = orderEquipmentPicturesForItr(equipment, {
+    siteName: context.site?.Name || context.site?.SiteName || null,
+    zoneName: context.zone?.Name || context.zone?.ZoneName || null,
+    eqId: equipment?.EqID || context.inspection?.eqId || null
+  });
   const attachmentPictures = Array.isArray(attachmentLookup?.all)
     ? attachmentLookup.all.filter(img => img && (img.blobPath || img.blobUrl))
     : [];
@@ -1645,7 +1702,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   ws.getRow(copcR).height = 22;
 
 
-  await appendItrEquipmentImagesSection(ws, workbook, equipment, attachmentLookup);
+  await appendItrEquipmentImagesSection(ws, workbook, equipment, attachmentLookup, { site, zone, inspection });
 
 
   // Végső finomhangolás: magasság a felső sorokra
@@ -2405,7 +2462,12 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName, requ
     const attachmentLookup = buildInspectionAttachmentLookup(
       inspection,
       eq['EqID'] || inspection.eqId,
-      sanitizedIdentifier
+      sanitizedIdentifier,
+      {
+        siteName: site?.Name || site?.SiteName || null,
+        zoneName: zone?.Name || zone?.ZoneName || null,
+        eqId: eq?.EqID || inspection?.eqId || null
+      }
     );
 
     const { workbook: itrWorkbook, fileName: itrFileName } = await buildInspectionWorkbook(
@@ -2422,10 +2484,19 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName, requ
       name: path.posix.join(PROJECT_REPORT_DIRS.INSPECTIONS, itrFileName)
     });
 
-    const equipmentDocs = collectEquipmentDocuments(eq, sanitizedIdentifier);
+    const equipmentDocs = collectEquipmentDocuments(eq, sanitizedIdentifier, {
+      siteName: site?.Name || site?.SiteName || null,
+      zoneName: zone?.Name || zone?.ZoneName || null,
+      eqId: eq?.EqID || inspection?.eqId || null
+    });
     const inspectionDocAttachments = collectInspectionDocumentAttachments(
       inspection,
-      sanitizedIdentifier
+      sanitizedIdentifier,
+      {
+        siteName: site?.Name || site?.SiteName || null,
+        zoneName: zone?.Name || zone?.ZoneName || null,
+        eqId: eq?.EqID || inspection?.eqId || null
+      }
     );
 
     const combinedImages = [
@@ -2540,7 +2611,7 @@ async function generateLatestInspectionArchive(
 
   const equipmentFilter = { tenantId };
   if (zoneId) {
-    await addZoneScopeToEquipmentFilter({ tenantId, zoneId, equipmentFilter });
+    await addZoneScopeToEquipmentFilter({ tenantId, zoneId, equipmentFilter, includeDescendants: false });
   }
   if (siteId) equipmentFilter.Site = siteId;
 
@@ -2627,7 +2698,12 @@ async function generateLatestInspectionArchive(
       ? buildInspectionAttachmentLookup(
           inspection,
           context.equipment?.EqID || inspection.eqId,
-          identifier
+          identifier,
+          {
+            siteName: context.site?.Name || context.site?.SiteName || null,
+            zoneName: context.zone?.Name || context.zone?.ZoneName || null,
+            eqId: context.equipment?.EqID || inspection.eqId || null
+          }
         )
       : null;
 
@@ -2921,7 +2997,12 @@ exports.exportInspectionXLSX = async (req, res) => {
       ? buildInspectionAttachmentLookup(
           inspection,
           context.equipment?.EqID || inspection.eqId,
-          eqIdentifier
+          eqIdentifier,
+          {
+            siteName: context.site?.Name || context.site?.SiteName || null,
+            zoneName: context.zone?.Name || context.zone?.ZoneName || null,
+            eqId: context.equipment?.EqID || inspection.eqId || null
+          }
         )
       : null;
 
@@ -2987,7 +3068,7 @@ exports.exportPunchlistXLSX = async (req, res) => {
     const equipmentFilter = { tenantId };
     if (siteId) equipmentFilter.Site = siteId;
     if (zoneId) {
-      await addZoneScopeToEquipmentFilter({ tenantId, zoneId, equipmentFilter });
+    await addZoneScopeToEquipmentFilter({ tenantId, zoneId, equipmentFilter, includeDescendants: false });
     }
 
     const equipments = await Dataplate.find(equipmentFilter).lean();
@@ -3052,7 +3133,12 @@ exports.exportPunchlistXLSX = async (req, res) => {
         ? buildInspectionAttachmentLookup(
             inspection,
             context.equipment?.EqID || inspection.eqId,
-            identifier
+            identifier,
+            {
+              siteName: context.site?.Name || context.site?.SiteName || null,
+              zoneName: context.zone?.Name || context.zone?.ZoneName || null,
+              eqId: context.equipment?.EqID || inspection.eqId || null
+            }
           )
         : null;
       if (includeImages && attachmentLookup?.all?.length) {

@@ -93,6 +93,7 @@ exports.createZone = async (req, res) => {
       EPL,
       AmbientTempMin,
       AmbientTempMax,
+      mobileSync,
       ...rest
     } = req.body || {};
 
@@ -119,6 +120,31 @@ exports.createZone = async (req, res) => {
       return res.status(400).json({ message: 'Missing Site for unit' });
     }
 
+    const tempId = typeof mobileSync?.tempId === 'string' ? mobileSync.tempId.trim() : '';
+    if (tempId) {
+      const existingByTemp = await Unit.findOne({ tenantId: tenantObjectId, 'mobileSync.tempId': tempId });
+      if (existingByTemp) {
+        return res.status(200).json({ message: 'Zone already created', zone: existingByTemp });
+      }
+    }
+
+    const nameKey = typeof Unit.normalizeNameKey === 'function' ? Unit.normalizeNameKey(rest.Name) : '';
+    if (nameKey) {
+      const existingByName = await Unit.findOne({
+        tenantId: tenantObjectId,
+        Site: siteIdFinal,
+        parentUnitId: parentUnit ? parentUnit._id : null,
+        nameKey
+      });
+      if (existingByName) {
+        return res.status(409).json({
+          message: 'Unit name already exists under this parent.',
+          code: 'UNIT_NAME_CONFLICT',
+          existingZone: existingByName
+        });
+      }
+    }
+
     const unit = new Unit({
       ...rest,
       Site: siteIdFinal,
@@ -133,12 +159,53 @@ exports.createZone = async (req, res) => {
       AmbientTempMax: AmbientTempMax !== undefined && AmbientTempMax !== null
         ? Number(AmbientTempMax)
         : undefined,
+      mobileSync: tempId
+        ? {
+            tempId,
+            deviceId: typeof mobileSync?.deviceId === 'string' ? mobileSync.deviceId.trim() : undefined,
+            createdAt: typeof mobileSync?.createdAt === 'string' || typeof mobileSync?.createdAt === 'number'
+              ? new Date(mobileSync.createdAt)
+              : new Date()
+          }
+        : undefined,
       CreatedBy: createdBy,
       ModifiedBy: modifiedBy,
       tenantId: tenantObjectId,
     });
 
-    await unit.save();
+    try {
+      await unit.save();
+    } catch (e) {
+      const err = e;
+      const isDup = err && typeof err === 'object' && (err.code === 11000 || err?.name === 'MongoServerError');
+      if (isDup) {
+        const keyPattern = err?.keyPattern || {};
+        const isTempDup = keyPattern['mobileSync.tempId'] || keyPattern['mobileSync.tempId'] === 1;
+        const isNameDup = keyPattern['nameKey'] || keyPattern['nameKey'] === 1;
+
+        if (tempId && isTempDup) {
+          const existingByTemp = await Unit.findOne({ tenantId: tenantObjectId, 'mobileSync.tempId': tempId });
+          if (existingByTemp) return res.status(200).json({ message: 'Zone already created', zone: existingByTemp });
+        }
+
+        if (nameKey && isNameDup) {
+          const existingByName = await Unit.findOne({
+            tenantId: tenantObjectId,
+            Site: siteIdFinal,
+            parentUnitId: parentUnit ? parentUnit._id : null,
+            nameKey
+          });
+          if (existingByName) {
+            return res.status(409).json({
+              message: 'Unit name already exists under this parent.',
+              code: 'UNIT_NAME_CONFLICT',
+              existingZone: existingByName
+            });
+          }
+        }
+      }
+      throw err;
+    }
 
     // After save, create an empty ".keep" in Azure Blob to represent the zone folder
     const tenantName = req.scope?.tenantName || '';
