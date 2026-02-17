@@ -119,17 +119,25 @@ const allowedHostnameSuffixes = rawCorsAllowedOrigins
 // Allow local/mobile app origins by default (keeps existing allowlist behavior intact)
 const defaultDevOrigins = new Set([
   'http://localhost',
+  'https://localhost',
   'http://localhost:8100',
+  'http://localhost:8080',
   'http://127.0.0.1',
+  'https://127.0.0.1',
   'http://127.0.0.1:8100',
+  'http://127.0.0.1:8080',
   'capacitor://localhost',
-  'ionic://localhost'
+  'ionic://localhost',
+  // Some WebViews (and file:// contexts) send Origin: null, which would otherwise be blocked and surfaces as status=0 "Unknown Error"
+  'null'
 ]);
 
 // Reusable CORS options (applies to REST + SSE)
 function isOriginAllowed(origin) {
   // allow same-origin or server-to-server (no origin)
   if (!origin) return true;
+  // Some clients send literal "null" (string) as Origin; treat it like no-origin for mobile/webview compatibility.
+  if (origin === 'null') return true;
 
   if (allowedOriginsExact.has(origin)) return true;
   if (allowedOriginWildcardRegexes.some((re) => re.test(origin))) return true;

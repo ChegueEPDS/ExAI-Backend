@@ -774,6 +774,10 @@ function parseClarifyNumericSelection(conversation, message) {
 exports.chatGovernedStream = async (req, res) => {
   const send = initSse(req, res, {
       setClosedFlag: 'sseClosed',
+      // Frontends often implement their own "no activity" timeout that ignores SSE comment lines.
+      // Use a real SSE event heartbeat here so the UI sees periodic activity while the model runs.
+      heartbeatMs: 5000,
+      heartbeatEvent: 'ping',
       onClose: ({ req }) => {
         try { logger.warn('governed.sse.closed', { requestId: req?.requestId, path: req?.originalUrl }); } catch { }
       }
