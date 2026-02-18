@@ -6,6 +6,7 @@ const logger = require('../config/logger');
 const { ingestTabularFileBuffer, ingestDocumentFileBuffer, deleteDatasetFileArtifacts } = require('../services/datasetIngestionService');
 const azureBlob = require('../services/azureBlobService');
 const systemSettings = require('../services/systemSettingsStore');
+const { notifyAndStore } = require('../lib/notifications/notifier');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024, files: 10 } });
 exports.uploadMulter = upload;
@@ -157,13 +158,6 @@ exports.uploadDatasetFiles = [
   }
 ];
 
-function writeSse(res, event, data) {
-  if (res.writableEnded) return;
-  const payload = data === undefined ? '' : JSON.stringify(data);
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${payload}\n\n`);
-}
-
 exports.uploadDatasetFilesStream = [
   upload.array('files', 10),
   async (req, res) => {
@@ -171,8 +165,15 @@ exports.uploadDatasetFilesStream = [
     const send = initSse(req, res, {
       // Some frontends ignore SSE comment lines as "activity".
       // Emit a real event heartbeat so the UI doesn't time out during ingest.
-      heartbeatMs: 10_000,
+      heartbeatMs: (() => {
+        const raw = Number(systemSettings.getNumber('DATASET_UPLOAD_SSE_HEARTBEAT_MS') || 10_000);
+        return Math.max(1000, Math.min(raw, 60000));
+      })(),
       heartbeatEvent: 'ping',
+      setClosedFlag: 'sseClosed',
+      onClose: ({ req: req0 }) => {
+        try { logger.warn('dataset.sse.closed', { requestId: req0?.requestId, path: req0?.originalUrl }); } catch { }
+      }
     });
     try {
       const tenantId = req.scope?.tenantId;
@@ -265,11 +266,36 @@ exports.uploadDatasetFilesStream = [
       try { logger.info('dataset.upload.done', { requestId: req.requestId, projectId, datasetVersion: ds.version, files: results.length }); } catch { }
       send('final', { ok: true, dataset: { id: String(ds._id), version: ds.version, status: ds.status }, files: results });
       send('done', {});
+
+      // If the client navigated away mid-upload, still notify when ready.
+      if (req.sseClosed) {
+        try {
+          await notifyAndStore(String(userId), {
+            type: 'dataset-upload-done',
+            title: 'Indexelés elkészült',
+            message: `A dataset indexelés elkészült (projekt: ${projectId}, v${ds.version}).`,
+            data: { projectId, datasetVersion: ds.version, files: results.map(r => ({ filename: r.filename, kind: r.kind })) },
+            meta: { requestId: req.requestId, route: '/assistant', query: { projectId, datasetVersion: ds.version } },
+          });
+        } catch { }
+      }
       return res.end();
     } catch (e) {
       try { logger.error('dataset.upload.error', { requestId: req?.requestId, error: e?.message || 'failed' }); } catch { }
-      try { writeSse(res, 'error', { error: e?.message || 'failed' }); } catch { }
-      try { writeSse(res, 'done', {}); } catch { }
+      try { send('error', { error: e?.message || 'failed' }); } catch { }
+      try { send('done', {}); } catch { }
+
+      if (req?.sseClosed) {
+        try {
+          await notifyAndStore(String(req.userId), {
+            type: 'dataset-upload-failed',
+            title: 'Indexelés sikertelen',
+            message: `A dataset indexelés sikertelen: ${e?.message || 'Ismeretlen hiba'}`,
+            data: { projectId: req.params?.projectId || null, datasetVersion: req.params?.version || null },
+            meta: { requestId: req?.requestId, route: '/assistant', query: { projectId: req.params?.projectId || null, datasetVersion: req.params?.version || null } },
+          });
+        } catch { }
+      }
       return res.end();
     }
   }

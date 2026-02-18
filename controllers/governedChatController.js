@@ -24,6 +24,9 @@ const { rerankWithLLM } = require('../services/rerankService');
 const measEval = require('../services/measurementEvaluatorService');
 const xlsxPlanner = require('../services/xlsxPlannerService');
 const xlsxPreview = require('../services/xlsxPreviewService');
+const tabularPreview = require('../services/tabularPreviewService');
+const tableQueryPlanner = require('../services/tableQueryPlannerService');
+const tableQuery = require('../services/tableQueryService');
 const systemSettings = require('../services/systemSettingsStore');
 
 const encoder = get_encoding('o200k_base');
@@ -577,16 +580,19 @@ async function selectStandardSetsWithLLM({ openai, sets, message, evidenceMode, 
     required: ['selected_keys', 'ask_clarify', 'clarifying_question_hu', 'confidence'],
   };
 
-  const respObj = await createResponse({
-    model,
-    instructions: sys,
-    input: [{ role: 'user', content: user }],
-    store: false,
-    temperature: 0,
-    maxOutputTokens: 700,
-    textFormat: { type: 'json_schema', name: 'standard_router', strict: true, schema },
-    timeoutMs: 60_000,
-  });
+	  const respObj = await createResponse({
+	    model,
+	    instructions: sys,
+	    input: [{ role: 'user', content: user }],
+	    store: false,
+	    temperature: 0,
+	    maxOutputTokens: 700,
+	    textFormat: { type: 'json_schema', name: 'standard_router', strict: true, schema },
+	    timeoutMs: (() => {
+	      const raw = Number(systemSettings.getNumber('STANDARD_ROUTER_OPENAI_TIMEOUT_MS') || 60_000);
+	      return Math.max(10_000, Math.min(raw, 180_000));
+	    })(),
+	  });
 
   const txt = String(extractOutputTextFromResponse(respObj) || '').trim();
   let parsed = null;
@@ -769,6 +775,59 @@ function parseClarifyNumericSelection(conversation, message) {
   return sid || null;
 }
 
+function parseClarifyXlsxToolSelection(conversation, message) {
+  const raw = String(message || '').trim();
+  const last = Array.isArray(conversation?.messages) ? conversation.messages.slice().reverse().find(x => x?.role === 'assistant') : null;
+  const meta = last?.meta || null;
+  if (!meta || meta.kind !== 'clarify_xlsx_tool') return null;
+  const opts = meta.options;
+  if (!Array.isArray(opts) || !opts.length) return null;
+
+  const yes = raw.toLowerCase();
+  if (['igen', 'ok', 'oke', 'okay', 'yes', 'y', 'mehet', 'go', 'rendben'].includes(yes)) {
+    return opts[0] || null;
+  }
+
+  // Allow "1,2" style multi-select; take first.
+  const firstToken = raw.split(/[,\s]+/).filter(Boolean)[0] || '';
+
+  // 1) Numeric selection
+  if (/^\d+$/.test(firstToken)) {
+    const n = Number(firstToken);
+    if (!Number.isInteger(n) || n <= 0) return null;
+    return opts.find(o => Number(o?.i) === n) || opts[n - 1] || null;
+  }
+
+  // 2) "1) ..." style selection
+  const m = raw.match(/^(\d+)\s*[\)\.\-:]/);
+  if (m) {
+    const n = Number(m[1]);
+    if (!Number.isInteger(n) || n <= 0) return null;
+    return opts.find(o => Number(o?.i) === n) || opts[n - 1] || null;
+  }
+
+  // 3) Match by tool/name
+  const norm = (s) => String(s || '').trim().toLowerCase();
+  const want = norm(raw);
+  if (!want) return null;
+  return opts.find(o => norm(o?.name) === want) || opts.find(o => norm(o?.tool) === want) || null;
+}
+
+function detectTabularIntent(message) {
+  const s = String(message || '').toLowerCase();
+  if (/\btable\s*1\b/i.test(s) || /\btable\s*4\b/i.test(s)) return false;
+  const needles = [
+    'összeg', 'osszeg', 'összes', 'osszes', 'sum', 'total',
+    'átlag', 'atlag', 'average', 'mean',
+    'minimum', 'min', 'maximum', 'max',
+    'darab', 'hány', 'mennyi', 'count',
+    'csoport', 'group', 'per ',
+    'top', 'legnagyobb', 'legkisebb',
+    'szűr', 'filter', 'where',
+  ];
+  return needles.some(n => s.includes(n));
+}
+
 // POST /api/chat/governed/stream
 // body: { threadId, projectId, datasetVersion?, message }
 exports.chatGovernedStream = async (req, res) => {
@@ -776,7 +835,10 @@ exports.chatGovernedStream = async (req, res) => {
       setClosedFlag: 'sseClosed',
       // Frontends often implement their own "no activity" timeout that ignores SSE comment lines.
       // Use a real SSE event heartbeat here so the UI sees periodic activity while the model runs.
-      heartbeatMs: 5000,
+      heartbeatMs: (() => {
+        const raw = Number(systemSettings.getNumber('GOVERNED_SSE_HEARTBEAT_MS') || 5000);
+        return Math.max(1000, Math.min(raw, 60000));
+      })(),
       heartbeatEvent: 'ping',
       onClose: ({ req }) => {
         try { logger.warn('governed.sse.closed', { requestId: req?.requestId, path: req?.originalUrl }); } catch { }
@@ -785,7 +847,7 @@ exports.chatGovernedStream = async (req, res) => {
   try {
     const userId = req.userId;
     const tenantId = req.scope?.tenantId;
-    const { threadId, message, standardRef: requestedStandardRef0 } = req.body || {};
+    const { threadId, message: message0, standardRef: requestedStandardRef0 } = req.body || {};
     const requestedVersion = req.body?.datasetVersion;
 
     const debugEnabled = systemSettings.getBoolean('DEBUG_GOVERNED');
@@ -800,25 +862,23 @@ exports.chatGovernedStream = async (req, res) => {
       send('done', { ok: false });
       return res.end();
     }
-    if (!message || typeof message !== 'string' || !message.trim()) {
+    if (!message0 || typeof message0 !== 'string' || !message0.trim()) {
       send('error', { message: 'message is required.' });
       send('done', { ok: false });
       return res.end();
     }
-
-    const lang = detectLanguage(message);
-    let answerMode = detectAnswerMode(message);
+    const rawUserMessage = String(message0);
 
     try {
       logger.info('governed.start', {
         requestId: req.requestId,
         tenantId: String(tenantId),
-        userId: String(userId),
-        projectId,
-        requestedVersion: requestedVersion === undefined ? null : requestedVersion,
-        messageChars: String(message).trim().length,
-        pineconeEnabled: pinecone.isPineconeEnabled(),
-      });
+	        userId: String(userId),
+	        projectId,
+	        requestedVersion: requestedVersion === undefined ? null : requestedVersion,
+	        messageChars: String(rawUserMessage).trim().length,
+	        pineconeEnabled: pinecone.isPineconeEnabled(),
+	      });
     } catch { }
 
     const conversation = await Conversation.findOne({ threadId, userId, tenantId });
@@ -827,6 +887,25 @@ exports.chatGovernedStream = async (req, res) => {
       send('done', { ok: false });
       return res.end();
     }
+
+    // If the previous assistant asked which XLSX tool to run, treat this message as the selection
+    // and continue with the original question.
+    let toolOverride = null;
+    let effectiveMessage = rawUserMessage;
+    const toolPick = parseClarifyXlsxToolSelection(conversation, rawUserMessage);
+    if (toolPick) {
+      const lastAssistant = Array.isArray(conversation?.messages)
+        ? conversation.messages.slice().reverse().find(x => x?.role === 'assistant')
+        : null;
+      const originalQuestion = String(lastAssistant?.meta?.originalQuestion || '').trim();
+      if (originalQuestion) {
+        toolOverride = toolPick;
+        effectiveMessage = originalQuestion;
+      }
+    }
+
+    const lang = detectLanguage(effectiveMessage);
+    let answerMode = detectAnswerMode(effectiveMessage);
 
     // --- Standard Explorer mode (tenant standard library, PDF-only) ---
     // If the client pins a standardRef, persist it on the conversation and allow governed chat without project datasets.
@@ -874,12 +953,12 @@ exports.chatGovernedStream = async (req, res) => {
       startedAt: new Date(),
       finishedAt: null,
       error: undefined,
-      meta: {
-        threadId,
-        projectId,
-        datasetVersion: requestedVersion === undefined ? null : requestedVersion,
-        totalChars: String(message || '').trim().length,
-      },
+	      meta: {
+	        threadId,
+	        projectId,
+	        datasetVersion: requestedVersion === undefined ? null : requestedVersion,
+	        totalChars: String(effectiveMessage || '').trim().length,
+	      },
       progress: { lastMessage: 'init' },
     });
 
@@ -954,11 +1033,11 @@ exports.chatGovernedStream = async (req, res) => {
       error: undefined,
       meta: {
         threadId,
-        projectId,
-        datasetVersion,
-        files: allowedFilenames.map((n) => ({ name: n })),
-        totalChars: String(message || '').trim().length,
-      },
+	        projectId,
+	        datasetVersion,
+	        files: allowedFilenames.map((n) => ({ name: n })),
+	        totalChars: String(effectiveMessage || '').trim().length,
+	      },
       progress: {
         filesTotal: allowedFilenames.length,
         filesProcessed: 0,
@@ -970,7 +1049,7 @@ exports.chatGovernedStream = async (req, res) => {
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const embeddingModel = process.env.RAG_EMBEDDING_MODEL || 'text-embedding-3-small';
-    const qEmbedding = await createEmbeddingVector(openai, message, embeddingModel);
+    const qEmbedding = await createEmbeddingVector(openai, effectiveMessage, embeddingModel);
     if (debugEnabled) {
       try { logger.info('governed.embedding', { requestId: req.requestId, model: embeddingModel, dims: qEmbedding.length }); } catch { }
     }
@@ -1013,7 +1092,7 @@ exports.chatGovernedStream = async (req, res) => {
 
     // --- Tenant-wide standard set routing (0..N sets) ---
     // If the previous assistant asked "choose 1/2/3", accept numeric reply without re-routing.
-    const chosenFromNumeric = parseClarifyNumericSelection(conversation, message);
+    const chosenFromNumeric = parseClarifyNumericSelection(conversation, effectiveMessage);
     let selectedSets = [];
     let clarify = null;
     if (!standardExplorerEnabled && chosenFromNumeric) {
@@ -1021,27 +1100,27 @@ exports.chatGovernedStream = async (req, res) => {
       selectedSets = doc ? [doc] : [];
     }
     if (!standardExplorerEnabled && !selectedSets.length) {
-      ({ selectedSets, clarify } = await resolveStandardSelection({ tenantId, message, evidenceText: routingEvidenceText, openai }));
+      ({ selectedSets, clarify } = await resolveStandardSelection({ tenantId, message: effectiveMessage, evidenceText: routingEvidenceText, openai }));
     }
     if (clarify) {
       if (debugEnabled) {
         try { logger.info('governed.standardSets.clarify', { requestId: req.requestId, options: clarify.options?.map(o => ({ i: o.i, name: o.name, key: o.key })) }); } catch { }
       }
-      await setConversationJob(conversation, {
-        type: 'governed_chat',
-        status: 'succeeded',
-        stage: 'clarify',
+	      await setConversationJob(conversation, {
+	        type: 'governed_chat',
+	        status: 'succeeded',
+	        stage: 'clarify',
         finishedAt: new Date(),
         progress: { lastMessage: 'clarify' },
-      });
-      const html = finalizeHtml(clarify.questionHu);
-      conversation.messages.push({ role: 'user', content: message, meta: { kind: 'chat-governed', projectId, datasetVersion } });
-      conversation.messages.push({ role: 'assistant', content: html, images: [], meta: { kind: 'clarify_standard_set', options: clarify.options } });
-      await conversation.save();
-      send('final', { html });
-      send('done', { ok: true });
-      try { res.end(); } catch { }
-      return;
+	      });
+	      const html = finalizeHtml(clarify.questionHu);
+	      conversation.messages.push({ role: 'user', content: effectiveMessage, meta: { kind: 'chat-governed', projectId, datasetVersion } });
+	      conversation.messages.push({ role: 'assistant', content: html, images: [], meta: { kind: 'clarify_standard_set', options: clarify.options } });
+	      await conversation.save();
+	      send('final', { html, meta: { kind: 'clarify_standard_set', options: clarify.options } });
+	      send('done', { ok: true });
+	      try { res.end(); } catch { }
+	      return;
     }
 
     const selectedStandardRefs = Array.from(new Set(
@@ -1209,7 +1288,7 @@ exports.chatGovernedStream = async (req, res) => {
             title: `${d.filename} ${d.sheet} row:${d.rowIndex}`,
             loc: `row:${d.rowIndex}`,
             text,
-            _score: hybridScoreValue({ query: message, text, vectorScore: c.vec }),
+            _score: hybridScoreValue({ query: effectiveMessage, text, vectorScore: c.vec }),
             filename: String(d.filename || ''),
           };
         })
@@ -1228,7 +1307,7 @@ exports.chatGovernedStream = async (req, res) => {
             title: `${d.filename}`,
             loc,
             text,
-            _score: hybridScoreValue({ query: message, text, vectorScore: c.vec }),
+            _score: hybridScoreValue({ query: effectiveMessage, text, vectorScore: c.vec }),
             filename: String(d.filename || ''),
           };
         })
@@ -1247,7 +1326,7 @@ exports.chatGovernedStream = async (req, res) => {
             title: `${d.filename}`,
             loc,
             text,
-            _score: hybridScoreValue({ query: message, text, vectorScore: c.vec }),
+            _score: hybridScoreValue({ query: effectiveMessage, text, vectorScore: c.vec }),
             filename: String(d.filename || ''),
           };
         })
@@ -1266,7 +1345,7 @@ exports.chatGovernedStream = async (req, res) => {
             title,
             loc: String(d.pageOrLoc || c.pageOrLoc || ''),
             text,
-            _score: hybridScoreValue({ query: message, text, vectorScore: c.vec }),
+            _score: hybridScoreValue({ query: effectiveMessage, text, vectorScore: c.vec }),
             key: String(d.standardRef || ''),
           };
         })
@@ -1274,10 +1353,10 @@ exports.chatGovernedStream = async (req, res) => {
         .sort((a, b) => b._score - a._score);
 
       // Optional LLM rerank (per kind, keeps diversity logic later).
-      try { tableRanked = await applyRerank({ query: message, kind: 'table_row', items: tableRanked, trace: { requestId: req.requestId } }); } catch { }
-      try { docRanked = await applyRerank({ query: message, kind: 'doc_chunk', items: docRanked, trace: { requestId: req.requestId } }); } catch { }
-      try { imgRanked = await applyRerank({ query: message, kind: 'image_chunk', items: imgRanked, trace: { requestId: req.requestId } }); } catch { }
-      try { stdRanked = await applyRerank({ query: message, kind: 'standard_clause', items: stdRanked, trace: { requestId: req.requestId } }); } catch { }
+      try { tableRanked = await applyRerank({ query: effectiveMessage, kind: 'table_row', items: tableRanked, trace: { requestId: req.requestId } }); } catch { }
+      try { docRanked = await applyRerank({ query: effectiveMessage, kind: 'doc_chunk', items: docRanked, trace: { requestId: req.requestId } }); } catch { }
+      try { imgRanked = await applyRerank({ query: effectiveMessage, kind: 'image_chunk', items: imgRanked, trace: { requestId: req.requestId } }); } catch { }
+      try { stdRanked = await applyRerank({ query: effectiveMessage, kind: 'standard_clause', items: stdRanked, trace: { requestId: req.requestId } }); } catch { }
 
       const selectedTable = pickByKey(tableRanked.map(it => ({ id: `row:${it.id}`, metadata: { filename: it.filename } })), {
         maxTotal: finalTables,
@@ -1366,7 +1445,7 @@ exports.chatGovernedStream = async (req, res) => {
       }
 
       // Neighbor expansion for standards (seq +/- 1)
-      const neighborRadius = (standardExplorerEnabled && isDefinitionLikeQuestion(message)) ? 2 : 1;
+      const neighborRadius = (standardExplorerEnabled && isDefinitionLikeQuestion(effectiveMessage)) ? 2 : 1;
       const neighbors = [];
       for (const s of scoredStandards) {
         const seq = Number(s?.seq || 0);
@@ -1450,8 +1529,8 @@ exports.chatGovernedStream = async (req, res) => {
     let hasMeasEvalContext = false;
     let hasMeasCompareContext = false;
 
-    // Optional: LLM planner chooses which deterministic XLSX tool to run.
-    try {
+	    // Optional: LLM planner chooses which deterministic XLSX tool to run.
+	    try {
       const hasXlsx = allowedFilenames.some(n => String(n).toLowerCase().endsWith('.xlsx') || String(n).toLowerCase().endsWith('.xls'));
       let planned = null;
 
@@ -1469,17 +1548,109 @@ exports.chatGovernedStream = async (req, res) => {
           });
         } catch { preview = null; }
         const hints = { xlsxFiles: xlsxList, xlsxPreview: preview };
-        const r = await xlsxPlanner.buildPlan({ message, xlsxHints: hints, trace: { requestId: req.requestId } });
+        const r = await xlsxPlanner.buildPlan({ message: effectiveMessage, xlsxHints: hints, trace: { requestId: req.requestId } });
         if (r?.ok && r.plan?.steps?.length) planned = r.plan;
       }
 
       const step = planned?.steps?.[0] || null;
-      const tool = String(step?.tool || '');
-      const args = step?.args || {};
+      let tool = String(step?.tool || '');
+      let args = step?.args || {};
+
+      if (toolOverride && toolOverride.tool) {
+        tool = String(toolOverride.tool);
+        args = toolOverride.args || {};
+      }
 
       // Fallback heuristic if planner is off/empty.
-      const fallbackCompare = measEval.enabled() && measEval.detectCompareTablesIntent(message);
-      const fallbackEval = measEval.enabled() && measEval.detectIntent(message);
+      const fallbackCompare = measEval.enabled() && measEval.detectCompareTablesIntent(effectiveMessage);
+      const fallbackEval = measEval.enabled() && measEval.detectIntent(effectiveMessage);
+      const fallbackTabular = detectTabularIntent(effectiveMessage);
+
+	      // UX: if multiple tools are plausible, ask the user to confirm which tool to run.
+	      const confirmEnabled = !!systemSettings.getBoolean('XLSX_TOOL_CONFIRM_ENABLED');
+	      const cameFromToolPick = !!toolOverride;
+	      if (hasXlsx && confirmEnabled && !cameFromToolPick) {
+	        const toolLabel = (t, lang0) => {
+	          const lang = String(lang0 || '').toLowerCase();
+	          const hu = lang === 'hu';
+	          const key = String(t || '').trim();
+	          if (key === 'analyze_measurement_tables') return hu
+	            ? 'Mérés táblák (Table 1–4) mérnöki elemzése'
+	            : 'Engineering analysis of measurement tables (Table 1–4)';
+	          if (key === 'compare_tables') return hu
+	            ? 'Mérés táblák (Table 1–4) összehasonlítás oszlop-tartományon'
+	            : 'Compare measurement tables (Table 1–4) over a column range';
+	          if (key === 'evaluate_measurements') return hu
+	            ? 'Mérések kiértékelése (összegzés / max / steady)'
+	            : 'Evaluate measurements (summary / max / steady)';
+	          if (key === 'table_query') return hu
+	            ? 'Általános táblázat lekérdezés (szűrés/csoportosítás/összeg/átlag)'
+	            : 'General table query (filter/group/sum/average)';
+	          return key || (hu ? 'Ismeretlen eszköz' : 'Unknown tool');
+	        };
+
+	        const candidates = new Map(); // tool -> { tool, name, args }
+
+	        const add = (t, name, a = {}) => {
+	          const k = String(t || '').trim();
+	          if (!k) return;
+	          if (candidates.has(k)) return;
+	          candidates.set(k, { tool: k, name, args: a });
+	        };
+
+	        // Preferred choice first (planner), then fallbacks.
+	        if (tool === 'analyze_measurement_tables') add('analyze_measurement_tables', toolLabel('analyze_measurement_tables', lang), args || {});
+	        if (tool === 'compare_tables') add('compare_tables', toolLabel('compare_tables', lang), args || {});
+	        if (tool === 'evaluate_measurements') add('evaluate_measurements', toolLabel('evaluate_measurements', lang), args || {});
+	        if (tool === 'table_query') add('table_query', toolLabel('table_query', lang), {});
+
+	        if (fallbackTabular) add('table_query', toolLabel('table_query', lang), {});
+	        if (fallbackCompare) add('compare_tables', toolLabel('compare_tables', lang), {});
+	        if (fallbackEval) add('evaluate_measurements', toolLabel('evaluate_measurements', lang), {});
+
+	        // If we still don't have a choice, default to table_query for normal tables.
+	        if (!candidates.size && fallbackTabular) add('table_query', toolLabel('table_query', lang), {});
+
+	        const opts = Array.from(candidates.values()).slice(0, 5).map((o, idx) => ({ i: idx + 1, ...o }));
+	        if (opts.length >= 2) {
+	          const isHu = String(lang || '').toLowerCase() === 'hu';
+	          const lines = (isHu
+	            ? [
+	              `A kérdés alapján ezt a táblázat-eszközt futtatnám: **${opts[0].name}**.`,
+	              'Jó így? Válaszolj a sorszámmal (pl. 1), vagy válassz másikat:',
+	              '',
+	              ...opts.map(o => `${o.i} - ${o.name}`),
+	            ]
+	            : [
+	              `Based on your question, I'd run: **${opts[0].name}**.`,
+	              'Reply with the number (e.g. 1) to confirm, or choose another tool:',
+	              '',
+	              ...opts.map(o => `${o.i} - ${o.name}`),
+	            ]).join('\n');
+
+          await setConversationJob(conversation, {
+            type: 'governed_chat',
+            status: 'succeeded',
+            stage: 'clarify',
+            finishedAt: new Date(),
+            progress: { lastMessage: 'clarify_xlsx_tool' },
+          });
+
+          const html = finalizeHtml(lines);
+          conversation.messages.push({ role: 'user', content: effectiveMessage, meta: { kind: 'chat-governed', projectId, datasetVersion } });
+          conversation.messages.push({
+            role: 'assistant',
+            content: html,
+            images: [],
+            meta: { kind: 'clarify_xlsx_tool', options: opts, originalQuestion: effectiveMessage },
+          });
+          await conversation.save();
+          send('final', { html, meta: { kind: 'clarify_xlsx_tool', options: opts, originalQuestion: effectiveMessage } });
+          send('done', { ok: true });
+          try { res.end(); } catch { }
+          return;
+        }
+      }
 
       if (measEval.enabled() && tool === 'analyze_measurement_tables') {
         send('progress', { stage: 'meas.analyze.start' });
@@ -1488,7 +1659,7 @@ exports.chatGovernedStream = async (req, res) => {
           projectId,
           datasetVersion,
           allowedFilenames,
-          message,
+          message: effectiveMessage,
           options: args || null,
           trace: { requestId: req.requestId },
         });
@@ -1507,7 +1678,7 @@ exports.chatGovernedStream = async (req, res) => {
           projectId,
           datasetVersion,
           allowedFilenames,
-          message,
+          message: effectiveMessage,
           options: tool === 'compare_tables' ? args : null,
           trace: { requestId: req.requestId },
         });
@@ -1533,6 +1704,42 @@ exports.chatGovernedStream = async (req, res) => {
           contextParts.push('---');
           hasMeasEvalContext = true;
           send('progress', { stage: 'meas.eval.done', tests: ev.result.by_test?.length || 0 });
+        }
+      } else if (systemSettings.getBoolean('TABLE_QUERY_ENABLED') && tool === 'table_query') {
+        send('progress', { stage: 'table.query.plan' });
+        const xlsxList = allowedFilenames.filter(n => /\.xls(x)?$/i.test(String(n || ''))).slice(0, 6);
+        let preview = null;
+        try {
+          preview = await tabularPreview.buildTabularPreview({
+            tenantId,
+            projectId,
+            datasetVersion,
+            filenames: xlsxList,
+            trace: { requestId: req.requestId },
+          });
+        } catch { preview = null; }
+
+        const planRes = await tableQueryPlanner.buildQueryPlan({
+          message: effectiveMessage,
+          tabularHints: { xlsxFiles: xlsxList, tabularPreview: preview },
+          trace: { requestId: req.requestId },
+        });
+
+        const plan = planRes?.ok ? planRes.plan : null;
+        send('progress', { stage: 'table.query.exec' });
+        const exec = await tableQuery.runTableQuery({
+          tenantId,
+          projectId,
+          datasetVersion,
+          allowedFilenames,
+          query: plan?.query || {},
+          trace: { requestId: req.requestId },
+        });
+        if (exec?.ok && exec?.result) {
+          contextParts.push('TABLE_QUERY_CONTEXT (deterministic tabular query; use this for sums/averages/counts/grouping in normal spreadsheets):');
+          contextParts.push(JSON.stringify({ plan, result: exec.result }).slice(0, 160000));
+          contextParts.push('---');
+          send('progress', { stage: 'table.query.done', rows: exec.result.rows?.length || 0 });
         }
       }
     } catch (e) {
@@ -1732,11 +1939,11 @@ exports.chatGovernedStream = async (req, res) => {
       'ALLOWED_FILES:',
       ...allowedFilenames.map(n => `- ${n}`),
       '',
-      'EVIDENCE_CONTEXT:',
-      contextParts.join('\n'),
-      '',
-      `QUESTION:\n${message}`
-    ].join('\n');
+	      'EVIDENCE_CONTEXT:',
+	      contextParts.join('\n'),
+	      '',
+	      `QUESTION:\n${effectiveMessage}`
+	    ].join('\n');
 
     send('progress', { stage: 'assistant.start' });
     if (debugEnabled) {
@@ -1855,7 +2062,11 @@ exports.chatGovernedStream = async (req, res) => {
       textVerbosity: standardExplorerEnabled ? stdVerbosity : null,
       maxOutputTokens: standardExplorerEnabled ? maxOut : null,
       textFormat: { type: 'json_schema', name: 'governed_answer', strict: true, schema: outSchema },
-      timeoutMs: 120_000,
+      timeoutMs: (() => {
+        const raw = Number(systemSettings.getNumber('GOVERNED_OPENAI_TIMEOUT_MS') || 300_000);
+        // Keep sane bounds to prevent accidental huge timeouts.
+        return Math.max(30_000, Math.min(raw, 600_000));
+      })(),
     });
 
     const txt = String(extractOutputTextFromResponse(respObj) || '').trim();
@@ -2228,12 +2439,12 @@ exports.chatGovernedStream = async (req, res) => {
 	      if (md) answerForDisplay = `${answerForDisplay}${md}`;
 	    }
 
-    const finalHtml = finalizeHtml(answerForDisplay);
-    conversation.messages.push({
-      role: 'user',
-      content: message,
-      meta: { kind: 'chat-governed', projectId, datasetVersion }
-    });
+	    const finalHtml = finalizeHtml(answerForDisplay);
+	    conversation.messages.push({
+	      role: 'user',
+	      content: toolOverride ? rawUserMessage : effectiveMessage,
+	      meta: { kind: 'chat-governed', projectId, datasetVersion }
+	    });
     conversation.messages.push({
       role: 'assistant',
       content: finalHtml,
@@ -2258,7 +2469,7 @@ exports.chatGovernedStream = async (req, res) => {
           title: 'Elemzés elkészült',
           message: `Az elemzés elkészült (projekt: ${projectId}, dataset v${datasetVersion}).`,
           data: { threadId, projectId, datasetVersion },
-          meta: { requestId: req.requestId },
+          meta: { requestId: req.requestId, route: '/assistant', query: { threadId } },
         });
       } catch { }
     }
@@ -2297,7 +2508,7 @@ exports.chatGovernedStream = async (req, res) => {
           title: 'Elemzés sikertelen',
           message: `Az elemzés sikertelen: ${e?.message || 'Ismeretlen hiba'}`,
           data: { threadId: req.body?.threadId || null, projectId: req.body?.projectId || null },
-          meta: { requestId: req?.requestId },
+          meta: { requestId: req?.requestId, route: '/assistant', query: { threadId: req.body?.threadId || null } },
         });
       } catch { }
     }

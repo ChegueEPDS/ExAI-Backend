@@ -22,6 +22,43 @@ const SETTINGS = [
     description: 'Require strict numericEvidence for numeric claims (governed chat).',
   },
   {
+    key: 'GOVERNED_OPENAI_TIMEOUT_MS',
+    group: 'Chat models',
+    type: 'number',
+    defaultValue: 300000,
+    description: 'Timeout (ms) for governed chat OpenAI Responses API call. Increase if large datasets or structured outputs frequently hit 120s timeouts.',
+  },
+  {
+    key: 'STANDARD_ROUTER_OPENAI_TIMEOUT_MS',
+    group: 'Chat models',
+    type: 'number',
+    defaultValue: 60000,
+    description: 'Timeout (ms) for the standard-set router OpenAI call (used to pick standard sets).',
+  },
+
+  // SSE / streaming
+  {
+    key: 'GOVERNED_SSE_HEARTBEAT_MS',
+    group: 'SSE',
+    type: 'number',
+    defaultValue: 5000,
+    description: 'Heartbeat interval (ms) for governed chat SSE stream. Smaller values reduce idle disconnects in browsers/proxies.',
+  },
+  {
+    key: 'DATASET_UPLOAD_SSE_HEARTBEAT_MS',
+    group: 'SSE',
+    type: 'number',
+    defaultValue: 10000,
+    description: 'Heartbeat interval (ms) for dataset upload SSE stream.',
+  },
+  {
+    key: 'NOTIFICATIONS_SSE_HEARTBEAT_MS',
+    group: 'SSE',
+    type: 'number',
+    defaultValue: 10000,
+    description: 'Heartbeat interval (ms) for notifications SSE stream.',
+  },
+  {
     key: 'SUMMARY_COMPLETIONS_MODEL',
     group: 'Chat models',
     type: 'string',
@@ -86,6 +123,17 @@ const SETTINGS = [
   { key: 'XLSX_PLANNER_PREVIEW_MAX_ROWS', group: 'XLSX planner', type: 'number', defaultValue: 8000, description: 'Preview max rows.' },
   { key: 'XLSX_PLANNER_PREVIEW_MAX_LABELS', group: 'XLSX planner', type: 'number', defaultValue: 16, description: 'Preview max labels per sheet.' },
   { key: 'XLSX_PLANNER_PREVIEW_MAX_CHARS', group: 'XLSX planner', type: 'number', defaultValue: 35000, description: 'Preview max characters.' },
+
+  // Table query (general spreadsheets)
+  { key: 'TABLE_QUERY_ENABLED', group: 'Table query', type: 'boolean', defaultValue: true, description: 'Enable general-purpose table_query tool for normal spreadsheets.' },
+  { key: 'TABLE_QUERY_MODEL', group: 'Table query', type: 'string', defaultValue: 'gpt-5-mini', description: 'Model for table_query planner.' },
+  { key: 'TABLE_QUERY_MAX_FILES', group: 'Table query', type: 'number', defaultValue: 3, description: 'Max XLSX files scanned for table_query previews per question.' },
+  { key: 'TABLE_QUERY_PREVIEW_MAX_ROWS', group: 'Table query', type: 'number', defaultValue: 400, description: 'Max rows scanned per sheet for preview.' },
+  { key: 'TABLE_QUERY_PREVIEW_MAX_COLS', group: 'Table query', type: 'number', defaultValue: 25, description: 'Max columns exposed to planner per sheet.' },
+  { key: 'TABLE_QUERY_EXEC_MAX_ROWS', group: 'Table query', type: 'number', defaultValue: 12000, description: 'Max dataset rows processed per table_query execution.' },
+
+  // XLSX UX
+  { key: 'XLSX_TOOL_CONFIRM_ENABLED', group: 'XLSX UX', type: 'boolean', defaultValue: true, description: 'Ask the user to confirm which XLSX tool to run when multiple are plausible.' },
 
   // PDF vision
   { key: 'PDF_VISION_ENABLED', group: 'PDF vision', type: 'boolean', defaultValue: false, description: 'Enable PDF page rendering + vision extraction.' },

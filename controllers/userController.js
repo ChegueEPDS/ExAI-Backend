@@ -9,10 +9,11 @@ const Tenant = require('../models/tenant');
 const path = require('path');
 
 const mailService = require('../services/mailService');
-const { tenantInviteEmailHtml } = require('../services/mailTemplates');
+const { tenantInviteEmailHtml, registrationEmailHtml } = require('../services/mailTemplates');
 const { migrateAllUserDataToTenant } = require('../services/tenantMigration');
 const azureBlob = require('../services/azureBlobService');
 const { computePermissions, getEffectiveProfessions, assertValidProfessions } = require('../helpers/rbac');
+const { resolvePublicBaseUrl, persistPublicBaseUrlIfMissing } = require('../helpers/publicBaseUrl');
 const contributionRewardService = require('../services/contributionRewardService');
 
 // --- Daily download quota (Free plan) helpers ---
@@ -362,12 +363,19 @@ exports.moveUserToTenant = async (req, res) => {
     // --- fire-and-forget tenant-added e-mail ---
     (async () => {
       try {
-        const appBase = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
+        const requestBaseUrl = await resolvePublicBaseUrl({ req, tenantId: toTenantId });
+        await persistPublicBaseUrlIfMissing({
+          tenantId: toTenantId,
+          baseUrl: requestBaseUrl,
+          updatedBy: req.user?.id || req.userId || null
+        });
+        const appBase = requestBaseUrl || process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
         const html = tenantInviteEmailHtml({
           firstName: user.firstName || '',
           lastName:  user.lastName  || '',
           tenantName: (toTenant && toTenant.name) || 'your organization',
           loginUrl: appBase,
+          baseUrl: requestBaseUrl || undefined,
           password: req.body?.generatedPassword || user._tempGeneratedPassword || null,
         });
         await mailService.sendMail({
@@ -690,11 +698,18 @@ async function createTenantForRegistration({ plan, companyName, ownerUserId }) {
     // Fire-and-forget welcome e-mail (do not block registration flow)
     (async () => {
       try {
-        const loginUrl = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
+        const requestBaseUrl = await resolvePublicBaseUrl({ req, tenantId: tenant._id });
+        await persistPublicBaseUrlIfMissing({
+          tenantId: tenant._id,
+          baseUrl: requestBaseUrl,
+          updatedBy: user._id
+        });
+        const loginUrl = requestBaseUrl || process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
         const html = registrationEmailHtml({
           firstName: user.firstName || '',
           lastName:  user.lastName  || '',
           loginUrl,
+          baseUrl: requestBaseUrl || undefined,
           tenantName: tenant.name
         });
         await mailService.sendMail({
@@ -903,11 +918,18 @@ exports.createPaidTenantUser = async (req, res) => {
     // 6) (Opcionális) e-mail küldés: tenantInviteEmailHtml használatával (fire-and-forget)
     (async () => {
       try {
+        const requestBaseUrl = await resolvePublicBaseUrl({ req, tenantId: tenant._id });
+        await persistPublicBaseUrlIfMissing({
+          tenantId: tenant._id,
+          baseUrl: requestBaseUrl,
+          updatedBy: req.user?.id || req.userId || null
+        });
         const html = tenantInviteEmailHtml({
           firstName: user.firstName || '',
           lastName: user.lastName || '',
           tenantName: tenant.name,
-          loginUrl: process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu',
+          loginUrl: requestBaseUrl || process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu',
+          baseUrl: requestBaseUrl || undefined,
           password: pwd
         });
         await mailService.sendMail({

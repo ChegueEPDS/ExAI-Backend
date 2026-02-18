@@ -16,6 +16,7 @@ function normalizeTool(t) {
   if (s === 'analyze_measurement_tables' || s === 'analyze_tables' || s === 'analyze') return 'analyze_measurement_tables';
   if (s === 'compare_tables' || s === 'compare') return 'compare_tables';
   if (s === 'evaluate_measurements' || s === 'meas_eval' || s === 'evaluate') return 'evaluate_measurements';
+  if (s === 'table_query' || s === 'table' || s === 'tabular' || s === 'query_table') return 'table_query';
   if (s === 'none') return 'none';
   return 'none';
 }
@@ -84,6 +85,9 @@ function sanitizePlan(plan) {
     if (tool === 'evaluate_measurements') {
       args.mode = 'summary';
     }
+    if (tool === 'table_query') {
+      args.mode = 'auto';
+    }
     out.steps.push({ tool, args });
   }
   out.needs_clarification = !!plan?.needs_clarification;
@@ -136,6 +140,7 @@ async function buildPlan({ message, xlsxHints = null, trace = null }) {
     '- analyze_measurement_tables: engineering-style comparative analysis for measurement workbooks (Table 1..4 semantics, steady-state/peak, within-supply comparisons).',
     '- compare_tables: compare Table 1..4 temperature points using a column range (e.g. C-K) and a delta threshold in °C.',
     '- evaluate_measurements: compute per-table/per-sheet summaries of temperature points (max/steady/external).',
+    '- table_query: general-purpose tabular query for normal spreadsheets (filter, group-by, sum/avg/min/max/count).',
     '- none: if the request is unrelated to XLSX analysis.',
     'Return STRICT JSON only. Do not add prose.',
   ].join(' ');
@@ -170,7 +175,7 @@ async function buildPlan({ message, xlsxHints = null, trace = null }) {
           properties: {
             tool: {
               type: 'string',
-              enum: ['analyze_measurement_tables', 'compare_tables', 'evaluate_measurements', 'none'],
+              enum: ['analyze_measurement_tables', 'compare_tables', 'evaluate_measurements', 'table_query', 'none'],
             },
             // Strict schema note:
             // In Responses strict JSON schema, optional keys are not supported the usual way.

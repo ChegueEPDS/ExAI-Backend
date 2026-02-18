@@ -10,6 +10,8 @@ test('xlsx planner normalizes tool aliases', () => {
   assert.equal(planner.__test.normalizeTool('analyze_measurement_tables'), 'analyze_measurement_tables');
   assert.equal(planner.__test.normalizeTool('compare'), 'compare_tables');
   assert.equal(planner.__test.normalizeTool('evaluate'), 'evaluate_measurements');
+  assert.equal(planner.__test.normalizeTool('table'), 'table_query');
+  assert.equal(planner.__test.normalizeTool('tabular'), 'table_query');
   assert.equal(planner.__test.normalizeTool('none'), 'none');
 });
 

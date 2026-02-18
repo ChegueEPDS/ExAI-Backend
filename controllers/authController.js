@@ -8,6 +8,7 @@ const Tenant = require('../models/tenant');
 const Subscription = require('../models/subscription');
 const mailService = require('../services/mailService');
 const { registrationEmailHtml, emailVerificationEmailHtml, forgotPasswordEmailHtml } = require('../services/mailTemplates');
+const { resolvePublicBaseUrl, persistPublicBaseUrlIfMissing } = require('../helpers/publicBaseUrl');
 const Stripe = require('stripe');
 const { ensureStripeCustomerForTenant } = require('../services/stripeCustomerProvisioning');
 const { computePermissions, getEffectiveProfessions } = require('../helpers/rbac');
@@ -319,13 +320,16 @@ exports.register = async (req, res) => {
 
     // Fire-and-forget: e-mail verifikációs link
     try {
-      const appBase = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
+      const requestBaseUrl = await resolvePublicBaseUrl({ req, tenantId: personalTenant._id });
+      await persistPublicBaseUrlIfMissing({ tenantId: personalTenant._id, baseUrl: requestBaseUrl, updatedBy: user._id });
+      const appBase = requestBaseUrl || process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
       const verifyUrl = `${appBase.replace(/\/+$/, '')}/verify-email?token=${encodeURIComponent(emailToken)}`;
       const html = emailVerificationEmailHtml({
         firstName: user.firstName || '',
         lastName: user.lastName || '',
         verifyUrl,
-        tenantName: personalTenant.name
+        tenantName: personalTenant.name,
+        baseUrl: requestBaseUrl || undefined
       });
       mailService.sendMail({
         to: user.email,
@@ -501,13 +505,16 @@ exports.resendVerificationEmail = async (req, res) => {
       }
     }
 
-    const appBase = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
+    const requestBaseUrl = await resolvePublicBaseUrl({ req, tenantId: user.tenantId || null });
+    await persistPublicBaseUrlIfMissing({ tenantId: user.tenantId || null, baseUrl: requestBaseUrl, updatedBy: user._id });
+    const appBase = requestBaseUrl || process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
     const verifyUrl = `${appBase.replace(/\/+$/, '')}/verify-email?token=${encodeURIComponent(emailToken)}`;
     const html = emailVerificationEmailHtml({
       firstName: user.firstName || '',
       lastName: user.lastName || '',
       verifyUrl,
-      tenantName: tenantName || undefined
+      tenantName: tenantName || undefined,
+      baseUrl: requestBaseUrl || undefined
     });
 
     mailService
@@ -677,13 +684,16 @@ exports.forgotPassword = async (req, res) => {
     }
 
     // Send email with the new temporary password
-    const loginUrl = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
+    const requestBaseUrl = await resolvePublicBaseUrl({ req, tenantId: user.tenantId || null });
+    await persistPublicBaseUrlIfMissing({ tenantId: user.tenantId || null, baseUrl: requestBaseUrl, updatedBy: user._id });
+    const loginUrl = requestBaseUrl || process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
     const html = forgotPasswordEmailHtml({
       firstName: user.firstName || '',
       lastName: user.lastName || '',
       loginUrl,
       tempPassword,
-      tenantName: tenantName || undefined
+      tenantName: tenantName || undefined,
+      baseUrl: requestBaseUrl || undefined
     });
 
     // fire-and-forget

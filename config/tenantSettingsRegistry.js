@@ -4,6 +4,16 @@
  */
 
 const SETTINGS = [
+  // Branding / public links
+  {
+    key: 'PUBLIC_BASE_URL',
+    group: 'Branding',
+    type: 'string',
+    defaultValue: '',
+    description:
+      'Public base URL for links in emails/notifications (scheme + host). If empty, links may be derived from request headers or env fallbacks.',
+  },
+
   // Tenant AI profile (no Assistants API dependency)
   {
     key: 'AI_MODEL',

@@ -15,16 +15,42 @@ function buildTenantUrl(tenantName, path = '') {
   return `${base}/${normalizedPath}`;
 }
 
+function normalizeBaseUrl(tenantName, baseUrl) {
+  const input = String(baseUrl || '').trim();
+  if (!input) return getTenantBaseUrl(tenantName).replace(/\/+$/, '');
+  try {
+    const u = new URL(input.startsWith('http') ? input : `https://${input}`);
+    return `${u.protocol}//${u.host}`;
+  } catch (_) {
+    return getTenantBaseUrl(tenantName).replace(/\/+$/, '');
+  }
+}
+
+function withBaseOrigin(baseUrl, rawUrl, fallbackPath = '') {
+  const base = String(baseUrl || '').replace(/\/+$/, '');
+  const input = String(rawUrl || '').trim();
+  if (!input) return fallbackPath ? `${base}/${String(fallbackPath).replace(/^\/+/, '')}` : `${base}/`;
+
+  try {
+    if (input.startsWith('/')) return `${base}${input}`;
+    const u = new URL(input.startsWith('http') ? input : `https://${input}`);
+    return `${base}${u.pathname || '/'}${u.search || ''}${u.hash || ''}`;
+  } catch (_) {
+    return fallbackPath ? `${base}/${String(fallbackPath).replace(/^\/+/, '')}` : `${base}/`;
+  }
+}
+
 function displayHost(url) {
   return String(url || '').replace(/^https?:\/\//i, '');
 }
 
-function baseTemplate({ title, bodyHtml, tenantName }) {
+function baseTemplate({ title, bodyHtml, tenantName, baseUrl }) {
   const isIndex = isIndexTenant(tenantName);
+  const effectiveBaseUrl = normalizeBaseUrl(tenantName, baseUrl);
   const logoUrl = isIndex ? 'https://certs.atexdb.eu/public/index_logo.png' : 'https://certs.atexdb.eu/public/ATEXdb.png';
   const logoAlt = isIndex ? 'ExAI IndEx Logo' : 'ATEXdb Certs Logo';
   const footerName = isIndex ? 'ExAI IndEx' : 'ATEXdb Certs';
-  const footerUrl = buildTenantUrl(tenantName);
+  const footerUrl = effectiveBaseUrl;
   const footerUrlLabel = displayHost(footerUrl);
 
   return `
@@ -45,7 +71,7 @@ function baseTemplate({ title, bodyHtml, tenantName }) {
                 <!-- ⚠️ SVG helyett PNG + e-mail safe inline stílusok -->
                 <img src="${logoUrl}"
                      alt="${logoAlt}"
-                     width="220" height="auto"
+                     width="220"
                      style="display:block; outline:none; border:0; text-decoration:none; -ms-interpolation-mode:bicubic; max-width:220px; height:auto;" />
               </td>
             </tr>
@@ -68,14 +94,15 @@ function baseTemplate({ title, bodyHtml, tenantName }) {
   `;
 }
 
-function registrationEmailHtml({ firstName, lastName, loginUrl, tenantName }) {
-  // loginUrl legyen teljes https URL
-  const safeLoginUrl = loginUrl?.startsWith('http') ? loginUrl : `https://${loginUrl}`;
-  const portalUrl = buildTenantUrl(tenantName);
+function registrationEmailHtml({ firstName, lastName, loginUrl, tenantName, baseUrl }) {
+  const effectiveBaseUrl = normalizeBaseUrl(tenantName, baseUrl);
+  const safeLoginUrl = withBaseOrigin(effectiveBaseUrl, loginUrl);
+  const portalUrl = effectiveBaseUrl;
   const portalUrlLabel = displayHost(portalUrl);
   return baseTemplate({
     title: 'Welcome to ATEXdb Certs',
     tenantName,
+    baseUrl: effectiveBaseUrl,
     bodyHtml: `
       <h2 style="color:#131313;">Dear ${firstName} ${lastName},</h2>
       <p>Thank you for registering on the <strong>${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb Certs'}</strong> platform.</p>
@@ -93,13 +120,15 @@ function registrationEmailHtml({ firstName, lastName, loginUrl, tenantName }) {
   });
 }
 
-function emailVerificationEmailHtml({ firstName, lastName, verifyUrl, tenantName }) {
-  const safeVerifyUrl = verifyUrl?.startsWith('http') ? verifyUrl : `https://${verifyUrl}`;
-  const portalUrl = buildTenantUrl(tenantName);
+function emailVerificationEmailHtml({ firstName, lastName, verifyUrl, tenantName, baseUrl }) {
+  const effectiveBaseUrl = normalizeBaseUrl(tenantName, baseUrl);
+  const safeVerifyUrl = withBaseOrigin(effectiveBaseUrl, verifyUrl, 'verify-email');
+  const portalUrl = effectiveBaseUrl;
   const portalUrlLabel = displayHost(portalUrl);
   return baseTemplate({
     title: 'Confirm your email address',
     tenantName,
+    baseUrl: effectiveBaseUrl,
     bodyHtml: `
       <h2 style="color:#131313;">Dear ${firstName} ${lastName},</h2>
       <p>Thank you for registering on the <strong>${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb Certs'}</strong> platform.</p>
@@ -118,13 +147,15 @@ function emailVerificationEmailHtml({ firstName, lastName, verifyUrl, tenantName
   });
 }
 
-function tenantInviteEmailHtml({ firstName, lastName, tenantName, loginUrl, password }) {
-  const safeLoginUrl = loginUrl?.startsWith('http') ? loginUrl : `https://${loginUrl}`;
-  const portalUrl = buildTenantUrl(tenantName);
+function tenantInviteEmailHtml({ firstName, lastName, tenantName, loginUrl, password, baseUrl }) {
+  const effectiveBaseUrl = normalizeBaseUrl(tenantName, baseUrl);
+  const safeLoginUrl = withBaseOrigin(effectiveBaseUrl, loginUrl);
+  const portalUrl = effectiveBaseUrl;
   const portalUrlLabel = displayHost(portalUrl);
   return baseTemplate({
     title: 'You have been added to a tenant',
     tenantName,
+    baseUrl: effectiveBaseUrl,
     bodyHtml: `
       <h2 style="color:#131313;">Dear ${firstName} ${lastName},</h2>
       <p>You have been added to the tenant <strong>${tenantName}</strong> on the <strong>${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb Certs'}</strong> platform.</p>
@@ -147,13 +178,15 @@ function tenantInviteEmailHtml({ firstName, lastName, tenantName, loginUrl, pass
   });
 }
 
-function forgotPasswordEmailHtml({ firstName, lastName, loginUrl, tempPassword, tenantName }) {
-  const safeLoginUrl = loginUrl?.startsWith('http') ? loginUrl : `https://${loginUrl}`;
-  const portalUrl = buildTenantUrl(tenantName);
+function forgotPasswordEmailHtml({ firstName, lastName, loginUrl, tempPassword, tenantName, baseUrl }) {
+  const effectiveBaseUrl = normalizeBaseUrl(tenantName, baseUrl);
+  const safeLoginUrl = withBaseOrigin(effectiveBaseUrl, loginUrl);
+  const portalUrl = effectiveBaseUrl;
   const portalUrlLabel = displayHost(portalUrl);
   return baseTemplate({
     title: 'Your temporary password',
     tenantName,
+    baseUrl: effectiveBaseUrl,
     bodyHtml: `
       <h2 style="color:#131313;">Dear ${firstName || ''} ${lastName || ''},</h2>
       <p>We received a request to reset your password for <strong>${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb Certs'}</strong>.</p>

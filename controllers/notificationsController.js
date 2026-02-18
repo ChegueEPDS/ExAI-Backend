@@ -2,21 +2,27 @@ const bus = require('../lib/notifications/bus');
 const Notification = require('../models/notification');
 const ReportExportJob = require('../models/reportExportJob');
 const azureBlob = require('../services/azureBlobService');
+const { initSse } = require('../services/sseService');
+const systemSettings = require('../services/systemSettingsStore');
 
 exports.notificationsStream = (req, res) => {
   const userId = req.userId;
   const tenantId = req.scope?.tenantId;
   if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // nginx: disable proxy buffering
-  res.setHeader('Content-Encoding', '');    // ensure no compression is applied on this route
-  res.flushHeaders?.();
+  // Ensure no compression is applied on this route (some proxies/bundlers misbehave with SSE + gzip).
+  res.setHeader('Content-Encoding', '');
+  const send = initSse(req, res, {
+    // Some clients treat only SSE "event:" frames as activity; avoid idle disconnects.
+    heartbeatMs: (() => {
+      const raw = Number(systemSettings.getNumber('NOTIFICATIONS_SSE_HEARTBEAT_MS') || 10_000);
+      return Math.max(1000, Math.min(raw, 60000));
+    })(),
+    heartbeatEvent: 'ping',
+  });
 
   // első “connected” event
-  res.write(`event: connected\ndata: ${JSON.stringify({ userId, tenantId, ts: new Date().toISOString() })}\n\n`);
+  send('connected', { userId, tenantId, ts: new Date().toISOString() });
   // Tell EventSource the default reconnection delay (ms)
   res.write('retry: 2000\n\n');
 
@@ -36,17 +42,13 @@ exports.notificationsStream = (req, res) => {
         meta: msg?.payload?.data?.meta || undefined,
         ts: msg.ts
       };
-      res.write(`event: ${msg.event || 'notification'}\n`);
-      res.write(`data: ${JSON.stringify(topLevel)}\n\n`);
+      send(msg.event || 'notification', topLevel);
     };
     bus.on(ch, handler);
     handlers.push({ ch, handler });
   });
 
-  const ping = setInterval(() => res.write(`: ping\n\n`), 30000);
-
   req.on('close', () => {
-    clearInterval(ping);
     handlers.forEach(({ ch, handler }) => bus.off(ch, handler));
     try { res.end(); } catch {}
   });

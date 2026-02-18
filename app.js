@@ -253,7 +253,16 @@ app.use((req, res, next) => {
     (req.headers.accept && req.headers.accept.includes('text/event-stream')) ||
     (req.headers['content-type'] && req.headers['content-type'].includes('text/event-stream'));
 
-	  if (acceptsSSE) {
+  function sanitizeSsePathForLogs(p) {
+    const s = String(p || '');
+    // Redact common sensitive query params (EventSource often uses ?token=... because headers are not supported).
+    return s
+      .replace(/([?&]token=)[^&]+/gi, '$1[REDACTED]')
+      .replace(/([?&]access_token=)[^&]+/gi, '$1[REDACTED]')
+      .replace(/([?&]auth=)[^&]+/gi, '$1[REDACTED]');
+  }
+
+  if (acceptsSSE) {
     // Extra SSE headers for proxy compatibility and to avoid transforms/buffering
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
@@ -263,9 +272,9 @@ app.use((req, res, next) => {
 	    if (res.socket && typeof res.socket.setTimeout === 'function') {
 	      res.socket.setTimeout(0); // disable idle socket timeout for SSE
 	    }
-	    req.on('aborted', () => logger.warn('SSE client aborted the connection', { requestId: req.requestId, path: req.originalUrl }));
+	    req.on('aborted', () => logger.warn('SSE client aborted the connection', { requestId: req.requestId, path: sanitizeSsePathForLogs(req.originalUrl) }));
 	    // Normal behavior for EventSource / stream consumers; keep at debug to avoid log spam.
-	    req.on('close',   () => logger.debug('SSE connection closed by client', { requestId: req.requestId, path: req.originalUrl }));
+	    req.on('close',   () => logger.debug('SSE connection closed by client', { requestId: req.requestId, path: sanitizeSsePathForLogs(req.originalUrl) }));
 	    res.on('error',   (err) => logger.error('SSE response stream error', err));
 	  }
 	  next();

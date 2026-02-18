@@ -4,6 +4,7 @@ const User = require('../models/user');
 const bcrypt = require('bcrypt');
 const mailService = require('../services/mailService');
 const { tenantInviteEmailHtml } = require('../services/mailTemplates');
+const { resolvePublicBaseUrl, persistPublicBaseUrlIfMissing } = require('../helpers/publicBaseUrl');
 const { assertValidProfessions } = require('../helpers/rbac');
 
 /** Erős ideiglenes jelszó (2-2 kis/nagy/ szám/ spec) */
@@ -170,12 +171,15 @@ exports.createInvite = async (req, res) => {
   // --- E-mail (fire-and-forget) ---
   (async () => {
     try {
-      const loginUrl = process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
+      const requestBaseUrl = await resolvePublicBaseUrl({ req, tenantId });
+      await persistPublicBaseUrlIfMissing({ tenantId, baseUrl: requestBaseUrl, updatedBy: req.user?.id || req.userId || null });
+      const loginUrl = requestBaseUrl || process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
       const html = tenantInviteEmailHtml({
         firstName: user.firstName || '',
         lastName:  user.lastName  || '',
         tenantName: t?.name || 'your organization',
         loginUrl,
+        baseUrl: requestBaseUrl || undefined,
         password: createdNewUser ? tempPassword : null, // csak új usernél
       });
 
