@@ -137,6 +137,13 @@ function toEvidenceComputed({ op, value, unit = '', sources = [] }) {
   };
 }
 
+function isAmbientPoint({ token, label }) {
+  const t = String(token || '').trim().toUpperCase();
+  if (t === 'T12') return true;
+  const s = String(label || '').toLowerCase();
+  return s.includes('ambient') || s.includes('outside');
+}
+
 function detectIntent(message) {
   const s = normalizeKey(message);
   const needles = [
@@ -280,6 +287,8 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
     },
     by_test: [],
     worst_by_point: [],
+    ambient: null,
+    ts_rise_by_point: [],
     numericEvidence: [],
   };
 
@@ -516,6 +525,7 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
   for (const [token, item] of worst.entries()) {
     result.worst_by_point.push({
       point: token,
+      label: String(item?.label || ''),
       max_C: item.max.value,
       fileName: String(item?.max?.cell?.fileName || ''),
       sheet: String(item?.sheet || ''),
@@ -526,6 +536,43 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
     result.numericEvidence.push(item.max.cell);
   }
   result.worst_by_point.sort((a, b) => Number(b.max_C) - Number(a.max_C));
+
+  // Ambient (best effort): use T12 or labels containing "ambient/outside"
+  const ambientCandidates = result.worst_by_point.filter(p => isAmbientPoint({ token: p.point, label: p.label }));
+  if (ambientCandidates.length) {
+    const best = ambientCandidates.slice().sort((a, b) => Number(b.max_C) - Number(a.max_C))[0];
+    result.ambient = {
+      max_C: Number(best.max_C),
+      evidence: best.evidence,
+      source_point: best.point,
+      source_label: best.label,
+    };
+    result.numericEvidence.push(best.evidence);
+  }
+
+  // Ts rise per point (max_C - ambient.max_C), when ambient exists
+  if (result.ambient && Number.isFinite(result.ambient.max_C)) {
+    for (const p of result.worst_by_point) {
+      if (isAmbientPoint({ token: p.point, label: p.label })) continue;
+      const delta = Number(p.max_C) - Number(result.ambient.max_C);
+      const ev = toEvidenceComputed({
+        op: 'minus',
+        value: round1(delta),
+        unit: '°C',
+        sources: [p.evidence, result.ambient.evidence],
+      });
+      result.ts_rise_by_point.push({
+        point: p.point,
+        label: p.label,
+        max_C: Number(p.max_C),
+        ambient_C: Number(result.ambient.max_C),
+        ts_rise_C: round1(delta),
+        evidence: ev,
+      });
+      result.numericEvidence.push(ev);
+    }
+  }
+
   result.numericEvidence = result.numericEvidence.slice(0, 250);
 
   try {

@@ -9,7 +9,6 @@ const { notifyAndStore } = require('../lib/notifications/notifier');
 
 const Conversation = require('../models/conversation');
 const Dataset = require('../models/dataset');
-const DatasetFile = require('../models/datasetFile');
 const DatasetRowChunk = require('../models/datasetRowChunk');
 const DatasetTableCell = require('../models/datasetTableCell');
 const DatasetDocChunk = require('../models/datasetDocChunk');
@@ -27,6 +26,14 @@ const xlsxPreview = require('../services/xlsxPreviewService');
 const tabularPreview = require('../services/tabularPreviewService');
 const tableQueryPlanner = require('../services/tableQueryPlannerService');
 const tableQuery = require('../services/tableQueryService');
+const pythonCalc = require('../services/pythonCalcClient');
+const complianceCheck = require('../services/complianceCheckService');
+const tableProfileJS = require('../services/tableProfileService');
+const tableCompareJS = require('../services/tableCompareService');
+const tablePivotJS = require('../services/tablePivotService');
+const timeSeriesJS = require('../services/timeSeriesService');
+const azureBlob = require('../services/azureBlobService');
+const DatasetFile = require('../models/datasetFile');
 const systemSettings = require('../services/systemSettingsStore');
 
 const encoder = get_encoding('o200k_base');
@@ -828,6 +835,16 @@ function detectTabularIntent(message) {
   return needles.some(n => s.includes(n));
 }
 
+function detectComplianceCheckIntent(message) {
+  const s = String(message || '').toLowerCase();
+  const needles = [
+    'compliance_check', 'compliance check', 'compliance matrix', 'requirement list',
+    'requirements list', 'requirements', 'conformance matrix',
+    'megfelelés mátrix', 'megfeleles matrix', 'szabvány-követelmény', 'kovetelmeny lista',
+  ];
+  return needles.some(n => s.includes(n));
+}
+
 // POST /api/chat/governed/stream
 // body: { threadId, projectId, datasetVersion?, message }
 exports.chatGovernedStream = async (req, res) => {
@@ -1529,8 +1546,10 @@ exports.chatGovernedStream = async (req, res) => {
     let hasMeasEvalContext = false;
     let hasMeasCompareContext = false;
 
-	    // Optional: LLM planner chooses which deterministic XLSX tool to run.
-	    try {
+    // Optional: LLM planner chooses which deterministic XLSX tool to run.
+    let chosenTool = '';
+    let chosenArgs = {};
+    try {
       const hasXlsx = allowedFilenames.some(n => String(n).toLowerCase().endsWith('.xlsx') || String(n).toLowerCase().endsWith('.xls'));
       let planned = null;
 
@@ -1560,6 +1579,9 @@ exports.chatGovernedStream = async (req, res) => {
         tool = String(toolOverride.tool);
         args = toolOverride.args || {};
       }
+      chosenTool = tool;
+      chosenArgs = args || {};
+      const forceComplianceCheck = String(tool || '') === 'compliance_check';
 
       // Fallback heuristic if planner is off/empty.
       const fallbackCompare = measEval.enabled() && measEval.detectCompareTablesIntent(effectiveMessage);
@@ -1567,9 +1589,10 @@ exports.chatGovernedStream = async (req, res) => {
       const fallbackTabular = detectTabularIntent(effectiveMessage);
 
 	      // UX: if multiple tools are plausible, ask the user to confirm which tool to run.
-	      const confirmEnabled = !!systemSettings.getBoolean('XLSX_TOOL_CONFIRM_ENABLED');
-	      const cameFromToolPick = !!toolOverride;
-	      if (hasXlsx && confirmEnabled && !cameFromToolPick) {
+      const confirmEnabled = !!systemSettings.getBoolean('XLSX_TOOL_CONFIRM_ENABLED');
+        const wantsComplianceCheck = detectComplianceCheckIntent(effectiveMessage) || forceComplianceCheck;
+		      const cameFromToolPick = !!toolOverride;
+		      if ((hasXlsx || wantsComplianceCheck) && confirmEnabled && !cameFromToolPick) {
 	        const toolLabel = (t, lang0) => {
 	          const lang = String(lang0 || '').toLowerCase();
 	          const hu = lang === 'hu';
@@ -1581,13 +1604,28 @@ exports.chatGovernedStream = async (req, res) => {
 	            ? 'Mérés táblák (Table 1–4) összehasonlítás oszlop-tartományon'
 	            : 'Compare measurement tables (Table 1–4) over a column range';
 	          if (key === 'evaluate_measurements') return hu
-	            ? 'Mérések kiértékelése (összegzés / max / steady)'
-	            : 'Evaluate measurements (summary / max / steady)';
-	          if (key === 'table_query') return hu
-	            ? 'Általános táblázat lekérdezés (szűrés/csoportosítás/összeg/átlag)'
-	            : 'General table query (filter/group/sum/average)';
-	          return key || (hu ? 'Ismeretlen eszköz' : 'Unknown tool');
-	        };
+	            ? 'Mérések kiértékelése (összegzés / max / steady / ambient)'
+	            : 'Evaluate measurements (summary / max / steady / ambient)';
+          if (key === 'table_query') return hu
+            ? 'Általános táblázat lekérdezés (szűrés/csoportosítás/összeg/átlag)'
+            : 'General table query (filter/group/sum/average)';
+          if (key === 'table_profile') return hu
+            ? 'Táblázat profilozás (adatminőség, hiányzók, outlier-ek)'
+            : 'Table profiling (data quality, missing values, outliers)';
+          if (key === 'table_compare') return hu
+            ? 'Táblázatok összehasonlítása (új/hiányzó/változott sorok)'
+            : 'Table comparison (added/removed/changed rows)';
+          if (key === 'table_pivot') return hu
+            ? 'Kimutatás (csoportosított összesítés / pivot)'
+            : 'Pivot table (grouped summary)';
+	          if (key === 'time_series') return hu
+	            ? 'Idősor (resample + trend)'
+	            : 'Time series (resample + trend)';
+          if (key === 'compliance_check') return hu
+            ? 'Megfelelőség ellenőrzés (követelménylista + mátrix)'
+            : 'Compliance check (requirements list + matrix)';
+		          return key || (hu ? 'Ismeretlen eszköz' : 'Unknown tool');
+		        };
 
 	        const candidates = new Map(); // tool -> { tool, name, args }
 
@@ -1602,14 +1640,20 @@ exports.chatGovernedStream = async (req, res) => {
 	        if (tool === 'analyze_measurement_tables') add('analyze_measurement_tables', toolLabel('analyze_measurement_tables', lang), args || {});
 	        if (tool === 'compare_tables') add('compare_tables', toolLabel('compare_tables', lang), args || {});
 	        if (tool === 'evaluate_measurements') add('evaluate_measurements', toolLabel('evaluate_measurements', lang), args || {});
-	        if (tool === 'table_query') add('table_query', toolLabel('table_query', lang), {});
+        if (tool === 'table_query') add('table_query', toolLabel('table_query', lang), {});
+        if (tool === 'table_profile') add('table_profile', toolLabel('table_profile', lang), {});
+        if (tool === 'table_compare') add('table_compare', toolLabel('table_compare', lang), {});
+        if (tool === 'table_pivot') add('table_pivot', toolLabel('table_pivot', lang), {});
+        if (tool === 'time_series') add('time_series', toolLabel('time_series', lang), {});
+        if (tool === 'compliance_check') add('compliance_check', toolLabel('compliance_check', lang), {});
 
-	        if (fallbackTabular) add('table_query', toolLabel('table_query', lang), {});
+        if (fallbackTabular) add('table_query', toolLabel('table_query', lang), {});
 	        if (fallbackCompare) add('compare_tables', toolLabel('compare_tables', lang), {});
 	        if (fallbackEval) add('evaluate_measurements', toolLabel('evaluate_measurements', lang), {});
+        if (wantsComplianceCheck) add('compliance_check', toolLabel('compliance_check', lang), {});
 
 	        // If we still don't have a choice, default to table_query for normal tables.
-	        if (!candidates.size && fallbackTabular) add('table_query', toolLabel('table_query', lang), {});
+        if (!candidates.size && fallbackTabular) add('table_query', toolLabel('table_query', lang), {});
 
 	        const opts = Array.from(candidates.values()).slice(0, 5).map((o, idx) => ({ i: idx + 1, ...o }));
 	        if (opts.length >= 2) {
@@ -1691,13 +1735,61 @@ exports.chatGovernedStream = async (req, res) => {
         }
       } else if (measEval.enabled() && (tool === 'evaluate_measurements' || fallbackEval)) {
         send('progress', { stage: 'meas.eval.start' });
-        const ev = await measEval.evaluateXlsxMeasurements({
-          tenantId,
-          projectId,
-          datasetVersion,
-          allowedFilenames,
-          trace: { requestId: req.requestId },
-        });
+        let ev = null;
+
+        if (pythonCalc.isEnabled()) {
+          try {
+            const maxFiles = Math.max(1, Math.min(Number(systemSettings.getNumber('MEAS_EVAL_MAX_FILES') || 3), 10));
+            const xlsxList = (allowedFilenames || [])
+              .filter(n => /\.xls(x)?$/i.test(String(n || '')))
+              .slice(0, maxFiles);
+            const files = [];
+            for (const filename of xlsxList) {
+              // eslint-disable-next-line no-await-in-loop
+              const fileDoc = await DatasetFile.findOne({ tenantId, projectId, datasetVersion, filename })
+                .select('storage.blobPath filename')
+                .lean();
+              if (!fileDoc?.storage?.blobPath) continue;
+              // eslint-disable-next-line no-await-in-loop
+              const url = await azureBlob.getReadSasUrl(String(fileDoc.storage.blobPath), {
+                ttlSeconds: 600,
+                httpsOnly: true,
+                filename: String(fileDoc.filename || filename),
+              });
+              files.push({ filename: String(fileDoc.filename || filename), url });
+            }
+
+            if (files.length) {
+              const extPoints = String(systemSettings.getString('MEAS_EXT_POINTS') || 'T10,T11,T4')
+                .split(',')
+                .map(s => s.trim())
+                .filter(Boolean);
+              ev = await pythonCalc.runMeasurementEvalPython({
+                files,
+                maxTables: Number(systemSettings.getNumber('MEAS_EVAL_MAX_TABLES') || 8),
+                extPoints,
+                timeoutMs: 120000,
+              });
+              try { logger.info('meas.eval.python.ok', { requestId: req.requestId }); } catch {}
+            }
+          } catch (e) {
+            try { logger.warn('meas.eval.python.failed', { requestId: req.requestId, error: e?.message || String(e) }); } catch {}
+            ev = null;
+          }
+        }
+
+        if (!ev) {
+          if (pythonCalc.isEnabled()) {
+            try { logger.info('meas.eval.js.fallback', { requestId: req.requestId }); } catch {}
+          }
+          ev = await measEval.evaluateXlsxMeasurements({
+            tenantId,
+            projectId,
+            datasetVersion,
+            allowedFilenames,
+            trace: { requestId: req.requestId },
+          });
+        }
         if (ev?.ok && ev?.result) {
           contextParts.push('MEASUREMENT_EVAL_CONTEXT (deterministic XLSX evaluation; prefer using these summaries instead of listing raw timeseries):');
           contextParts.push(JSON.stringify(ev.result).slice(0, 120000));
@@ -1727,24 +1819,541 @@ exports.chatGovernedStream = async (req, res) => {
 
         const plan = planRes?.ok ? planRes.plan : null;
         send('progress', { stage: 'table.query.exec' });
-        const exec = await tableQuery.runTableQuery({
-          tenantId,
-          projectId,
-          datasetVersion,
-          allowedFilenames,
-          query: plan?.query || {},
-          trace: { requestId: req.requestId },
-        });
+        let exec = null;
+
+        // If Python calc is enabled, try it first (local PoC). Fallback to JS on any error.
+        if (pythonCalc.isEnabled()) {
+          try {
+            const files = [];
+            for (const filename of xlsxList) {
+              // Resolve blobPath -> SAS URL for Python
+              // (Python loads the XLSX via URL; no direct bytes pass-through)
+              // eslint-disable-next-line no-await-in-loop
+              const fileDoc = await DatasetFile.findOne({ tenantId, projectId, datasetVersion, filename })
+                .select('storage.blobPath filename')
+                .lean();
+              if (!fileDoc?.storage?.blobPath) continue;
+              // eslint-disable-next-line no-await-in-loop
+              const url = await azureBlob.getReadSasUrl(String(fileDoc.storage.blobPath), {
+                ttlSeconds: 600,
+                httpsOnly: true,
+                filename: String(fileDoc.filename || filename),
+              });
+              files.push({ filename: String(fileDoc.filename || filename), url });
+            }
+
+            if (files.length) {
+              exec = await pythonCalc.runTableQueryPython({
+                files,
+                query: plan?.query || {},
+                maxRows: Number(systemSettings.getNumber('TABLE_QUERY_EXEC_MAX_ROWS') || 12000),
+                timeoutMs: 120000,
+              });
+              try { logger.info('table.query.python.ok', { requestId: req.requestId }); } catch {}
+            }
+          } catch (e) {
+            try {
+              logger.warn('table.query.python.failed', { requestId: req.requestId, error: e?.message || String(e) });
+            } catch {}
+            exec = null;
+          }
+        }
+
+        if (!exec) {
+          if (pythonCalc.isEnabled()) {
+            try { logger.info('table.query.js.fallback', { requestId: req.requestId }); } catch {}
+          }
+          exec = await tableQuery.runTableQuery({
+            tenantId,
+            projectId,
+            datasetVersion,
+            allowedFilenames,
+            query: plan?.query || {},
+            trace: { requestId: req.requestId },
+          });
+        }
         if (exec?.ok && exec?.result) {
           contextParts.push('TABLE_QUERY_CONTEXT (deterministic tabular query; use this for sums/averages/counts/grouping in normal spreadsheets):');
           contextParts.push(JSON.stringify({ plan, result: exec.result }).slice(0, 160000));
           contextParts.push('---');
           send('progress', { stage: 'table.query.done', rows: exec.result.rows?.length || 0 });
         }
+      } else if (systemSettings.getBoolean('TABLE_PROFILE_ENABLED') && tool === 'table_profile') {
+        send('progress', { stage: 'table.profile.start' });
+        const maxFiles = Math.max(1, Math.min(Number(systemSettings.getNumber('TABLE_PROFILE_MAX_FILES') || 3), 10));
+        const maxRows = Math.max(200, Math.min(Number(systemSettings.getNumber('TABLE_PROFILE_MAX_ROWS') || 12000), 50000));
+        const maxCols = Math.max(8, Math.min(Number(systemSettings.getNumber('TABLE_PROFILE_MAX_COLS') || 80), 200));
+        const xlsxList = allowedFilenames.filter(n => /\.xls(x)?$/i.test(String(n || ''))).slice(0, maxFiles);
+
+        let prof = null;
+        if (pythonCalc.isEnabled()) {
+          try {
+            const files = [];
+            for (const filename of xlsxList) {
+              // eslint-disable-next-line no-await-in-loop
+              const fileDoc = await DatasetFile.findOne({ tenantId, projectId, datasetVersion, filename })
+                .select('storage.blobPath filename')
+                .lean();
+              if (!fileDoc?.storage?.blobPath) continue;
+              // eslint-disable-next-line no-await-in-loop
+              const url = await azureBlob.getReadSasUrl(String(fileDoc.storage.blobPath), {
+                ttlSeconds: 600,
+                httpsOnly: true,
+                filename: String(fileDoc.filename || filename),
+              });
+              files.push({ filename: String(fileDoc.filename || filename), url });
+            }
+            if (files.length) {
+              prof = await pythonCalc.runTableProfilePython({
+                files,
+                sheet: null,
+                maxRows,
+                maxCols,
+                timeoutMs: 120000,
+              });
+              try { logger.info('table.profile.python.ok', { requestId: req.requestId }); } catch {}
+            }
+          } catch (e) {
+            try { logger.warn('table.profile.python.failed', { requestId: req.requestId, error: e?.message || String(e) }); } catch {}
+            prof = null;
+          }
+        }
+
+        if (!prof) {
+          try {
+            if (pythonCalc.isEnabled()) {
+              try { logger.info('table.profile.js.fallback', { requestId: req.requestId }); } catch {}
+            }
+            const filename = xlsxList[0] || null;
+            if (filename) {
+              prof = await tableProfileJS.runTableProfileJS({
+                tenantId,
+                projectId,
+                datasetVersion,
+                filename,
+                sheet: null,
+                maxRows,
+                maxCols,
+              });
+            }
+          } catch (e) {
+            try { logger.warn('table.profile.js.failed', { requestId: req.requestId, error: e?.message || String(e) }); } catch {}
+            prof = null;
+          }
+        }
+
+        if (prof?.ok && prof?.result) {
+          contextParts.push('TABLE_PROFILE_CONTEXT (data quality profile; missing values, outliers, numeric stats):');
+          contextParts.push(JSON.stringify(prof.result).slice(0, 160000));
+          contextParts.push('---');
+          send('progress', { stage: 'table.profile.done', columns: prof.result.profiles?.length || 0 });
+        }
+      } else if (systemSettings.getBoolean('TABLE_COMPARE_ENABLED') && tool === 'table_compare') {
+        send('progress', { stage: 'table.compare.start' });
+        const maxFiles = Math.max(1, Math.min(Number(systemSettings.getNumber('TABLE_COMPARE_MAX_FILES') || 2), 6));
+        const maxRows = Math.max(200, Math.min(Number(systemSettings.getNumber('TABLE_COMPARE_MAX_ROWS') || 12000), 50000));
+        const maxCols = Math.max(8, Math.min(Number(systemSettings.getNumber('TABLE_COMPARE_MAX_COLS') || 80), 200));
+        const xlsxList = allowedFilenames.filter(n => /\.xls(x)?$/i.test(String(n || ''))).slice(0, maxFiles);
+
+        let preview = null;
+        try {
+          preview = await tabularPreview.buildTabularPreview({
+            tenantId,
+            projectId,
+            datasetVersion,
+            filenames: xlsxList,
+            trace: { requestId: req.requestId },
+          });
+        } catch { preview = null; }
+
+        const previewByFile = new Map();
+        for (const f of preview?.files || []) previewByFile.set(String(f?.filename || ''), f);
+
+        const pickSheet = (filePreview, preferred) => {
+          if (preferred) return preferred;
+          const sh = Array.isArray(filePreview?.sheets) ? filePreview.sheets : [];
+          return sh[0]?.sheet || null;
+        };
+
+        const pickColumns = (filePreview, sheetName) => {
+          const sh = Array.isArray(filePreview?.sheets) ? filePreview.sheets : [];
+          let sheet = null;
+          if (sheetName) sheet = sh.find(s => String(s?.sheet || '') === String(sheetName || ''));
+          if (!sheet) sheet = sh[0];
+          const cols = Array.isArray(sheet?.columns) ? sheet.columns : [];
+          return cols.map(c => String(c)).filter(Boolean);
+        };
+
+        let leftFilename = args?.left_filename || null;
+        let rightFilename = args?.right_filename || null;
+
+        if (!leftFilename || !rightFilename) {
+          if (xlsxList.length >= 2) {
+            leftFilename = leftFilename || xlsxList[0];
+            rightFilename = rightFilename || xlsxList[1];
+          } else if (xlsxList.length === 1) {
+            leftFilename = leftFilename || xlsxList[0];
+            rightFilename = rightFilename || xlsxList[0];
+          }
+        }
+
+        const leftPreview = previewByFile.get(String(leftFilename || '')) || null;
+        const rightPreview = previewByFile.get(String(rightFilename || '')) || null;
+
+        let leftSheet = args?.left_sheet || null;
+        let rightSheet = args?.right_sheet || null;
+
+        if (leftFilename && rightFilename && leftFilename === rightFilename && (!leftSheet || !rightSheet || leftSheet === rightSheet)) {
+          const sheets = Array.isArray(leftPreview?.sheets) ? leftPreview.sheets : [];
+          if (sheets.length >= 2) {
+            leftSheet = leftSheet || sheets[0]?.sheet || null;
+            rightSheet = rightSheet || sheets[1]?.sheet || null;
+          }
+        }
+
+        const keyColumnsArg = Array.isArray(args?.key_columns)
+          ? args.key_columns.map(String).filter(Boolean)
+          : (args?.key_columns ? [String(args.key_columns)] : []);
+        const compareColumnsArg = Array.isArray(args?.compare_columns)
+          ? args.compare_columns.map(String).filter(Boolean)
+          : (args?.compare_columns ? [String(args.compare_columns)] : []);
+
+        let keyColumns = keyColumnsArg;
+        if (!keyColumns.length) {
+          const leftCols = pickColumns(leftPreview, leftSheet);
+          const rightCols = pickColumns(rightPreview, rightSheet);
+          const rightLower = new Set(rightCols.map(c => c.toLowerCase()));
+          const match = leftCols.find(c => rightLower.has(String(c).toLowerCase()));
+          if (match) keyColumns = [match];
+          else if (leftCols[0]) keyColumns = [leftCols[0]];
+        }
+
+        let exec = null;
+        if (pythonCalc.isEnabled() && leftFilename && rightFilename && keyColumns.length) {
+          try {
+            const files = [];
+
+            const addFileMeta = async (filename) => {
+              const fileDoc = await DatasetFile.findOne({ tenantId, projectId, datasetVersion, filename })
+                .select('storage.blobPath filename')
+                .lean();
+              if (!fileDoc?.storage?.blobPath) return null;
+              const url = await azureBlob.getReadSasUrl(String(fileDoc.storage.blobPath), {
+                ttlSeconds: 600,
+                httpsOnly: true,
+                filename: String(fileDoc.filename || filename),
+              });
+              const meta = { filename: String(fileDoc.filename || filename), url };
+              files.push(meta);
+              return meta;
+            };
+
+            const leftMeta = await addFileMeta(leftFilename);
+            const rightMeta = leftFilename === rightFilename ? leftMeta : await addFileMeta(rightFilename);
+
+            if (leftMeta && rightMeta) {
+              exec = await pythonCalc.runTableComparePython({
+                files,
+                left: { filename: leftMeta.filename, sheet: leftSheet || null },
+                right: { filename: rightMeta.filename, sheet: rightSheet || null },
+                keyColumns,
+                compareColumns: compareColumnsArg.length ? compareColumnsArg : null,
+                maxRows,
+                maxCols,
+                timeoutMs: 120000,
+              });
+              try { logger.info('table.compare.python.ok', { requestId: req.requestId, mode: exec?.result?.meta?.mode || 'unknown' }); } catch {}
+            }
+          } catch (e) {
+            try { logger.warn('table.compare.python.failed', { requestId: req.requestId, error: e?.message || String(e) }); } catch {}
+            exec = null;
+          }
+        }
+
+        if (!exec && leftFilename && rightFilename && keyColumns.length) {
+          try {
+            if (pythonCalc.isEnabled()) {
+              try { logger.info('table.compare.js.fallback', { requestId: req.requestId }); } catch {}
+            }
+            exec = await tableCompareJS.runTableCompareJS({
+              tenantId,
+              projectId,
+              datasetVersion,
+              left: { filename: leftFilename, sheet: leftSheet || null },
+              right: { filename: rightFilename, sheet: rightSheet || null },
+              keyColumns,
+              compareColumns: compareColumnsArg.length ? compareColumnsArg : null,
+              maxRows,
+              maxCols,
+            });
+          } catch (e) {
+            try { logger.warn('table.compare.js.failed', { requestId: req.requestId, error: e?.message || String(e) }); } catch {}
+            exec = null;
+          }
+        }
+
+        if (exec?.ok && exec?.result) {
+          contextParts.push('TABLE_COMPARE_CONTEXT (table diff; added/removed/changed rows by key):');
+          contextParts.push(JSON.stringify(exec.result).slice(0, 160000));
+          contextParts.push('---');
+          send('progress', { stage: 'table.compare.done', changed: exec.result.meta?.changed || 0 });
+        }
+      } else if (systemSettings.getBoolean('TABLE_PIVOT_ENABLED') && tool === 'table_pivot') {
+        send('progress', { stage: 'table.pivot.start' });
+        const maxFiles = Math.max(1, Math.min(Number(systemSettings.getNumber('TABLE_PIVOT_MAX_FILES') || 3), 10));
+        const maxRows = Math.max(200, Math.min(Number(systemSettings.getNumber('TABLE_PIVOT_MAX_ROWS') || 12000), 50000));
+        const maxCols = Math.max(8, Math.min(Number(systemSettings.getNumber('TABLE_PIVOT_MAX_COLS') || 80), 200));
+        const xlsxList = allowedFilenames.filter(n => /\.xls(x)?$/i.test(String(n || ''))).slice(0, maxFiles);
+
+        let preview = null;
+        try {
+          preview = await tabularPreview.buildTabularPreview({
+            tenantId,
+            projectId,
+            datasetVersion,
+            filenames: xlsxList,
+            trace: { requestId: req.requestId },
+          });
+        } catch { preview = null; }
+
+        const previewByFile = new Map();
+        for (const f of preview?.files || []) previewByFile.set(String(f?.filename || ''), f);
+
+        const pickColumns = (filePreview, sheetName) => {
+          const sh = Array.isArray(filePreview?.sheets) ? filePreview.sheets : [];
+          let sheet = null;
+          if (sheetName) sheet = sh.find(s => String(s?.sheet || '') === String(sheetName || ''));
+          if (!sheet) sheet = sh[0];
+          const cols = Array.isArray(sheet?.columns) ? sheet.columns : [];
+          return cols.map(c => String(c)).filter(Boolean);
+        };
+
+        let filename = args?.filename || null;
+        if (!filename && xlsxList.length) filename = xlsxList[0];
+
+        const filePreview = previewByFile.get(String(filename || '')) || null;
+        const sheet = args?.sheet || null;
+        const cols = pickColumns(filePreview, sheet);
+
+        const groupByArg = Array.isArray(args?.group_by) ? args.group_by.map(String).filter(Boolean) : [];
+        const valuesArg = Array.isArray(args?.values) ? args.values.map(String).filter(Boolean) : [];
+        const aggArg = Array.isArray(args?.agg) ? args.agg.map(String).filter(Boolean) : [];
+
+        const groupBy = groupByArg.length ? groupByArg : (cols[0] ? [cols[0]] : []);
+        const values = valuesArg.length ? valuesArg : (cols[1] ? [cols[1]] : []);
+
+        let exec = null;
+        if (pythonCalc.isEnabled() && filename && groupBy.length && values.length) {
+          try {
+            const files = [];
+            const fileDoc = await DatasetFile.findOne({ tenantId, projectId, datasetVersion, filename })
+              .select('storage.blobPath filename')
+              .lean();
+            if (fileDoc?.storage?.blobPath) {
+              const url = await azureBlob.getReadSasUrl(String(fileDoc.storage.blobPath), {
+                ttlSeconds: 600,
+                httpsOnly: true,
+                filename: String(fileDoc.filename || filename),
+              });
+              files.push({ filename: String(fileDoc.filename || filename), url });
+
+              exec = await pythonCalc.runTablePivotPython({
+                files,
+                filename: String(fileDoc.filename || filename),
+                sheet: sheet || null,
+                groupBy,
+                values,
+                agg: aggArg.length ? aggArg : null,
+                maxRows,
+                maxCols,
+                timeoutMs: 120000,
+              });
+              try { logger.info('table.pivot.python.ok', { requestId: req.requestId }); } catch {}
+            }
+          } catch (e) {
+            try { logger.warn('table.pivot.python.failed', { requestId: req.requestId, error: e?.message || String(e) }); } catch {}
+            exec = null;
+          }
+        }
+
+        if (!exec && filename && groupBy.length && values.length) {
+          try {
+            if (pythonCalc.isEnabled()) {
+              try { logger.info('table.pivot.js.fallback', { requestId: req.requestId }); } catch {}
+            }
+            exec = await tablePivotJS.runTablePivotJS({
+              tenantId,
+              projectId,
+              datasetVersion,
+              filename,
+              sheet: sheet || null,
+              groupBy,
+              values,
+              agg: aggArg.length ? aggArg : null,
+              maxRows,
+              maxCols,
+            });
+          } catch (e) {
+            try { logger.warn('table.pivot.js.failed', { requestId: req.requestId, error: e?.message || String(e) }); } catch {}
+            exec = null;
+          }
+        }
+
+        if (exec?.ok && exec?.result) {
+          contextParts.push('TABLE_PIVOT_CONTEXT (grouped summary; use this for pivot-style outputs):');
+          contextParts.push(JSON.stringify(exec.result).slice(0, 160000));
+          contextParts.push('---');
+          send('progress', { stage: 'table.pivot.done', rows: exec.result.rows?.length || 0 });
+        }
+      } else if (systemSettings.getBoolean('TIME_SERIES_ENABLED') && tool === 'time_series') {
+        send('progress', { stage: 'time.series.start' });
+        const maxFiles = Math.max(1, Math.min(Number(systemSettings.getNumber('TIME_SERIES_MAX_FILES') || 2), 6));
+        const maxRows = Math.max(200, Math.min(Number(systemSettings.getNumber('TIME_SERIES_MAX_ROWS') || 12000), 50000));
+        const maxCols = Math.max(8, Math.min(Number(systemSettings.getNumber('TIME_SERIES_MAX_COLS') || 80), 200));
+        const xlsxList = allowedFilenames.filter(n => /\.xls(x)?$/i.test(String(n || ''))).slice(0, maxFiles);
+
+        let preview = null;
+        try {
+          preview = await tabularPreview.buildTabularPreview({
+            tenantId,
+            projectId,
+            datasetVersion,
+            filenames: xlsxList,
+            trace: { requestId: req.requestId },
+          });
+        } catch { preview = null; }
+
+        const previewByFile = new Map();
+        for (const f of preview?.files || []) previewByFile.set(String(f?.filename || ''), f);
+
+        const pickColumns = (filePreview, sheetName) => {
+          const sh = Array.isArray(filePreview?.sheets) ? filePreview.sheets : [];
+          let sheet = null;
+          if (sheetName) sheet = sh.find(s => String(s?.sheet || '') === String(sheetName || ''));
+          if (!sheet) sheet = sh[0];
+          const cols = Array.isArray(sheet?.columns) ? sheet.columns : [];
+          return cols.map(c => String(c)).filter(Boolean);
+        };
+
+        let filename = args?.filename || null;
+        if (!filename && xlsxList.length) filename = xlsxList[0];
+
+        const filePreview = previewByFile.get(String(filename || '')) || null;
+        const sheet = args?.sheet || null;
+        const cols = pickColumns(filePreview, sheet);
+
+        const timeColumn = args?.time_column ? String(args.time_column) : null;
+        const valueColumnsArg = Array.isArray(args?.value_columns) ? args.value_columns.map(String).filter(Boolean) : [];
+        const valueColumns = valueColumnsArg.length ? valueColumnsArg : (cols[1] ? [cols[1]] : []);
+        const freq = args?.freq ? String(args.freq) : null;
+        const agg = args?.agg ? String(args.agg) : null;
+        const trendWindow = args?.trend_window ? Number(args.trend_window) : null;
+
+        // If no time column provided, try common names.
+        let resolvedTimeColumn = timeColumn;
+        if (!resolvedTimeColumn && cols.length) {
+          const candidates = ['date', 'time', 'timestamp', 'datetime', 'idő', 'ido'];
+          const lower = cols.map(c => c.toLowerCase());
+          const hitIdx = lower.findIndex(c => candidates.some(k => c.includes(k)));
+          resolvedTimeColumn = hitIdx >= 0 ? cols[hitIdx] : cols[0];
+        }
+
+        let exec = null;
+        if (pythonCalc.isEnabled() && filename && resolvedTimeColumn && valueColumns.length) {
+          try {
+            const files = [];
+            const fileDoc = await DatasetFile.findOne({ tenantId, projectId, datasetVersion, filename })
+              .select('storage.blobPath filename')
+              .lean();
+            if (fileDoc?.storage?.blobPath) {
+              const url = await azureBlob.getReadSasUrl(String(fileDoc.storage.blobPath), {
+                ttlSeconds: 600,
+                httpsOnly: true,
+                filename: String(fileDoc.filename || filename),
+              });
+              files.push({ filename: String(fileDoc.filename || filename), url });
+
+              exec = await pythonCalc.runTimeSeriesPython({
+                files,
+                filename: String(fileDoc.filename || filename),
+                sheet: sheet || null,
+                timeColumn: resolvedTimeColumn,
+                valueColumns,
+                freq,
+                agg,
+                trendWindow,
+                maxRows,
+                maxCols,
+                timeoutMs: 120000,
+              });
+              try { logger.info('time.series.python.ok', { requestId: req.requestId }); } catch {}
+            }
+          } catch (e) {
+            try { logger.warn('time.series.python.failed', { requestId: req.requestId, error: e?.message || String(e) }); } catch {}
+            exec = null;
+          }
+        }
+
+        if (!exec && filename && resolvedTimeColumn && valueColumns.length) {
+          try {
+            if (pythonCalc.isEnabled()) {
+              try { logger.info('time.series.js.fallback', { requestId: req.requestId }); } catch {}
+            }
+            exec = await timeSeriesJS.runTimeSeriesJS({
+              tenantId,
+              projectId,
+              datasetVersion,
+              filename,
+              sheet: sheet || null,
+              timeColumn: resolvedTimeColumn,
+              valueColumns,
+              freq,
+              agg,
+              trendWindow,
+              maxRows,
+              maxCols,
+            });
+          } catch (e) {
+            try { logger.warn('time.series.js.failed', { requestId: req.requestId, error: e?.message || String(e) }); } catch {}
+            exec = null;
+          }
+        }
+
+        if (exec?.ok && exec?.result) {
+          contextParts.push('TIME_SERIES_CONTEXT (resampled time series with trends):');
+          contextParts.push(JSON.stringify(exec.result).slice(0, 160000));
+          contextParts.push('---');
+          send('progress', { stage: 'time.series.done', rows: exec.result.rows?.length || 0 });
+        }
       }
     } catch (e) {
       try { logger.warn('meas.eval.error', { requestId: req.requestId, error: e?.message || String(e) }); } catch { }
     }
+
+    const forceComplianceCheckFinal = String(chosenTool || '') === 'compliance_check';
+    try {
+      const wantsComplianceCheck = detectComplianceCheckIntent(effectiveMessage) || forceComplianceCheckFinal;
+      if (wantsComplianceCheck && complianceCheck.enabled()) {
+        send('progress', { stage: 'compliance.check.start' });
+        const r = await complianceCheck.buildComplianceMatrix({
+          message: effectiveMessage,
+          standards: scoredStandards,
+          docs: scoredDocs,
+          tables: scoredTables,
+          lang,
+          trace: { requestId: req.requestId },
+        });
+        if (r?.ok && r?.result) {
+          contextParts.push('COMPLIANCE_CHECK_CONTEXT (requirements list + compliance matrix):');
+          contextParts.push(JSON.stringify(r.result).slice(0, 160000));
+          contextParts.push('---');
+          send('progress', { stage: 'compliance.check.done', requirements: r.result.requirements?.length || 0 });
+        }
+      }
+    } catch (e) {
+      try { logger.warn('compliance.check.error', { requestId: req.requestId, error: e?.message || String(e) }); } catch { }
+    }
+
     if (scoredStandards.length) {
       contextParts.push('STANDARD_CONTEXT (tenant library):');
       for (const s of scoredStandards) {

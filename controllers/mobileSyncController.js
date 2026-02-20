@@ -81,6 +81,26 @@ function normalizeSeverity(input) {
   return null;
 }
 
+function parseClientTimestamp(input) {
+  if (input == null) return null;
+  if (typeof input === 'number' && Number.isFinite(input)) {
+    const d = new Date(input);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  if (typeof input === 'string') {
+    const s = input.trim();
+    if (!s) return null;
+    const asNum = Number(s);
+    if (Number.isFinite(asNum)) {
+      const d = new Date(asNum);
+      return Number.isNaN(d.getTime()) ? null : d;
+    }
+    const d = new Date(s);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  return null;
+}
+
 async function getNextOrderIndex(tenantId, siteId = null, zoneId = null) {
   const filter = { tenantId };
   if (siteId) filter.Site = siteId;
@@ -209,6 +229,7 @@ exports.mobileSync = async (req, res) => {
   ]);
 
   const tempIdToEquipmentId = {};
+  const conflicts = [];
   // Only newly created equipment should be post-processed (OCR + auto inspection).
   const newlyCreatedEquipmentIds = [];
   const metaByEquipmentId = {};
@@ -265,6 +286,9 @@ exports.mobileSync = async (req, res) => {
     const protectionTypesRaw = Array.isArray(item?.protectionTypes) ? item.protectionTypes : null;
     const normalizedProtectionTypes = protectionTypesRaw ? normalizeProtectionTypes(protectionTypesRaw) : [];
 
+    const clientUpdatedAt = parseClientTimestamp(item?.clientUpdatedAt ?? item?.updatedAt);
+    const baseUpdatedAt = parseClientTimestamp(item?.baseUpdatedAt);
+
     // Optional: manual overrides from mobile "Edit all data".
     const manual = item?.manual && typeof item.manual === 'object' ? item.manual : null;
     const manualFields = manual?.fields && typeof manual.fields === 'object' ? manual.fields : null;
@@ -307,6 +331,21 @@ exports.mobileSync = async (req, res) => {
       if (!existing) {
         return res.status(404).json({ message: `Item ${tempId}: equipment not found for tenant.` });
       }
+      if (baseUpdatedAt && existing.updatedAt && existing.updatedAt > baseUpdatedAt) {
+        conflicts.push({
+          tempId,
+          equipmentId: String(existing._id),
+          message: 'Conflict: newer server changes detected.',
+          serverUpdatedAt: existing.updatedAt ? new Date(existing.updatedAt).toISOString() : null
+        });
+        // Clean up any uploaded temp files for this item.
+        for (const f of files.filter((x) => parseFileKeyFromOriginalName(x.originalname) === tempId)) {
+          try {
+            fs.unlinkSync(f.path);
+          } catch {}
+        }
+        continue;
+      }
       const oldSnapshot = existing.toObject({ depopulate: true });
       existing.ModifiedBy = userId;
       existing.Site = siteId;
@@ -334,6 +373,7 @@ exports.mobileSync = async (req, res) => {
           tenantId,
           equipmentId: saved._id,
           changedBy: userId,
+          changedAt: clientUpdatedAt || new Date(),
           source: 'import',
           oldSnapshot,
           newSnapshot: saved?.toObject?.({ depopulate: true }) || saved,
@@ -381,6 +421,7 @@ exports.mobileSync = async (req, res) => {
           tenantId,
           equipmentId: saved._id,
           changedBy: userId,
+          changedAt: clientUpdatedAt || new Date(),
           source: 'create',
           oldSnapshot: {},
           newSnapshot: saved?.toObject?.({ depopulate: true }) || saved,
@@ -538,7 +579,8 @@ exports.mobileSync = async (req, res) => {
 
   return res.status(201).json({
     jobId: String(job._id),
-    map: tempIdToEquipmentId
+    map: tempIdToEquipmentId,
+    conflicts
   });
 };
 
