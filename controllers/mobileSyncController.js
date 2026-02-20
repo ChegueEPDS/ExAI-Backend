@@ -7,11 +7,14 @@ const Equipment = require('../models/dataplate');
 const Site = require('../models/site');
 const Unit = require('../models/unit');
 const ProcessingJob = require('../models/processingJob');
+const EquipmentConflict = require('../models/equipmentConflict');
+const User = require('../models/user');
 const azureBlob = require('../services/azureBlobService');
-const { createEquipmentDataVersion } = require('../services/equipmentVersioningService');
+const { createEquipmentDataVersion, sanitizeEquipmentSnapshot } = require('../services/equipmentVersioningService');
 const { normalizeProtectionTypes } = require('../helpers/protectionTypes');
 const SyncTombstone = require('../models/syncTombstone');
 const { parseSinceDate } = require('../services/syncTombstoneService');
+const { notifyAndStore } = require('../lib/notifications/notifier');
 
 const toObjectId = (value) => {
   if (!value) return null;
@@ -79,6 +82,48 @@ function normalizeSeverity(input) {
   const raw = typeof input === 'string' ? input.trim().toUpperCase() : '';
   if (raw === 'P1' || raw === 'P2' || raw === 'P3' || raw === 'P4') return raw;
   return null;
+}
+
+function buildClientChanges({
+  eqIdRaw,
+  equipmentTypeRaw,
+  compliance,
+  otherInfo,
+  failureNote,
+  failureSeverity,
+  normalizedProtectionTypes,
+  manualFields,
+  manualExMarking
+}) {
+  const equipment = {};
+  if (eqIdRaw) equipment.EqID = eqIdRaw;
+  if (equipmentTypeRaw) equipment.equipmentType = equipmentTypeRaw;
+  equipment.Compliance = compliance;
+  equipment.otherInfo = otherInfo;
+  if (failureNote != null) equipment.failureNote = failureNote;
+  if (failureSeverity != null) equipment.failureSeverity = failureSeverity;
+
+  const fields = {};
+  if (manualFields && typeof manualFields === 'object') {
+    Object.keys(manualFields).forEach((k) => {
+      fields[k] = manualFields[k];
+    });
+  }
+
+  const exMarking = {};
+  if (manualExMarking && typeof manualExMarking === 'object') {
+    Object.keys(manualExMarking).forEach((k) => {
+      exMarking[k] = manualExMarking[k];
+    });
+  }
+
+  const out = { equipment };
+  if (Object.keys(fields).length) out.fields = fields;
+  if (Object.keys(exMarking).length) out.exMarking = exMarking;
+  if (Array.isArray(normalizedProtectionTypes) && normalizedProtectionTypes.length) {
+    out.protectionTypes = normalizedProtectionTypes;
+  }
+  return out;
 }
 
 function parseClientTimestamp(input) {
@@ -332,11 +377,80 @@ exports.mobileSync = async (req, res) => {
         return res.status(404).json({ message: `Item ${tempId}: equipment not found for tenant.` });
       }
       if (baseUpdatedAt && existing.updatedAt && existing.updatedAt > baseUpdatedAt) {
+        const serverUpdatedAt = existing.updatedAt ? new Date(existing.updatedAt).toISOString() : null;
+        let conflictDoc = null;
+        let wasOpen = false;
+        try {
+          conflictDoc = await EquipmentConflict.findOne({ tenantId, clientTempId: tempId }).lean();
+          wasOpen = conflictDoc?.status === 'open';
+          const serverSnapshot = sanitizeEquipmentSnapshot(existing.toObject({ depopulate: true }));
+          const clientChanges = buildClientChanges({
+            eqIdRaw,
+            equipmentTypeRaw,
+            compliance,
+            otherInfo,
+            failureNote,
+            failureSeverity,
+            normalizedProtectionTypes,
+            manualFields,
+            manualExMarking
+          });
+          const nextDoc = await EquipmentConflict.findOneAndUpdate(
+            { tenantId, clientTempId: tempId },
+            {
+              $set: {
+                tenantId,
+                equipmentId: existing._id,
+                siteId,
+                zoneId,
+                createdBy: userId,
+                baseUpdatedAt,
+                clientUpdatedAt,
+                clientChanges,
+                serverSnapshot,
+                status: 'open'
+              }
+            },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+          );
+          conflictDoc = nextDoc || conflictDoc;
+
+          if (!wasOpen && conflictDoc) {
+            const conflictId = String(conflictDoc._id);
+            const eqIdLabel = String(existing.EqID || existing._id);
+            const title = 'Equipment conflict detected';
+            const message = `Conflict detected for ${eqIdLabel}. Resolve in Conflicts.`;
+            const meta = { route: `/conflicts/${conflictId}` };
+
+            await notifyAndStore(String(userId), {
+              type: 'equipment-conflict',
+              title,
+              message,
+              data: { conflictId, equipmentId: String(existing._id), meta }
+            });
+
+            const adminUsers = await User.find({ tenantId, role: { $in: ['Admin', 'SuperAdmin'] } })
+              .select('_id')
+              .lean();
+            const adminIds = (adminUsers || []).map((u) => String(u._id)).filter(Boolean);
+            for (const idStr of adminIds) {
+              if (idStr === String(userId)) continue;
+              await notifyAndStore(idStr, {
+                type: 'equipment-conflict',
+                title,
+                message,
+                data: { conflictId, equipmentId: String(existing._id), meta }
+              });
+            }
+          }
+        } catch {}
+
         conflicts.push({
           tempId,
           equipmentId: String(existing._id),
+          conflictId: conflictDoc ? String(conflictDoc._id) : undefined,
           message: 'Conflict: newer server changes detected.',
-          serverUpdatedAt: existing.updatedAt ? new Date(existing.updatedAt).toISOString() : null
+          serverUpdatedAt
         });
         // Clean up any uploaded temp files for this item.
         for (const f of files.filter((x) => parseFileKeyFromOriginalName(x.originalname) === tempId)) {
