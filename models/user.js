@@ -45,6 +45,7 @@ const UserSchema = new mongoose.Schema(
     },
     position:  { type: String },
     positionInfo: { type: String },
+    uiScale: { type: Number, enum: [0.8, 1], default: 0.8 },
     // Optional inspector signature stored in Azure Blob Storage
     signatureBlobPath: { type: String },
     signatureBlobUrl: { type: String },

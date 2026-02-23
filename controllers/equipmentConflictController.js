@@ -139,10 +139,16 @@ exports.listConflicts = async (req, res) => {
   const role = req.role;
   const status = String(req.query.status || 'open').toLowerCase();
   const limit = Math.min(parseInt(req.query.limit || '200', 10), 500);
+  const equipmentId = toObjectId(req.query.equipmentId);
 
   const q = isAdminRole(role)
     ? { tenantId }
     : { tenantId, createdBy: userId };
+
+  if (req.query.equipmentId) {
+    if (!equipmentId) return res.status(400).json({ error: 'Invalid equipmentId' });
+    q.equipmentId = equipmentId;
+  }
 
   if (status !== 'all') {
     q.status = status;
@@ -257,7 +263,8 @@ exports.resolveConflict = async (req, res) => {
       type: 'equipment-conflict-resolved',
       title,
       message,
-      data: { conflictId, equipmentId: String(equipment._id), meta }
+      data: { conflictId, equipmentId: String(equipment._id), meta },
+      meta
     });
 
     const adminUsers = await User.find({ tenantId, role: { $in: ['Admin', 'SuperAdmin'] } })
@@ -270,7 +277,8 @@ exports.resolveConflict = async (req, res) => {
         type: 'equipment-conflict-resolved',
         title,
         message,
-        data: { conflictId, equipmentId: String(equipment._id), meta }
+        data: { conflictId, equipmentId: String(equipment._id), meta },
+        meta
       });
     }
   } catch {}

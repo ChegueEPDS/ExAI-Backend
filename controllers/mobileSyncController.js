@@ -426,7 +426,8 @@ exports.mobileSync = async (req, res) => {
               type: 'equipment-conflict',
               title,
               message,
-              data: { conflictId, equipmentId: String(existing._id), meta }
+              data: { conflictId, equipmentId: String(existing._id), meta },
+              meta
             });
 
             const adminUsers = await User.find({ tenantId, role: { $in: ['Admin', 'SuperAdmin'] } })
@@ -439,7 +440,8 @@ exports.mobileSync = async (req, res) => {
                 type: 'equipment-conflict',
                 title,
                 message,
-                data: { conflictId, equipmentId: String(existing._id), meta }
+                data: { conflictId, equipmentId: String(existing._id), meta },
+                meta
               });
             }
           }
