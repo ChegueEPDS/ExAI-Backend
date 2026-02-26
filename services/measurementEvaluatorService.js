@@ -255,7 +255,7 @@ function pickCellByCol(cells, colIndex) {
   return null;
 }
 
-async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, allowedFilenames = [], trace = null }) {
+async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, allowedFilenames = [], filename = null, sheet = null, trace = null }) {
   if (!enabled()) return { ok: false, skipped: true, reason: 'MEAS_EVAL_ENABLED is off' };
 
   const maxFiles = Math.max(1, Math.min(Number(systemSettings.getNumber('MEAS_EVAL_MAX_FILES') || 3), 10));
@@ -268,9 +268,17 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
     dust_surface_C: Number(systemSettings.getString('MEAS_LIMIT_DUST_SURFACE_C') || '') || null,
   };
 
-  const xlsxFiles = (allowedFilenames || [])
+  let xlsxFiles = (allowedFilenames || [])
     .filter(n => String(n).toLowerCase().endsWith('.xlsx') || String(n).toLowerCase().endsWith('.xls'))
     .slice(0, maxFiles);
+
+  if (filename) {
+    const want = String(filename).trim().toLowerCase();
+    const hit = xlsxFiles.find(f => String(f).trim().toLowerCase() === want)
+      || xlsxFiles.find(f => String(f).toLowerCase().includes(want))
+      || null;
+    xlsxFiles = hit ? [hit] : [];
+  }
 
   if (!xlsxFiles.length) return { ok: false, skipped: true, reason: 'no xlsx in allowedFilenames' };
 
@@ -289,6 +297,9 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
     worst_by_point: [],
     ambient: null,
     ts_rise_by_point: [],
+    ambient_field_by_sheet: [],
+    ts_by_point: [],
+    tmax_by_point: [],
     numericEvidence: [],
   };
 
@@ -313,10 +324,52 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
       bySheet.get(sh).push(r);
     }
 
-    const sheetNames = Array.from(bySheet.keys()).slice(0, maxSheets);
+    let sheetNames = Array.from(bySheet.keys()).slice(0, maxSheets);
+    if (sheet) {
+      const want = String(sheet).trim().toLowerCase();
+      const exact = sheetNames.find(s => String(s).trim().toLowerCase() === want);
+      const fuzzy = exact || sheetNames.find(s => String(s).toLowerCase().includes(want));
+      sheetNames = fuzzy ? [fuzzy] : [];
+    }
     for (const sheet of sheetNames) {
       const sheetRows = (bySheet.get(sheet) || []).slice().sort((a, b) => Number(a.rowIndex) - Number(b.rowIndex));
       if (!sheetRows.length) continue;
+
+      // Ambient field from header rows (e.g. "Max. allowed ambient temperature")
+      let ambientField = null;
+      for (const r of sheetRows.slice(0, 40)) {
+        const label = normalizeKey(extractRowLabelFromRowText(r.text) || r.text);
+        if (!label.includes('ambient')) continue;
+        if (!(label.includes('max') || label.includes('allowed') || label.includes('temperature') || label.includes('range'))) continue;
+        const rowIndex = Number(r.rowIndex);
+        const cells = await DatasetTableCell.find({
+          tenantId,
+          projectId,
+          datasetVersion,
+          datasetFileId,
+          filename,
+          sheet,
+          rowIndex,
+        }).select('filename sheet rowIndex colIndex cell valueRaw valueNumber').lean();
+        const best = pickMaxCell(cells);
+        if (best && Number.isFinite(Number(best.valueNumber))) {
+          ambientField = {
+            value: Number(best.valueNumber),
+            evidence: toEvidenceCell({ ...best, filename, sheet }),
+            label: String(extractRowLabelFromRowText(r.text) || r.text || ''),
+          };
+          break;
+        }
+      }
+      if (ambientField?.evidence) {
+        result.ambient_field_by_sheet.push({
+          sheet,
+          ambient_field_C: Number(ambientField.value),
+          label: ambientField.label || '',
+          evidence: ambientField.evidence,
+        });
+        result.numericEvidence.push(ambientField.evidence);
+      }
 
       // Find "Table N" markers by scanning row text.
       const tables = [];
@@ -339,6 +392,8 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
       }
       const selectedTables = unique.slice(0, maxTablesPerSheet);
       if (!selectedTables.length) continue;
+
+      const deltaWorst = { service: new Map(), max: new Map() };
 
       for (let ti = 0; ti < selectedTables.length; ti += 1) {
         const tableNo = selectedTables[ti].tableNo;
@@ -426,6 +481,30 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
         const points = [];
         let hottest = null;
         let externalMax = null;
+        const ambientRow = seriesRows.find(r => {
+          const token = tokenFromLabel(r.text);
+          const label = extractRowLabelFromRowText(r.text) || String(r.text || '');
+          return token && isAmbientPoint({ token, label });
+        }) || null;
+
+        let ambientByCol = new Map();
+        if (ambientRow) {
+          const ambientCells = await DatasetTableCell.find({
+            tenantId,
+            projectId,
+            datasetVersion,
+            datasetFileId,
+            filename,
+            sheet,
+            rowIndex: Number(ambientRow.rowIndex),
+            colIndex: { $in: timeColIndices },
+          }).select('filename sheet rowIndex colIndex cell valueRaw valueNumber').lean();
+          ambientByCol = new Map(
+            (ambientCells || [])
+              .filter(c => Number.isFinite(Number(c.valueNumber)))
+              .map(c => [Number(c.colIndex), c])
+          );
+        }
 
         for (const sr of seriesRows) {
           const label = extractRowLabelFromRowText(sr.text) || String(sr.text || '').trim();
@@ -448,6 +527,23 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
           const lastCell = cells.find(c => Number(c.colIndex) === lastTimeCol) || null;
           if (!maxCell) continue;
 
+          // Max delta vs ambient (T12) per time column
+          let maxDelta = null;
+          let maxDeltaCell = null;
+          let ambCell = null;
+          if (ambientByCol.size) {
+            for (const c of (cells || [])) {
+              const amb = ambientByCol.get(Number(c.colIndex));
+              if (!amb || !Number.isFinite(Number(c.valueNumber))) continue;
+              const d = Number(c.valueNumber) - Number(amb.valueNumber);
+              if (maxDelta === null || d > maxDelta) {
+                maxDelta = d;
+                maxDeltaCell = c;
+                ambCell = amb;
+              }
+            }
+          }
+
           const item = {
             point: token,
             label,
@@ -457,6 +553,13 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
             },
             steady: lastCell && Number.isFinite(lastCell.valueNumber)
               ? { value: Number(lastCell.valueNumber), cell: toEvidenceCell({ ...lastCell, filename, sheet }) }
+              : null,
+            delta: (maxDelta !== null && maxDeltaCell && ambCell)
+              ? {
+                value: Number(maxDelta),
+                point_cell: toEvidenceCell({ ...maxDeltaCell, filename, sheet }),
+                ambient_cell: toEvidenceCell({ ...ambCell, filename, sheet }),
+              }
               : null,
           };
           points.push(item);
@@ -469,6 +572,25 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
           const w = worst.get(token);
           if (!w || item.max.value > w.max.value) {
             worst.set(token, { ...item, sheet, tableNo, supply: meta['supply voltage'] ?? null });
+          }
+
+          if (item.delta && item.delta.point_cell && item.delta.ambient_cell) {
+            let group = null;
+            if (tableNo >= 1 && tableNo <= 4) group = 'service';
+            else if (tableNo >= 5 && tableNo <= 8) group = 'max';
+            if (group) {
+              const prev = deltaWorst[group].get(token);
+              if (!prev || Number(item.delta.value) > Number(prev.delta)) {
+                deltaWorst[group].set(token, {
+                  delta: Number(item.delta.value),
+                  label,
+                  sheet,
+                  table: tableNo,
+                  point_cell: item.delta.point_cell,
+                  ambient_cell: item.delta.ambient_cell,
+                });
+              }
+            }
           }
         }
 
@@ -516,7 +638,52 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
           external_max: externalMax ? { point: externalMax.point, max_C: externalMax.max.value, evidence: externalMax.max.cell } : null,
           delta_max_minus_steady: delta ? { value_C: delta.value, evidence: delta.evidence } : null,
           points: points.slice(0, 24).map(p => ({ point: p.point, max_C: p.max.value, steady_C: p.steady ? p.steady.value : null })),
+          delta_points: points.slice(0, 24).map(p => ({ point: p.point, delta_C: p.delta ? p.delta.value : null })),
         });
+      }
+
+      // Compute Ts/Tmax using ambient field (header) + worst delta vs ambient (T12)
+      if (ambientField && ambientField.evidence) {
+        for (const [token, it] of deltaWorst.service.entries()) {
+          const ts = round1(Number(ambientField.value) + Number(it.delta));
+          const ev = toEvidenceComputed({
+            op: 'sum',
+            value: ts,
+            unit: '°C',
+            sources: [it.point_cell, it.ambient_cell, ambientField.evidence].filter(Boolean),
+          });
+          result.ts_by_point.push({
+            point: token,
+            label: it.label || '',
+            sheet,
+            table: it.table,
+            delta_C: round1(Number(it.delta)),
+            ambient_field_C: Number(ambientField.value),
+            ts_C: ts,
+            evidence: ev,
+          });
+          result.numericEvidence.push(ev);
+        }
+        for (const [token, it] of deltaWorst.max.entries()) {
+          const tmax = round1(Number(ambientField.value) + Number(it.delta));
+          const ev = toEvidenceComputed({
+            op: 'sum',
+            value: tmax,
+            unit: '°C',
+            sources: [it.point_cell, it.ambient_cell, ambientField.evidence].filter(Boolean),
+          });
+          result.tmax_by_point.push({
+            point: token,
+            label: it.label || '',
+            sheet,
+            table: it.table,
+            delta_C: round1(Number(it.delta)),
+            ambient_field_C: Number(ambientField.value),
+            tmax_C: tmax,
+            evidence: ev,
+          });
+          result.numericEvidence.push(ev);
+        }
       }
     }
   }

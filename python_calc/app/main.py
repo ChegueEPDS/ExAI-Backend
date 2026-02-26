@@ -4,6 +4,9 @@ import certifi
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 import pandas as pd
+import logging
+import json
+import os
 
 def _create_https_context():
     return ssl.create_default_context(cafile=certifi.where())
@@ -12,6 +15,8 @@ ssl._create_default_https_context = _create_https_context
 
 app = FastAPI()
 
+logging.basicConfig(level=os.getenv("PY_CALC_LOG_LEVEL", "INFO"))
+logger = logging.getLogger("python_calc")
 
 class TableQueryRequest(BaseModel):
     files: List[Dict[str, Any]]  # [{filename, url}]
@@ -172,9 +177,49 @@ def _computed_evidence(op: str, value: Any, unit: str, sources: List[Dict[str, A
     }
 
 
+def _parse_number(v: Any):
+    try:
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v or "").strip()
+        if not s:
+            return None
+        import re
+        s2 = re.sub(r"[^0-9,\\.\\-]", "", s)
+        s2 = s2.replace(",", ".")
+        if not s2 or s2 in {".", "-", "+", "+.", "-."}:
+            return None
+        return float(s2)
+    except Exception:
+        return None
+
+
+def _find_ambient_field(df: pd.DataFrame, filename: str, sheet_name: str):
+    # Try to find "Max. allowed ambient temperature" (or similar) near the top rows.
+    max_rows = min(40, len(df.index))
+    max_cols = min(6, len(df.columns))
+    for r in range(max_rows):
+        for c in range(max_cols - 1):
+            label = df.iloc[r, c]
+            if not isinstance(label, str):
+                continue
+            key = label.lower()
+            if "ambient" not in key:
+                continue
+            if not ("max" in key or "allowed" in key or "temperature" in key or "range" in key):
+                continue
+            val = df.iloc[r, c + 1]
+            num = _parse_number(val)
+            if num is None:
+                continue
+            ev = _cell_evidence(filename, sheet_name, int(r) + 1, int(c) + 2, num)
+            return {"value": float(num), "evidence": ev, "label": str(label)}
+    return None
+
+
 def _token_from_label(label: str) -> str:
     import re
-    m = re.search(r"\\b(T\\d{1,2})\\b", str(label or ""), re.I)
+    m = re.search(r"\b(T\d{1,2})\b", str(label or ""), re.I)
     if not m:
         return ""
     tok = m.group(1).upper()
@@ -759,6 +804,18 @@ def time_series(req: TimeSeriesRequest):
 def measurement_eval(req: MeasurementEvalRequest):
     if not req.files:
         raise HTTPException(status_code=400, detail="files is required")
+    try:
+        logger.info("measurement_eval.start %s", json.dumps({
+            "files": [str(f.get("filename") or "") for f in req.files],
+            "filename": str(req.filename or ""),
+            "sheet": str(req.sheet or ""),
+            "max_tables": req.max_tables,
+            "max_rows": req.max_rows,
+            "max_cols": req.max_cols,
+            "ext_points": req.ext_points,
+        }))
+    except Exception:
+        pass
 
     def resolve_file(name: str):
         for f in req.files:
@@ -787,10 +844,14 @@ def measurement_eval(req: MeasurementEvalRequest):
         "worst_by_point": [],
         "ambient": None,
         "ts_rise_by_point": [],
+        "ambient_field_by_sheet": [],
+        "ts_by_point": [],
+        "tmax_by_point": [],
         "numericEvidence": [],
     }
 
     worst = {}  # token -> {max, evidence, label, sheet, table}
+    delta_worst = {"service": {}, "max": {}}  # token -> {delta, point_cell, ambient_cell, label, sheet, table}
 
     for f in iter_files():
         if not f:
@@ -805,27 +866,76 @@ def measurement_eval(req: MeasurementEvalRequest):
             else:
                 sheets = pd.read_excel(url, sheet_name=None, header=None)
         except Exception as e:
+            try:
+                logger.error("measurement_eval.read_failed file=%s error=%s", filename, str(e))
+            except Exception:
+                pass
             raise HTTPException(status_code=400, detail=f"failed to read file: {e}")
 
         for sheet_name, df in (sheets or {}).items():
             if df is None or df.empty:
                 continue
+            try:
+                logger.info("measurement_eval.sheet file=%s sheet=%s rows=%s cols=%s", filename, sheet_name, int(df.shape[0]), int(df.shape[1]))
+            except Exception:
+                pass
             if req.max_rows:
                 df = df.head(int(req.max_rows))
             if req.max_cols:
                 df = df[df.columns[: int(req.max_cols)]]
 
-            # find table markers (col 0)
+            # Ambient field (e.g., "Max. allowed ambient temperature")
+            ambient_field = _find_ambient_field(df, filename, sheet_name)
+            if ambient_field:
+                try:
+                    logger.info("measurement_eval.ambient_field sheet=%s value=%s", sheet_name, ambient_field.get("value"))
+                except Exception:
+                    pass
+                result["ambient_field_by_sheet"].append({
+                    "sheet": sheet_name,
+                    "ambient_field_C": float(ambient_field.get("value") or 0),
+                    "label": ambient_field.get("label") or "",
+                    "evidence": ambient_field.get("evidence"),
+                })
+                if ambient_field.get("evidence"):
+                    result["numericEvidence"].append(ambient_field.get("evidence"))
+
+            # find table markers (scan whole row to be robust to merged cells)
             tables = []
-            for i, v in df.iloc[:, 0].items():
-                if isinstance(v, str):
-                    import re
-                    m = re.search(r"\\bTable\\s+(\\d+)\\b", v)
+            import re
+            for i, row in df.iterrows():
+                try:
+                    row_vals = row.tolist()
+                except Exception:
+                    row_vals = []
+                for v in row_vals:
+                    try:
+                        if pd.isna(v):
+                            continue
+                    except Exception:
+                        pass
+                    s = str(v).replace("\u00A0", " ").strip()
+                    if not s:
+                        continue
+                    m = re.search(r"\bTable\s+(\d+)\b", s, re.I)
                     if m:
                         tables.append((int(m.group(1)), int(i)))
+                        break
             tables.sort(key=lambda x: x[1])
             if not tables:
+                try:
+                    sample = []
+                    for r in range(min(25, len(df.index))):
+                        row = df.iloc[r, :].tolist()
+                        sample.append([str(x) for x in row[:6]])
+                    logger.warning("measurement_eval.no_tables sheet=%s sample_rows=%s", sheet_name, sample[:10])
+                except Exception:
+                    pass
                 continue
+            try:
+                logger.info("measurement_eval.tables sheet=%s tables=%s", sheet_name, [t[0] for t in tables])
+            except Exception:
+                pass
 
             # unique by start row
             seen = set()
@@ -845,11 +955,19 @@ def measurement_eval(req: MeasurementEvalRequest):
                 time_row = None
                 for r in range(start_row + 1, min(end_row, start_row + 600)):
                     row = df.iloc[r, :].tolist()
-                    if any(isinstance(x, str) and "time" in x.lower() for x in row):
+                    if any((str(x).lower().find("time") >= 0) for x in row if str(x).strip()):
                         time_row = r
                         break
                 if time_row is None:
+                    try:
+                        logger.warning("measurement_eval.no_time_row sheet=%s table=%s", sheet_name, table_no)
+                    except Exception:
+                        pass
                     continue
+                try:
+                    logger.info("measurement_eval.table sheet=%s table=%s time_row=%s", sheet_name, table_no, time_row + 1)
+                except Exception:
+                    pass
 
                 # time columns: numeric values in time row
                 time_cols = []
@@ -857,7 +975,15 @@ def measurement_eval(req: MeasurementEvalRequest):
                     if isinstance(val, (int, float)) and val >= 0:
                         time_cols.append((int(c), float(val)))
                 if not time_cols:
+                    try:
+                        logger.warning("measurement_eval.no_time_cols sheet=%s table=%s", sheet_name, table_no)
+                    except Exception:
+                        pass
                     continue
+                try:
+                    logger.info("measurement_eval.time_cols sheet=%s table=%s count=%s", sheet_name, table_no, len(time_cols))
+                except Exception:
+                    pass
 
                 # last time col by time value
                 last_time_col, last_time_val = max(time_cols, key=lambda x: x[1])
@@ -865,6 +991,29 @@ def measurement_eval(req: MeasurementEvalRequest):
                 points = []
                 hottest = None
                 external_max = None
+                ambient_row = None
+                ambient_label = None
+
+                # First pass: detect ambient row (T12 / ambient label)
+                for r in range(time_row + 1, min(end_row, time_row + 200)):
+                    label = df.iloc[r, 0] if df.shape[1] > 0 else None
+                    unit = df.iloc[r, 1] if df.shape[1] > 1 else None
+                    token = _token_from_label(label)
+                    if not token:
+                        continue
+                    if not _is_temp_row(str(label or ""), str(unit or "")):
+                        continue
+                    if _is_ambient(token, str(label or "")):
+                        ambient_row = r
+                        ambient_label = str(label or "")
+                        break
+
+                ambient_by_col = {}
+                if ambient_row is not None:
+                    for c, _t in time_cols:
+                        v = df.iloc[ambient_row, c] if c < df.shape[1] else None
+                        if isinstance(v, (int, float)):
+                            ambient_by_col[int(c)] = float(v)
 
                 for r in range(time_row + 1, min(end_row, time_row + 200)):
                     label = df.iloc[r, 0] if df.shape[1] > 0 else None
@@ -900,11 +1049,34 @@ def measurement_eval(req: MeasurementEvalRequest):
                     if steady_val is not None:
                         steady_ev = _cell_evidence(filename, sheet_name, row_idx, int(last_time_col) + 1, steady_val)
 
+                    # Max delta vs ambient (T12) per time column
+                    max_delta = None
+                    max_delta_col = None
+                    amb_val = None
+                    if ambient_by_col:
+                        for c, _t in time_cols:
+                            v = df.iloc[r, c] if c < df.shape[1] else None
+                            a = ambient_by_col.get(int(c))
+                            if isinstance(v, (int, float)) and isinstance(a, (int, float)):
+                                d = float(v) - float(a)
+                                if (max_delta is None) or (d > max_delta):
+                                    max_delta = d
+                                    max_delta_col = int(c)
+                                    amb_val = float(a)
+
+                    delta_point_ev = None
+                    delta_amb_ev = None
+                    if max_delta is not None and max_delta_col is not None:
+                        delta_point_ev = _cell_evidence(filename, sheet_name, row_idx, int(max_delta_col) + 1, float(df.iloc[r, max_delta_col]))
+                        if ambient_row is not None:
+                            delta_amb_ev = _cell_evidence(filename, sheet_name, int(ambient_row) + 1, int(max_delta_col) + 1, amb_val)
+
                     item = {
                         "point": token,
                         "label": str(label or ""),
                         "max": {"value": max_val, "cell": max_ev},
                         "steady": {"value": steady_val, "cell": steady_ev} if steady_val is not None else None,
+                        "delta": {"value": max_delta, "point_cell": delta_point_ev, "ambient_cell": delta_amb_ev} if max_delta is not None else None,
                     }
                     points.append(item)
 
@@ -924,8 +1096,35 @@ def measurement_eval(req: MeasurementEvalRequest):
                             "table": table_no,
                         }
 
+                    # Track worst delta by point for tables 1-4 (service) and 5-8 (max)
+                    if item.get("delta") and item["delta"].get("point_cell") and item["delta"].get("ambient_cell"):
+                        group = None
+                        if 1 <= int(table_no) <= 4:
+                            group = "service"
+                        elif 5 <= int(table_no) <= 8:
+                            group = "max"
+                        if group:
+                            dprev = delta_worst[group].get(token)
+                            dval = float(item["delta"]["value"])
+                            if (dprev is None) or (dval > float(dprev.get("delta") or 0)):
+                                delta_worst[group][token] = {
+                                    "delta": dval,
+                                    "label": str(label or ""),
+                                    "sheet": sheet_name,
+                                    "table": table_no,
+                                    "point_cell": item["delta"]["point_cell"],
+                                    "ambient_cell": item["delta"]["ambient_cell"],
+                                }
+
                 if not hottest:
                     continue
+                try:
+                    logger.info("measurement_eval.table_done sheet=%s table=%s points=%s hottest=%s external=%s",
+                                sheet_name, table_no, len(points),
+                                hottest["point"] if hottest else None,
+                                external_max["point"] if external_max else None)
+                except Exception:
+                    pass
 
                 time_ev = _cell_evidence(filename, sheet_name, int(time_row) + 1, int(last_time_col) + 1, last_time_val)
                 result["numericEvidence"].append(hottest["max"]["cell"])
@@ -945,6 +1144,7 @@ def measurement_eval(req: MeasurementEvalRequest):
                     "hottest": {"point": hottest["point"], "max_C": hottest["max"]["value"], "evidence": hottest["max"]["cell"]},
                     "external_max": {"point": external_max["point"], "max_C": external_max["max"]["value"], "evidence": external_max["max"]["cell"]} if external_max else None,
                     "points": [{"point": p["point"], "max_C": p["max"]["value"], "steady_C": p["steady"]["value"] if p.get("steady") else None} for p in points[:24]],
+                    "delta_points": [{"point": p["point"], "delta_C": p["delta"]["value"] if p.get("delta") else None} for p in points[:24]],
                 })
 
     # worst_by_point
@@ -980,7 +1180,7 @@ def measurement_eval(req: MeasurementEvalRequest):
             if _is_ambient(p.get("point", ""), p.get("label", "")):
                 continue
             delta = float(p.get("max_C") or 0) - amb
-            ev = _computed_evidence("minus", round(delta, 1), "°C", [p.get("evidence"), result["ambient"]["evidence"]])
+            ev = _computed_evidence("delta", round(delta, 1), "°C", [p.get("evidence"), result["ambient"]["evidence"]])
             result["ts_rise_by_point"].append({
                 "point": p.get("point"),
                 "label": p.get("label"),
@@ -991,7 +1191,74 @@ def measurement_eval(req: MeasurementEvalRequest):
             })
             result["numericEvidence"].append(ev)
 
+    # Compute Ts/Tmax using ambient field (from header) + max delta vs ambient (T12)
+    for sheet_meta in result.get("ambient_field_by_sheet") or []:
+        sheet_name = sheet_meta.get("sheet")
+        amb_field = sheet_meta.get("ambient_field_C")
+        amb_ev = sheet_meta.get("evidence")
+        if amb_field is None or not isinstance(amb_field, (int, float)) or not amb_ev:
+            continue
+
+        for token, item in (delta_worst.get("service") or {}).items():
+            if item.get("sheet") != sheet_name:
+                continue
+            ts_val = round(float(amb_field) + float(item.get("delta") or 0), 1)
+            ev = _computed_evidence(
+                "sum",
+                ts_val,
+                "°C",
+                [item.get("point_cell"), item.get("ambient_cell"), amb_ev],
+            )
+            result["ts_by_point"].append({
+                "point": token,
+                "label": item.get("label") or "",
+                "sheet": sheet_name,
+                "table": item.get("table"),
+                "delta_C": round(float(item.get("delta") or 0), 1),
+                "ambient_field_C": float(amb_field),
+                "ts_C": ts_val,
+                "evidence": ev,
+            })
+            result["numericEvidence"].append(ev)
+
+        for token, item in (delta_worst.get("max") or {}).items():
+            if item.get("sheet") != sheet_name:
+                continue
+            tmax_val = round(float(amb_field) + float(item.get("delta") or 0), 1)
+            ev = _computed_evidence(
+                "sum",
+                tmax_val,
+                "°C",
+                [item.get("point_cell"), item.get("ambient_cell"), amb_ev],
+            )
+            result["tmax_by_point"].append({
+                "point": token,
+                "label": item.get("label") or "",
+                "sheet": sheet_name,
+                "table": item.get("table"),
+                "delta_C": round(float(item.get("delta") or 0), 1),
+                "ambient_field_C": float(amb_field),
+                "tmax_C": tmax_val,
+                "evidence": ev,
+            })
+            result["numericEvidence"].append(ev)
+
     result["numericEvidence"] = result["numericEvidence"][:250]
+
+    try:
+        logger.info("measurement_eval.done %s", json.dumps({
+            "by_test": len(result.get("by_test") or []),
+            "worst_by_point": len(result.get("worst_by_point") or []),
+            "ambient": result.get("ambient"),
+            "ambient_field_by_sheet": len(result.get("ambient_field_by_sheet") or []),
+            "ts_by_point": len(result.get("ts_by_point") or []),
+            "tmax_by_point": len(result.get("tmax_by_point") or []),
+            "numericEvidence": len(result.get("numericEvidence") or []),
+            "ts_sample": (result.get("ts_by_point") or [])[:5],
+            "tmax_sample": (result.get("tmax_by_point") or [])[:5],
+        }))
+    except Exception:
+        pass
 
     return {"ok": True, "result": result}
 

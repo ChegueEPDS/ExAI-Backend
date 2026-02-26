@@ -461,6 +461,32 @@ function detectLanguage(userMsg = '') {
   return 'en';
 }
 
+function extractQuotedSheetName(message = '') {
+  const s = String(message || '');
+  const re = /(?:sheet|sheets|munkalap|lap)\s*(?:named|name|called|nev(?:u|ű)?|:)?\s*["“”']([^"“”']{3,120})["“”']/i;
+  const m = s.match(re);
+  if (m && String(m[1] || '').trim()) return String(m[1]).trim();
+  return null;
+}
+
+function resolveSheetName({ requested, sheets = [] }) {
+  const req = String(requested || '').trim();
+  if (!req || !Array.isArray(sheets) || !sheets.length) return null;
+  const exact = sheets.find(s => String(s).trim().toLowerCase() === req.toLowerCase());
+  if (exact) return exact;
+  const fuzzy = bestFuzzyMatch({ message: req, candidates: sheets, threshold: 0.6 });
+  return fuzzy?.raw || null;
+}
+
+function resolveFilename({ requested, filenames = [] }) {
+  const req = String(requested || '').trim();
+  if (!req || !Array.isArray(filenames) || !filenames.length) return null;
+  const exact = filenames.find(f => String(f).trim().toLowerCase() === req.toLowerCase());
+  if (exact) return exact;
+  const fuzzy = bestFuzzyMatch({ message: req, candidates: filenames, threshold: 0.6 });
+  return fuzzy?.raw || null;
+}
+
 function isDefinitionLikeQuestion(message) {
   const s = String(message || '').toLowerCase();
   if (/\b\d+(?:\.\d+){1,5}\b/.test(s)) return true; // clause id like 3.69.4
@@ -1547,6 +1573,7 @@ exports.chatGovernedStream = async (req, res) => {
     let hasMeasCompareContext = false;
 
     // Optional: LLM planner chooses which deterministic XLSX tool to run.
+    let xlsxPreviewCache = null;
     let chosenTool = '';
     let chosenArgs = {};
     try {
@@ -1566,6 +1593,7 @@ exports.chatGovernedStream = async (req, res) => {
             trace: { requestId: req.requestId },
           });
         } catch { preview = null; }
+        xlsxPreviewCache = preview;
         const hints = { xlsxFiles: xlsxList, xlsxPreview: preview };
         const r = await xlsxPlanner.buildPlan({ message: effectiveMessage, xlsxHints: hints, trace: { requestId: req.requestId } });
         if (r?.ok && r.plan?.steps?.length) planned = r.plan;
@@ -1598,32 +1626,32 @@ exports.chatGovernedStream = async (req, res) => {
 	          const hu = lang === 'hu';
 	          const key = String(t || '').trim();
 	          if (key === 'analyze_measurement_tables') return hu
-	            ? 'Mérés táblák (Table 1–4) mérnöki elemzése'
-	            : 'Engineering analysis of measurement tables (Table 1–4)';
+	            ? 'Mérés táblák elemzése'
+	            : 'Measurement tables analysis';
 	          if (key === 'compare_tables') return hu
-	            ? 'Mérés táblák (Table 1–4) összehasonlítás oszlop-tartományon'
-	            : 'Compare measurement tables (Table 1–4) over a column range';
+	            ? 'Mérés táblák összehasonlítása'
+	            : 'Measurement tables comparison';
 	          if (key === 'evaluate_measurements') return hu
-	            ? 'Mérések kiértékelése (összegzés / max / steady / ambient)'
-	            : 'Evaluate measurements (summary / max / steady / ambient)';
+	            ? 'Mérések kiértékelése'
+	            : 'Evaluate measurements';
           if (key === 'table_query') return hu
-            ? 'Általános táblázat lekérdezés (szűrés/csoportosítás/összeg/átlag)'
-            : 'General table query (filter/group/sum/average)';
+            ? 'Általános táblázat lekérdezés'
+            : 'General table query';
           if (key === 'table_profile') return hu
-            ? 'Táblázat profilozás (adatminőség, hiányzók, outlier-ek)'
-            : 'Table profiling (data quality, missing values, outliers)';
+            ? 'Táblázat profilozás'
+            : 'Table profiling';
           if (key === 'table_compare') return hu
-            ? 'Táblázatok összehasonlítása (új/hiányzó/változott sorok)'
-            : 'Table comparison (added/removed/changed rows)';
+            ? 'Táblázatok összehasonlítása'
+            : 'Table comparison';
           if (key === 'table_pivot') return hu
-            ? 'Kimutatás (csoportosított összesítés / pivot)'
-            : 'Pivot table (grouped summary)';
+            ? 'Kimutatás'
+            : 'Pivot table';
 	          if (key === 'time_series') return hu
-	            ? 'Idősor (resample + trend)'
-	            : 'Time series (resample + trend)';
+	            ? 'Idősor'
+	            : 'Time series';
           if (key === 'compliance_check') return hu
-            ? 'Megfelelőség ellenőrzés (követelménylista + mátrix)'
-            : 'Compliance check (requirements list + matrix)';
+            ? 'Megfelelőség ellenőrzés'
+            : 'Compliance check';
 		          return key || (hu ? 'Ismeretlen eszköz' : 'Unknown tool');
 		        };
 
@@ -1636,26 +1664,30 @@ exports.chatGovernedStream = async (req, res) => {
 	          candidates.set(k, { tool: k, name, args: a });
 	        };
 
-	        // Preferred choice first (planner), then fallbacks.
-	        if (tool === 'analyze_measurement_tables') add('analyze_measurement_tables', toolLabel('analyze_measurement_tables', lang), args || {});
-	        if (tool === 'compare_tables') add('compare_tables', toolLabel('compare_tables', lang), args || {});
-	        if (tool === 'evaluate_measurements') add('evaluate_measurements', toolLabel('evaluate_measurements', lang), args || {});
-        if (tool === 'table_query') add('table_query', toolLabel('table_query', lang), {});
-        if (tool === 'table_profile') add('table_profile', toolLabel('table_profile', lang), {});
-        if (tool === 'table_compare') add('table_compare', toolLabel('table_compare', lang), {});
-        if (tool === 'table_pivot') add('table_pivot', toolLabel('table_pivot', lang), {});
-        if (tool === 'time_series') add('time_series', toolLabel('time_series', lang), {});
-        if (tool === 'compliance_check') add('compliance_check', toolLabel('compliance_check', lang), {});
+	        // Always offer all tools (limitless). Keep planner choice first if present.
+	        const allTools = [
+	          'analyze_measurement_tables',
+	          'compare_tables',
+	          'evaluate_measurements',
+	          'table_query',
+	          'table_profile',
+	          'table_compare',
+	          'table_pivot',
+	          'time_series',
+	          'compliance_check',
+	        ];
 
-        if (fallbackTabular) add('table_query', toolLabel('table_query', lang), {});
-	        if (fallbackCompare) add('compare_tables', toolLabel('compare_tables', lang), {});
-	        if (fallbackEval) add('evaluate_measurements', toolLabel('evaluate_measurements', lang), {});
-        if (wantsComplianceCheck) add('compliance_check', toolLabel('compliance_check', lang), {});
+	        const preferred = String(tool || '').trim();
+	        if (preferred) {
+	          add(preferred, toolLabel(preferred, lang), args || {});
+	        }
 
-	        // If we still don't have a choice, default to table_query for normal tables.
-        if (!candidates.size && fallbackTabular) add('table_query', toolLabel('table_query', lang), {});
+	        for (const t of allTools) {
+	          if (t === preferred) continue;
+	          add(t, toolLabel(t, lang), {});
+	        }
 
-	        const opts = Array.from(candidates.values()).slice(0, 5).map((o, idx) => ({ i: idx + 1, ...o }));
+	        const opts = Array.from(candidates.values()).map((o, idx) => ({ i: idx + 1, ...o }));
 	        if (opts.length >= 2) {
 	          const isHu = String(lang || '').toLowerCase() === 'hu';
 	          const lines = (isHu
@@ -1663,13 +1695,13 @@ exports.chatGovernedStream = async (req, res) => {
 	              `A kérdés alapján ezt a táblázat-eszközt futtatnám: **${opts[0].name}**.`,
 	              'Jó így? Válaszolj a sorszámmal (pl. 1), vagy válassz másikat:',
 	              '',
-	              ...opts.map(o => `${o.i} - ${o.name}`),
+	              ...opts.map(o => `${o.i}. ${o.name}`),
 	            ]
 	            : [
 	              `Based on your question, I'd run: **${opts[0].name}**.`,
 	              'Reply with the number (e.g. 1) to confirm, or choose another tool:',
 	              '',
-	              ...opts.map(o => `${o.i} - ${o.name}`),
+	              ...opts.map(o => `${o.i}. ${o.name}`),
 	            ]).join('\n');
 
           await setConversationJob(conversation, {
@@ -1736,15 +1768,42 @@ exports.chatGovernedStream = async (req, res) => {
       } else if (measEval.enabled() && (tool === 'evaluate_measurements' || fallbackEval)) {
         send('progress', { stage: 'meas.eval.start' });
         let ev = null;
+        const maxFiles = Math.max(1, Math.min(Number(systemSettings.getNumber('MEAS_EVAL_MAX_FILES') || 3), 10));
+        const xlsxList = (allowedFilenames || [])
+          .filter(n => /\.xls(x)?$/i.test(String(n || '')))
+          .slice(0, maxFiles);
+        const requestedFilename = String(args?.filename || '').trim() || null;
+        const resolvedFilename = resolveFilename({ requested: requestedFilename, filenames: xlsxList }) || (xlsxList.length === 1 ? xlsxList[0] : null);
+
+        // Resolve sheet name (from args or question) using preview if available.
+        let previewForEval = xlsxPreviewCache;
+        if (!previewForEval) {
+          try {
+            previewForEval = await xlsxPreview.buildXlsxPreview({
+              tenantId,
+              projectId,
+              datasetVersion,
+              filenames: xlsxList,
+              trace: { requestId: req.requestId },
+            });
+          } catch { previewForEval = null; }
+        }
+
+        const sheetHint = String(args?.sheet || extractQuotedSheetName(effectiveMessage) || '').trim() || null;
+        const previewFiles = Array.isArray(previewForEval?.files) ? previewForEval.files : [];
+        const filePreview = resolvedFilename
+          ? previewFiles.find(f => String(f?.filename || '') === String(resolvedFilename || ''))
+          : (previewFiles[0] || null);
+        const sheetList = Array.isArray(filePreview?.sheets)
+          ? filePreview.sheets.map(s => String(s?.sheet || '')).filter(Boolean)
+          : [];
+        const resolvedSheet = resolveSheetName({ requested: sheetHint, sheets: sheetList }) || (sheetList.length === 1 ? sheetList[0] : null);
 
         if (pythonCalc.isEnabled()) {
           try {
-            const maxFiles = Math.max(1, Math.min(Number(systemSettings.getNumber('MEAS_EVAL_MAX_FILES') || 3), 10));
-            const xlsxList = (allowedFilenames || [])
-              .filter(n => /\.xls(x)?$/i.test(String(n || '')))
-              .slice(0, maxFiles);
             const files = [];
             for (const filename of xlsxList) {
+              if (resolvedFilename && String(filename) !== String(resolvedFilename)) continue;
               // eslint-disable-next-line no-await-in-loop
               const fileDoc = await DatasetFile.findOne({ tenantId, projectId, datasetVersion, filename })
                 .select('storage.blobPath filename')
@@ -1766,6 +1825,8 @@ exports.chatGovernedStream = async (req, res) => {
                 .filter(Boolean);
               ev = await pythonCalc.runMeasurementEvalPython({
                 files,
+                filename: resolvedFilename || null,
+                sheet: resolvedSheet || null,
                 maxTables: Number(systemSettings.getNumber('MEAS_EVAL_MAX_TABLES') || 8),
                 extPoints,
                 timeoutMs: 120000,
@@ -1787,11 +1848,14 @@ exports.chatGovernedStream = async (req, res) => {
             projectId,
             datasetVersion,
             allowedFilenames,
+            filename: resolvedFilename || null,
+            sheet: resolvedSheet || null,
             trace: { requestId: req.requestId },
           });
         }
         if (ev?.ok && ev?.result) {
           contextParts.push('MEASUREMENT_EVAL_CONTEXT (deterministic XLSX evaluation; prefer using these summaries instead of listing raw timeseries):');
+          contextParts.push('NOTE: If result contains ts_by_point / tmax_by_point, these are COMPUTED values (ambient_field + max(Ti−T12)). Use ts_by_point for Ts (Tables 1–4) and tmax_by_point for Tmax (Tables 5–8). Do not describe them as directly measured.');
           contextParts.push(JSON.stringify(ev.result).slice(0, 120000));
           contextParts.push('---');
           hasMeasEvalContext = true;
@@ -2447,6 +2511,7 @@ exports.chatGovernedStream = async (req, res) => {
       'FONTOS: a MEASUREMENT_COMPARE_CONTEXT.deltaThreshold_C csak "jelző" küszöb (significance), NEM szabványi követelmény. Ettől önmagában nem lesz NEM MEGFELELŐ.',
       'Ha van MEASUREMENT_TABLE_ANALYSIS_CONTEXT, akkor a "Table 1–4 mit jelentenek" + worst-case + trendek + jelentős eltérések részt abból készítsd.',
       'Ha van MEASUREMENT_EVAL_CONTEXT, akkor a mérési adatok kiértékelését abból készítsd, és ne próbálj a TABLE_CONTEXT-ből teljes idősorokat felsorolni.',
+      'Ha a MEASUREMENT_EVAL_CONTEXT tartalmaz ts_by_point / tmax_by_point mezőket, ezeket COMPUTED értékként kezeld (ambient_field + max(Ti−T12)). Ts-hez ts_by_point, Tmax-hoz tmax_by_point használható. Ne nevezd ezeket közvetlenül mért értéknek.',
       'Ha van MEASUREMENT_COMPARE_CONTEXT, akkor a Table 1–4 / oszlop tartomány szerinti összehasonlítást abból készítsd.',
       answerMode === 'report'
         ? 'Kötelező elkülönítés: (1) "Eltéréselemzés" (trendek / jelentős különbségek) és (2) "Szabványi megfelelőség" (csak standard quote + limit + mért érték alapján).'
@@ -2468,6 +2533,8 @@ exports.chatGovernedStream = async (req, res) => {
       'A "numericEvidence" lista: XLSX cellák + (opcionális) számolt értékek forrás cellákkal. A "cell" mezőt töltsd ki, ha elérhető (pl. "C15").',
       'A "quotes" listában legyen rövid idézet (1-3 mondat) a releváns dokumentum/standard részről (fileName + pageOrLoc).',
       'Válasz struktúra javaslat: "Projekt összefoglaló", "Fő megállapítások", "Compliance mátrix" (Markdown táblázat), "Kockázatok / hiányok", "Következő lépések".'
+      ,
+      'Formázás: ha címsorokat használsz (pl. "Projekt összefoglaló", "Fő megállapítások", "Következő lépések"), írd őket félkövérrel (pl. **Projekt összefoglaló**), akkor is, ha sima szövegként jelennek meg.'
     ];
 
     let systemPartsEn = [
@@ -2488,6 +2555,7 @@ exports.chatGovernedStream = async (req, res) => {
       'IMPORTANT: MEASUREMENT_COMPARE_CONTEXT.deltaThreshold_C is only a significance flag, NOT a standards requirement. Do not label FAIL based on that alone.',
       'If MEASUREMENT_TABLE_ANALYSIS_CONTEXT is present, use it to explain what Table 1–4 represent, worst-case ranking, trends, and significant differences.',
       'If MEASUREMENT_EVAL_CONTEXT is present, use it for spreadsheet evaluation and do NOT enumerate full time series from TABLE_CONTEXT.',
+      'If MEASUREMENT_EVAL_CONTEXT includes ts_by_point / tmax_by_point, treat them as COMPUTED values (ambient_field + max(Ti−T12)). Use ts_by_point for Ts and tmax_by_point for Tmax. Do not call them directly measured values.',
       'If MEASUREMENT_COMPARE_CONTEXT is present, use it for Table 1–4 / column-range comparisons.',
       answerMode === 'report'
         ? 'Required separation: (1) "Difference analysis" (trends / significant deltas) and (2) "Standards compliance" (only when you have a standards requirement/limit quote + a measured value to compare).'
@@ -2509,6 +2577,8 @@ exports.chatGovernedStream = async (req, res) => {
       'The "numericEvidence" list must contain XLSX cells and (optionally) computed values with source cells. Fill "cell" if available (e.g., "C15").',
       'The "quotes" list must include short excerpts (1-3 sentences) from the relevant document/standard (fileName + pageOrLoc).',
       'Suggested structure: "Project summary", "Key findings", "Compliance matrix" (Markdown table), "Risks / gaps", "Next actions".'
+      ,
+      'Formatting: if you use section headings (e.g., "Project summary", "Key findings", "Next actions"), render them in bold (e.g., **Project summary**), even when they are plain text lines.'
     ];
 
     // Override style for Standard Explorer: quote + explain (legacy standard chat style).

@@ -3,3 +3,4 @@ uvicorn==0.30.6
 pandas==2.2.3
 openpyxl==3.1.5
 certifi==2024.8.30
+azure-functions==1.21.3
