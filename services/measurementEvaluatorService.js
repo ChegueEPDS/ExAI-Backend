@@ -138,10 +138,16 @@ function toEvidenceComputed({ op, value, unit = '', sources = [] }) {
 }
 
 function isAmbientPoint({ token, label }) {
+  const allowed = String(systemSettings.getString('MEAS_AMBIENT_TOKEN') || process.env.MEAS_AMBIENT_TOKEN || 'T12')
+    .split(',')
+    .map(s => String(s || '').trim().toUpperCase())
+    .filter(Boolean);
+  const allowedSet = new Set(allowed.length ? allowed : ['T12']);
   const t = String(token || '').trim().toUpperCase();
-  if (t === 'T12') return true;
+  // IMPORTANT: Many labels include "outside" (e.g. T10/T11), but only T12 is ambient.
+  if (t) return allowedSet.has(t);
   const s = String(label || '').toLowerCase();
-  return s.includes('ambient') || s.includes('outside');
+  return s.includes('ambient');
 }
 
 function detectIntent(message) {

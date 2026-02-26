@@ -6,3 +6,6 @@
 /uploads/*
 /logs/*
 !.gitkeep
+
+# Local-only Azure Functions Python calc service (do not commit)
+/python_calc/
