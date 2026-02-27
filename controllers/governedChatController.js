@@ -2534,7 +2534,8 @@ exports.chatGovernedStream = async (req, res) => {
       'A "quotes" listában legyen rövid idézet (1-3 mondat) a releváns dokumentum/standard részről (fileName + pageOrLoc).',
       'Válasz struktúra javaslat: "Projekt összefoglaló", "Fő megállapítások", "Compliance mátrix" (Markdown táblázat), "Kockázatok / hiányok", "Következő lépések".'
       ,
-      'Formázás: ha címsorokat használsz (pl. "Projekt összefoglaló", "Fő megállapítások", "Következő lépések"), írd őket félkövérrel (pl. **Projekt összefoglaló**), akkor is, ha sima szövegként jelennek meg.'
+      'Formázás: ha címsorokat használsz (pl. "Projekt összefoglaló", "Fő megállapítások", "Következő lépések"), írd őket félkövérrel (pl. **Projekt összefoglaló**), akkor is, ha sima szövegként jelennek meg.',
+      'Táblázat szabály: ha egy szekció több elemet sorol fel azonos mezőkkel (pl. T1..T8 pontok Ts/Tmax/értékelés; követelmények listája PASS/FAIL; fájlonkénti eredmények), akkor NE írj ismétlődő bekezdéseket — inkább használd a Markdown táblázat formátumot.'
     ];
 
     let systemPartsEn = [
@@ -2578,7 +2579,8 @@ exports.chatGovernedStream = async (req, res) => {
       'The "quotes" list must include short excerpts (1-3 sentences) from the relevant document/standard (fileName + pageOrLoc).',
       'Suggested structure: "Project summary", "Key findings", "Compliance matrix" (Markdown table), "Risks / gaps", "Next actions".'
       ,
-      'Formatting: if you use section headings (e.g., "Project summary", "Key findings", "Next actions"), render them in bold (e.g., **Project summary**), even when they are plain text lines.'
+      'Formatting: if you use section headings (e.g., "Project summary", "Key findings", "Next actions"), render them in bold (e.g., **Project summary**), even when they are plain text lines.',
+      'Table rule: if a section enumerates multiple items with the same fields (e.g., points T1..T8 with Ts/Tmax/assessment; requirement rows with PASS/FAIL; per-file results), avoid repetitive paragraphs and instead render a Markdown table.'
     ];
 
     // Override style for Standard Explorer: quote + explain (legacy standard chat style).
