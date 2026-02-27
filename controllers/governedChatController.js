@@ -820,6 +820,9 @@ function parseClarifyXlsxToolSelection(conversation, message) {
   if (['igen', 'ok', 'oke', 'okay', 'yes', 'y', 'mehet', 'go', 'rendben'].includes(yes)) {
     return opts[0] || null;
   }
+  if (['0', 'skip', 'pass', 'no', 'nope', 'csak válasz', 'csak valasz', 'válasz', 'valasz', 'just answer', 'answer only'].includes(yes)) {
+    return { tool: 'none', name: 'Just answer', args: {} };
+  }
 
   // Allow "1,2" style multi-select; take first.
   const firstToken = raw.split(/[,\s]+/).filter(Boolean)[0] || '';
@@ -827,7 +830,8 @@ function parseClarifyXlsxToolSelection(conversation, message) {
   // 1) Numeric selection
   if (/^\d+$/.test(firstToken)) {
     const n = Number(firstToken);
-    if (!Number.isInteger(n) || n <= 0) return null;
+    if (!Number.isInteger(n) || n < 0) return null;
+    if (n === 0) return { tool: 'none', name: 'Just answer', args: {} };
     return opts.find(o => Number(o?.i) === n) || opts[n - 1] || null;
   }
 
@@ -867,6 +871,17 @@ function detectComplianceCheckIntent(message) {
     'compliance_check', 'compliance check', 'compliance matrix', 'requirement list',
     'requirements list', 'requirements', 'conformance matrix',
     'megfelelés mátrix', 'megfeleles matrix', 'szabvány-követelmény', 'kovetelmeny lista',
+  ];
+  return needles.some(n => s.includes(n));
+}
+
+function detectTempMarkingIntent(message) {
+  const s = String(message || '').toLowerCase();
+  const needles = [
+    'explosionproof marking', 'explosion proof marking', 'ex marking', 'atex marking', 'iecex marking',
+    'temperature class', 't-class', 't class', 't1', 't2', 't3', 't4', 't5', 't6',
+    'gas temperature', 'surface temperature', 'maximum surface',
+    'dust', 'por', 'ex tb', 'ex t',
   ];
   return needles.some(n => s.includes(n));
 }
@@ -949,6 +964,7 @@ exports.chatGovernedStream = async (req, res) => {
 
     const lang = detectLanguage(effectiveMessage);
     let answerMode = detectAnswerMode(effectiveMessage);
+    const wantsTempMarking = detectTempMarkingIntent(effectiveMessage);
 
     // --- Standard Explorer mode (tenant standard library, PDF-only) ---
     // If the client pins a standardRef, persist it on the conversation and allow governed chat without project datasets.
@@ -1258,6 +1274,31 @@ exports.chatGovernedStream = async (req, res) => {
       } else {
         stdMatches = await pinecone.queryVectors({ namespace: stdNamespace, vector: qEmbedding, topK: candStd, filter: stdFilter });
       }
+
+      // If the user asks for Ex marking / temperature class, add a second targeted retrieval pass.
+      // This helps reliably pull in IEC 60079-14 Table 14 and the dust surface-temperature selection rules.
+      try {
+        if (wantsTempMarking) {
+          const q2 = [
+            'IEC 60079-14 Table 14 relationship between ignition temperature and temperature class T1 T2 T3 T4 T5 T6',
+            'maximum surface temperature limits for temperature classes',
+            'dust cloud two-thirds TCL',
+            'dust layer 5 mm minus 75 C',
+          ].join('. ');
+          const q2Embedding = await createEmbeddingVector(openai, q2, embeddingModel);
+          if (Array.isArray(q2Embedding) && q2Embedding.length) {
+            const extra = await pinecone.queryVectors({ namespace: stdNamespace, vector: q2Embedding, topK: candStd, filter: stdFilter });
+            const seen = new Set((stdMatches || []).map(m => String(m?.id || '')));
+            for (const m of (extra || [])) {
+              const id = String(m?.id || '');
+              if (!id || seen.has(id)) continue;
+              stdMatches.push(m);
+              seen.add(id);
+              if (stdMatches.length >= candStd) break;
+            }
+          }
+        }
+      } catch { }
       if (debugEnabled) {
         try {
           logger.info('governed.retrieval.pinecone.matches', {
@@ -1616,11 +1657,12 @@ exports.chatGovernedStream = async (req, res) => {
       const fallbackEval = measEval.enabled() && measEval.detectIntent(effectiveMessage);
       const fallbackTabular = detectTabularIntent(effectiveMessage);
 
-	      // UX: if multiple tools are plausible, ask the user to confirm which tool to run.
+	      // UX: if a spreadsheet tool is actually needed, ask the user to confirm which tool to run.
       const confirmEnabled = !!systemSettings.getBoolean('XLSX_TOOL_CONFIRM_ENABLED');
         const wantsComplianceCheck = detectComplianceCheckIntent(effectiveMessage) || forceComplianceCheck;
 		      const cameFromToolPick = !!toolOverride;
-		      if ((hasXlsx || wantsComplianceCheck) && confirmEnabled && !cameFromToolPick) {
+          const needsTool = (String(tool || '').trim() && String(tool || '').trim().toLowerCase() !== 'none') || fallbackCompare || fallbackEval || fallbackTabular || wantsComplianceCheck;
+		      if (needsTool && confirmEnabled && !cameFromToolPick) {
 	        const toolLabel = (t, lang0) => {
 	          const lang = String(lang0 || '').toLowerCase();
 	          const hu = lang === 'hu';
@@ -1687,19 +1729,22 @@ exports.chatGovernedStream = async (req, res) => {
 	          add(t, toolLabel(t, lang), {});
 	        }
 
-	        const opts = Array.from(candidates.values()).map((o, idx) => ({ i: idx + 1, ...o }));
+	        let opts = Array.from(candidates.values()).map((o, idx) => ({ i: idx + 1, ...o }));
+          // Add an explicit "no tool" option for follow-up / narrative questions.
+          const noToolLabel = String(lang || '').toLowerCase() === 'hu' ? 'Csak válasz' : 'Just answer';
+          opts = [...opts, { i: 0, tool: 'none', name: noToolLabel, args: {} }];
 	        if (opts.length >= 2) {
 	          const isHu = String(lang || '').toLowerCase() === 'hu';
 	          const lines = (isHu
 	            ? [
 	              `A kérdés alapján ezt a táblázat-eszközt futtatnám: **${opts[0].name}**.`,
-	              'Jó így? Válaszolj a sorszámmal (pl. 1), vagy válassz másikat:',
+	              'Jó így? Válaszolj a sorszámmal (pl. 1), vagy válassz másikat (0 = csak válasz):',
 	              '',
 	              ...opts.map(o => `${o.i}. ${o.name}`),
 	            ]
 	            : [
 	              `Based on your question, I'd run: **${opts[0].name}**.`,
-	              'Reply with the number (e.g. 1) to confirm, or choose another tool:',
+	              'Reply with the number (e.g. 1) to confirm, or choose another tool (0 = just answer):',
 	              '',
 	              ...opts.map(o => `${o.i}. ${o.name}`),
 	            ]).join('\n');
@@ -2512,6 +2557,7 @@ exports.chatGovernedStream = async (req, res) => {
       'Ha van MEASUREMENT_TABLE_ANALYSIS_CONTEXT, akkor a "Table 1–4 mit jelentenek" + worst-case + trendek + jelentős eltérések részt abból készítsd.',
       'Ha van MEASUREMENT_EVAL_CONTEXT, akkor a mérési adatok kiértékelését abból készítsd, és ne próbálj a TABLE_CONTEXT-ből teljes idősorokat felsorolni.',
       'Ha a MEASUREMENT_EVAL_CONTEXT tartalmaz ts_by_point / tmax_by_point mezőket, ezeket COMPUTED értékként kezeld (ambient_field + max(Ti−T12)). Ts-hez ts_by_point, Tmax-hoz tmax_by_point használható. Ne nevezd ezeket közvetlenül mért értéknek.',
+      'Ha a user Ex jelölést / hőmérséklet osztályt kér (gáz + por): (1) állapítsd meg a kontrolling hőmérsékletet a pontok közül a legnagyobb Ts/Tmax alapján; (2) a gáz T-osztályt a STANDARD_CONTEXT-ben lévő releváns táblázat/határérték alapján válaszd ki; (3) porra a kontrolling hőmérsékletből adj meg "T{X}°C" jelölést (max. felületi hőmérséklet), és KEREKÍTS FEL egész °C-ra; FONTOS: a "tb" nem hőmérséklet, hanem Ex t védelmi mód (IEC 60079-31), ezért ne írj olyat, hogy "tb90°C" — helyette (ha ismert a DOCUMENT_CONTEXT alapján) formázd így: "Ex tb … T{X}°C Db"; (4) a jelölés többi részét (csoport/kategória/védelmi mód/EPL) a DOCUMENT_CONTEXT alapján írd ki, és idézz releváns standard quote-ot a döntési logikához.',
       'Ha van MEASUREMENT_COMPARE_CONTEXT, akkor a Table 1–4 / oszlop tartomány szerinti összehasonlítást abból készítsd.',
       answerMode === 'report'
         ? 'Kötelező elkülönítés: (1) "Eltéréselemzés" (trendek / jelentős különbségek) és (2) "Szabványi megfelelőség" (csak standard quote + limit + mért érték alapján).'
@@ -2557,6 +2603,7 @@ exports.chatGovernedStream = async (req, res) => {
       'If MEASUREMENT_TABLE_ANALYSIS_CONTEXT is present, use it to explain what Table 1–4 represent, worst-case ranking, trends, and significant differences.',
       'If MEASUREMENT_EVAL_CONTEXT is present, use it for spreadsheet evaluation and do NOT enumerate full time series from TABLE_CONTEXT.',
       'If MEASUREMENT_EVAL_CONTEXT includes ts_by_point / tmax_by_point, treat them as COMPUTED values (ambient_field + max(Ti−T12)). Use ts_by_point for Ts and tmax_by_point for Tmax. Do not call them directly measured values.',
+      'If the user asks to determine Ex marking / temperature class (gases + dusts): (1) identify the controlling temperature as the maximum across all points and across Ts/Tmax; (2) determine the gas temperature class using the relevant standards table/limits from STANDARD_CONTEXT; (3) for dust, output a dust surface temperature marking as "T{X}°C" derived from the controlling temperature and ROUND UP to a whole °C. IMPORTANT: "tb" is not a temperature; it is the Ex t protection level (IEC 60079-31). Do NOT write "tb90°C". If the protection mode / EPL is known from DOCUMENT_CONTEXT, format like "Ex tb … T{X}°C Db"; (4) include the rest of the marking (group/category/protection/EPL) using DOCUMENT_CONTEXT when available, and cite the relevant standard quotes for the selection logic.',
       'If MEASUREMENT_COMPARE_CONTEXT is present, use it for Table 1–4 / column-range comparisons.',
       answerMode === 'report'
         ? 'Required separation: (1) "Difference analysis" (trends / significant deltas) and (2) "Standards compliance" (only when you have a standards requirement/limit quote + a measured value to compare).'

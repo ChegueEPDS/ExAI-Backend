@@ -50,6 +50,45 @@ async function createEmbeddingVector(openaiClient, text, embeddingModel) {
   return resp.data?.[0]?.embedding || [];
 }
 
+async function createEmbeddingVectors(openaiClient, texts, embeddingModel) {
+  const arr0 = Array.isArray(texts) ? texts : [];
+  if (!arr0.length) return [];
+  const inputs = arr0.map((t) => {
+    const input0 = sanitizeEmbeddingInput(t);
+    return sanitizeEmbeddingInput(tokenTrim(input0, 800));
+  });
+
+  // Keep output aligned to input indices, even if some inputs are blank.
+  const out = new Array(inputs.length).fill(null).map(() => []);
+  const batchSize = Math.max(1, Math.min(Number(process.env.OPENAI_EMBEDDING_BATCH_SIZE || 32), 256));
+
+  for (let i = 0; i < inputs.length; i += batchSize) {
+    const slice = inputs.slice(i, i + batchSize);
+    const idxMap = [];
+    const requestInputs = [];
+
+    for (let j = 0; j < slice.length; j += 1) {
+      const v = slice[j];
+      if (!v) continue;
+      idxMap.push(i + j);
+      requestInputs.push(v);
+    }
+    if (!requestInputs.length) continue;
+
+    const resp = await openaiClient.embeddings.create({ model: embeddingModel, input: requestInputs });
+    const data = Array.isArray(resp?.data) ? resp.data : [];
+
+    // OpenAI returns embeddings in the same order as inputs; also includes `index`.
+    for (let k = 0; k < data.length; k += 1) {
+      const idx = idxMap[k];
+      const emb = data[k]?.embedding;
+      if (idx === undefined) continue;
+      out[idx] = Array.isArray(emb) ? emb : [];
+    }
+  }
+  return out;
+}
+
 function chunkWithOverlap(text, { chunkTokens = 900, overlapTokens = 120 } = {}) {
   const ids = encoder.encode(String(text || ''));
   const chunks = [];
@@ -277,6 +316,53 @@ async function ingestTabularFileBuffer({
       const maxCols = Math.min(Math.max(headers.length, 1), Number(systemSettings.getNumber('DATASET_MAX_COLS') || 80));
 
       const vectorsToUpsert = [];
+      const rowBatch = [];
+      const rowBatchSize = Math.max(1, Math.min(Number(process.env.DATASET_ROW_BATCH_SIZE || 32), 256));
+      const flushRowBatch = async () => {
+        if (!rowBatch.length) return;
+        const embeddingTexts = rowBatch.map(x => x.embeddingText);
+        const embeddings = await createEmbeddingVectors(openai, embeddingTexts, embeddingModel);
+        const docs = rowBatch.map((x, idx) => ({
+          tenantId,
+          projectId,
+          datasetId,
+          datasetVersion,
+          datasetFileId: fileDoc._id,
+          filename,
+          sheet: sheetName,
+          rowIndex: x.rowIndex,
+          text: x.text,
+          tokens: x.tokens,
+          embedding: pineconeEnabled ? [] : (embeddings[idx] || []),
+        }));
+
+        const inserted = await DatasetRowChunk.insertMany(docs, { ordered: true });
+        totalRows += inserted.length;
+
+        if (pineconeEnabled) {
+          for (let i = 0; i < inserted.length; i += 1) {
+            const emb = embeddings[i] || [];
+            if (!Array.isArray(emb) || !emb.length) continue;
+            vectorsToUpsert.push({
+              id: `row:${String(inserted[i]._id)}`,
+              values: emb,
+              metadata: {
+                kind: 'table_row',
+                tenantId: String(tenantId),
+                projectId: String(projectId),
+                datasetVersion: Number(datasetVersion),
+                datasetFileId: String(fileDoc._id),
+                filename,
+                sheet: sheetName,
+                rowIndex: rowBatch[i].rowIndex,
+              }
+            });
+          }
+        }
+
+        rowBatch.length = 0;
+      };
+
       for (let r = 1; r < maxRows; r += 1) {
         const row = Array.isArray(rows[r]) ? rows[r] : [];
         const rowIndex = rangeRow0 + r + 1; // 1-based Excel row number (best-effort)
@@ -287,42 +373,13 @@ async function ingestTabularFileBuffer({
           fields: { filename, sheet: sheetName, rowIndex: String(rowIndex) },
           text,
         });
-        const embedding = await createEmbeddingVector(openai, embeddingText, embeddingModel);
-
-        const rowDoc = await DatasetRowChunk.create({
-          tenantId,
-          projectId,
-          datasetId,
-          datasetVersion,
-          datasetFileId: fileDoc._id,
-          filename,
-          sheet: sheetName,
-          rowIndex,
-          text,
-          tokens,
-          embedding: pineconeEnabled ? [] : embedding,
-        });
-        totalRows += 1;
-
-        if (pineconeEnabled && Array.isArray(embedding) && embedding.length) {
-          vectorsToUpsert.push({
-            id: `row:${String(rowDoc._id)}`,
-            values: embedding,
-            metadata: {
-              kind: 'table_row',
-              tenantId: String(tenantId),
-              projectId: String(projectId),
-              datasetVersion: Number(datasetVersion),
-              datasetFileId: String(fileDoc._id),
-              filename,
-              sheet: sheetName,
-              rowIndex,
-            }
-          });
+        rowBatch.push({ rowIndex, text, tokens, embeddingText });
+        if (rowBatch.length >= rowBatchSize) {
+          await flushRowBatch();
         }
-
         // Numeric cells are captured from the worksheet below (true coordinates).
       }
+      await flushRowBatch();
 
       if (pineconeEnabled && vectorsToUpsert.length) {
         await pinecone.upsertVectors({ namespace, vectors: vectorsToUpsert });
@@ -332,6 +389,14 @@ async function ingestTabularFileBuffer({
       const maxCells = Number(systemSettings.getNumber('DATASET_MAX_NUMERIC_CELLS') || 200000);
       try {
         const keys = Object.keys(ws).filter(k => k && k[0] !== '!' && /^[A-Z]+[0-9]+$/.test(k));
+        const ops = [];
+        const bulkSize = Math.max(50, Math.min(Number(process.env.DATASET_CELL_BULK_SIZE || 500), 5000));
+        const flushOps = async () => {
+          if (!ops.length) return;
+          try {
+            await DatasetTableCell.bulkWrite(ops.splice(0, ops.length), { ordered: false });
+          } catch { }
+        };
         for (const addr of keys) {
           if (totalCells >= maxCells) break;
           const cellObj = ws[addr];
@@ -344,28 +409,32 @@ async function ingestTabularFileBuffer({
           const rowIndex = decoded.r + 1;
           const colIndex = decoded.c + 1;
           totalCells += 1;
-          await DatasetTableCell.updateOne(
-            { tenantId, projectId, datasetVersion, datasetFileId: fileDoc._id, sheet: sheetName, rowIndex, colIndex },
-            {
-              $set: {
-                tenantId,
-                projectId,
-                datasetId,
-                datasetVersion,
-                datasetFileId: fileDoc._id,
-                filename,
-                sheet: sheetName,
-                rowIndex,
-                colIndex,
-                cell: addr,
-                colHeader: String(headers[colIndex - (rangeCol0 + 1)] ?? '').trim(),
-                valueRaw: raw,
-                valueNumber: n,
-              }
-            },
-            { upsert: true }
-          );
+          ops.push({
+            updateOne: {
+              filter: { tenantId, projectId, datasetVersion, datasetFileId: fileDoc._id, sheet: sheetName, rowIndex, colIndex },
+              update: {
+                $set: {
+                  tenantId,
+                  projectId,
+                  datasetId,
+                  datasetVersion,
+                  datasetFileId: fileDoc._id,
+                  filename,
+                  sheet: sheetName,
+                  rowIndex,
+                  colIndex,
+                  cell: addr,
+                  colHeader: String(headers[colIndex - (rangeCol0 + 1)] ?? '').trim(),
+                  valueRaw: raw,
+                  valueNumber: n,
+                }
+              },
+              upsert: true,
+            }
+          });
+          if (ops.length >= bulkSize) await flushOps();
         }
+        await flushOps();
       } catch { }
     }
 

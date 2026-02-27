@@ -137,6 +137,27 @@ function toEvidenceComputed({ op, value, unit = '', sources = [] }) {
   };
 }
 
+function pickControllingTempFromSummaries({ tsByPoint, tmaxByPoint }) {
+  const tsItems = Array.isArray(tsByPoint) ? tsByPoint : [];
+  const tmaxItems = Array.isArray(tmaxByPoint) ? tmaxByPoint : [];
+  let controlling = null; // { kind, point, label, valueC, evidence }
+  for (const it of tsItems) {
+    const v = Number(it?.ts_C);
+    if (!Number.isFinite(v)) continue;
+    if (!controlling || v > controlling.valueC) {
+      controlling = { kind: 'Ts', point: String(it.point || ''), label: String(it.label || ''), valueC: v, evidence: it.evidence || null };
+    }
+  }
+  for (const it of tmaxItems) {
+    const v = Number(it?.tmax_C);
+    if (!Number.isFinite(v)) continue;
+    if (!controlling || v > controlling.valueC) {
+      controlling = { kind: 'Tmax', point: String(it.point || ''), label: String(it.label || ''), valueC: v, evidence: it.evidence || null };
+    }
+  }
+  return controlling;
+}
+
 function isAmbientPoint({ token, label }) {
   const allowed = String(systemSettings.getString('MEAS_AMBIENT_TOKEN') || process.env.MEAS_AMBIENT_TOKEN || 'T12')
     .split(',')
@@ -757,6 +778,22 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
       tests: result.by_test.length,
       worstPoints: result.worst_by_point.length,
     });
+  } catch { }
+
+  // Provide deterministic marking inputs (LLM will apply standards + project doc context).
+  try {
+    const controlling = pickControllingTempFromSummaries({ tsByPoint: result.ts_by_point, tmaxByPoint: result.tmax_by_point });
+    if (controlling && Number.isFinite(controlling.valueC)) {
+      result.marking_inputs = {
+        controlling: {
+          kind: controlling.kind,
+          point: controlling.point,
+          label: controlling.label,
+          temp_C: round1(controlling.valueC),
+          evidence: controlling.evidence || null,
+        },
+      };
+    }
   } catch { }
 
   return { ok: true, result };
