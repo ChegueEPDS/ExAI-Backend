@@ -113,11 +113,49 @@ async function deleteByFilter({ namespace, filter, bestEffort = false }) {
   try {
     const index = getIndex();
     const ns = namespace || '';
-    await index.namespace(ns).deleteMany({ filter });
+    // `@pinecone-database/pinecone` expects the metadata filter object directly (not wrapped).
+    // Example: `deleteMany({ tenantId: '...', projectId: '...' })`
+    await index.namespace(ns).deleteMany(filter);
     return { ok: true };
   } catch (e) {
     if (bestEffort) {
       try { console.warn('[pinecone] deleteByFilter failed (bestEffort)', e?.message || e); } catch {}
+      return { ok: false, error: e?.message || String(e) };
+    }
+    throw e;
+  }
+}
+
+async function deleteByIds({ namespace, ids, bestEffort = false }) {
+  try {
+    const arr = Array.isArray(ids) ? ids.filter(Boolean).map(String) : [];
+    if (!arr.length) return { ok: true, deleted: 0 };
+    const index = getIndex();
+    const ns = namespace || '';
+    const batchSize = Math.max(1, Math.min(Number(process.env.PINECONE_DELETE_BATCH || 500), 1000));
+    for (let i = 0; i < arr.length; i += batchSize) {
+      const slice = arr.slice(i, i + batchSize);
+      await index.namespace(ns).deleteMany(slice);
+    }
+    return { ok: true, deleted: arr.length };
+  } catch (e) {
+    if (bestEffort) {
+      try { console.warn('[pinecone] deleteByIds failed (bestEffort)', e?.message || e); } catch {}
+      return { ok: false, error: e?.message || String(e) };
+    }
+    throw e;
+  }
+}
+
+async function deleteAll({ namespace, bestEffort = false }) {
+  try {
+    const index = getIndex();
+    const ns = namespace || '';
+    await index.namespace(ns).deleteAll();
+    return { ok: true };
+  } catch (e) {
+    if (bestEffort) {
+      try { console.warn('[pinecone] deleteAll failed (bestEffort)', e?.message || e); } catch {}
       return { ok: false, error: e?.message || String(e) };
     }
     throw e;
@@ -130,4 +168,6 @@ module.exports = {
   upsertVectors,
   queryVectors,
   deleteByFilter,
+  deleteByIds,
+  deleteAll,
 };

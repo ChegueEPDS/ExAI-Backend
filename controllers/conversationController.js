@@ -337,13 +337,61 @@ exports.deleteConversation = async (req, res) => {
       // 1) Pinecone vectors (scoped by tenant+project namespace)
       if (pinecone.isPineconeEnabled()) {
         const namespace = pinecone.resolveNamespace({ tenantId, projectId });
-        await safeDelete(() =>
-          pinecone.deleteByFilter({
+        // Most robust: wipe everything in this per-project namespace (works for serverless + pod indexes).
+        const rAll = await pinecone.deleteAll({ namespace, bestEffort: true });
+        if (rAll?.ok) {
+          logger.info('[DELETE][CLEANUP] pinecone deleteAll done', { tenantId: String(tenantId), projectId: String(projectId), namespace });
+        } else {
+          logger.warn('[DELETE][CLEANUP] pinecone deleteAll failed (bestEffort)', { tenantId: String(tenantId), projectId: String(projectId), namespace, error: rAll?.error || 'unknown' });
+        }
+
+        // Fallback: delete by IDs (works for serverless + pod indexes). Then also try a filter delete
+        // to clean up any legacy/orphan vectors (best-effort) in case deleteAll isn't supported by the environment.
+        const batch = [];
+        let deletedByIds = 0;
+        const flush = async () => {
+          if (!batch.length) return;
+          const r = await pinecone.deleteByIds({ namespace, ids: batch.splice(0, batch.length), bestEffort: true });
+          if (!r?.ok) {
+            logger.warn('[DELETE][CLEANUP] pinecone deleteByIds failed (bestEffort)', { tenantId: String(tenantId), projectId: String(projectId), error: r?.error || 'unknown' });
+            return;
+          }
+          deletedByIds += Number(r.deleted || 0);
+        };
+
+        const collectIds = async (Model, prefix) => {
+          try {
+            const cursor = Model.find({ tenantId, projectId }).select('_id').lean().cursor();
+            for await (const doc of cursor) {
+              const id = doc?._id ? String(doc._id) : '';
+              if (!id) continue;
+              batch.push(`${prefix}${id}`);
+              if (batch.length >= 500) {
+                await flush();
+              }
+            }
+          } catch (e) {
+            logger.warn('[DELETE][CLEANUP] pinecone id collection failed', { tenantId: String(tenantId), projectId: String(projectId), error: e?.message || String(e) });
+          }
+        };
+
+        await collectIds(DatasetRowChunk, 'row:');
+        await collectIds(DatasetDocChunk, 'doc:');
+        await collectIds(DatasetImageChunk, 'img:');
+        await flush();
+
+        if (!rAll?.ok) {
+          logger.info('[DELETE][CLEANUP] pinecone deleteByIds done', { tenantId: String(tenantId), projectId: String(projectId), namespace, deleted: deletedByIds });
+
+          const rFilter = await pinecone.deleteByFilter({
             namespace,
             filter: { tenantId: String(tenantId), projectId: String(projectId) },
             bestEffort: true,
-          })
-        );
+          });
+          if (!rFilter?.ok) {
+            logger.warn('[DELETE][CLEANUP] pinecone deleteByFilter failed (bestEffort)', { tenantId: String(tenantId), projectId: String(projectId), error: rFilter?.error || 'unknown' });
+          }
+        }
       }
 
       // 2) DB records

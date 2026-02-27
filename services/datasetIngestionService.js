@@ -656,23 +656,42 @@ async function ingestDocumentFileBuffer({
 }
 
 async function deleteDatasetFileArtifacts({ tenantId, projectId, datasetFileId, datasetVersion = null }) {
+  if (pinecone.isPineconeEnabled()) {
+    const namespace = pinecone.resolveNamespace({ tenantId, projectId });
+    // Prefer deleting by IDs (works for serverless + pod indexes).
+    const batch = [];
+    const flush = async () => {
+      if (!batch.length) return;
+      await pinecone.deleteByIds({ namespace, ids: batch.splice(0, batch.length), bestEffort: true });
+    };
+    const collectIds = async (Model, prefix) => {
+      const cursor = Model.find({ tenantId, projectId, datasetFileId }).select('_id').lean().cursor();
+      for await (const doc of cursor) {
+        const id = doc?._id ? String(doc._id) : '';
+        if (!id) continue;
+        batch.push(`${prefix}${id}`);
+        if (batch.length >= 500) await flush();
+      }
+    };
+
+    try {
+      await collectIds(DatasetRowChunk, 'row:');
+      await collectIds(DatasetDocChunk, 'doc:');
+      await collectIds(DatasetImageChunk, 'img:');
+    } catch { }
+
+    await flush();
+
+    // Also try filter deletion for any legacy/orphan vectors (best-effort).
+    const filter = { tenantId: String(tenantId), projectId: String(projectId), datasetFileId: String(datasetFileId) };
+    if (datasetVersion !== null && datasetVersion !== undefined) filter.datasetVersion = Number(datasetVersion);
+    await pinecone.deleteByFilter({ namespace, filter, bestEffort: true });
+  }
+
   await DatasetRowChunk.deleteMany({ tenantId, projectId, datasetFileId });
   await DatasetTableCell.deleteMany({ tenantId, projectId, datasetFileId });
   await DatasetDocChunk.deleteMany({ tenantId, projectId, datasetFileId });
   await DatasetImageChunk.deleteMany({ tenantId, projectId, datasetFileId });
-
-  if (pinecone.isPineconeEnabled()) {
-    const namespace = pinecone.resolveNamespace({ tenantId, projectId });
-    const filter = {
-      tenantId: String(tenantId),
-      projectId: String(projectId),
-      datasetFileId: String(datasetFileId),
-    };
-    if (datasetVersion !== null && datasetVersion !== undefined) {
-      filter.datasetVersion = Number(datasetVersion);
-    }
-    await pinecone.deleteByFilter({ namespace, filter, bestEffort: true });
-  }
 }
 
 module.exports = {
