@@ -158,6 +158,88 @@ function pickControllingTempFromSummaries({ tsByPoint, tmaxByPoint }) {
   return controlling;
 }
 
+function classifySurfaceScope({ point, label, extPoints = [] }) {
+  const token = String(point || '').trim().toUpperCase();
+  const lbl = String(label || '').toLowerCase();
+  const ext = Array.isArray(extPoints) ? extPoints.map(s => String(s || '').trim().toUpperCase()) : [];
+  const isExternalHint =
+    (token && ext.includes(token)) ||
+    lbl.includes(' outside') ||
+    lbl.includes('outside') ||
+    lbl.includes(' external') ||
+    lbl.includes('external') ||
+    lbl.includes('cable gland');
+
+  const isEncapsulatedHint =
+    lbl.includes('under encapsul') ||
+    lbl.includes('under encaps') ||
+    lbl.includes('encapsulant') ||
+    lbl.includes('potting') ||
+    lbl.includes('potted') ||
+    lbl.includes('under resin') ||
+    lbl.includes('resin');
+
+  const isInsideHint = lbl.includes(' inside') || lbl.includes('inside');
+
+  // NOTE: this is best-effort heuristic. The LLM should verify with DOCUMENT_CONTEXT when available.
+  // Default conservative assumption for gas: treat as accessible unless we have a strong hint it's not (ambient/encapsulated).
+  // Dust is only assumed for clearly external surfaces.
+  let gas_accessible = 'yes'; // yes|no|unknown
+  let dust_surface = 'no'; // yes|no|unknown
+  let reason = 'default_assume_gas_accessible';
+
+  if (isAmbientPoint({ token, label })) {
+    gas_accessible = 'no';
+    dust_surface = 'no';
+    reason = 'ambient';
+    return { gas_accessible, dust_surface, reason };
+  }
+
+  if (isEncapsulatedHint) {
+    gas_accessible = 'no';
+    dust_surface = 'no';
+    reason = 'encapsulated_or_potted_internal';
+    return { gas_accessible, dust_surface, reason };
+  }
+
+  if (isExternalHint) {
+    gas_accessible = 'yes';
+    dust_surface = 'yes';
+    reason = 'external_surface_hint';
+    return { gas_accessible, dust_surface, reason };
+  }
+
+  if (isInsideHint) {
+    gas_accessible = 'yes';
+    dust_surface = 'no';
+    reason = 'inside_surface_hint';
+    return { gas_accessible, dust_surface, reason };
+  }
+
+  return { gas_accessible, dust_surface, reason: reason || 'unknown' };
+}
+
+function pickControllingTmaxByScope({ tmaxByPoint, predicate }) {
+  const items = Array.isArray(tmaxByPoint) ? tmaxByPoint : [];
+  let best = null; // { point,label,valueC,evidence,table,sheet }
+  for (const it of items) {
+    if (predicate && !predicate(it)) continue;
+    const v = Number(it?.tmax_C);
+    if (!Number.isFinite(v)) continue;
+    if (!best || v > best.valueC) {
+      best = {
+        point: String(it.point || ''),
+        label: String(it.label || ''),
+        valueC: v,
+        evidence: it.evidence || null,
+        sheet: String(it.sheet || ''),
+        table: Number(it.table || 0) || null,
+      };
+    }
+  }
+  return best;
+}
+
 function isAmbientPoint({ token, label }) {
   const allowed = String(systemSettings.getString('MEAS_AMBIENT_TOKEN') || process.env.MEAS_AMBIENT_TOKEN || 'T12')
     .split(',')
@@ -282,6 +364,78 @@ function pickCellByCol(cells, colIndex) {
   return null;
 }
 
+function enrichMeasurementEvalResultForMarking(result) {
+  const r = (result && typeof result === 'object') ? result : null;
+  if (!r) return r;
+  if (r.marking_inputs && (r.marking_inputs.controlling_gas_accessible_tmax || r.marking_inputs.controlling_dust_surface_tmax) && Array.isArray(r.point_scopes) && r.point_scopes.length) {
+    return r; // already enriched
+  }
+
+  const extPoints = Array.isArray(r?.meta?.external_points) ? r.meta.external_points : [];
+  const worst = Array.isArray(r?.worst_by_point) ? r.worst_by_point : [];
+  const scopes = [];
+  const seen = new Set();
+  for (const it of worst) {
+    const token = String(it?.point || '').trim().toUpperCase();
+    if (!token || seen.has(token)) continue;
+    seen.add(token);
+    const label = String(it?.label || '');
+    const scope = classifySurfaceScope({ point: token, label, extPoints });
+    scopes.push({ point: token, label, ...scope });
+  }
+  r.point_scopes = scopes;
+
+  const controlling_all = pickControllingTempFromSummaries({ tsByPoint: r.ts_by_point, tmaxByPoint: r.tmax_by_point });
+  const controlling_gas = pickControllingTmaxByScope({
+    tmaxByPoint: r.tmax_by_point,
+    predicate: (it) => {
+      const token = String(it?.point || '').trim().toUpperCase();
+      const meta = scopes.find(s => String(s.point || '').toUpperCase() === token);
+      return meta?.gas_accessible === 'yes';
+    },
+  });
+  const controlling_dust = pickControllingTmaxByScope({
+    tmaxByPoint: r.tmax_by_point,
+    predicate: (it) => {
+      const token = String(it?.point || '').trim().toUpperCase();
+      const meta = scopes.find(s => String(s.point || '').toUpperCase() === token);
+      return meta?.dust_surface === 'yes';
+    },
+  });
+
+  if (!r.marking_inputs) r.marking_inputs = {};
+  if (controlling_all && Number.isFinite(controlling_all.valueC) && !r.marking_inputs.controlling_all) {
+    r.marking_inputs.controlling_all = {
+      kind: controlling_all.kind,
+      point: controlling_all.point,
+      label: controlling_all.label,
+      temp_C: round1(controlling_all.valueC),
+      evidence: controlling_all.evidence || null,
+    };
+  }
+  if (controlling_gas && Number.isFinite(controlling_gas.valueC) && !r.marking_inputs.controlling_gas_accessible_tmax) {
+    r.marking_inputs.controlling_gas_accessible_tmax = {
+      point: controlling_gas.point,
+      label: controlling_gas.label,
+      temp_C: round1(controlling_gas.valueC),
+      evidence: controlling_gas.evidence || null,
+      sheet: controlling_gas.sheet || '',
+      table: controlling_gas.table || null,
+    };
+  }
+  if (controlling_dust && Number.isFinite(controlling_dust.valueC) && !r.marking_inputs.controlling_dust_surface_tmax) {
+    r.marking_inputs.controlling_dust_surface_tmax = {
+      point: controlling_dust.point,
+      label: controlling_dust.label,
+      temp_C: round1(controlling_dust.valueC),
+      evidence: controlling_dust.evidence || null,
+      sheet: controlling_dust.sheet || '',
+      table: controlling_dust.table || null,
+    };
+  }
+  return r;
+}
+
 async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, allowedFilenames = [], filename = null, sheet = null, trace = null }) {
   if (!enabled()) return { ok: false, skipped: true, reason: 'MEAS_EVAL_ENABLED is off' };
 
@@ -317,6 +471,7 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
       limits,
       notes: [
         'This evaluation is deterministic from XLSX cells stored in the dataset.',
+        'ambient_field is treated as Ta,max (declared maximum allowed ambient). T12 is treated as test ambient during measurement (same time column).',
         'All numbers must be cited via numericEvidence (cell or computed) for full compliance answers.',
       ],
     },
@@ -327,6 +482,7 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
     ambient_field_by_sheet: [],
     ts_by_point: [],
     tmax_by_point: [],
+    point_scopes: [],
     numericEvidence: [],
   };
 
@@ -782,16 +938,66 @@ async function evaluateXlsxMeasurements({ tenantId, projectId, datasetVersion, a
 
   // Provide deterministic marking inputs (LLM will apply standards + project doc context).
   try {
-    const controlling = pickControllingTempFromSummaries({ tsByPoint: result.ts_by_point, tmaxByPoint: result.tmax_by_point });
-    if (controlling && Number.isFinite(controlling.valueC)) {
+    // Build per-point scope hints (gas accessible vs dust deposit surface).
+    const scopes = [];
+    const seen = new Set();
+    for (const it of result.worst_by_point || []) {
+      const token = String(it?.point || '').trim().toUpperCase();
+      if (!token || seen.has(token)) continue;
+      seen.add(token);
+      const label = String(it?.label || '');
+      const scope = classifySurfaceScope({ point: token, label, extPoints });
+      scopes.push({ point: token, label, ...scope });
+    }
+    result.point_scopes = scopes;
+
+    const controlling_all = pickControllingTempFromSummaries({ tsByPoint: result.ts_by_point, tmaxByPoint: result.tmax_by_point });
+    const controlling_gas = pickControllingTmaxByScope({
+      tmaxByPoint: result.tmax_by_point,
+      predicate: (it) => {
+        const token = String(it?.point || '').trim().toUpperCase();
+        const meta = scopes.find(s => String(s.point || '').toUpperCase() === token);
+        return meta?.gas_accessible === 'yes';
+      },
+    });
+    const controlling_dust = pickControllingTmaxByScope({
+      tmaxByPoint: result.tmax_by_point,
+      predicate: (it) => {
+        const token = String(it?.point || '').trim().toUpperCase();
+        const meta = scopes.find(s => String(s.point || '').toUpperCase() === token);
+        return meta?.dust_surface === 'yes';
+      },
+    });
+
+    if (controlling_all && Number.isFinite(controlling_all.valueC)) {
       result.marking_inputs = {
-        controlling: {
-          kind: controlling.kind,
-          point: controlling.point,
-          label: controlling.label,
-          temp_C: round1(controlling.valueC),
-          evidence: controlling.evidence || null,
+        controlling_all: {
+          kind: controlling_all.kind,
+          point: controlling_all.point,
+          label: controlling_all.label,
+          temp_C: round1(controlling_all.valueC),
+          evidence: controlling_all.evidence || null,
         },
+        ...(controlling_gas && Number.isFinite(controlling_gas.valueC) ? {
+          controlling_gas_accessible_tmax: {
+            point: controlling_gas.point,
+            label: controlling_gas.label,
+            temp_C: round1(controlling_gas.valueC),
+            evidence: controlling_gas.evidence || null,
+            sheet: controlling_gas.sheet || '',
+            table: controlling_gas.table || null,
+          }
+        } : {}),
+        ...(controlling_dust && Number.isFinite(controlling_dust.valueC) ? {
+          controlling_dust_surface_tmax: {
+            point: controlling_dust.point,
+            label: controlling_dust.label,
+            temp_C: round1(controlling_dust.valueC),
+            evidence: controlling_dust.evidence || null,
+            sheet: controlling_dust.sheet || '',
+            table: controlling_dust.table || null,
+          }
+        } : {}),
       };
     }
   } catch { }
@@ -1565,6 +1771,7 @@ module.exports = {
   detectIntent,
   detectCompareTablesIntent,
   evaluateXlsxMeasurements,
+  enrichMeasurementEvalResultForMarking,
   analyzeMeasurementTables,
   compareTablesColumns,
   __test: {

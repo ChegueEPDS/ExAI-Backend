@@ -14,6 +14,24 @@ const EquipmentConflictSchema = new mongoose.Schema(
     clientChanges: { type: Object, default: {} },
     // Full server snapshot at time of conflict for merge context.
     serverSnapshot: { type: Object, default: {} },
+    // Files uploaded by the client during a sync that resulted in a conflict.
+    // These are persisted so images are not lost while waiting for manual resolution.
+    clientDocuments: {
+      type: [
+        {
+          name: { type: String },
+          alias: { type: String, default: '' },
+          type: { type: String, enum: ['document', 'image'], default: 'image' },
+          blobPath: { type: String },
+          blobUrl: { type: String },
+          contentType: { type: String },
+          size: { type: Number },
+          uploadedAt: { type: Date, default: Date.now },
+          tag: { type: String, enum: ['dataplate', 'general', 'fault'], default: 'general' }
+        }
+      ],
+      default: []
+    },
     status: { type: String, enum: ['open', 'resolved', 'dismissed'], default: 'open', index: true },
     resolvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     resolvedAt: { type: Date, default: null },

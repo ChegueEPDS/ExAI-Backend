@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const EquipmentConflict = require('../models/equipmentConflict');
 const Equipment = require('../models/dataplate');
 const User = require('../models/user');
+const azureBlob = require('../services/azureBlobService');
 const { createEquipmentDataVersion, sanitizeEquipmentSnapshot } = require('../services/equipmentVersioningService');
 const { notifyAndStore } = require('../lib/notifications/notifier');
 
@@ -229,6 +230,42 @@ exports.resolveConflict = async (req, res) => {
   for (const key of mergedKeys) {
     equipment.set ? equipment.set(key, merged[key]) : (equipment[key] = merged[key]);
   }
+
+  // Preserve uploaded images/documents from the conflicting mobile sync attempt.
+  // If the conflict is resolved in the web app, these should be attached to the equipment as well.
+  try {
+    const clientDocs = Array.isArray(conflict.clientDocuments) ? conflict.clientDocuments : [];
+    if (clientDocs.length) {
+      const current = Array.isArray(equipment.documents) ? [...equipment.documents] : [];
+      for (const d of clientDocs) {
+        const name = String(d?.name || '').trim();
+        if (!name) continue;
+        const blobPath = String(d?.blobPath || d?.blobUrl || '').trim();
+        const exists = current.some((x) => {
+          const n = String(x?.name || '');
+          const p = String(x?.blobPath || x?.blobUrl || '');
+          if (n && n === name) return true;
+          if (blobPath && p) return azureBlob.toBlobPath(p) === azureBlob.toBlobPath(blobPath);
+          return false;
+        });
+        if (exists) continue;
+        current.push({
+          name,
+          alias: String(d?.alias || ''),
+          type: String(d?.type || 'image') === 'document' ? 'document' : 'image',
+          blobPath: blobPath || undefined,
+          blobUrl: String(d?.blobUrl || '') || (blobPath ? azureBlob.getBlobUrl(blobPath) : undefined),
+          contentType: String(d?.contentType || '') || undefined,
+          size: typeof d?.size === 'number' ? d.size : undefined,
+          uploadedAt: d?.uploadedAt ? new Date(d.uploadedAt) : new Date(),
+          tag: d?.tag
+        });
+      }
+      equipment.documents = current;
+      if (equipment.markModified) equipment.markModified('documents');
+    }
+  } catch {}
+
   equipment.ModifiedBy = userId;
   await equipment.save();
 

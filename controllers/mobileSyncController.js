@@ -454,12 +454,108 @@ exports.mobileSync = async (req, res) => {
           message: 'Conflict: newer server changes detected.',
           serverUpdatedAt
         });
-        // Clean up any uploaded temp files for this item.
-        for (const f of files.filter((x) => parseFileKeyFromOriginalName(x.originalname) === tempId)) {
-          try {
-            fs.unlinkSync(f.path);
-          } catch {}
+
+        // Preserve uploaded images/files by attaching them to the conflict document.
+        // This prevents data loss when a mobile sync hits a conflict and requires manual resolution in the web app.
+        try {
+          let docToUpdate = conflictDoc || null;
+          if (docToUpdate && typeof docToUpdate.save !== 'function') {
+            try {
+              docToUpdate = await EquipmentConflict.findOne({ tenantId, clientTempId: tempId });
+            } catch {
+              docToUpdate = null;
+            }
+          }
+
+          const conflictId = docToUpdate ? String(docToUpdate._id) : '';
+          const matchingFiles = files.filter((f) => parseFileKeyFromOriginalName(f.originalname) === tempId);
+          if (conflictId && matchingFiles.length && docToUpdate && typeof docToUpdate.save === 'function') {
+            const eqIdForPrefix = existing.EqID || EqID;
+            const eqPrefix = buildEquipmentPrefix(tenantName, tenantIdStr, String(siteId), String(zoneId), eqIdForPrefix);
+
+            const docsOut = Array.isArray(docToUpdate.clientDocuments) ? [...docToUpdate.clientDocuments] : [];
+            let attachedDataplate = docsOut.some((d) => String(d?.tag || '') === 'dataplate');
+
+            for (const file of matchingFiles) {
+              const safeOriginalName = cleanFileName(stripFileKeyPrefix(file.originalname));
+              const buf = fs.readFileSync(file.path);
+              const { buffer, name: convertedName, contentType } = await convertHeicBufferIfNeeded(
+                buf,
+                safeOriginalName,
+                file.mimetype || mime.lookup(safeOriginalName) || 'application/octet-stream'
+              );
+
+              const cleanName = convertedName || safeOriginalName || 'image';
+              const guessedType = contentType || 'application/octet-stream';
+              const blobPath = `${eqPrefix}/_conflicts/${conflictId}/${cleanName}`;
+
+              const alreadyHas = docsOut.some((d) => {
+                const n = String(d?.name || '');
+                const p = String(d?.blobPath || d?.blobUrl || '');
+                return (n && n === cleanName) || (p && azureBlob.toBlobPath(p) === azureBlob.toBlobPath(blobPath));
+              });
+
+              if (!alreadyHas) {
+                await azureBlob.uploadBuffer(blobPath, buffer, guessedType);
+              }
+
+              const perItemTagMap = tagLookup.get(tempId) || null;
+              const lookupKeys = [
+                normalizeNameKey(cleanName).raw,
+                normalizeNameKey(cleanName).cleaned,
+                normalizeNameKey(cleanName).rawLower,
+                normalizeNameKey(cleanName).cleanedLower,
+                normalizeNameKey(safeOriginalName).raw,
+                normalizeNameKey(safeOriginalName).cleaned,
+                normalizeNameKey(safeOriginalName).rawLower,
+                normalizeNameKey(safeOriginalName).cleanedLower
+              ];
+              const tagFromPayload = perItemTagMap
+                ? lookupKeys.map((k) => perItemTagMap.get(k)).find((v) => typeof v === 'string' && v.trim())
+                : null;
+              let tag = normalizeImageTag(tagFromPayload, 'general');
+              if (tag === 'dataplate') {
+                if (attachedDataplate) tag = 'general';
+                else attachedDataplate = true;
+              }
+
+              if (alreadyHas) {
+                // Best-effort: update tag if it became known later.
+                try {
+                  const idx = docsOut.findIndex((d) => String(d?.name || '') === cleanName);
+                  if (idx >= 0 && tag && docsOut[idx] && docsOut[idx].tag !== tag) {
+                    docsOut[idx] = { ...docsOut[idx], tag };
+                  }
+                } catch {
+                  // ignore
+                }
+              } else {
+                docsOut.push({
+                  name: cleanName,
+                  alias: '',
+                  type: guessedType && String(guessedType).toLowerCase().startsWith('image/') ? 'image' : 'document',
+                  blobPath,
+                  blobUrl: azureBlob.getBlobUrl(blobPath),
+                  contentType: guessedType,
+                  size: buffer.length,
+                  uploadedAt: new Date(),
+                  tag
+                });
+              }
+
+              try {
+                fs.unlinkSync(file.path);
+              } catch {}
+            }
+
+            docToUpdate.clientDocuments = docsOut;
+            if (docToUpdate.markModified) docToUpdate.markModified('clientDocuments');
+            await docToUpdate.save();
+          }
+        } catch {
+          // ignore (conflict is still returned; client can re-upload later if needed)
         }
+
         continue;
       }
       const oldSnapshot = existing.toObject({ depopulate: true });
