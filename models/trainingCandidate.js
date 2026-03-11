@@ -36,6 +36,15 @@ const TrainingCandidateSchema = new mongoose.Schema(
       generatedAt: { type: Date, default: null }
     },
 
+    finalPdf: {
+      fileName: { type: String, default: '', trim: true },
+      blobPath: { type: String, default: '', trim: true },
+      blobUrl: { type: String, default: '', trim: true },
+      generatedAt: { type: Date, default: null },
+      // Keep undefined when not set so the sparse unique index doesn't treat it as a duplicate value.
+      verifyToken: { type: String, trim: true }
+    },
+
     status: { type: String, enum: ['pending', 'generated', 'error'], default: 'pending', index: true },
     error: { type: String, default: '', trim: true }
   },
@@ -43,6 +52,7 @@ const TrainingCandidateSchema = new mongoose.Schema(
 );
 
 TrainingCandidateSchema.index({ trainingId: 1, createdAt: -1 });
+TrainingCandidateSchema.index({ 'finalPdf.verifyToken': 1 }, { unique: true, sparse: true });
 
 TrainingCandidateSchema.set('toJSON', {
   virtuals: true,

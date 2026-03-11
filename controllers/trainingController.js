@@ -1,6 +1,7 @@
 // controllers/trainingController.js
 const multer = require('multer');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 
 const azureBlob = require('../services/azureBlobService');
 const { parseCandidatesFromXlsxBuffer } = require('../services/trainingXlsxParser');
@@ -12,11 +13,65 @@ const IecExTrainingUnit = require('../models/iecexTrainingUnit');
 const Training = require('../models/training');
 const TrainingCandidate = require('../models/trainingCandidate');
 const TrainingRecordCounter = require('../models/trainingRecordCounter');
+const { convertDocxBufferToPdfBuffer } = require('../services/graphDocxToPdfService');
+const { stampPdfWithQr } = require('../services/pdfQrStampService');
+const systemSettings = require('../services/systemSettingsStore');
 
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 30 * 1024 * 1024 } // 30MB
 });
+
+function envInt(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+  const v = Number.parseInt(String(raw).trim(), 10);
+  return Number.isFinite(v) ? v : fallback;
+}
+
+function getQrStampOptions() {
+  const size = Number(systemSettings.getNumber('QR_STAMP_SIZE') ?? 60);
+  const marginX = Number(systemSettings.getNumber('QR_STAMP_MARGIN_X') ?? 50);
+  const marginY = Number(systemSettings.getNumber('QR_STAMP_MARGIN_Y') ?? 100);
+  const labelFontSize = Number(systemSettings.getNumber('QR_STAMP_NOTE_FONT_SIZE') ?? 8);
+
+  return {
+    size: Math.max(24, Math.min(size || 60, 240)),
+    position: 'bottom-left',
+    marginX: Math.max(0, marginX || 0),
+    marginY: Math.max(0, marginY || 0),
+    addLabel: true,
+    labelFontSize: Math.max(6, Math.min(labelFontSize || 8, 16)),
+  };
+}
+
+function envFloat(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+  const v = Number.parseFloat(String(raw).trim());
+  return Number.isFinite(v) ? v : fallback;
+}
+
+function getSignatureWatermarkOptions({ training, candidate }) {
+  const enabled = String(process.env.SIGN_WM_ENABLED || '').trim().toLowerCase() === 'true';
+  if (!enabled) return { enabled: false };
+
+  const recordNo = String(training?.recordOfTrainingNo || '').trim();
+  const fullName = `${String(candidate?.lastName || '').trim()} ${String(candidate?.givenNames || '').trim()}`.trim();
+  const pieces = [recordNo, fullName, 'Valid only with QR verification'].filter(Boolean);
+
+  return {
+    enabled: true,
+    text: pieces.join(' • '),
+    position: String(process.env.SIGN_WM_POSITION || 'bottom-right'),
+    marginX: envInt('SIGN_WM_MARGIN_X', 36),
+    marginY: envInt('SIGN_WM_MARGIN_Y', 72),
+    maxWidth: envInt('SIGN_WM_MAX_WIDTH', 260),
+    fontSize: envInt('SIGN_WM_FONT_SIZE', 9),
+    opacity: envFloat('SIGN_WM_OPACITY', 0.25),
+    rotateDeg: envFloat('SIGN_WM_ROTATE_DEG', -18)
+  };
+}
 
 function safeSegment(input, maxLen = 120) {
   const s = String(input || '').trim();
@@ -344,6 +399,7 @@ exports.generateRotDocs = async (req, res) => {
   const id = String(req.params.id || '').trim();
   const training = await Training.findById(id).lean();
   if (!training) return res.status(404).json({ ok: false, error: 'Training not found' });
+  if (training.status === 'closed') return res.status(400).json({ ok: false, error: 'Training is closed' });
 
   const settings = await getTemplateSettings();
   const templateBlobPath = settings?.templateDocx?.blobPath || '';
@@ -418,6 +474,302 @@ exports.generateRotDocs = async (req, res) => {
   return res.json({ ok: true, generated, failed, candidates: updatedCandidates });
 };
 
+function computeModulesSnapshot(candidates) {
+  const out = new Set();
+  for (const c of candidates || []) {
+    for (const u of c?.units || []) {
+      const code = String(u?.code || '').trim().toUpperCase();
+      if (!code) continue;
+      const scope = String(u?.scope || 'both').trim().toLowerCase();
+      if (scope && scope !== 'both') out.add(`${code}(${scope})`);
+      else out.add(code);
+    }
+  }
+  return Array.from(out.values()).sort((a, b) => a.localeCompare(b, 'en'));
+}
+
+exports.closeTraining = async (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    const training = await Training.findById(id);
+    if (!training) return res.status(404).json({ ok: false, error: 'Training not found' });
+    if (training.status === 'closed') {
+      return res.json({ ok: true, training: training.toJSON(), alreadyClosed: true });
+    }
+
+    const candidates = await TrainingCandidate.find({ trainingId: id }).sort({ rowNo: 1, createdAt: 1 });
+    if (!candidates.length) return res.status(400).json({ ok: false, error: 'No candidates found for this training' });
+
+    const notReady = candidates.filter((c) => c.status !== 'generated' || !c.rotDocx?.blobPath);
+    if (notReady.length) {
+      return res.status(400).json({
+        ok: false,
+        error: `Cannot close training: ${notReady.length} candidate(s) are not generated.`
+      });
+    }
+
+    // For each candidate: convert their DOCX to PDF (Graph app-only) and upload to blob.
+    for (const cand of candidates) {
+      const docxPath = cand.rotDocx.blobPath;
+      const docxBuf = await azureBlob.downloadToBuffer(docxPath);
+      const docxName = cand.rotDocx.fileName || 'rot.docx';
+      const pdfBuf = await convertDocxBufferToPdfBuffer(docxBuf, {
+        fileName: docxName,
+        folderPath: `rot-convert/${training.folderName}`
+      });
+
+      const pdfName = String(docxName || 'rot.docx').replace(/\.docx$/i, '') + '.pdf';
+      const pdfBlobPath = `index/trainings/${training.folderName}/final/${safeSegment(pdfName, 160)}`;
+
+      const verifyToken =
+        cand.finalPdf?.verifyToken ||
+        crypto.randomBytes(24).toString('base64url');
+
+      const publicBaseUrl = String(process.env.PUBLIC_ROT_BASE_URL || '').trim() || 'http://localhost:4200';
+      const verifyUrl = `${publicBaseUrl.replace(/\/+$/, '')}/rot/${encodeURIComponent(verifyToken)}`;
+      // Place QR under "Record of Training No." (tunable via env vars).
+      const stampedPdfBuf = await stampPdfWithQr(pdfBuf, verifyUrl, {
+        ...getQrStampOptions(),
+        signatureWatermark: getSignatureWatermarkOptions({ training, candidate: cand })
+      });
+
+      cand.finalPdf = {
+        fileName: pdfName,
+        blobPath: pdfBlobPath,
+        blobUrl: azureBlob.getBlobUrl(pdfBlobPath),
+        generatedAt: new Date(),
+        verifyToken
+      };
+      // Upload stamped PDF (overwrite same blob path)
+      await azureBlob.uploadBuffer(pdfBlobPath, stampedPdfBuf, 'application/pdf');
+      await cand.save();
+    }
+
+    training.status = 'closed';
+    training.closedAt = new Date();
+    training.closedByUserId = mongoose.Types.ObjectId.isValid(req.scope?.userId) ? req.scope.userId : null;
+    training.finalModules = computeModulesSnapshot(candidates.map((c) => c.toObject()));
+    await training.save();
+
+    return res.json({ ok: true, training: training.toJSON() });
+  } catch (e) {
+    // Make Graph permission issues obvious (these often show up as AccessDenied).
+    const msg = String(e?.message || 'Failed to close training');
+    const status = Number(e?.statusCode || e?.status || 0);
+    const code = String(e?.code || '');
+
+    // Best-effort logging (useful in local dev and Azure logs).
+    // Some environments route console.error into structured loggers and stringify poorly,
+    // so we stringify ourselves.
+    try {
+      const payload = {
+        message: msg,
+        statusCode: status || null,
+        code: code || null,
+        details: e?.details || null,
+        stack: e?.stack || null
+      };
+      // eslint-disable-next-line no-console
+      console.error(`[trainings.close] failed ${JSON.stringify(payload)}`);
+    } catch {
+      // eslint-disable-next-line no-console
+      console.error('[trainings.close] failed (could not stringify error)');
+    }
+
+    if ((status === 401 || status === 403) || /access\s*denied/i.test(msg) || /accessdenied/i.test(code)) {
+      const resp = {
+        ok: false,
+        error: msg || 'Graph Access denied',
+        hint:
+          'Graph app-only conversion needs Application permissions and admin consent (e.g. Sites.ReadWrite.All or Sites.Selected + site grant).'
+      };
+      if (process.env.NODE_ENV !== 'production') {
+        resp.debug = { statusCode: status || null, code: code || null, details: e?.details || null };
+      }
+      return res.status(403).json(resp);
+    }
+
+    return res.status(500).json({ ok: false, error: msg || 'Failed to close training' });
+  }
+};
+
+exports.stampFinalPdfsWithQr = async (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    const training = await Training.findById(id).lean();
+    if (!training) return res.status(404).json({ ok: false, error: 'Training not found' });
+
+    const candidates = await TrainingCandidate.find({ trainingId: id }).sort({ rowNo: 1, createdAt: 1 });
+    if (!candidates.length) return res.status(400).json({ ok: false, error: 'No candidates found for this training' });
+
+    const publicBaseUrl = String(process.env.PUBLIC_ROT_BASE_URL || '').trim() || 'http://localhost:4200';
+    const base = publicBaseUrl.replace(/\/+$/, '');
+
+    let stamped = 0;
+    let skipped = 0;
+    let missing = 0;
+
+    for (const cand of candidates) {
+      const blobPath = cand.finalPdf?.blobPath || '';
+      if (!blobPath) {
+        missing++;
+        continue;
+      }
+
+      const verifyToken = cand.finalPdf?.verifyToken || crypto.randomBytes(24).toString('base64url');
+      const verifyUrl = `${base}/rot/${encodeURIComponent(verifyToken)}`;
+
+      // Rebuild PDF from the original generated DOCX to avoid "stacking" multiple QR stamps.
+      // If DOCX is missing, fall back to stamping the existing PDF in place.
+      let pdfBuf;
+      if (cand.rotDocx?.blobPath) {
+        const docxBuf = await azureBlob.downloadToBuffer(cand.rotDocx.blobPath);
+        const docxName = cand.rotDocx.fileName || 'rot.docx';
+        pdfBuf = await convertDocxBufferToPdfBuffer(docxBuf, {
+          fileName: docxName,
+          folderPath: `rot-convert/${training.folderName || training._id}`
+        });
+      } else {
+        pdfBuf = await azureBlob.downloadToBuffer(blobPath);
+      }
+
+      const stampedPdfBuf = await stampPdfWithQr(pdfBuf, verifyUrl, {
+        ...getQrStampOptions(),
+        signatureWatermark: getSignatureWatermarkOptions({ training, candidate: cand })
+      });
+      await azureBlob.uploadBuffer(blobPath, stampedPdfBuf, 'application/pdf');
+
+      if (!cand.finalPdf?.verifyToken) {
+        cand.finalPdf = {
+          ...(cand.finalPdf || {}),
+          verifyToken,
+          blobUrl: azureBlob.getBlobUrl(blobPath)
+        };
+        await cand.save();
+      }
+      stamped++;
+    }
+
+    return res.json({ ok: true, stamped, skipped, missing });
+  } catch (e) {
+    const msg = String(e?.message || 'Failed to stamp QR');
+    try {
+      // eslint-disable-next-line no-console
+      console.error(`[trainings.stampQr] failed ${JSON.stringify({ message: msg, stack: e?.stack || null })}`);
+    } catch {}
+    return res.status(500).json({ ok: false, error: msg });
+  }
+};
+
+exports.reopenTraining = async (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    const training = await Training.findById(id);
+    if (!training) return res.status(404).json({ ok: false, error: 'Training not found' });
+
+    if (training.status !== 'closed') {
+      return res.json({ ok: true, training: training.toJSON(), alreadyOpen: true });
+    }
+
+    // Delete all final PDFs under the training's final/ prefix (best effort).
+    const prefix = `index/trainings/${training.folderName}/final/`;
+    await azureBlob.deletePrefix(prefix);
+
+    // Clear candidate final PDF metadata + tokens so closing can regenerate fresh PDFs/QRs.
+    await TrainingCandidate.updateMany(
+      { trainingId: training._id },
+      {
+        $unset: { finalPdf: 1 }
+      }
+    );
+
+    training.status = 'open';
+    training.closedAt = null;
+    training.closedByUserId = null;
+    training.finalModules = [];
+    training.finalPdf = {
+      fileName: '',
+      blobPath: '',
+      blobUrl: '',
+      generatedAt: null
+    };
+    await training.save();
+
+    return res.json({ ok: true, training: training.toJSON() });
+  } catch (e) {
+    const msg = String(e?.message || 'Failed to reopen training');
+    try {
+      // eslint-disable-next-line no-console
+      console.error(`[trainings.reopen] failed ${JSON.stringify({ message: msg, stack: e?.stack || null })}`);
+    } catch {}
+    return res.status(500).json({ ok: false, error: msg });
+  }
+};
+
+exports.listClosedTrainings = async (_req, res) => {
+  const items = await Training.find({ status: 'closed' }).sort({ closedAt: -1, createdAt: -1 }).limit(500).lean();
+  return res.json({ ok: true, items });
+};
+
+exports.listDatabaseCandidates = async (_req, res) => {
+  const items = await TrainingCandidate.aggregate([
+    { $match: { 'finalPdf.blobPath': { $ne: '' } } },
+    {
+      $lookup: {
+        from: 'trainings',
+        localField: 'trainingId',
+        foreignField: '_id',
+        as: 't'
+      }
+    },
+    { $unwind: '$t' },
+    { $match: { 't.status': 'closed' } },
+    {
+      $project: {
+        _id: 1,
+        trainingId: 1,
+        recordOfTrainingNo: '$t.recordOfTrainingNo',
+        trainingName: '$t.name',
+        validityFrom: '$t.validityFrom',
+        validityTo: '$t.validityTo',
+        candidateGivenNames: '$givenNames',
+        candidateLastName: '$lastName',
+        units: 1,
+        finalPdf: 1,
+        closedAt: '$t.closedAt'
+      }
+    },
+    { $sort: { closedAt: -1, recordOfTrainingNo: -1, rowNo: 1 } },
+    { $limit: 2000 }
+  ]);
+
+  return res.json({ ok: true, items });
+};
+
+exports.getCandidateFinalPdfDownloadUrl = async (req, res) => {
+  const trainingId = String(req.params.id || '').trim();
+  const candidateId = String(req.params.candidateId || '').trim();
+
+  const cand = await TrainingCandidate.findOne({ _id: candidateId, trainingId }).lean();
+  if (!cand) return res.status(404).json({ ok: false, error: 'Candidate not found' });
+  const blobPath = cand.finalPdf?.blobPath;
+  if (!blobPath) return res.status(404).json({ ok: false, error: 'Final PDF not generated yet' });
+
+  const url = await azureBlob.getReadSasUrl(blobPath, {
+    ttlSeconds: 900,
+    filename: cand.finalPdf?.fileName || 'rot.pdf',
+    contentType: 'application/pdf'
+  });
+  return res.json({ ok: true, url });
+};
+
+exports.getFinalPdfDownloadUrl = async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const training = await Training.findById(id).lean();
+  if (!training) return res.status(404).json({ ok: false, error: 'Training not found' });
+  return res.status(400).json({ ok: false, error: 'Training-level PDF not used. Use candidate PDF endpoint.' });
+};
+
 exports.getCandidateDownloadUrl = async (req, res) => {
   const trainingId = String(req.params.id || '').trim();
   const candidateId = String(req.params.candidateId || '').trim();
@@ -442,22 +794,48 @@ exports.generateRotZip = async (req, res) => {
     if (!training) return res.status(404).json({ ok: false, error: 'Training not found' });
 
     const candidates = await TrainingCandidate.find({ trainingId: id }).lean();
-    const items = candidates
+    const docxItems = candidates
       .filter((c) => c?.status === 'generated' && c?.rotDocx?.blobPath)
       .map((c) => ({ blobPath: c.rotDocx.blobPath, fileName: c.rotDocx.fileName || 'rot.docx' }));
 
-    if (!items.length) {
-      return res.status(400).json({ ok: false, error: 'No generated DOCX files found for this training.' });
+    const includePdfs = training.status === 'closed';
+    const pdfItems = includePdfs
+      ? candidates
+          .filter((c) => c?.finalPdf?.blobPath)
+          .map((c) => ({ blobPath: c.finalPdf.blobPath, fileName: c.finalPdf.fileName || 'rot.pdf' }))
+      : [];
+
+    if (!docxItems.length && !pdfItems.length) {
+      return res.status(400).json({ ok: false, error: 'No generated files found for this training.' });
+    }
+
+    function normalizeZipName(fileName, fallback) {
+      const raw = String(fileName || '').trim() || fallback;
+      const ext = raw.includes('.') ? raw.slice(raw.lastIndexOf('.')) : '';
+      const base = ext ? raw.slice(0, -ext.length) : raw;
+      const safeBase = safeSegment(base, 160) || safeSegment(fallback, 40) || 'file';
+      const safeExt = ext && ext.length <= 10 ? ext : '';
+      return `${safeBase}${safeExt}`;
     }
 
     const zip = new JSZip();
-    for (const it of items) {
+
+    // Keep backward-compatible structure for "open" trainings (DOCX in root).
+    // When closed, also include PDFs under /pdf and place DOCX under /docx to avoid name collisions.
+    for (const it of docxItems) {
       const buf = await azureBlob.downloadToBuffer(it.blobPath);
-      zip.file(it.fileName, buf);
+      const name = normalizeZipName(it.fileName, 'rot.docx');
+      zip.file(includePdfs ? `docx/${name}` : name, buf);
+    }
+
+    for (const it of pdfItems) {
+      const buf = await azureBlob.downloadToBuffer(it.blobPath);
+      const name = normalizeZipName(it.fileName, 'rot.pdf');
+      zip.file(`pdf/${name}`, buf);
     }
 
     const zipBuf = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
-    const zipName = `ROT_${training.folderName || safeSegment(training.name, 80)}_${Date.now()}.zip`;
+    const zipName = `ROT_${training.folderName || safeSegment(training.name, 80)}_${includePdfs ? 'FINAL_' : ''}${Date.now()}.zip`;
     const zipBlobPath = `index/trainings/${training.folderName}/rot/${zipName}`;
     await azureBlob.uploadBuffer(zipBlobPath, zipBuf, 'application/zip');
 

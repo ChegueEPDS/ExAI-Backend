@@ -407,7 +407,6 @@ exports.updateUserProfile = async (req, res) => {
     billingAddress,
     position,
     positionInfo,
-    uiScale: uiScaleInput,
     email,
     role: targetRole,
     professions: professionsInput,
@@ -475,14 +474,6 @@ exports.updateUserProfile = async (req, res) => {
       ...(positionInfo !== undefined ? { positionInfo } : {}),
       ...signatureUpdate
     };
-
-    if (uiScaleInput !== undefined) {
-      const parsed = Number(uiScaleInput);
-      if (![0.8, 1].includes(parsed)) {
-        return res.status(400).json({ error: 'Invalid uiScale' });
-      }
-      updateFields.uiScale = parsed;
-    }
 
     // Admin-only fields (never for normal users)
     if (isAdminLike) {

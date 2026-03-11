@@ -237,6 +237,36 @@ const SETTINGS = [
   { key: 'QA_CHUNK_TOKENS', group: 'Misc', type: 'number', defaultValue: 900, description: 'Chunk tokens for upload/ask map stage.' },
   { key: 'UPLOAD_ASK_INPUT_CAP', group: 'Misc', type: 'number', defaultValue: 2000, description: 'Input cap for upload ask step.' },
 
+  // Trainings / ROT (QR + reports)
+  {
+    key: 'QR_STAMP_SIZE',
+    group: 'Training reports',
+    type: 'number',
+    defaultValue: 60,
+    description: 'QR size in the final PDFs (PDF points).',
+  },
+  {
+    key: 'QR_STAMP_MARGIN_X',
+    group: 'Training reports',
+    type: 'number',
+    defaultValue: 50,
+    description: 'QR horizontal margin from the left edge (PDF points).',
+  },
+  {
+    key: 'QR_STAMP_MARGIN_Y',
+    group: 'Training reports',
+    type: 'number',
+    defaultValue: 100,
+    description: 'QR vertical margin from the bottom edge (PDF points).',
+  },
+  {
+    key: 'QR_STAMP_NOTE_FONT_SIZE',
+    group: 'Training reports',
+    type: 'number',
+    defaultValue: 8,
+    description: 'Font size for the QR label + note under the QR (PDF points).',
+  },
+
   // Contribution rewards (certificate upload incentives)
   {
     key: 'CONTRIBUTION_REWARD_AUTO_ENABLED',
