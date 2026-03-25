@@ -11,6 +11,8 @@ test('IP rating validator accepts common IP patterns and rejects others', () => 
   assert.equal(_internals.isValidIpRating('IP6X').value, 'IP6X');
   assert.equal(_internals.isValidIpRating('IP69K').value, 'IP69K');
   assert.equal(_internals.isValidIpRating('IP66, IP67').value, 'IP66, IP67');
+  assert.equal(_internals.isValidIpRating('IP66 & IP67').value, 'IP66, IP67');
+  assert.equal(_internals.isValidIpRating('IP55A').value, 'IP55');
 
   const bad = _internals.isValidIpRating('IP6S'); // common OCR, but should be repaired later, not accepted as-is
   assert.equal(bad.ok, false);
@@ -118,4 +120,66 @@ test('validateAndCleanDataplateFields derives temp class from glued token like T
   assert.equal(out.fields['Ex Marking'].length, 1);
   assert.equal(out.fields['Ex Marking'][0]['Temperature Class'], 'T3');
   assert.equal(out.fields['Ex Marking'][0]['Equipment Protection Level'], 'Gb');
+});
+
+test('extractFromMarking handles spaced subgroup and omitted leading category tokens', () => {
+  const parsed = _internals.extractFromMarking('Ex de II B T4 Gb');
+  assert.equal(parsed.equipmentGroup, 'II');
+  assert.equal(parsed.environment, 'G');
+  assert.equal(parsed.gasDustGroup, 'IIB');
+  assert.equal(parsed.temperatureClass, 'T4');
+  assert.equal(parsed.epl, 'Gb');
+});
+
+test('normalizeEquipmentCategory accepts slash categories with OCR I/2 form', () => {
+  assert.equal(_internals.normalizeEquipmentCategory('I/2'), '1/2');
+  assert.equal(_internals.normalizeEquipmentCategory('I/3'), '1/3');
+});
+
+test('extractFromMarking keeps slash category for II 1/2G forms', () => {
+  const parsed = _internals.extractFromMarking('II 1/2G Ex h IIB T3 Ga/Gb');
+  assert.equal(parsed.equipmentGroup, 'II');
+  assert.equal(parsed.equipmentCategory, '1/2');
+  assert.equal(parsed.environment, 'G');
+  assert.equal(parsed.gasDustGroup, 'IIB');
+});
+
+test('normalizeGasDustGroup prefers IIB over IIIB for Ex d OCR noise in group II context', () => {
+  assert.equal(
+    _internals.normalizeGasDustGroup('IIIB', { protection: 'd', equipmentGroup: 'II', environment: 'G' }),
+    'IIB'
+  );
+});
+
+test('validateAndCleanDataplateFields parses mixed gas/dust marking with slash category', () => {
+  const input = {
+    Manufacturer: 'Nadi',
+    'Model/Type': 'C03T18DUC',
+    'Serial Number': '47619/16',
+    'Equipment Type': 'Valve',
+    'IP rating': 'IP67',
+    'Certificate No': 'EUMI 12 ATEX 0784',
+    'Max Ambient Temp': '-20 /+40°C',
+    'Other Info': '',
+    Compliance: 'NA',
+    'Ex Marking': [
+      {
+        Marking: 'II 1/2 GDc Ex d II C T5 Gb',
+        'Equipment Group': '',
+        'Equipment Category': '',
+        Environment: '',
+        'Type of Protection': '',
+        'Gas / Dust Group': '',
+        'Temperature Class': '',
+        'Equipment Protection Level': '',
+      },
+    ],
+  };
+
+  const out = validateAndCleanDataplateFields(input);
+  assert.equal(out.fields['Ex Marking'].length, 1);
+  assert.equal(out.fields['Ex Marking'][0]['Equipment Group'], 'II');
+  assert.equal(out.fields['Ex Marking'][0]['Equipment Category'], '1/2');
+  assert.equal(out.fields['Ex Marking'][0].Environment, 'GD');
+  assert.equal(out.fields['Ex Marking'][0]['Gas / Dust Group'], 'IIC');
 });

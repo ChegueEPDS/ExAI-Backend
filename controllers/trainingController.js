@@ -16,6 +16,7 @@ const TrainingRecordCounter = require('../models/trainingRecordCounter');
 const { convertDocxBufferToPdfBuffer } = require('../services/graphDocxToPdfService');
 const { stampPdfWithQr } = require('../services/pdfQrStampService');
 const systemSettings = require('../services/systemSettingsStore');
+const { signPdfBuffer } = require('../services/pdfSigningService');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -532,6 +533,9 @@ exports.closeTraining = async (req, res) => {
         ...getQrStampOptions(),
         signatureWatermark: getSignatureWatermarkOptions({ training, candidate: cand })
       });
+      const finalPdfBuf = await signPdfBuffer(stampedPdfBuf, {
+        reason: `IECEx ROT final PDF (${training.recordOfTrainingNo || training.name || ''})`,
+      });
 
       cand.finalPdf = {
         fileName: pdfName,
@@ -541,7 +545,7 @@ exports.closeTraining = async (req, res) => {
         verifyToken
       };
       // Upload stamped PDF (overwrite same blob path)
-      await azureBlob.uploadBuffer(pdfBlobPath, stampedPdfBuf, 'application/pdf');
+      await azureBlob.uploadBuffer(pdfBlobPath, finalPdfBuf, 'application/pdf');
       await cand.save();
     }
 
@@ -637,7 +641,10 @@ exports.stampFinalPdfsWithQr = async (req, res) => {
         ...getQrStampOptions(),
         signatureWatermark: getSignatureWatermarkOptions({ training, candidate: cand })
       });
-      await azureBlob.uploadBuffer(blobPath, stampedPdfBuf, 'application/pdf');
+      const finalPdfBuf = await signPdfBuffer(stampedPdfBuf, {
+        reason: `IECEx ROT final PDF (${training.recordOfTrainingNo || training.name || ''})`,
+      });
+      await azureBlob.uploadBuffer(blobPath, finalPdfBuf, 'application/pdf');
 
       if (!cand.finalPdf?.verifyToken) {
         cand.finalPdf = {

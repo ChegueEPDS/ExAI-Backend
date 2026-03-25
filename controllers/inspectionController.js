@@ -147,7 +147,7 @@ async function generateInspectionResultsForEquipment({ equipmentDoc, tenantId, i
   }
 
   const relevantTypes = await computeRelevantEquipmentTypes(equipmentDoc, tenantId);
-  const basePassedTypes = new Set(['general', 'environment', 'additional checks']);
+  const basePassedTypes = new Set(['general', 'environment', 'additional checks', 'installation']);
 
   let results = (questions || [])
     .filter((q) => {

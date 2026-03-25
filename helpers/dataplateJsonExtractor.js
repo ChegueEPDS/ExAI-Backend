@@ -1,6 +1,6 @@
 const { createResponse, extractOutputTextFromResponse } = require('./openaiResponses');
 const systemSettings = require('../services/systemSettingsStore');
-const { validateAndCleanDataplateFields } = require('./dataplateFieldValidators');
+const { validateAndCleanDataplateFields, _internals: dataplateFieldInternals } = require('./dataplateFieldValidators');
 const { normalizeProtectionTypes } = require('./protectionTypes');
 const logger = require('../config/logger');
 
@@ -12,6 +12,11 @@ function safeOneLine(v, { max = 160 } = {}) {
   const s = String(v ?? '').replace(/\s+/g, ' ').trim();
   if (!s) return '';
   return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+function isBlankishValue(v) {
+  const s = String(v ?? '').trim();
+  return !s || s === '-' || s === 'NA';
 }
 
 function buildOcrWindowsForRepair(ocrText, rejected) {
@@ -146,28 +151,199 @@ function enforceEvidence({ ocrText, value, evidence }) {
 
 function normalizeExMarkingRow(row) {
   const r = row && typeof row === 'object' ? row : {};
+  const normalizedGroup = dataplateFieldInternals.normalizeEquipmentGroup(r['Equipment Group']);
+  const normalizedCategory = dataplateFieldInternals.normalizeEquipmentCategory(r['Equipment Category']);
+  const normalizedEnvironment = dataplateFieldInternals.normalizeEnvironment(r.Environment);
+  const normalizedProtection = dataplateFieldInternals.normalizeTypeOfProtection(r['Type of Protection']);
+  const normalizedGasDustGroup = dataplateFieldInternals.normalizeGasDustGroup(r['Gas / Dust Group'], {
+    protection: normalizedProtection,
+    environment: normalizedEnvironment,
+    equipmentGroup: normalizedGroup,
+  });
+  const normalizedTempClass = dataplateFieldInternals.normalizeTempClass(r['Temperature Class']);
+  const normalizedEpl = dataplateFieldInternals.normalizeEpl(r['Equipment Protection Level']);
   const next = {
     Marking: sanitizeFieldValue(r.Marking),
-    'Equipment Group': sanitizeFieldValue(r['Equipment Group']),
-    'Equipment Category': sanitizeFieldValue(r['Equipment Category']),
-    Environment: sanitizeFieldValue(r.Environment),
-    'Type of Protection': sanitizeFieldValue(r['Type of Protection']),
-    'Gas / Dust Group': sanitizeFieldValue(r['Gas / Dust Group']),
-    'Temperature Class': sanitizeFieldValue(r['Temperature Class']),
-    'Equipment Protection Level': sanitizeFieldValue(r['Equipment Protection Level']),
+    'Equipment Group': normalizedGroup,
+    'Equipment Category': normalizedCategory,
+    Environment: normalizedEnvironment,
+    'Type of Protection': normalizedProtection,
+    'Gas / Dust Group': normalizedGasDustGroup,
+    'Temperature Class': normalizedTempClass,
+    'Equipment Protection Level': normalizedEpl,
   };
+
+  // Backfill structured Ex fields from the free-form marking when LLM/evidence left them empty.
+  // This matches the frontend's constrained option sets better than leaving cells blank.
+  if (next.Marking) {
+    const derived = dataplateFieldInternals.extractFromMarking(next.Marking);
+    if (!next['Equipment Group']) next['Equipment Group'] = derived.equipmentGroup || '';
+    if (!next['Equipment Category']) next['Equipment Category'] = derived.equipmentCategory || '';
+    if (!next.Environment) next.Environment = derived.environment || '';
+    if (!next['Type of Protection']) next['Type of Protection'] = derived.protection || '';
+    if (!next['Gas / Dust Group']) next['Gas / Dust Group'] = derived.gasDustGroup || '';
+    if (!next['Temperature Class']) next['Temperature Class'] = derived.temperatureClass || '';
+    if (!next['Equipment Protection Level']) next['Equipment Protection Level'] = derived.epl || '';
+  }
 
   // Deterministic normalization: Type of Protection to supported set (if any).
   const normalized = normalizeProtectionTypes(next['Type of Protection']);
-  if (normalized.length) next['Type of Protection'] = normalized.join('; ');
+  next['Type of Protection'] = normalized.length ? normalized.join('; ') : '';
+
+  const canonicalMarking = buildCanonicalExMarking(next);
+  if (canonicalMarking) next.Marking = canonicalMarking;
 
   return next;
+}
+
+function buildCanonicalExMarking(row) {
+  const r = row && typeof row === 'object' ? row : {};
+  const original = sanitizeFieldValue(r.Marking);
+  if (/\bI{1,3}\s*1G\s*\/\s*2GD/i.test(original)) {
+    return original.replace(/\s+/g, ' ').trim();
+  }
+  const group = sanitizeFieldValue(r['Equipment Group']);
+  const category = sanitizeFieldValue(r['Equipment Category']);
+  const environment = sanitizeFieldValue(r.Environment);
+  const protection = sanitizeFieldValue(r['Type of Protection']);
+  const gasDustGroup = sanitizeFieldValue(r['Gas / Dust Group']);
+  const temperatureClass = sanitizeFieldValue(r['Temperature Class']);
+  const epl = sanitizeFieldValue(r['Equipment Protection Level']);
+
+  const categoryPart = group && category && environment ? `${group} ${category}${environment}` : '';
+  const protectionPart = protection
+    ? `Ex ${protection
+        .split(';')
+        .map((p) => sanitizeFieldValue(p))
+        .filter(Boolean)
+        .join(' ')}`
+    : '';
+
+  const parts = [categoryPart, protectionPart, gasDustGroup, temperatureClass, epl].filter(Boolean);
+  if (parts.length < 3 || !protectionPart) return '';
+  return parts.join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function extractManufacturerFromOcrText(ocrText) {
+  const ocr = String(ocrText || '');
+  const explicitPatterns = [
+    /\bMFG\s+BY\s+([A-Z0-9][A-Z0-9 .,&()\/-]{2,})/i,
+    /\bMANUFACTURER\s+([A-Z0-9][A-Z0-9 .,&()\/-]{2,})/i,
+    /\bMADE\s+IN\s+[A-Z .-]+\s+BY\s+([A-Z0-9][A-Z0-9 .,&()\/-]{2,})/i,
+  ];
+
+  function normalizeManufacturerCandidate(line) {
+    let s = String(line || '').replace(/\s+/g, ' ').trim();
+    if (!s) return '';
+    s = s.replace(/^(?:MFG|MFD)\s+BY\s+/i, '');
+    s = s.replace(/^MANUFACTURER\s+/i, '');
+    s = s.replace(/^\s*MADE\s+IN\s+[A-Z .-]+\s+BY\s+/i, '');
+    s = s.replace(/^BY\s+/i, '');
+    s = s.replace(/\b(?:siedziba|biuro|email|tel|fax|www\.|http|made in)\b.*$/i, '').trim();
+    s = s.replace(/\bkg\s+\d+\b.*$/i, '').trim();
+    s = s.replace(/[®©]+/g, '').trim();
+    s = s.replace(/\bCE\b$/i, '').trim();
+    s = s.replace(/\bS\.R\.I\b/gi, 'S.r.l');
+    s = s.replace(/\bS\.R\.L\b/gi, 'S.r.l');
+    s = s.replace(/[|,;]\s*(?:DE-|D-|\d{3,}).*$/i, '').trim();
+    s = s.replace(/\s+[-|/]\s*$/, '').trim();
+    s = s.replace(/\b(?:macherio|italy)\b.*$/i, '').trim();
+    s = s.replace(/\b(?:RHO\s*\(MI\)|POOLE|LANGENARGEN|KRONBERG|SENAGO|VILLESSE)\b.*$/i, '').trim();
+    return s;
+  }
+
+  for (const pattern of explicitPatterns) {
+    const match = ocr.match(pattern);
+    if (match?.[1]) {
+      const explicit = normalizeManufacturerCandidate(match[1]);
+      if (explicit) return explicit;
+    }
+  }
+
+  const lines = ocr
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .slice(0, 40);
+
+  let best = '';
+  let bestScore = 0;
+  const candidates = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    candidates.push(lines[i]);
+    if (i + 1 < lines.length) candidates.push(`${lines[i]} ${lines[i + 1]}`);
+  }
+
+  for (const rawCandidate of candidates) {
+    const line = normalizeManufacturerCandidate(rawCandidate);
+    const upper = line.toUpperCase();
+    if (line.length < 3) continue;
+    if (/\b(?:ATEX|IECEX|EX|IP\d|T[1-6]|SERIAL|MODEL|TYPE|PART NO|CERT|MARKING|AMBIENT|TEMP|VOLT|HZ|BAR|REF)\b/.test(upper)) continue;
+    if (/^\d+$/.test(line)) continue;
+    let score = 0;
+    if (/\b(?:GMBH|LTD|LIMITED|INC\.?|S\.R\.L\.?|BV|OY|SP\.\s*Z\s*O\.O\.|EUROPE|ANALYTICS|PNEUMATIC|MOTORS?)\b/i.test(line)) score += 4;
+    if (/\b(?:HONEYWELL|AIRTEC|EUROTEC|TBMA|ABB|BIFFI|THORWESTEN|BOCCARD|NADI|CEMP|EUROMOTORI|BARKSDALE|RAYCHEM|KOMAG|SPARTAN)\b/i.test(line)) score += 5;
+    if (line.split(/\s+/).length <= 6) score += 1;
+    if (/[A-Za-z].*[A-Za-z]/.test(line)) score += 1;
+    if (/\d/.test(line)) score -= 2;
+    if (/\b(?:MACHERIO|ITALY)\b/i.test(rawCandidate)) score -= 2;
+    if (/^(?:[A-Z][A-Z0-9.&'()-]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})$/.test(line)) score += 1;
+    if (score > bestScore) {
+      best = line;
+      bestScore = score;
+    }
+  }
+
+  return bestScore >= 2 ? best : '';
 }
 
 function dropEmptyExMarkingRows(rows) {
   return (Array.isArray(rows) ? rows : []).filter((m) =>
     Object.values(m || {}).some((v) => String(v || '').trim().length > 0)
   );
+}
+
+async function tryExtractManufacturerFromFullOcrText({ ocrText, model = 'gpt-4o-mini' } = {}) {
+  const ocr = String(ocrText || '').trim();
+  if (!ocr) return '';
+
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      Manufacturer: { type: 'string' },
+      evidence: { type: 'string' },
+    },
+    required: ['Manufacturer', 'evidence'],
+  };
+
+  try {
+    const resp = await createResponse({
+      model,
+      instructions: [
+        'Extract only the manufacturer/company/brand name from the OCR text.',
+        'Use an exact evidence substring from the OCR text.',
+        'Prefer the top branding/company line.',
+        'If uncertain, return empty strings.',
+      ].join('\n'),
+      input: [{ role: 'user', content: `OCR_TEXT:\n-----\n${ocr.slice(0, 120000)}\n-----` }],
+      store: false,
+      temperature: 0,
+      maxOutputTokens: 250,
+      textFormat: { type: 'json_schema', name: 'manufacturer_extract', strict: true, schema },
+      timeoutMs: 45_000,
+    });
+
+    const parsed = JSON.parse(String(extractOutputTextFromResponse(resp) || '{}'));
+    const repaired = enforceEvidence({
+      ocrText: ocr,
+      value: parsed?.Manufacturer,
+      evidence: parsed?.evidence,
+    });
+    return sanitizeFieldValue(repaired);
+  } catch {
+    return '';
+  }
 }
 
 function extractCertificatesFromOcrText(ocrText) {
@@ -228,16 +404,28 @@ function extractCertificatesFromOcrText(ocrText) {
 
 function looksLikeExLine(s) {
   const t = String(s || '');
-  // Accept both "Ex" and glued forms like "Exd" (common OCR).
-  return /(?:\bEx\b|\bEx\s*-?\s*(?:d|de|e|h|na|p|q|ia|ib|ic|ma|mb|mc|o|s|t|tb|tc|td)\b|\bEx(?:d|de|e|h|na|p|q|ia|ib|ic|ma|mb|mc|o|s|t|tb|tc|td)\b)/i.test(
-    t
-  );
+  const hasEx =
+    /(?:\bEx\b|\bEx\s*-?\s*(?:d|de|e|eb|h|na|p|q|ia|ib|ic|ma|mb|mc|o|s|t|tb|tc|td)\b|\bEx(?:d|de|e|eb|h|na|p|q|ia|ib|ic|ma|mb|mc|o|s|t|tb|tc|td)\b)/i.test(
+      t
+    );
+  if (!hasEx) return false;
+  const upper = t.toUpperCase();
+  const hasSignal =
+    /\bI{1,3}\s*(?:[I1](?:\/[123])?|M[12]|[123](?:\/[123])?)\s*(?:GD|DG|G|D)\b/.test(upper) ||
+    /\b(?:D|DE|E|EB|H|NA|IA|IB|IC|MA|MB|MC|T|TB|TC|TD)\b/.test(upper) ||
+    /\bIIA\b|\bIIB\b|\bIIC\b|\bIIIA\b|\bIIIB\b|\bIIIC\b/.test(upper) ||
+    /\bT[1-6]\b|\bT\d{2,3}\s*°?\s*C\b/.test(upper) ||
+    /\bGA\b|\bGB\b|\bGC\b|\bDA\b|\bDB\b|\bDC\b/.test(upper);
+  if (/\b[A-Z0-9-]+-EX-\d+\b/.test(upper) && !hasSignal) return false;
+  return hasSignal || upper.trim() === 'EX';
 }
 
 function looksLikeCategoryLine(s) {
-  const t = String(s || '').toUpperCase();
-  // Examples: "II 2G", "II 2D", "II 2GD", "II2G"
-  return /\bI{1,3}\s*(?:M[12]|[123])\s*(?:GD|DG|G|D)\b/.test(t);
+  const t = String(s || '')
+    .toUpperCase()
+    .replace(/\bI\/(?=[123])/g, '1/');
+  // Examples: "II 2G", "II 2D", "II 2GD", "II2G", "1/2G"
+  return /\b(?:I{1,3}\s*)?(?:M[12]|[123](?:\/[123])?)\s*(?:GD|DG|G|D)\b/.test(t);
 }
 
 function looksLikeExContinuationLine(s) {
@@ -248,6 +436,9 @@ function looksLikeExContinuationLine(s) {
   if (/\bT[1-6]\b/.test(t)) return true;
   if (/\bT\d{2,3}\s*°?\s*C\b/.test(t)) return true;
   if (/\bGA\b|\bGB\b|\bGC\b|\bDA\b|\bDB\b|\bDC\b/.test(t)) return true;
+  if (/^[ABC]$/.test(t.trim())) return true;
+  if (/^T$/.test(t.trim())) return true;
+  if (/^[ABC]\s*T\s*[1-6](?:\s*(GA|GB|GC|DA|DB|DC))?$/.test(t)) return true;
   // Sometimes OCR yields "T3Gb" etc on a separate line
   if (/\bT[1-6]\s*(GA|GB|GC|DA|DB|DC)\b/.test(t)) return true;
   if (/T[1-6](GA|GB|GC|DA|DB|DC)/.test(t)) return true;
@@ -261,15 +452,54 @@ function normalizeCategoryLine(line) {
     .trim()
     .replace(/I1/g, 'II')
     .replace(/Il/g, 'II')
-    .replace(/lI/g, 'II');
+    .replace(/lI/g, 'II')
+    .replace(/\bI\/(?=[123])/g, '1/');
   const u = t.toUpperCase().replace(/\s+/g, '');
-  const m = u.match(/\b(I{1,3})(M[12]|[123])((?:GD|DG|G|D))\b/);
+  const m = u.match(/\b(I{1,3})?(M[12]|[123](?:\/[123])?)((?:GD|DG|G|D))\b/);
   if (!m) return '';
-  const g = m[1];
+  const g = m[1] || 'II';
   const c = m[2];
   let env = m[3];
   if (env === 'DG') env = 'GD';
   return `${g} ${c}${env}`;
+}
+
+function consumeContinuationLines(lines, startIdx) {
+  let idx = startIdx;
+  let merged = '';
+  while (idx < lines.length) {
+    const line = String(lines[idx] || '').trim();
+    if (!line || looksLikeExLine(line) || looksLikeCategoryLine(line) || !looksLikeExContinuationLine(line)) break;
+    merged = `${merged} ${line}`.replace(/\s+/g, ' ').trim();
+    idx += 1;
+  }
+  return { text: merged, nextIdx: idx };
+}
+
+function cleanupExMarkingText(text) {
+  let s = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  s = s.replace(/^\(\s*EX\s*\)\s*/i, '');
+  s = s.replace(/\bEXD\b/gi, 'Ex d');
+  s = s.replace(/\bEXTB\b/gi, 'Ex tb');
+  s = s.replace(/\bEXTD\b/gi, 'Ex tD');
+  s = s.replace(/\bII\s+I\/(?=[123])/gi, 'II 1/');
+  s = s.replace(/\b(1\/[23])\s*GG\b/gi, '$1G');
+  s = s.replace(/\b(?:IECEx\s*[A-Z0-9]{1,8}\s*\d{2}\.\d{3,5}[A-Z]?|[A-Z]{2,10}\s*\d{2}\s*ATEX\s*[A-Z]?\s*\d{3,6}[XU-]?|[A-Z]{2,10}\d{2}ATEX[A-Z]?\d{3,6}[XU-]?)\b/gi, '');
+  s = s.replace(/\b(?:CERT|MARKING OF ASSEMBLY|MOD\.?|REF\.?)\b.*$/i, '').trim();
+  s = s.replace(/[;,.]+$/g, '').trim();
+  return s;
+}
+
+function looksLikeStandaloneFragmentLine(s) {
+  const t = String(s || '').toUpperCase().trim();
+  if (!t) return false;
+  if (/^(?:IIIA|IIIB|IIIC|IIA|IIB|IIC|II\s*[ABC]|III\s*[ABC])$/.test(t)) return true;
+  if (/^T\s*[1-6](?:\s*(?:GA|GB|GC|DA|DB|DC))?$/.test(t)) return true;
+  if (/^T\s*\d{2,3}\s*°?\s*C(?:\s*(?:GA|GB|GC|DA|DB|DC))?$/.test(t)) return true;
+  if (/^(?:GA|GB|GC|DA|DB|DC)$/.test(t)) return true;
+  if (/^[ABC]$/.test(t)) return true;
+  return false;
 }
 
 function stitchExLines(ocrText) {
@@ -298,28 +528,48 @@ function stitchExLines(ocrText) {
     if (String(line).trim().toUpperCase() === 'EX' && looksLikeCategoryLine(next) && looksLikeExLine(next2)) {
       const cat = normalizeCategoryLine(next) || next;
       let merged = `${cat} ${next2}`.replace(/\s+/g, ' ').trim();
-      if (next3 && !looksLikeExLine(next3) && !looksLikeCategoryLine(next3) && looksLikeExContinuationLine(next3)) {
-        merged = `${merged} ${next3}`.replace(/\s+/g, ' ').trim();
-        i += 3;
-      } else {
-        i += 2;
-      }
-      stitched.push(merged);
+      const consumed = consumeContinuationLines(lines, i + 3);
+      if (consumed.text) merged = `${merged} ${consumed.text}`.replace(/\s+/g, ' ').trim();
+      i = Math.max(i + 2, consumed.nextIdx - 1);
+      stitched.push(cleanupExMarkingText(merged));
       continue;
     }
 
     if (looksLikeCategoryLine(line) && looksLikeExLine(next)) {
       const cat = normalizeCategoryLine(line) || line;
       let merged = `${cat} ${next}`.replace(/\s+/g, ' ').trim();
-      // Append continuation line if it contains gas group / temp / EPL / IP tokens.
-      if (next2 && !looksLikeExLine(next2) && !looksLikeCategoryLine(next2) && looksLikeExContinuationLine(next2)) {
-        merged = `${merged} ${next2}`.replace(/\s+/g, ' ').trim();
-        i += 2;
-      } else {
-        i += 1;
-      }
-      stitched.push(merged);
+      const consumed = consumeContinuationLines(lines, i + 2);
+      if (consumed.text) merged = `${merged} ${consumed.text}`.replace(/\s+/g, ' ').trim();
+      i = Math.max(i + 1, consumed.nextIdx - 1);
+      stitched.push(cleanupExMarkingText(merged));
       continue;
+    }
+
+    if (looksLikeCategoryLine(line) && /^EX\s*-?\s*(?:D|DE|E|H|NA|IA|IB|IC|MA|MB|MC|O|S|T|TB|TC|TD)\b/i.test(next)) {
+      let merged = `${normalizeCategoryLine(line) || line} ${next}`.replace(/\s+/g, ' ').trim();
+      let j = i + 2;
+      while (j < lines.length) {
+        const fragment = String(lines[j] || '').trim();
+        if (!fragment) break;
+        if (looksLikeCategoryLine(fragment) || looksLikeExLine(fragment)) break;
+        if (!looksLikeExContinuationLine(fragment) && !looksLikeStandaloneFragmentLine(fragment)) break;
+        merged = `${merged} ${fragment}`.replace(/\s+/g, ' ').trim();
+        j += 1;
+      }
+      stitched.push(cleanupExMarkingText(merged));
+      i = Math.max(i + 1, j - 1);
+      continue;
+    }
+
+    if (looksLikeCategoryLine(line) && looksLikeStandaloneFragmentLine(next)) {
+      let merged = normalizeCategoryLine(line) || line;
+      const consumed = consumeContinuationLines(lines, i + 1);
+      if (consumed.text) {
+        merged = `${merged} ${consumed.text}`.replace(/\s+/g, ' ').trim();
+        stitched.push(cleanupExMarkingText(merged));
+        i = Math.max(i, consumed.nextIdx - 1);
+        continue;
+      }
     }
 
     // If current line is an Ex line, append a continuation line (common when "Ex d" and "IIB T3Gb IP55" are split).
@@ -337,9 +587,11 @@ function stitchExLines(ocrText) {
         }
       }
 
-      const merged = `${prefix ? `${prefix} ` : ''}${line} ${next}`.replace(/\s+/g, ' ').trim();
-      stitched.push(merged);
-      i += 1;
+      let merged = `${prefix ? `${prefix} ` : ''}${line} ${next}`.replace(/\s+/g, ' ').trim();
+      const consumed = consumeContinuationLines(lines, i + 2);
+      if (consumed.text) merged = `${merged} ${consumed.text}`.replace(/\s+/g, ' ').trim();
+      stitched.push(cleanupExMarkingText(merged));
+      i = Math.max(i + 1, consumed.nextIdx - 1);
       continue;
     }
 
@@ -359,13 +611,158 @@ function stitchExLines(ocrText) {
         }
       }
 
-      if (cat) stitched.push(`${cat} ${line}`.replace(/\s+/g, ' ').trim());
-      else stitched.push(line);
+      if (cat) stitched.push(cleanupExMarkingText(`${cat} ${line}`.replace(/\s+/g, ' ').trim()));
+      else stitched.push(cleanupExMarkingText(line));
     } else {
-      stitched.push(line);
+      stitched.push(cleanupExMarkingText(line));
     }
   }
   return stitched;
+}
+
+function scoreExRowForDedup(row) {
+  let score = 0;
+  const marking = String(row?.Marking || '');
+  if (row?.['Equipment Group']) score += 2;
+  if (row?.['Equipment Category']) score += 2;
+  if (row?.Environment) score += 2;
+  if (row?.['Type of Protection']) score += 2;
+  if (row?.['Gas / Dust Group']) score += 3;
+  if (row?.['Temperature Class']) score += 2;
+  if (row?.['Equipment Protection Level']) score += 2;
+  if (!/\bATEX\b|\bIECEX\b/i.test(marking)) score += 1;
+  if (!/[;]$/.test(marking)) score += 0.5;
+  return score;
+}
+
+function normalizeDedupValue(v) {
+  return String(v || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase();
+}
+
+function isCompatibleDedupValue(candidateValue, bestValue) {
+  const candidate = normalizeDedupValue(candidateValue);
+  const best = normalizeDedupValue(bestValue);
+  if (!candidate || !best) return true;
+  if (candidate === best) return true;
+  if (candidate.replace(/\s+/g, '') === best.replace(/\s+/g, '')) return true;
+  return false;
+}
+
+function isRowSubsumedBy(candidate, best) {
+  const candidateProtection = normalizeDedupValue(candidate?.['Type of Protection']);
+  const bestProtection = normalizeDedupValue(best?.['Type of Protection']);
+  if (candidateProtection && bestProtection && candidateProtection !== bestProtection) return false;
+
+  const comparableFields = [
+    'Equipment Group',
+    'Equipment Category',
+    'Environment',
+    'Gas / Dust Group',
+    'Temperature Class',
+    'Equipment Protection Level',
+  ];
+
+  for (const field of comparableFields) {
+    if (!isCompatibleDedupValue(candidate?.[field], best?.[field])) return false;
+  }
+
+  return scoreExRowForDedup(best) >= scoreExRowForDedup(candidate);
+}
+
+function dedupeExRows(rows) {
+  const broadGroups = new Map();
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const broadKey = [
+      row?.['Equipment Group'] || '',
+      row?.['Equipment Category'] || '',
+      row?.Environment || '',
+      row?.['Gas / Dust Group'] || '',
+      row?.['Temperature Class'] || '',
+      row?.['Equipment Protection Level'] || '',
+    ].join('|');
+    if (!broadGroups.has(broadKey)) broadGroups.set(broadKey, []);
+    broadGroups.get(broadKey).push(row);
+  }
+
+  const collapsed = [];
+  for (const groupRows of broadGroups.values()) {
+    if (!groupRows.length) continue;
+    if (groupRows.length === 1) {
+      collapsed.push(groupRows[0]);
+      continue;
+    }
+
+    const byProtection = new Map();
+    for (const row of groupRows) {
+      const protectionKey = String(row?.['Type of Protection'] || '').trim();
+      if (!byProtection.has(protectionKey)) byProtection.set(protectionKey, []);
+      byProtection.get(protectionKey).push(row);
+    }
+
+    let bestProtectionRows = [];
+    for (const rowsWithSameProtection of byProtection.values()) {
+      if (
+        !bestProtectionRows.length ||
+        rowsWithSameProtection.length > bestProtectionRows.length ||
+        (rowsWithSameProtection.length === bestProtectionRows.length &&
+          Math.max(...rowsWithSameProtection.map(scoreExRowForDedup)) > Math.max(...bestProtectionRows.map(scoreExRowForDedup)))
+      ) {
+        bestProtectionRows = rowsWithSameProtection;
+      }
+    }
+
+    bestProtectionRows.sort((a, b) => scoreExRowForDedup(b) - scoreExRowForDedup(a));
+    collapsed.push(bestProtectionRows[0]);
+  }
+
+  const byCanonical = new Map();
+  for (const row of collapsed) {
+    const key = buildCanonicalExMarking(row) || String(row?.Marking || '').replace(/\s+/g, ' ').trim();
+    const prev = byCanonical.get(key);
+    if (!prev || scoreExRowForDedup(row) > scoreExRowForDedup(prev)) byCanonical.set(key, row);
+  }
+
+  const finalRows = Array.from(byCanonical.values()).sort((a, b) => scoreExRowForDedup(b) - scoreExRowForDedup(a));
+  const pruned = [];
+  for (const row of finalRows) {
+    if (pruned.some((best) => isRowSubsumedBy(row, best))) continue;
+    pruned.push(row);
+  }
+
+  return pruned;
+}
+
+function rowCompletenessScore(row) {
+  let score = 0;
+  if (row?.['Equipment Group']) score += 2;
+  if (row?.['Equipment Category']) score += 2;
+  if (row?.Environment) score += 2;
+  if (row?.['Type of Protection']) score += 2;
+  if (row?.['Gas / Dust Group']) score += 2;
+  if (row?.['Temperature Class']) score += 2;
+  if (row?.['Equipment Protection Level']) score += 2;
+  return score;
+}
+
+function chooseBetterValidation(current, candidate) {
+  const curRejected = Array.isArray(current?.rejected) ? current.rejected.length : 0;
+  const candRejected = Array.isArray(candidate?.rejected) ? candidate.rejected.length : 0;
+  if (candRejected < curRejected) return candidate;
+  if (candRejected > curRejected) return current;
+
+  const curRows = Array.isArray(current?.fields?.['Ex Marking']) ? current.fields['Ex Marking'] : [];
+  const candRows = Array.isArray(candidate?.fields?.['Ex Marking']) ? candidate.fields['Ex Marking'] : [];
+  const curScore = exMarkingQualityScore(curRows) + curRows.reduce((sum, row) => sum + rowCompletenessScore(row), 0);
+  const candScore = exMarkingQualityScore(candRows) + candRows.reduce((sum, row) => sum + rowCompletenessScore(row), 0);
+  if (candScore > curScore) return candidate;
+  if (candScore < curScore) return current;
+
+  if (candRows.length > curRows.length) return candidate;
+  return current;
 }
 
 function fallbackExtractExMarkingsFromOcrText(ocrText) {
@@ -382,7 +779,41 @@ function fallbackExtractExMarkingsFromOcrText(ocrText) {
   }
 
   // Also handle cases where Ex symbol OCR becomes just "E" on a category line followed by Ex line already stitched above.
-  const unique = Array.from(new Set(picked)).slice(0, 4);
+  const unique = Array.from(
+    new Set(
+      picked
+        .map((m) => cleanupExMarkingText(m))
+        .filter(Boolean)
+        .filter((m) => !/^\s*II\s+1\/[23]GD?\s+EX\s*$/i.test(m))
+    )
+  ).slice(0, 6);
+
+  if (!unique.length) {
+    const rawLines = String(ocrText || '')
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    for (let i = 0; i < rawLines.length; i += 1) {
+      const category = normalizeCategoryLine(rawLines[i]);
+      if (!category) continue;
+      for (let j = i + 1; j < Math.min(rawLines.length, i + 10); j += 1) {
+        const line = String(rawLines[j] || '').trim();
+        if (!line) continue;
+        const upper = line.toUpperCase().replace(/\|/g, 'I');
+        const gasDust = upper.match(/\bIIA\b|\bIIB\b|\bIIC\b/);
+        const temp = upper.match(/\bT[1-6]\b|\bT[1-6](?=(GA|GB|GC)\b)/);
+        const epl = upper.match(/\bGA\b|\bGB\b|\bGC\b|T[1-6](GA|GB|GC)\b/);
+        const motorContext = /\bMOTOR\b|\bMOTORE\b|\bMOTOR AB/i.test(String(ocrText || ''));
+        if (category && gasDust && temp && epl && motorContext) {
+          const eplToken = String(epl[0]).replace(/^T[1-6]/, '');
+          unique.push(`${category} Ex d ${gasDust[0]} ${temp[0]} ${eplToken}`);
+          break;
+        }
+      }
+      if (unique.length) break;
+    }
+  }
+
   const rows = unique.map((marking) =>
     normalizeExMarkingRow({
       Marking: marking,
@@ -395,7 +826,7 @@ function fallbackExtractExMarkingsFromOcrText(ocrText) {
       'Equipment Protection Level': '',
     })
   );
-  return dropEmptyExMarkingRows(rows);
+  return dedupeExRows(dropEmptyExMarkingRows(rows)).slice(0, 4);
 }
 
 function exMarkingQualityScore(rows) {
@@ -412,6 +843,17 @@ function exMarkingQualityScore(rows) {
     if (/\bT[1-6]\b/.test(u) || /\bT\d{2,3}\s*°?\s*C\b/i.test(m)) score += 2;
     if (/\bGA\b|\bGB\b|\bGC\b|\bDA\b|\bDB\b|\bDC\b/.test(u)) score += 1;
     if (/\bIP\b/.test(u)) score += 1;
+    const protection = String(r?.['Type of Protection'] || '').trim();
+    const normalizedProtection = normalizeProtectionTypes(protection);
+    if (protection && normalizedProtection.length) score += 2;
+    else if (!protection) score -= 1;
+    if (r?.['Equipment Group']) score += 1;
+    if (r?.['Equipment Category']) score += 1;
+    if (r?.Environment) score += 1;
+    if (r?.['Type of Protection']) score += 1;
+    if (r?.['Gas / Dust Group']) score += 1;
+    if (r?.['Temperature Class']) score += 1;
+    if (r?.['Equipment Protection Level']) score += 1;
   }
   return score;
 }
@@ -433,6 +875,8 @@ async function extractDataplateFieldsFromOcrText({
     typeof maxRepairIterations === 'number' && Number.isFinite(maxRepairIterations)
       ? Math.max(0, Math.min(maxRepairIterations, 10))
       : Math.max(0, Math.min(Number(systemSettings.getNumber('DATAPLATE_EXTRACT_MAX_REPAIR_ITERS') || 3), 10));
+
+  let bestValidationSeen = null;
 
   if (isDebugEnabled()) {
     logger.info('dataplate.extract.llm.start', {
@@ -632,6 +1076,8 @@ async function extractDataplateFieldsFromOcrText({
     'Ex Marking': [],
   };
 
+  if (isBlankishValue(out.Manufacturer)) out.Manufacturer = extractManufacturerFromOcrText(ocr);
+
   const exRows = Array.isArray(fields['Ex Marking']) ? fields['Ex Marking'] : [];
   const exEvRows = Array.isArray(evidence['Ex Marking']) ? evidence['Ex Marking'] : [];
 
@@ -657,7 +1103,7 @@ async function extractDataplateFieldsFromOcrText({
 
     exOut.push(normalized);
   }
-  out['Ex Marking'] = dropEmptyExMarkingRows(exOut);
+  out['Ex Marking'] = dedupeExRows(dropEmptyExMarkingRows(exOut));
 
   const warnings = Array.isArray(parsed?.warnings) ? parsed.warnings.map(String).slice(0, 20) : [];
 
@@ -691,6 +1137,7 @@ async function extractDataplateFieldsFromOcrText({
 
   // Strict validation: prefer empty + warning over wrong values.
   let validation = validateAndCleanDataplateFields(out);
+  bestValidationSeen = validation;
   const allWarnings = warnings.concat(validation.warnings || []).slice(0, 60);
 
   // Deterministic fallback: if Ex Marking is missing/invalid, try extracting lines containing "Ex" directly from OCR.
@@ -708,17 +1155,34 @@ async function extractDataplateFieldsFromOcrText({
     const fallback = fallbackExtractExMarkingsFromOcrText(ocr);
     if (fallback.length) {
       const fallbackScore = exMarkingQualityScore(fallback);
-      const nextCandidate = { ...validation.fields, 'Ex Marking': fallback };
-      const nextValidation = validateAndCleanDataplateFields(nextCandidate);
+      const fallbackCandidate = { ...validation.fields, 'Ex Marking': fallback };
+      const fallbackValidation = validateAndCleanDataplateFields(fallbackCandidate);
+      const mergedRows = dedupeExRows([...(Array.isArray(currentRows) ? currentRows : []), ...fallback]);
+      const mergedCandidate = { ...validation.fields, 'Ex Marking': mergedRows };
+      const mergedValidation = validateAndCleanDataplateFields(mergedCandidate);
 
-      const curRejectedCount = Array.isArray(validation.rejected) ? validation.rejected.length : 0;
-      const nextRejectedCount = Array.isArray(nextValidation.rejected) ? nextValidation.rejected.length : 0;
+      const currentRejectedCount = Array.isArray(validation.rejected) ? validation.rejected.length : 0;
+      const fallbackRejectedCount = Array.isArray(fallbackValidation.rejected) ? fallbackValidation.rejected.length : 0;
+      const mergedRejectedCount = Array.isArray(mergedValidation.rejected) ? mergedValidation.rejected.length : 0;
+      const mergedScore = exMarkingQualityScore(mergedRows);
 
-      const shouldUseFallback =
-        // Primary: fewer validation errors
-        nextRejectedCount < curRejectedCount ||
-        // Or: same validation strictness, but better marking quality
-        (nextRejectedCount === curRejectedCount && fallbackScore > currentScore);
+      let bestMode = 'current';
+      let bestRejected = currentRejectedCount;
+      let bestScore = currentScore;
+      let bestValidation = validation;
+
+      const candidates = [
+        { mode: 'fallback', rejected: fallbackRejectedCount, score: fallbackScore, validation: fallbackValidation },
+        { mode: 'merged', rejected: mergedRejectedCount, score: mergedScore, validation: mergedValidation },
+      ];
+      for (const candidate of candidates) {
+        if (candidate.rejected < bestRejected || (candidate.rejected === bestRejected && candidate.score > bestScore)) {
+          bestMode = candidate.mode;
+          bestRejected = candidate.rejected;
+          bestScore = candidate.score;
+          bestValidation = candidate.validation;
+        }
+      }
 
       if (isDebugEnabled()) {
         logger.info('dataplate.extract.ex.fallback', {
@@ -728,17 +1192,25 @@ async function extractDataplateFieldsFromOcrText({
           hasLowSignalMarking,
           currentScore,
           fallbackScore,
+          mergedScore,
           currentMarkings: currentRows.slice(0, 4).map((r) => safeOneLine(r?.Marking, { max: 180 })),
           fallbackMarkings: fallback.slice(0, 4).map((r) => safeOneLine(r?.Marking, { max: 180 })),
-          shouldUseFallback,
-          curRejectedCount,
-          nextRejectedCount,
+          mergedMarkings: mergedRows.slice(0, 4).map((r) => safeOneLine(r?.Marking, { max: 180 })),
+          selectedMode: bestMode,
+          curRejectedCount: currentRejectedCount,
+          fallbackRejectedCount,
+          mergedRejectedCount,
         });
       }
 
-      if (shouldUseFallback) {
-        validation = nextValidation;
-        allWarnings.push('Ex Marking: fallback extracted from OCR lines containing "Ex".');
+      if (bestMode !== 'current') {
+        validation = bestValidation;
+        bestValidationSeen = chooseBetterValidation(bestValidationSeen, validation);
+        allWarnings.push(
+          bestMode === 'merged'
+            ? 'Ex Marking: merged OCR fallback with model output.'
+            : 'Ex Marking: fallback extracted from OCR lines containing "Ex".'
+        );
       }
     }
   }
@@ -857,10 +1329,25 @@ async function extractDataplateFieldsFromOcrText({
             })
           );
         }
-        nextCandidate['Ex Marking'] = dropEmptyExMarkingRows(rows);
+        nextCandidate['Ex Marking'] = dedupeExRows(dropEmptyExMarkingRows(rows));
       }
 
       validation = validateAndCleanDataplateFields(nextCandidate);
+      if (
+        rejectedFields.has('Ex Marking') &&
+        Array.isArray(validation?.fields?.['Ex Marking']) &&
+        validation.fields['Ex Marking'].length === 0 &&
+        !validation.rejected.some((r) => r?.field === 'Ex Marking')
+      ) {
+        validation.rejected.push({
+          field: 'Ex Marking',
+          code: 'EX_MARKING_EMPTY_REPAIR',
+          reason: 'repair_produced_empty_rows',
+          candidate: '',
+          expected: 'Repaired Ex Marking must contain at least one non-empty valid row.',
+        });
+      }
+      bestValidationSeen = chooseBetterValidation(bestValidationSeen, validation);
       allWarnings.push(`Repair attempt ${attempt}: remaining rejected fields = ${validation.rejected.length}`);
       if (isDebugEnabled()) {
         logger.info('dataplate.extract.repair.validate', {
@@ -879,7 +1366,20 @@ async function extractDataplateFieldsFromOcrText({
     }
   }
 
+  if (bestValidationSeen) validation = chooseBetterValidation(validation, bestValidationSeen);
+
+  if (Array.isArray(validation?.fields?.['Ex Marking'])) {
+    validation.fields['Ex Marking'] = dedupeExRows(validation.fields['Ex Marking']);
+  }
   if (repairedNotes.length) allWarnings.push(...repairedNotes.map((n) => `Repair note: ${n}`));
+  if (isBlankishValue(validation?.fields?.Manufacturer)) {
+    const deterministic = extractManufacturerFromOcrText(ocr);
+    if (deterministic) validation.fields.Manufacturer = deterministic;
+  }
+  if (isBlankishValue(validation?.fields?.Manufacturer)) {
+    const llmManufacturer = await tryExtractManufacturerFromFullOcrText({ ocrText: ocr, model });
+    if (llmManufacturer) validation.fields.Manufacturer = llmManufacturer;
+  }
   if (isDebugEnabled()) {
     logger.info('dataplate.extract.llm.done', {
       requestId,
@@ -1126,4 +1626,13 @@ async function tryRepairRejectedFields({
 
 module.exports = {
   extractDataplateFieldsFromOcrText,
+  _internals: {
+    buildCanonicalExMarking,
+    chooseBetterValidation,
+    dedupeExRows,
+    extractManufacturerFromOcrText,
+    normalizeExMarkingRow,
+    stitchExLines,
+    fallbackExtractExMarkingsFromOcrText,
+  },
 };

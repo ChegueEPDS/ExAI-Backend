@@ -239,7 +239,7 @@ async function ensureAutoInspectionFromMobileSync({
 
   const inspectionType = 'Detailed';
   const questionDocs = await loadAutoInspectionQuestions(equipmentDoc, tenantId, inspectionType);
-  const basePassedTypes = new Set(['general', 'environment', 'additional checks']);
+  const basePassedTypes = new Set(['general', 'environment', 'additional checks', 'installation']);
   const relevantTypes = await getRelevantEquipmentTypesForDevice(equipmentDoc, tenantId);
   let results = [];
 

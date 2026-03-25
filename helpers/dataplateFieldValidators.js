@@ -18,6 +18,7 @@ function normalizeIpRating(raw) {
   let s = cleanString(raw).toUpperCase();
   if (!s) return '';
   s = s.replace(/\s+/g, '');
+  s = s.replace(/&/g, ',');
   s = s.replace(/[^A-Z0-9,;/]/g, '');
   return s;
 }
@@ -47,6 +48,7 @@ function isValidIpRating(raw) {
   for (const p of parts.slice(0, 4)) {
     if (/^IP[0-6X][0-9X]$/.test(p)) okParts.push(p);
     else if (p === 'IP69K') okParts.push(p);
+    else if (/^(IP[0-6X][0-9X])[A-Z]$/.test(p)) okParts.push(p.slice(0, 4));
     else return { ok: false, value: '', reason: `Invalid IP rating: "${cleanString(raw)}"` };
   }
 
@@ -64,6 +66,8 @@ function normalizeCertificateToken(raw) {
   s = s.replace(/\bA\s*TEX\b/gi, 'ATEX');
   s = s.replace(/\bIEC\s*EX\b/gi, 'IECEx');
   s = s.replace(/\s+/g, ' ').trim();
+  s = s.replace(/(?:\.{2,}|[;,]+)$/g, '').trim();
+  s = s.replace(/-\s*$/g, '').trim();
   return s;
 }
 
@@ -134,7 +138,10 @@ function normalizeEnvironment(raw) {
   const s = cleanString(raw).toUpperCase().replace(/\s+/g, '');
   if (!s) return '';
   // Accept G, D, GD (order-insensitive)
-  if (s === 'G' || s === 'D' || s === 'GD' || s === 'DG') return s === 'DG' ? 'GD' : s;
+  const compact = s.replace(/C$/, '');
+  if (compact === 'GG') return 'G';
+  if (compact === 'DD') return 'D';
+  if (compact === 'G' || compact === 'D' || compact === 'GD' || compact === 'DG') return compact === 'DG' ? 'GD' : compact;
   return '';
 }
 
@@ -164,17 +171,31 @@ function normalizeEquipmentGroup(raw) {
 }
 
 function normalizeEquipmentCategory(raw) {
-  const s = cleanString(raw).toUpperCase().replace(/\s+/g, '');
+  const s = cleanString(raw)
+    .toUpperCase()
+    .replace(/\s+/g, '')
+    .replace(/\bI\/(?=[123])/g, '1/')
+    .replace(/^[IL]$/g, '1')
+    .replace(/^I(?=\/[123])/, '1');
   if (!s) return '';
   if (s === 'M1' || s === 'M2') return s;
   if (s === '1' || s === '2' || s === '3') return s;
+  if (s === '1/2' || s === '2/3' || s === '1/3') return s;
   return '';
 }
 
-function normalizeGasDustGroup(raw) {
-  const s = cleanString(raw).toUpperCase().replace(/\s+/g, '');
+function normalizeGasDustGroup(raw, { protection = '', environment = '', equipmentGroup = '' } = {}) {
+  const s = cleanString(raw)
+    .toUpperCase()
+    .replace(/\s+/g, '')
+    .replace(/\|/g, 'I');
   if (!s) return '';
   const allowed = new Set(['IIA', 'IIB', 'IIC', 'IIIA', 'IIIB', 'IIIC']);
+  const repaired = s.replace(/1/g, 'I').replace(/6/g, 'B');
+  if (/^I{3}B$/.test(repaired) && /\bD\b/i.test(String(protection || '')) && String(equipmentGroup || '').toUpperCase() !== 'III') {
+    return 'IIB';
+  }
+  if (allowed.has(repaired)) return repaired;
   return allowed.has(s) ? s : '';
 }
 
@@ -197,7 +218,11 @@ function normalizeTypeOfProtection(raw) {
 
 function extractFromMarking(marking) {
   const s = cleanString(marking);
-  const upper = s.toUpperCase();
+  const upper = s
+    .toUpperCase()
+    .replace(/\|/g, 'I')
+    .replace(/\bI\/(?=[123])/g, '1/')
+    .replace(/\bII\s+I\/(?=[123])/g, 'II 1/');
 
   // Group + category + environment
   // "II 3G", "II 3D", "II 2GD", "I M2", ...
@@ -205,13 +230,20 @@ function extractFromMarking(marking) {
   let equipmentCategory = '';
   let environment = '';
 
-  const m = upper.match(/\b(I{1,3})\s*(M[12]|[123])\s*(GD|DG|G|D)\b/);
+  const mixedPrefix = upper.match(/\b(I{1,3})\s*1G\s*\/\s*2GD(C)?\b/);
+  if (mixedPrefix) {
+    equipmentGroup = mixedPrefix[1];
+    equipmentCategory = '1/2';
+    environment = 'GD';
+  }
+
+  const m = !equipmentGroup && upper.match(/\b(I{1,3})\s*(M[12]|[123](?:\/[123])?)\s*(GD|DG|G|D)C?\b/);
   if (m) {
     equipmentGroup = m[1];
     equipmentCategory = m[2];
     environment = m[3] === 'DG' ? 'GD' : m[3];
   } else {
-    const m2 = upper.match(/\b(I{1,3})\s*(M[12]|[123])\b/);
+    const m2 = upper.match(/\b(I{1,3})\s*(M[12]|[123](?:\/[123])?)\b/);
     if (m2) {
       equipmentGroup = m2[1];
       equipmentCategory = m2[2];
@@ -222,9 +254,9 @@ function extractFromMarking(marking) {
 
   // Gas/Dust group tokens
   const groupTokens = [];
-  const tokenRe = /\bIIIA\b|\bIIIB\b|\bIIIC\b|\bIIA\b|\bIIB\b|\bIIC\b/g;
+  const tokenRe = /\bIII\s*[ABC]\b|\bII\s*[ABC]\b/g;
   let mt;
-  while ((mt = tokenRe.exec(upper)) !== null) groupTokens.push(mt[0]);
+  while ((mt = tokenRe.exec(upper)) !== null) groupTokens.push(mt[0].replace(/\s+/g, ''));
   let gasDustGroup = dedupeJoin(groupTokens);
 
   // Heuristic: recover gas group when OCR yields pipes/Is like "|| | B" after "Ex d".
@@ -233,7 +265,8 @@ function extractFromMarking(marking) {
     const noisy = upper.match(/(?:\|\s*|[IL1]\s*){2,5}\s*(A|B|C)\b/);
     if (noisy) {
       const letter = noisy[1];
-      if (equipmentGroup === 'II') gasDustGroup = `II${letter}`;
+      const hasDustProtection = /\bEX\s*-?\s*T(?:B|C|D)?\b/.test(upper);
+      if ((equipmentGroup === 'II' || !equipmentGroup) && !hasDustProtection) gasDustGroup = `II${letter}`;
       else if (equipmentGroup === 'III') gasDustGroup = `III${letter}`;
     }
   }
@@ -241,9 +274,13 @@ function extractFromMarking(marking) {
   // Temp class tokens
   const tTokens = [];
   // Accept "T3" and glued forms like "T3Gb" (common in Ex marking lines).
-  const tRe = /\bT[1-6]\b|\bT[1-6](?=(GA|GB|GC|DA|DB|DC)\b)|\bT\d{2,3}\s*°?\s*C\b/gi;
+  const tRe = /\bT\s*[1-6]\b|\bT[1-6](?=(GA|GB|GC|DA|DB|DC)\b)|\bT\s*\d{2,3}\s*°?\s*C\b/gi;
   while ((mt = tRe.exec(s)) !== null) tTokens.push(mt[0]);
-  const temperatureClass = dedupeJoin(tTokens.map((x) => normalizeTempClass(x)).filter(Boolean));
+  const temperatureClass = dedupeJoin(
+    tTokens
+      .map((x) => normalizeTempClass(String(x || '').replace(/\s+/g, '')))
+      .filter(Boolean)
+  );
 
   // EPL
   const eplTokens = [];
@@ -252,12 +289,12 @@ function extractFromMarking(marking) {
   // Also capture glued forms like "T3Gb" / "T4Db" (no word boundary before the EPL token).
   const eplGluedRe = /T[1-6]\s*(GA|GB|GC|DA|DB|DC)\b/gi;
   while ((mt = eplGluedRe.exec(upper)) !== null) eplTokens.push(mt[1]);
-  const epl = dedupeJoin(eplTokens.map((x) => normalizeEpl(x)).filter(Boolean));
+  let epl = dedupeJoin(eplTokens.map((x) => normalizeEpl(x)).filter(Boolean));
 
   // Type of protection: extract known tokens after "Ex" (avoid misreading gas group like IIA as protection)
   const protTokens = [];
   const protRe =
-    /\bEx\b\s*-?\s*(d|de|e|h|na|p|q|ia|ib|ic|ma|mb|mc|o|s|t|tb|tc|td)\b/gi;
+    /\bEx\b\s*-?\s*(d|de|e|h|na|p|q|ia|ib|ic|ma|mb|mc|o|s|t|tb|tc|td|eb|mb)\b/gi;
   while ((mt = protRe.exec(s)) !== null) {
     protTokens.push(mt[1]);
   }
@@ -266,11 +303,18 @@ function extractFromMarking(marking) {
     protection = normalizeTypeOfProtection(protTokens.join(' '));
   }
 
+  if (!equipmentGroup && gasDustGroup.startsWith('II')) equipmentGroup = gasDustGroup.startsWith('III') ? 'III' : 'II';
+  if (!environment && epl) environment = /^[G]/i.test(epl) ? 'G' : /^[D]/i.test(epl) ? 'D' : '';
+  if (!equipmentCategory && environment) {
+    const simple = upper.match(/\b(I{1,3})\s*([123](?:\/[123])?)(?=(?:GD|DG|G|D)\b)/);
+    if (simple) equipmentCategory = simple[2];
+  }
+
   return {
     equipmentGroup: normalizeEquipmentGroup(equipmentGroup),
     equipmentCategory: normalizeEquipmentCategory(equipmentCategory),
     environment: normalizeEnvironment(environment),
-    gasDustGroup,
+    gasDustGroup: normalizeGasDustGroup(gasDustGroup, { protection, environment, equipmentGroup }),
     temperatureClass,
     epl,
     protection,
@@ -432,7 +476,13 @@ module.exports = {
     normalizeAndValidateCertificateNo,
     looksLikeAtex,
     looksLikeIecex,
+    normalizeEquipmentCategory,
+    normalizeEquipmentGroup,
+    normalizeGasDustGroup,
     normalizeTempClass,
     normalizeEnvironment,
+    normalizeTypeOfProtection,
+    normalizeEpl,
+    extractFromMarking,
   },
 };
