@@ -13,6 +13,31 @@ if (stripeKey) {
 }
 
 const { ensureStripeCustomerForTenant } = require('../services/stripeCustomerProvisioning');
+
+async function resolvePromotionCodeId({ customerId, promoCode }) {
+  const normalizedCode = String(promoCode || '').trim();
+  if (!normalizedCode) return null;
+  if (!stripe) throw new Error('Stripe is not configured');
+
+  const result = await stripe.promotionCodes.list({
+    code: normalizedCode,
+    active: true,
+    limit: 100,
+  });
+
+  const candidates = Array.isArray(result?.data) ? result.data : [];
+  const match = candidates.find((entry) => {
+    if (!entry?.active) return false;
+    const restrictedCustomer = entry.customer ? String(entry.customer) : '';
+    if (!restrictedCustomer) return true;
+    return customerId && restrictedCustomer === String(customerId);
+  });
+
+  if (!match?.id) {
+    throw new Error(`Invalid or unavailable promotion code: ${normalizedCode}`);
+  }
+  return String(match.id);
+}
 const brevoService = require('../services/brevoService');
 
 // Env-driven toggle for phone collection in Checkout (default: false)
@@ -131,7 +156,7 @@ exports.createCheckoutSession = async (req, res) => {
     if (!requireStripeOrFail(res)) return;
 
     try {
-        const { tenantId, plan, seats, priceId, successUrl, cancelUrl, companyName, userId } = req.body;
+        const { tenantId, plan, seats, priceId, successUrl, cancelUrl, companyName, userId, promoCode, campaign } = req.body;
         console.log('[billing] /checkout body:', JSON.stringify({
             tenantId,
             plan,
@@ -140,7 +165,9 @@ exports.createCheckoutSession = async (req, res) => {
             successUrl,
             cancelUrl,
             companyName,
-            userId
+            userId,
+            promoCode,
+            campaign
         }, null, 2));
 
         // --- Support monthly + yearly variants; keep legacy behavior otherwise ---
@@ -255,7 +282,8 @@ exports.createCheckoutSession = async (req, res) => {
                 billingPeriod,
                 metadataPlan: normalizedPlan
             }, null, 2));
-            const session = await stripe.checkout.sessions.create({
+            const promotionCodeId = await resolvePromotionCodeId({ customerId, promoCode });
+            const sessionPayload = {
                 mode: 'subscription',
                 customer: customerId,
                 line_items: [{
@@ -271,7 +299,7 @@ exports.createCheckoutSession = async (req, res) => {
                 automatic_tax: { enabled: true },
                 // Copy name & address from Checkout to the Customer automatically
                 customer_update: { address: 'auto', name: 'auto' },
-                allow_promotion_codes: true,
+                allow_promotion_codes: promotionCodeId ? false : true,
                 client_reference_id: String(tenant._id),
                 success_url: SUCCESS_URL + '?session_id={CHECKOUT_SESSION_ID}',
                 cancel_url: CANCEL_URL,
@@ -282,7 +310,8 @@ exports.createCheckoutSession = async (req, res) => {
                         billingPeriod,
                         seats: String(qty),
                         tenantId: String(tenant._id),
-                        userId: (req.user?.id || req.user?._id || userId || '').toString()
+                        userId: (req.user?.id || req.user?._id || userId || '').toString(),
+                        campaign: String(campaign || '').trim()
                     }
                 },
                 metadata: {
@@ -291,9 +320,14 @@ exports.createCheckoutSession = async (req, res) => {
                     billingPeriod,
                     seats: String(qty),
                     tenantId: String(tenant._id),
-                    userId: (req.user?.id || req.user?._id || userId || '').toString()
+                    userId: (req.user?.id || req.user?._id || userId || '').toString(),
+                    campaign: String(campaign || '').trim()
                 }
-            });
+            };
+            if (promotionCodeId) {
+              sessionPayload.discounts = [{ promotion_code: promotionCodeId }];
+            }
+            const session = await stripe.checkout.sessions.create(sessionPayload);
 
             return res.json({ url: session.url });
         } else if (normalizedPlan === 'team' || normalizedPlan === 'team_yearly') {
@@ -353,7 +387,8 @@ exports.createCheckoutSession = async (req, res) => {
                     billingPeriod,
                     seats: String(qty),
                     userId: (req.user?.id || req.user?._id || userId || '').toString(),
-                    companyName: (companyName || '').toString()
+                    companyName: (companyName || '').toString(),
+                    campaign: String(campaign || '').trim()
                 };
                 console.log('[billing] creating TEAM checkout session (no tenantId) with:', JSON.stringify({
                     mode: 'subscription',
@@ -365,7 +400,8 @@ exports.createCheckoutSession = async (req, res) => {
                     metadataPlan: normalizedPlan,
                     meta
                 }, null, 2));
-                const session = await stripe.checkout.sessions.create({
+                const promotionCodeId = await resolvePromotionCodeId({ customerId, promoCode });
+                const sessionPayload = {
                     mode: 'subscription',
                     customer: customerId,
                     line_items: [{
@@ -381,7 +417,7 @@ exports.createCheckoutSession = async (req, res) => {
                     automatic_tax: { enabled: true },
                     // Copy name & address from Checkout to the Customer automatically
                     customer_update: { address: 'auto', name: 'auto' },
-                    allow_promotion_codes: allowPromoCodes,
+                    allow_promotion_codes: promotionCodeId ? false : allowPromoCodes,
                     client_reference_id: clientRef,
                     success_url: SUCCESS_URL + '?session_id={CHECKOUT_SESSION_ID}',
                     cancel_url: CANCEL_URL,
@@ -389,7 +425,11 @@ exports.createCheckoutSession = async (req, res) => {
                         metadata: meta
                     },
                     metadata: meta
-                });
+                };
+                if (promotionCodeId) {
+                  sessionPayload.discounts = [{ promotion_code: promotionCodeId }];
+                }
+                const session = await stripe.checkout.sessions.create(sessionPayload);
                 return res.json({ url: session.url });
             } else {
                 // TEAM: admin/edge case with tenantId
@@ -411,7 +451,8 @@ exports.createCheckoutSession = async (req, res) => {
                     seats: String(qty),
                     tenantId: String(tenant._id),
                     userId: (req.user?.id || req.user?._id || userId || '').toString(),
-                    companyName: (companyName || '').toString()
+                    companyName: (companyName || '').toString(),
+                    campaign: String(campaign || '').trim()
                 };
                 console.log('[billing] creating TEAM checkout session (with tenantId) with:', JSON.stringify({
                     mode: 'subscription',
@@ -423,7 +464,8 @@ exports.createCheckoutSession = async (req, res) => {
                     metadataPlan: normalizedPlan,
                     meta
                 }, null, 2));
-                const session = await stripe.checkout.sessions.create({
+                const promotionCodeId = await resolvePromotionCodeId({ customerId, promoCode });
+                const sessionPayload = {
                     mode: 'subscription',
                     customer: customerId,
                     line_items: [{
@@ -439,7 +481,7 @@ exports.createCheckoutSession = async (req, res) => {
                     automatic_tax: { enabled: true },
                     // Copy name & address from Checkout to the Customer automatically
                     customer_update: { address: 'auto', name: 'auto' },
-                    allow_promotion_codes: allowPromoCodes,
+                    allow_promotion_codes: promotionCodeId ? false : allowPromoCodes,
                     client_reference_id: String(tenant._id),
                     success_url: SUCCESS_URL + '?session_id={CHECKOUT_SESSION_ID}',
                     cancel_url: CANCEL_URL,
@@ -447,7 +489,11 @@ exports.createCheckoutSession = async (req, res) => {
                         metadata: meta
                     },
                     metadata: meta
-                });
+                };
+                if (promotionCodeId) {
+                  sessionPayload.discounts = [{ promotion_code: promotionCodeId }];
+                }
+                const session = await stripe.checkout.sessions.create(sessionPayload);
                 return res.json({ url: session.url });
             }
         } else {

@@ -57,6 +57,8 @@ const UserSchema = new mongoose.Schema(
     pendingCheckoutPlan: { type: String }, // 'pro' | 'team' | 'pro_yearly' | 'team_yearly'
     pendingCheckoutSeats: { type: Number },
     pendingCheckoutCompanyName: { type: String },
+    pendingCheckoutPromoCode: { type: String },
+    pendingCheckoutCampaign: { type: String },
   },
   { timestamps: true }
 );

@@ -257,6 +257,8 @@ exports.register = async (req, res) => {
     desiredPlan,
     desiredSeats,
     desiredCompanyName,
+    desiredPromoCode,
+    desiredCampaign,
   } = req.body || {};
 
   try {
@@ -284,6 +286,8 @@ exports.register = async (req, res) => {
       normalizedDesiredPlan.startsWith('team')
         ? String(desiredCompanyName || '').trim()
         : '';
+    const pendingPromoCode = String(desiredPromoCode || '').trim();
+    const pendingCampaign = String(desiredCampaign || '').trim();
     if (normalizedDesiredPlan.startsWith('team') && !pendingCompanyName) {
       return res.status(400).json({ error: 'desiredCompanyName is required for team plans' });
     }
@@ -304,6 +308,8 @@ exports.register = async (req, res) => {
             pendingCheckoutPlan: normalizedDesiredPlan,
             pendingCheckoutSeats: pendingSeats,
             pendingCheckoutCompanyName: pendingCompanyName || undefined,
+            pendingCheckoutPromoCode: pendingPromoCode || undefined,
+            pendingCheckoutCampaign: pendingCampaign || undefined,
           }
         : {}),
     });
@@ -426,6 +432,8 @@ exports.verifyEmail = async (req, res) => {
                 ? Math.max(5, Number(user.pendingCheckoutSeats || 5))
                 : 1,
             companyName: String(user.pendingCheckoutCompanyName || ''),
+            promoCode: String(user.pendingCheckoutPromoCode || ''),
+            campaign: String(user.pendingCheckoutCampaign || ''),
           }
         : null;
 
@@ -433,6 +441,8 @@ exports.verifyEmail = async (req, res) => {
     user.pendingCheckoutPlan = undefined;
     user.pendingCheckoutSeats = undefined;
     user.pendingCheckoutCompanyName = undefined;
+    user.pendingCheckoutPromoCode = undefined;
+    user.pendingCheckoutCampaign = undefined;
     await user.save();
 
     if (!user.tenantId) {
