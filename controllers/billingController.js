@@ -299,7 +299,6 @@ exports.createCheckoutSession = async (req, res) => {
                 automatic_tax: { enabled: true },
                 // Copy name & address from Checkout to the Customer automatically
                 customer_update: { address: 'auto', name: 'auto' },
-                allow_promotion_codes: promotionCodeId ? false : true,
                 client_reference_id: String(tenant._id),
                 success_url: SUCCESS_URL + '?session_id={CHECKOUT_SESSION_ID}',
                 cancel_url: CANCEL_URL,
@@ -326,6 +325,8 @@ exports.createCheckoutSession = async (req, res) => {
             };
             if (promotionCodeId) {
               sessionPayload.discounts = [{ promotion_code: promotionCodeId }];
+            } else {
+              sessionPayload.allow_promotion_codes = true;
             }
             const session = await stripe.checkout.sessions.create(sessionPayload);
 
@@ -417,7 +418,6 @@ exports.createCheckoutSession = async (req, res) => {
                     automatic_tax: { enabled: true },
                     // Copy name & address from Checkout to the Customer automatically
                     customer_update: { address: 'auto', name: 'auto' },
-                    allow_promotion_codes: promotionCodeId ? false : allowPromoCodes,
                     client_reference_id: clientRef,
                     success_url: SUCCESS_URL + '?session_id={CHECKOUT_SESSION_ID}',
                     cancel_url: CANCEL_URL,
@@ -428,6 +428,8 @@ exports.createCheckoutSession = async (req, res) => {
                 };
                 if (promotionCodeId) {
                   sessionPayload.discounts = [{ promotion_code: promotionCodeId }];
+                } else {
+                  sessionPayload.allow_promotion_codes = allowPromoCodes;
                 }
                 const session = await stripe.checkout.sessions.create(sessionPayload);
                 return res.json({ url: session.url });
@@ -481,7 +483,6 @@ exports.createCheckoutSession = async (req, res) => {
                     automatic_tax: { enabled: true },
                     // Copy name & address from Checkout to the Customer automatically
                     customer_update: { address: 'auto', name: 'auto' },
-                    allow_promotion_codes: promotionCodeId ? false : allowPromoCodes,
                     client_reference_id: String(tenant._id),
                     success_url: SUCCESS_URL + '?session_id={CHECKOUT_SESSION_ID}',
                     cancel_url: CANCEL_URL,
@@ -492,6 +493,8 @@ exports.createCheckoutSession = async (req, res) => {
                 };
                 if (promotionCodeId) {
                   sessionPayload.discounts = [{ promotion_code: promotionCodeId }];
+                } else {
+                  sessionPayload.allow_promotion_codes = allowPromoCodes;
                 }
                 const session = await stripe.checkout.sessions.create(sessionPayload);
                 return res.json({ url: session.url });
