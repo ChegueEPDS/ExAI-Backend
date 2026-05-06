@@ -3,6 +3,8 @@ const express = require('express');
 const router = express.Router();
 
 const {
+  getPricingCatalog,
+  getOfferPreview,
   createCheckoutSession,
   createBillingPortal,
   handleBillingPortalReturn,
@@ -105,6 +107,9 @@ async function validateCheckoutBody(req, res, next) {
 }
 
 // --- Billing endpointok ---
+
+router.get('/offer-preview', getOfferPreview);
+router.get('/catalog', getPricingCatalog);
 
 // Checkout: auth + normalizálás
 router.post('/checkout', requireAuth, validateCheckoutBody, createCheckoutSession);

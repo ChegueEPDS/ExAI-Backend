@@ -168,6 +168,11 @@ exports.listUsers = async (req, res) => {
       preLookupMatch.tenantId = new mongoose.Types.ObjectId(String(tenantId));
     }
 
+    const search = String(req.query.search || '').trim();
+    const sortByRaw = String(req.query.sortBy || 'firstName').trim();
+    const sortDirRaw = String(req.query.sortDir || 'asc').trim().toLowerCase();
+    const sortDir = sortDirRaw === 'desc' ? -1 : 1;
+
     const pipeline = [];
     if (Object.keys(preLookupMatch).length > 0) {
       pipeline.push({ $match: preLookupMatch });
@@ -238,8 +243,6 @@ exports.listUsers = async (req, res) => {
       },
       { $addFields: { pendingCount: { $ifNull: [ { $arrayElemAt: ['$pendingAgg.count', 0] }, 0 ] } } },
       { $unset: 'pendingAgg' },
-      // Stabil, determinisztikus sorrend (kliens oldali szűrés/rendezés/lapozás lesz)
-      { $sort: { firstName: 1, _id: 1 } },
       {
         $project: {
           _id: 0,
@@ -265,6 +268,41 @@ exports.listUsers = async (req, res) => {
       }
     );
 
+    if (search) {
+      const rx = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      pipeline.push({
+        $match: {
+          $or: [
+            { firstName: rx },
+            { lastName: rx },
+            { email: rx },
+            { tenantName: rx },
+            { tenantPlan: rx },
+            { subscriptionTier: rx },
+            { subscriptionStatus: rx }
+          ]
+        }
+      });
+    }
+
+    const sortFieldMap = {
+      firstName: 'firstName',
+      lastName: 'lastName',
+      email: 'email',
+      tenantName: 'tenantName',
+      subscriptionTier: 'subscriptionTier',
+      subscriptionStatus: 'subscriptionStatus',
+      subscriptionExpiresAt: 'subscriptionExpiresAt',
+      azureId: 'azureId',
+      stats: 'publicContributionCount'
+    };
+    const sortField = sortFieldMap[sortByRaw] || 'firstName';
+    const sortSpec = { [sortField]: sortDir };
+    if (sortField !== 'firstName') sortSpec.firstName = 1;
+    if (sortField !== 'lastName') sortSpec.lastName = 1;
+    sortSpec.id = 1;
+    const sortStage = { $sort: sortSpec };
+
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const pageSizeRaw = parseInt(req.query.pageSize, 10) || 25;
     const allowedPageSizes = [10, 25, 50];
@@ -274,11 +312,12 @@ exports.listUsers = async (req, res) => {
     const [rows, total] = await Promise.all([
       User.aggregate([
         ...pipeline,
+        sortStage,
         { $skip: skip },
         { $limit: pageSize }
       ]),
       User.aggregate([
-        ...(Object.keys(preLookupMatch).length > 0 ? [{ $match: preLookupMatch }] : []),
+        ...pipeline,
         { $count: 'count' }
       ]).then(countArr => (countArr[0]?.count || 0))
     ]);

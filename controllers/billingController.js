@@ -14,7 +14,376 @@ if (stripeKey) {
 
 const { ensureStripeCustomerForTenant } = require('../services/stripeCustomerProvisioning');
 
-async function resolvePromotionCodeId({ customerId, promoCode }) {
+const brevoService = require('../services/brevoService');
+
+// Env-driven toggle for phone collection in Checkout (default: false)
+const COLLECT_PHONE = String(process.env.STRIPE_CHECKOUT_COLLECT_PHONE || 'false').toLowerCase() === 'true';
+
+const DISPLAY_PRICE_BY_PLAN = Object.freeze({
+  pro: {
+    billingPeriod: 'month',
+    currency: 'EUR',
+    amount: 9,
+    cadenceLabel: '/ month',
+    billedAmount: 9,
+    billedLabel: '9 EUR billed monthly',
+  },
+  team: {
+    billingPeriod: 'month',
+    currency: 'EUR',
+    amount: 20,
+    cadenceLabel: '/ month',
+    billedAmount: 20,
+    billedLabel: '20 EUR billed monthly',
+    seatPricing: {
+      minimumSeats: 5,
+      additionalSeatAmount: 2,
+      additionalSeatMonthlyAmount: 2,
+      additionalSeatBillingPeriod: 'month',
+    },
+  },
+  pro_yearly: {
+    billingPeriod: 'year',
+    currency: 'EUR',
+    amount: 7.5,
+    cadenceLabel: '/ month',
+    billedAmount: 90,
+    billedLabel: '90 EUR billed yearly',
+  },
+  team_yearly: {
+    billingPeriod: 'year',
+    currency: 'EUR',
+    amount: 15,
+    cadenceLabel: '/ month',
+    billedAmount: 180,
+    billedLabel: '180 EUR billed yearly',
+    seatPricing: {
+      minimumSeats: 5,
+      additionalSeatAmount: 18,
+      additionalSeatMonthlyAmount: 1.5,
+      additionalSeatBillingPeriod: 'year',
+    },
+  }
+});
+
+function normalizeRequestedPlan({ plan, product, billingPeriod }) {
+  const rawPlan = String(plan || '').trim().toLowerCase();
+  if (['pro', 'team', 'pro_yearly', 'team_yearly'].includes(rawPlan)) return rawPlan;
+
+  const normalizedProduct = String(product || '').trim().toLowerCase() === 'team' ? 'team' : 'pro';
+  const normalizedPeriod = String(billingPeriod || '').trim().toLowerCase() === 'year' ? 'year' : 'month';
+  return normalizedProduct === 'team'
+    ? (normalizedPeriod === 'year' ? 'team_yearly' : 'team')
+    : (normalizedPeriod === 'year' ? 'pro_yearly' : 'pro');
+}
+
+async function resolvePriceAndProductIdsForPlan(plan) {
+  const normalizedPlan = normalizeRequestedPlan({ plan });
+  const PRICE_BY_PLAN = {
+    pro: process.env.STRIPE_PRICE_PRO,
+    team: process.env.STRIPE_PRICE_TEAM,
+    pro_yearly: process.env.STRIPE_PRICE_PRO_YEARLY,
+    team_yearly: process.env.STRIPE_PRICE_TEAM_YEARLY || process.env.STRIPE_PRICE_TEAM,
+  };
+  const priceId = String(PRICE_BY_PLAN[normalizedPlan] || '').trim();
+  if (!priceId || !stripe) return { normalizedPlan, priceId: priceId || null, productId: null };
+
+  try {
+    const price = await stripe.prices.retrieve(priceId, { expand: ['tiers'] });
+    return {
+      normalizedPlan,
+      priceId,
+      productId: price?.product ? String(price.product) : null,
+    };
+  } catch {
+    return { normalizedPlan, priceId, productId: null };
+  }
+}
+
+async function resolveDisplayPriceForPlan(plan, options = {}) {
+  const normalizedPlan = normalizeRequestedPlan({ plan });
+  const fallback = DISPLAY_PRICE_BY_PLAN[normalizedPlan];
+  const { priceId, productId } = await resolvePriceAndProductIdsForPlan(normalizedPlan);
+  if (!priceId || !stripe) {
+    return {
+      plan: normalizedPlan,
+      priceId: priceId || null,
+      productId: productId || null,
+      ...fallback,
+      source: 'fallback',
+    };
+  }
+
+  try {
+    const price = await stripe.prices.retrieve(priceId, { expand: ['tiers'] });
+    const unitAmount = Number(price?.unit_amount || 0) / 100;
+    const currency = String(price?.currency || fallback?.currency || 'EUR').toUpperCase();
+    const interval = String(price?.recurring?.interval || fallback?.billingPeriod || 'month').toLowerCase();
+    const intervalCount = Math.max(1, Number(price?.recurring?.interval_count || 1));
+    const requestedSeats = Number(options?.seats);
+    const defaultQuantity = normalizedPlan.startsWith('team')
+      ? Math.max(5, Number.isFinite(requestedSeats) ? requestedSeats : 5)
+      : 1;
+    const tiers = Array.isArray(price?.tiers) ? price.tiers : [];
+
+    const computeTieredTotal = (qty) => {
+      if (!tiers.length) return 0;
+      const quantity = Math.max(0, Number(qty || 0));
+      const cents = (value) => Number(value || 0);
+
+      if (String(price?.tiers_mode || '').toLowerCase() === 'volume') {
+        const tier = tiers.find((entry) => {
+          const upTo = entry?.up_to;
+          return upTo === 'inf' || quantity <= Number(upTo);
+        }) || tiers[tiers.length - 1];
+        return (cents(tier?.flat_amount) + (cents(tier?.unit_amount) * quantity)) / 100;
+      }
+
+      let remaining = quantity;
+      let previousUpTo = 0;
+      let totalCents = 0;
+      for (const tier of tiers) {
+        if (remaining <= 0) break;
+        const upTo = tier?.up_to == null || tier?.up_to === 'inf' ? Infinity : Number(tier.up_to);
+        const tierUnits = Math.max(0, Math.min(remaining, upTo - previousUpTo));
+        if (tierUnits > 0 || cents(tier?.flat_amount) > 0) {
+          totalCents += cents(tier?.flat_amount);
+          totalCents += cents(tier?.unit_amount) * tierUnits;
+        }
+        remaining -= tierUnits;
+        previousUpTo = Number.isFinite(upTo) ? upTo : previousUpTo;
+      }
+      return totalCents / 100;
+    };
+
+    const extractSeatPricing = () => {
+      if (!normalizedPlan.startsWith('team') || !tiers.length) return null;
+      const firstTier = tiers[0] || {};
+      const secondTier = tiers[1] || {};
+      const minimumSeats = Math.max(1, Number(firstTier?.up_to || 1));
+      const additionalSeatAmount = secondTier?.unit_amount != null && Number.isFinite(Number(secondTier.unit_amount))
+        ? Number(secondTier.unit_amount) / 100
+        : null;
+      const additionalSeatMonthlyAmount = additionalSeatAmount == null
+        ? null
+        : (interval === 'year' ? additionalSeatAmount / (12 * intervalCount) : additionalSeatAmount / intervalCount);
+      return {
+        minimumSeats,
+        additionalSeatAmount,
+        additionalSeatMonthlyAmount,
+        additionalSeatBillingPeriod: interval === 'year' ? 'year' : 'month',
+      };
+    };
+
+    let amount = unitAmount;
+    let cadenceLabel = '/ month';
+    let billedAmount = unitAmount;
+    let billedLabel = `${unitAmount} ${currency} billed monthly`;
+    let billingPeriod = interval === 'year' ? 'year' : 'month';
+
+    if (String(price?.billing_scheme || '').toLowerCase() === 'tiered') {
+      billedAmount = computeTieredTotal(defaultQuantity);
+      amount = billedAmount;
+    }
+
+    if (interval === 'year') {
+      if (String(price?.billing_scheme || '').toLowerCase() === 'tiered') {
+        amount = billedAmount / (12 * intervalCount);
+      } else {
+        amount = unitAmount / (12 * intervalCount);
+        billedAmount = unitAmount;
+      }
+      cadenceLabel = '/ month';
+      billedLabel = `${unitAmount} ${currency} billed yearly`;
+      billingPeriod = 'year';
+    } else if (interval === 'month') {
+      if (String(price?.billing_scheme || '').toLowerCase() === 'tiered') {
+        amount = billedAmount / intervalCount;
+      } else {
+        amount = unitAmount / intervalCount;
+        billedAmount = unitAmount;
+      }
+      cadenceLabel = intervalCount === 1 ? '/ month' : `/ ${intervalCount} months`;
+      billedLabel = intervalCount === 1
+        ? `${unitAmount} ${currency} billed monthly`
+        : `${unitAmount} ${currency} billed every ${intervalCount} months`;
+      billingPeriod = 'month';
+    }
+
+    if (String(price?.billing_scheme || '').toLowerCase() === 'tiered') {
+      billedLabel = interval === 'year'
+        ? `${billedAmount} ${currency} billed yearly`
+        : `${billedAmount} ${currency} billed monthly`;
+    }
+
+    return {
+      plan: normalizedPlan,
+      priceId,
+      productId: price?.product ? String(price.product) : productId || null,
+      billingPeriod,
+      currency,
+      amount,
+      cadenceLabel,
+      billedAmount,
+      billedLabel,
+      seatPricing: extractSeatPricing(),
+      source: 'stripe',
+    };
+  } catch {
+    return {
+      plan: normalizedPlan,
+      priceId: priceId || null,
+      productId: productId || null,
+      ...fallback,
+      source: 'fallback',
+    };
+  }
+}
+
+async function buildPricingCatalog() {
+  const plans = ['pro', 'team', 'pro_yearly', 'team_yearly'];
+  const entries = await Promise.all(plans.map((plan) => resolveDisplayPriceForPlan(plan)));
+  return entries.reduce((acc, entry) => {
+    acc[entry.plan] = entry;
+    return acc;
+  }, {});
+}
+
+function computeDiscountedAmount(baseAmount, promoMeta) {
+  const amount = Number(baseAmount || 0);
+  if (!promoMeta?.valid) return amount;
+
+  if (promoMeta.amountOff != null && Number.isFinite(Number(promoMeta.amountOff))) {
+    return Math.max(0, amount - Number(promoMeta.amountOff));
+  }
+  if (promoMeta.percentOff != null && Number.isFinite(Number(promoMeta.percentOff))) {
+    return Math.max(0, amount * (1 - (Number(promoMeta.percentOff) / 100)));
+  }
+  return amount;
+}
+
+/**
+ * Promotion coupon applicability rules
+ *
+ * Priority / matching order:
+ * 1. Stripe-native `coupon.applies_to.products`, if Stripe returns it
+ * 2. `coupon.metadata.applicable_plan`, if present
+ * 3. Otherwise `coupon.metadata.applicable_product` + `coupon.metadata.applicable_for`
+ * 4. If none of the above are present, the coupon is treated as applicable to every plan
+ *
+ * Supported metadata values:
+ *
+ * `applicable_for`
+ * - `monthly` / `month` => monthly plans only
+ * - `yearly` / `year` / `annual` / `annually` => yearly plans only
+ * - empty / missing / `all` / `both` / `any` => both monthly and yearly
+ *
+ * `applicable_product`
+ * - `team` => Team monthly + Team yearly
+ * - `pro` => Pro monthly + Pro yearly
+ * - empty / missing / `all` / `both` / `any` => both products
+ *
+ * `applicable_plan`
+ * - `pro_monthly`
+ * - `team_monthly`
+ * - `pro_yearly`
+ * - `team_yearly`
+ * - `pro` => Pro monthly + Pro yearly
+ * - `team` => Team monthly + Team yearly
+ * - empty / missing / `all` / `both` / `any` => no explicit plan restriction
+ *
+ * Notes:
+ * - `applicable_plan` is stronger than `applicable_product` / `applicable_for`
+ * - Stripe `applies_to.products` is still honored whenever Stripe provides it
+ * - Final applicability is effectively the intersection of all available restrictions
+ */
+function readCouponBillingPeriodMetadata(coupon) {
+  const metadata = coupon?.metadata || {};
+  const raw = metadata.applicable_for;
+
+  const normalized = String(raw || '').trim().toLowerCase();
+  if (!normalized || ['all', 'both', 'any'].includes(normalized)) return null;
+  if (['month', 'monthly'].includes(normalized)) return 'month';
+  if (['year', 'yearly', 'annual', 'annually'].includes(normalized)) return 'year';
+  return null;
+}
+
+function readCouponPlanMetadata(coupon) {
+  const metadata = coupon?.metadata || {};
+  const raw = String(metadata.applicable_plan || '').trim().toLowerCase();
+  if (!raw || ['all', 'both', 'any'].includes(raw)) return null;
+  if (['pro', 'team', 'pro_monthly', 'team_monthly', 'pro_yearly', 'team_yearly'].includes(raw)) return raw;
+  return null;
+}
+
+function readCouponProductMetadata(coupon) {
+  const metadata = coupon?.metadata || {};
+  const raw = String(metadata.applicable_product || '').trim().toLowerCase();
+  if (!raw || ['all', 'both', 'any'].includes(raw)) return null;
+  if (['pro', 'team'].includes(raw)) return raw;
+  return null;
+}
+
+function resolvePlanBillingPeriod(normalizedPlan) {
+  return String(normalizedPlan || '').endsWith('_yearly') ? 'year' : 'month';
+}
+
+function resolvePlanBaseProduct(normalizedPlan) {
+  return String(normalizedPlan || '').startsWith('team') ? 'team' : 'pro';
+}
+
+function isCouponApplicableToPlan({ coupon, productId, normalizedPlan }) {
+  const appliesToProducts = Array.isArray(coupon?.applies_to?.products)
+    ? coupon.applies_to.products.map(String)
+    : [];
+  if (appliesToProducts.length && productId && !appliesToProducts.includes(String(productId))) {
+    return false;
+  }
+
+  const applicablePlan = readCouponPlanMetadata(coupon);
+  if (applicablePlan) {
+    const planBillingPeriod = resolvePlanBillingPeriod(normalizedPlan);
+    const baseProduct = resolvePlanBaseProduct(normalizedPlan);
+    if (applicablePlan === 'pro' || applicablePlan === 'team') {
+      if (applicablePlan !== baseProduct) {
+        return false;
+      }
+    } else if (applicablePlan === 'pro_monthly' || applicablePlan === 'team_monthly') {
+      const [product] = applicablePlan.split('_');
+      if (product !== baseProduct || planBillingPeriod !== 'month') {
+        return false;
+      }
+    } else if (applicablePlan === 'pro_yearly' || applicablePlan === 'team_yearly') {
+      const [product] = applicablePlan.split('_');
+      if (product !== baseProduct || planBillingPeriod !== 'year') {
+        return false;
+      }
+    } else if (applicablePlan !== normalizedPlan) {
+      return false;
+    }
+  }
+  else {
+    const applicableProduct = readCouponProductMetadata(coupon);
+    if (applicableProduct) {
+      const baseProduct = resolvePlanBaseProduct(normalizedPlan);
+      if (applicableProduct !== baseProduct) {
+        return false;
+      }
+    }
+
+    const applicableFor = readCouponBillingPeriodMetadata(coupon);
+    if (applicableFor) {
+      const planBillingPeriod = resolvePlanBillingPeriod(normalizedPlan);
+      if (applicableFor !== planBillingPeriod) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+async function resolvePromotionCodeId({ customerId, promoCode, normalizedPlan }) {
   const normalizedCode = String(promoCode || '').trim();
   if (!normalizedCode) return null;
   if (!stripe) throw new Error('Stripe is not configured');
@@ -36,12 +405,92 @@ async function resolvePromotionCodeId({ customerId, promoCode }) {
   if (!match?.id) {
     throw new Error(`Invalid or unavailable promotion code: ${normalizedCode}`);
   }
+
+  if (normalizedPlan) {
+    const { productId } = await resolvePriceAndProductIdsForPlan(normalizedPlan);
+    const couponRef = match?.coupon;
+    const couponId = typeof couponRef === 'string' ? couponRef : String(couponRef?.id || '');
+    const coupon = couponId ? await stripe.coupons.retrieve(couponId) : null;
+    const applies = isCouponApplicableToPlan({ coupon, productId, normalizedPlan });
+    if (!applies) {
+      throw new Error(`Promotion code ${normalizedCode} is not applicable to ${normalizedPlan}`);
+    }
+  }
+
   return String(match.id);
 }
-const brevoService = require('../services/brevoService');
 
-// Env-driven toggle for phone collection in Checkout (default: false)
-const COLLECT_PHONE = String(process.env.STRIPE_CHECKOUT_COLLECT_PHONE || 'false').toLowerCase() === 'true';
+async function resolvePromotionPreview({ promoCode, normalizedPlan }) {
+  const normalizedCode = String(promoCode || '').trim();
+  if (!normalizedCode) return null;
+  if (!stripe) return { code: normalizedCode, valid: false, reason: 'stripe_not_configured' };
+
+  const { productId } = await resolvePriceAndProductIdsForPlan(normalizedPlan);
+  const result = await stripe.promotionCodes.list({
+    code: normalizedCode,
+    active: true,
+    limit: 100,
+  });
+  const candidates = Array.isArray(result?.data) ? result.data : [];
+  const unrestricted = candidates.find((entry) => entry?.active && !entry?.customer) || null;
+
+  if (!unrestricted) {
+    return { code: normalizedCode, valid: false, reason: 'not_found_or_restricted' };
+  }
+
+  const couponRef = unrestricted?.coupon;
+  const couponId = typeof couponRef === 'string' ? couponRef : String(couponRef?.id || '');
+  const coupon = couponId ? await stripe.coupons.retrieve(couponId) : null;
+  console.info('[billing] promo preview stripe objects:', JSON.stringify({
+    normalizedPlan,
+    requestedCode: normalizedCode,
+    promotionCode: unrestricted ? {
+      id: unrestricted.id || null,
+      code: unrestricted.code || null,
+      active: Boolean(unrestricted.active),
+      customer: unrestricted.customer || null,
+      expiresAt: unrestricted.expires_at || null,
+      restrictions: unrestricted.restrictions || null,
+      metadata: unrestricted.metadata || {},
+      coupon: typeof unrestricted.coupon === 'string'
+        ? unrestricted.coupon
+        : unrestricted.coupon || null,
+    } : null,
+    coupon: coupon ? {
+      id: coupon.id || null,
+      name: coupon.name || null,
+      valid: Boolean(coupon.valid),
+      percent_off: coupon.percent_off ?? null,
+      amount_off: coupon.amount_off ?? null,
+      currency: coupon.currency ?? null,
+      duration: coupon.duration ?? null,
+      duration_in_months: coupon.duration_in_months ?? null,
+      redeem_by: coupon.redeem_by ?? null,
+      applies_to: coupon.applies_to ?? null,
+      metadata: coupon.metadata || {},
+    } : null,
+  }));
+  const applies = isCouponApplicableToPlan({ coupon, productId, normalizedPlan });
+
+  if (!applies) {
+    return { code: normalizedCode, valid: false, reason: 'not_applicable_to_selected_plan' };
+  }
+
+  return {
+    code: unrestricted.code || normalizedCode,
+    promotionCodeId: unrestricted.id ? String(unrestricted.id) : null,
+    valid: true,
+    percentOff: coupon?.percent_off != null && Number.isFinite(Number(coupon.percent_off))
+      ? Number(coupon.percent_off)
+      : null,
+    amountOff: coupon?.amount_off != null && Number.isFinite(Number(coupon.amount_off))
+      ? Number(coupon.amount_off) / 100
+      : null,
+    duration: coupon?.duration || null,
+    durationInMonths: coupon?.duration_in_months || null,
+    expiresAt: unrestricted?.expires_at ? new Date(Number(unrestricted.expires_at) * 1000).toISOString() : null,
+  };
+}
 
 // kis helper, hogy endpoint elején ellenőrizzünk
 function requireStripeOrFail(res) {
@@ -148,6 +597,65 @@ async function resolveStripeCustomerId(tenantId) {
   }
   return fromSub;
 }
+
+exports.getOfferPreview = async (req, res) => {
+  if (!requireStripeOrFail(res)) return;
+
+  try {
+    const normalizedPlan = normalizeRequestedPlan({
+      plan: req.query?.plan,
+      product: req.query?.product,
+      billingPeriod: req.query?.billingPeriod || req.query?.period,
+    });
+    const requestedSeats = Number(req.query?.seats);
+    const pricing = await resolveDisplayPriceForPlan(normalizedPlan, {
+      seats: normalizedPlan.startsWith('team') ? requestedSeats : 1,
+    });
+    if (!pricing) {
+      return res.status(400).json({ message: 'Unsupported plan' });
+    }
+
+    const promoCode = String(req.query?.promoCode || req.query?.promo || '').trim();
+    const promo = promoCode
+      ? await resolvePromotionPreview({ promoCode, normalizedPlan })
+      : null;
+
+    const discountedFirstPayment = promo?.valid
+      ? computeDiscountedAmount(pricing.billedAmount, promo)
+      : pricing.billedAmount;
+
+    return res.json({
+      plan: normalizedPlan,
+      billingPeriod: pricing.billingPeriod,
+      pricing,
+      promo,
+      effective: {
+        hasDiscount: Boolean(promo?.valid),
+        firstPaymentAmount: discountedFirstPayment,
+        firstPaymentLabel: promo?.valid
+          ? `${discountedFirstPayment} ${pricing.currency} first payment`
+          : pricing.billedLabel,
+        recurringAmount: pricing.billedAmount,
+        recurringLabel: pricing.billedLabel,
+      }
+    });
+  } catch (e) {
+    console.error('[billing] getOfferPreview error', e);
+    return res.status(500).json({ message: e?.message || 'Failed to resolve offer preview' });
+  }
+};
+
+exports.getPricingCatalog = async (req, res) => {
+  if (!requireStripeOrFail(res)) return;
+
+  try {
+    const catalog = await buildPricingCatalog();
+    return res.json({ items: catalog });
+  } catch (e) {
+    console.error('[billing] getPricingCatalog error', e);
+    return res.status(500).json({ message: e?.message || 'Failed to load pricing catalog' });
+  }
+};
 // POST /api/billing/checkout
 // Body (normalizált a route middleware által): 
 //   { tenantId: string, plan: 'pro'|'team', seats: number, priceId?, successUrl?, cancelUrl?, companyName?, userId? }
@@ -282,7 +790,7 @@ exports.createCheckoutSession = async (req, res) => {
                 billingPeriod,
                 metadataPlan: normalizedPlan
             }, null, 2));
-            const promotionCodeId = await resolvePromotionCodeId({ customerId, promoCode });
+            const promotionCodeId = await resolvePromotionCodeId({ customerId, promoCode, normalizedPlan });
             const sessionPayload = {
                 mode: 'subscription',
                 customer: customerId,
@@ -401,7 +909,7 @@ exports.createCheckoutSession = async (req, res) => {
                     metadataPlan: normalizedPlan,
                     meta
                 }, null, 2));
-                const promotionCodeId = await resolvePromotionCodeId({ customerId, promoCode });
+                const promotionCodeId = await resolvePromotionCodeId({ customerId, promoCode, normalizedPlan });
                 const sessionPayload = {
                     mode: 'subscription',
                     customer: customerId,
@@ -466,7 +974,7 @@ exports.createCheckoutSession = async (req, res) => {
                     metadataPlan: normalizedPlan,
                     meta
                 }, null, 2));
-                const promotionCodeId = await resolvePromotionCodeId({ customerId, promoCode });
+                const promotionCodeId = await resolvePromotionCodeId({ customerId, promoCode, normalizedPlan });
                 const sessionPayload = {
                     mode: 'subscription',
                     customer: customerId,
