@@ -365,33 +365,50 @@ exports.register = async (req, res) => {
 // ----------------------
 exports.login = async (req, res) => {
   const { email, password, tenantName } = req.body;
+  const startedAt = Date.now();
+  const loginEmail = String(email || '').trim().toLowerCase();
+  const stepLog = (step) => {
+    console.log(`[auth.login] ${step} email=${loginEmail || '-'} client=${req.headers?.['x-client'] || '-'} elapsedMs=${Date.now() - startedAt}`);
+  };
 
   try {
+    stepLog('start');
     if (!email || !password) {
+      stepLog('missing-credentials');
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
     let user = await User.findOne({ email });
+    stepLog('user-loaded');
     if (!user) {
+      stepLog('user-not-found');
       return res.status(400).json({ error: 'User not found with this email' });
     }
 
     const isPasswordValid = await bcrypt.compare(password, user.password);
+    stepLog('password-checked');
     if (!isPasswordValid) {
+      stepLog('bad-password');
       return res.status(400).json({ error: 'Incorrect password' });
     }
 
     if (user.emailVerified === false) {
+      stepLog('email-not-verified');
       return res.status(403).json({ error: 'Please verify your email address before logging in.' });
     }
 
     // Ha régi usernek nincs tenantja → állítsuk be tenantName alapján, különben personal
     if (!user.tenantId) {
+      stepLog('ensure-tenant-start');
       const ensured = await ensureTenantForUserFromName(user, tenantName);
       user = ensured.user;
+      stepLog('ensure-tenant-done');
     }
 
+    stepLog('sign-token-start');
     const token = await signAccessTokenWithSubscription(user, { expiresIn: getAccessTokenExpiresIn(req) });
+    stepLog('sign-token-done');
+    stepLog('success-response');
     return res.status(200).json({ token });
   } catch (error) {
     console.error('❌ Login error:', error);
