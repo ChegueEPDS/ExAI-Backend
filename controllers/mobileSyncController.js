@@ -92,15 +92,19 @@ function buildClientChanges({
   failureNote,
   failureSeverity,
   normalizedProtectionTypes,
+  clearBaseFields,
+  otherInfoPresent,
+  failureNotePresent,
   manualFields,
   manualExMarking
 }) {
   const equipment = {};
-  if (eqIdRaw) equipment.EqID = eqIdRaw;
-  if (equipmentTypeRaw) equipment.equipmentType = equipmentTypeRaw;
+  const shouldClear = (key) => clearBaseFields && clearBaseFields.has(key);
+  if (eqIdRaw || shouldClear('EqID')) equipment.EqID = eqIdRaw;
+  if (equipmentTypeRaw || shouldClear('equipmentType')) equipment.equipmentType = equipmentTypeRaw;
   equipment.Compliance = compliance;
-  equipment.otherInfo = otherInfo;
-  if (failureNote != null) equipment.failureNote = failureNote;
+  if (otherInfoPresent || shouldClear('otherInfo')) equipment.otherInfo = otherInfo;
+  if (failureNotePresent || shouldClear('failureNote')) equipment.failureNote = failureNote;
   if (failureSeverity != null) equipment.failureSeverity = failureSeverity;
 
   const fields = {};
@@ -120,7 +124,7 @@ function buildClientChanges({
   const out = { equipment };
   if (Object.keys(fields).length) out.fields = fields;
   if (Object.keys(exMarking).length) out.exMarking = exMarking;
-  if (Array.isArray(normalizedProtectionTypes) && normalizedProtectionTypes.length) {
+  if (Array.isArray(normalizedProtectionTypes) && (normalizedProtectionTypes.length || shouldClear('protectionTypes'))) {
     out.protectionTypes = normalizedProtectionTypes;
   }
   return out;
@@ -306,9 +310,13 @@ exports.mobileSync = async (req, res) => {
       return res.status(400).json({ message: `Item ${tempId}: missing Site/Zone.` });
     }
 
+    const hasOwn = (obj, key) => !!obj && typeof obj === 'object' && Object.prototype.hasOwnProperty.call(obj, key);
+    const clearBaseFields = new Set(Array.isArray(item?.clearBaseFields) ? item.clearBaseFields.map((k) => String(k || '').trim()).filter(Boolean) : []);
+
     const eqIdRaw = typeof item?.EqID === 'string' ? item.EqID.trim() : '';
     const EqID = eqIdRaw || `MOB_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const compliance = normalizeCompliance(item?.Compliance ?? item?.compliance, 'NA');
+    const otherInfoPresent = hasOwn(item, 'Other Info') || hasOwn(item, 'otherInfo');
     const otherInfo = item?.['Other Info'] ?? item?.otherInfo ?? '';
     const equipmentTypeRaw =
       typeof item?.equipmentType === 'string'
@@ -318,6 +326,7 @@ exports.mobileSync = async (req, res) => {
           : typeof item?.EquipmentType === 'string'
             ? item.EquipmentType.trim()
             : '';
+    const failureNotePresent = hasOwn(item, 'failureNote') || hasOwn(item, 'Failure Note');
     const failureNote =
       typeof item?.failureNote === 'string'
         ? item.failureNote
@@ -339,7 +348,6 @@ exports.mobileSync = async (req, res) => {
     const manualFields = manual?.fields && typeof manual.fields === 'object' ? manual.fields : null;
     const manualExMarking = manual?.exMarking && typeof manual.exMarking === 'object' ? manual.exMarking : null;
 
-    const hasOwn = (obj, key) => !!obj && typeof obj === 'object' && Object.prototype.hasOwnProperty.call(obj, key);
     const pickManualString = (obj, key) => {
       if (!hasOwn(obj, key)) return { present: false, value: '' };
       return { present: true, value: String(obj[key] ?? '').trim() };
@@ -392,6 +400,9 @@ exports.mobileSync = async (req, res) => {
             failureNote,
             failureSeverity,
             normalizedProtectionTypes,
+            clearBaseFields,
+            otherInfoPresent,
+            failureNotePresent,
             manualFields,
             manualExMarking
           });
@@ -565,10 +576,10 @@ exports.mobileSync = async (req, res) => {
       existing.Unit = zoneId;
       if (!existing.mobileSync || typeof existing.mobileSync !== 'object') existing.mobileSync = {};
       if (!existing.mobileSync.tempId) existing.mobileSync.tempId = tempId;
-      if (eqIdRaw) existing.EqID = EqID;
-      if (equipmentTypeRaw) existing['Equipment Type'] = equipmentTypeRaw;
+      if (eqIdRaw || clearBaseFields.has('EqID')) existing.EqID = eqIdRaw;
+      if (equipmentTypeRaw || clearBaseFields.has('equipmentType')) existing['Equipment Type'] = equipmentTypeRaw;
       existing.Compliance = compliance;
-      existing['Other Info'] = otherInfo;
+      if (otherInfoPresent || clearBaseFields.has('otherInfo')) existing['Other Info'] = String(otherInfo || '').trim();
 
       // Apply manual field edits (including clearing to '').
       for (const k of allowedFieldKeys) {
@@ -608,6 +619,7 @@ exports.mobileSync = async (req, res) => {
         orderIndex: await getNextOrderIndex(tenantId, siteId, zoneId)
       };
       if (equipmentTypeRaw) equipmentPayload['Equipment Type'] = equipmentTypeRaw;
+      if (otherInfoPresent || clearBaseFields.has('otherInfo')) equipmentPayload['Other Info'] = String(otherInfo || '').trim();
 
       // Apply manual field edits (including clearing to '').
       for (const k of allowedFieldKeys) {
@@ -644,7 +656,7 @@ exports.mobileSync = async (req, res) => {
 
     // Manual protection selection from mobile (applies to existing + new).
     // If empty, we leave it untouched (OCR may fill for newly created equipment later).
-    if ((normalizedProtectionTypes.length || Object.keys(exUpdates).length) && saved) {
+    if ((normalizedProtectionTypes.length || clearBaseFields.has('protectionTypes') || Object.keys(exUpdates).length) && saved) {
       try {
         const marks = Array.isArray(saved['Ex Marking']) ? saved['Ex Marking'] : [];
         if (!marks.length) marks.push({});
@@ -655,7 +667,7 @@ exports.mobileSync = async (req, res) => {
             nextFirst[k] = exUpdates[k];
           });
         }
-        if (normalizedProtectionTypes.length) {
+        if (normalizedProtectionTypes.length || clearBaseFields.has('protectionTypes')) {
           nextFirst['Type of Protection'] = normalizedProtectionTypes.join('; ');
         }
         marks[0] = nextFirst;
