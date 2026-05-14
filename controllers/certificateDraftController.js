@@ -36,7 +36,7 @@ async function ensureLinkForTenant(tenantId, certId, userId, session) {
 /* ===== Single-concurrency processing queue (max 1 concurrent) ===== */
 const PROCESS_CONCURRENCY = 1;
 let activeProcesses = 0;
-const processQueue = []; // items: { uploadId, resolve, reject }
+const processQueue = []; // items: { uploadId, options, resolve, reject }
 const inFlight = new Set(); // uploadIds currently being processed
 const queuedIds = new Set(); // uploadIds queued to avoid duplicates
 
@@ -45,12 +45,12 @@ function runNextProcess() {
   const next = processQueue.shift();
   if (!next) return;
 
-  const { uploadId, resolve, reject } = next;
+  const { uploadId, options, resolve, reject } = next;
   queuedIds.delete(uploadId);
   inFlight.add(uploadId);
   activeProcesses++;
 
-  _processDraftsInternal(uploadId)
+  _processDraftsInternal(uploadId, options)
     .then((result) => resolve(result))
     .catch((err) => reject(err))
     .finally(() => {
@@ -60,13 +60,13 @@ function runNextProcess() {
     });
 }
 
-function enqueueProcess(uploadId) {
+function enqueueProcess(uploadId, options = {}) {
   // avoid duplicate queueing for the same uploadId
   if (inFlight.has(uploadId) || queuedIds.has(uploadId)) {
     return { alreadyQueuedOrRunning: true, position: null };
   }
   return new Promise((resolve, reject) => {
-    processQueue.push({ uploadId, resolve, reject });
+    processQueue.push({ uploadId, options, resolve, reject });
     queuedIds.add(uploadId);
     runNextProcess();
   });
@@ -403,11 +403,17 @@ exports.bulkUpload = [
 ];
 
 // Internal helper for actual processing logic (not Express handler)
-async function _processDraftsInternal(uploadId) {
+async function _processDraftsInternal(uploadId, options = {}) {
   try {
-    const drafts = await DraftCertificate.find({ uploadId });
+    const statusFilter = Array.isArray(options.statuses) && options.statuses.length
+      ? options.statuses.filter((status) => typeof status === 'string' && status.trim()).map((status) => status.trim())
+      : null;
+    const draftsQuery = statusFilter
+      ? { uploadId, status: { $in: statusFilter } }
+      : { uploadId };
+    const drafts = await DraftCertificate.find(draftsQuery);
     if (drafts.length === 0) {
-      throw new Error('No drafts found for this uploadId');
+      throw new Error(statusFilter ? 'No matching drafts found for this uploadId' : 'No drafts found for this uploadId');
     }
     // max párhuzamos feldolgozás (környezeti változóval felülírható)
     const FILE_CONCURRENCY = Math.max(1, Math.min(Number(systemSettings.getNumber('CERT_FILE_CONCURRENCY') || 4), 32));
@@ -436,7 +442,7 @@ async function _processDraftsInternal(uploadId) {
         }
 
         // 2) OpenAI kivonat (backoff + hosszabb timeout a helperben)
-        const tenantId = req.scope?.tenantId || (draft?.tenantId ? String(draft.tenantId) : null);
+        const tenantId = draft?.tenantId ? String(draft.tenantId) : null;
         const extractedData = await retryWithBackoff(
           () => extractCertFieldsFromOCR(recognizedText, { tenantId }),
           { label: 'extractCertFieldsFromOCR' }
@@ -560,6 +566,54 @@ exports.processDrafts = async (req, res) => {
   } catch (err) {
     console.error('❌ Queueing error:', err.message);
     return res.status(500).json({ error: 'Failed to enqueue processing' });
+  }
+};
+
+exports.reprocessNotReadyDrafts = async (req, res) => {
+  const { uploadId } = req.params;
+  const roleRaw = (req.scope?.role || req.scope?.userRole || req.role || '').toString();
+  const isSuperAdmin = /superadmin/i.test(roleRaw);
+
+  if (!isSuperAdmin) {
+    return res.status(403).json({ message: 'Only SuperAdmin can reprocess uploads.' });
+  }
+
+  try {
+    const hasAny = await DraftCertificate.exists({
+      uploadId,
+      status: { $in: ['draft', 'error'] }
+    });
+    if (!hasAny) {
+      return res.status(404).json({ message: 'No draft/error items found for this uploadId' });
+    }
+
+    const willQueue = activeProcesses >= PROCESS_CONCURRENCY;
+    const position = willQueue ? processQueue.length + 1 : 0;
+
+    const p = enqueueProcess(uploadId, { statuses: ['draft', 'error'] });
+
+    if (p && p.alreadyQueuedOrRunning) {
+      return res.status(202).json({
+        message: 'Already queued or running',
+        uploadId,
+        state: inFlight.has(uploadId) ? 'processing' : 'queued',
+        concurrency: { active: activeProcesses, limit: PROCESS_CONCURRENCY, queueLength: processQueue.length }
+      });
+    }
+
+    if (p && typeof p.then === 'function') {
+      p.then(() => { /* no-op */ }).catch((err) => console.error('Retry queue item failed:', err.message));
+    }
+
+    return res.status(202).json({
+      message: willQueue ? `Queued at position ${position}` : 'Reprocessing started',
+      uploadId,
+      state: willQueue ? 'queued' : 'processing',
+      concurrency: { active: activeProcesses, limit: PROCESS_CONCURRENCY, queueLength: processQueue.length }
+    });
+  } catch (err) {
+    console.error('❌ Reprocess queueing error:', err.message);
+    return res.status(500).json({ error: 'Failed to enqueue reprocessing' });
   }
 };
 

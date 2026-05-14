@@ -7,6 +7,7 @@ const authMiddleware = require('../middlewares/authMiddleware')
 
 router.post('/certificates/bulk-upload', authMiddleware(), certificateDraftController.bulkUpload);
 router.post('/certificates/drafts/process/:uploadId', authMiddleware(), certificateDraftController.processDrafts);
+router.post('/certificates/drafts/reprocess-not-ready/:uploadId', authMiddleware(['SuperAdmin']), certificateDraftController.reprocessNotReadyDrafts);
 router.get('/certificates/drafts/:uploadId', authMiddleware(), certificateDraftController.getDraftsByUploadId);
 router.patch('/certificates/drafts/by-id/:id', authMiddleware(), certificateDraftController.updateDraftExtractedById);
 router.post('/certificates/drafts/finalize/by-id/:id', authMiddleware(), certificateDraftController.finalizeSingleDraftById);
