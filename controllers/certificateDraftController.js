@@ -1378,7 +1378,7 @@ exports.getPendingUploads = async (req, res) => {
       const error = Number(c.error || 0);
       const total = Number(c.total || 0);
       const finished = total > 0 && ready + error === total;
-      if (finished) {
+      if (finished && !queueState) {
         queueState = null;
         queuePosition = null;
       }
