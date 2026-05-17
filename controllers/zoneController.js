@@ -13,6 +13,7 @@ const ExcelJS = require('exceljs');
 const sharp = require('sharp');
 const heicConvert = require('heic-convert');
 const { computeOperationalSummary, computeMaintenanceSeveritySummary } = require('../services/operationalSummaryService');
+const { sanitizeCustomFields } = require('../services/customFieldService');
 
 // Helper: convert string tenantId to ObjectId safely
 const toObjectId = (id) => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null);
@@ -145,8 +146,15 @@ exports.createZone = async (req, res) => {
       }
     }
 
+    const customFields = await sanitizeCustomFields({
+      tenantId: tenantObjectId,
+      entityType: 'zone',
+      values: rest.customFields
+    });
+
     const unit = new Unit({
       ...rest,
+      customFields,
       Site: siteIdFinal,
       parentUnitId: parentUnit ? parentUnit._id : null,
       ancestors: parentUnit ? [...(parentUnit.ancestors || []), parentUnit._id] : [],
@@ -356,6 +364,14 @@ exports.updateZone = async (req, res) => {
       AmbientTempMax,
       ...restBody
     } = req.body || {};
+
+    if (Object.prototype.hasOwnProperty.call(restBody, 'customFields')) {
+      restBody.customFields = await sanitizeCustomFields({
+        tenantId: tenantObjectId,
+        entityType: 'zone',
+        values: restBody.customFields
+      });
+    }
 
     Object.assign(zone, restBody);
 

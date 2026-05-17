@@ -128,7 +128,12 @@ const UnitSchema = new mongoose.Schema(
         AmbientTempMin: { type: Number },
         AmbientTempMax: { type: Number },
       }
-    ]
+    ],
+    customFields: {
+      type: Map,
+      of: mongoose.Schema.Types.Mixed,
+      default: {}
+    }
   },
   { timestamps: true, collection: 'zones' }
 );

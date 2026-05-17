@@ -99,7 +99,12 @@ const EquipmentSchema = new mongoose.Schema({
     index: true
   },
   operationalStatusChangedAt: { type: Date, default: null },
-  operationalStatusChangedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }
+  operationalStatusChangedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  customFields: {
+    type: Map,
+    of: mongoose.Schema.Types.Mixed,
+    default: {}
+  }
 }, { timestamps: true }); // ⏳ Timestamps (createdAt, updatedAt)
 
 // Lookup helper for mobile sync retries (not unique to avoid migration issues if old duplicates exist).

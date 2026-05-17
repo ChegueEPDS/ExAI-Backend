@@ -15,6 +15,7 @@ const { normalizeProtectionTypes } = require('../helpers/protectionTypes');
 const SyncTombstone = require('../models/syncTombstone');
 const { parseSinceDate } = require('../services/syncTombstoneService');
 const { notifyAndStore } = require('../lib/notifications/notifier');
+const { sanitizeCustomFields } = require('../services/customFieldService');
 
 const toObjectId = (value) => {
   if (!value) return null;
@@ -92,6 +93,7 @@ function buildClientChanges({
   failureNote,
   failureSeverity,
   normalizedProtectionTypes,
+  customFields,
   clearBaseFields,
   otherInfoPresent,
   failureNotePresent,
@@ -124,6 +126,9 @@ function buildClientChanges({
   const out = { equipment };
   if (Object.keys(fields).length) out.fields = fields;
   if (Object.keys(exMarking).length) out.exMarking = exMarking;
+  if (customFields && typeof customFields === 'object' && Object.keys(customFields).length) {
+    out.customFields = { ...customFields };
+  }
   if (Array.isArray(normalizedProtectionTypes) && (normalizedProtectionTypes.length || shouldClear('protectionTypes'))) {
     out.protectionTypes = normalizedProtectionTypes;
   }
@@ -347,6 +352,12 @@ exports.mobileSync = async (req, res) => {
     const manual = item?.manual && typeof item.manual === 'object' ? item.manual : null;
     const manualFields = manual?.fields && typeof manual.fields === 'object' ? manual.fields : null;
     const manualExMarking = manual?.exMarking && typeof manual.exMarking === 'object' ? manual.exMarking : null;
+    const rawCustomFields = item?.customFields && typeof item.customFields === 'object' && !Array.isArray(item.customFields)
+      ? item.customFields
+      : null;
+    const customFields = rawCustomFields
+      ? await sanitizeCustomFields({ tenantId, entityType: 'equipment', values: rawCustomFields })
+      : null;
 
     const pickManualString = (obj, key) => {
       if (!hasOwn(obj, key)) return { present: false, value: '' };
@@ -400,6 +411,7 @@ exports.mobileSync = async (req, res) => {
             failureNote,
             failureSeverity,
             normalizedProtectionTypes,
+            customFields,
             clearBaseFields,
             otherInfoPresent,
             failureNotePresent,
@@ -580,6 +592,10 @@ exports.mobileSync = async (req, res) => {
       if (equipmentTypeRaw || clearBaseFields.has('equipmentType')) existing['Equipment Type'] = equipmentTypeRaw;
       existing.Compliance = compliance;
       if (otherInfoPresent || clearBaseFields.has('otherInfo')) existing['Other Info'] = String(otherInfo || '').trim();
+      if (customFields) {
+        existing.customFields = customFields;
+        if (existing.markModified) existing.markModified('customFields');
+      }
 
       // Apply manual field edits (including clearing to '').
       for (const k of allowedFieldKeys) {
@@ -618,6 +634,7 @@ exports.mobileSync = async (req, res) => {
         tenantId,
         orderIndex: await getNextOrderIndex(tenantId, siteId, zoneId)
       };
+      if (customFields) equipmentPayload.customFields = customFields;
       if (equipmentTypeRaw) equipmentPayload['Equipment Type'] = equipmentTypeRaw;
       if (otherInfoPresent || clearBaseFields.has('otherInfo')) equipmentPayload['Other Info'] = String(otherInfo || '').trim();
 

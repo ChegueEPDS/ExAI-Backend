@@ -14,6 +14,7 @@ const mime = require('mime-types');
 const sharp = require('sharp');
 const heicConvert = require('heic-convert');
 const { recordTombstone } = require('../services/syncTombstoneService');
+const { sanitizeCustomFields } = require('../services/customFieldService');
 
 // LEGACY: const axios = require('axios');
 
@@ -96,10 +97,17 @@ exports.createSite = async (req, res) => {
     }
 
     // 1) Site létrehozása és mentése
+    const customFields = await sanitizeCustomFields({
+      tenantId: tenantObjectId,
+      entityType: 'site',
+      values: req.body?.customFields
+    });
+
     const newSite = new Site({
       Name: req.body.Name,
       Client: req.body.Client,
       Note: req.body.Note,
+      customFields,
       CreatedBy: CreatedBy,
       tenantId: tenantObjectId,
     });
@@ -374,6 +382,13 @@ exports.updateSite = async (req, res) => {
     site.Client = Client || site.Client;
     if (Note !== undefined) {
       site.Note = Note;
+    }
+    if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'customFields')) {
+      site.customFields = await sanitizeCustomFields({
+        tenantId: tenantObjectId,
+        entityType: 'site',
+        values: req.body.customFields
+      });
     }
 
     if (CreatedBy && CreatedBy !== String(site.CreatedBy)) {

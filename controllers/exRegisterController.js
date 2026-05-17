@@ -6,6 +6,7 @@ const Inspection = require('../models/inspection');
 const Certificate = require('../models/certificate');
 const Question = require('../models/questions');
 const QuestionTypeMapping = require('../models/questionTypeMapping');
+const CustomFieldDefinition = require('../models/customFieldDefinition');
 const mongoose = require('mongoose');
 const fs = require('fs');
 const azureBlob = require('../services/azureBlobService');
@@ -25,6 +26,7 @@ const cleanupService = require('../services/cleanupService');
 const EquipmentDataVersion = require('../models/equipmentDataVersion');
 const { createEquipmentDataVersion } = require('../services/equipmentVersioningService');
 const { recordTombstone } = require('../services/syncTombstoneService');
+const { sanitizeCustomFields } = require('../services/customFieldService');
 
 const { BlobServiceClient } = require('@azure/storage-blob');
 const path = require('path');
@@ -66,6 +68,15 @@ const HEADER_ALIASES = {
   'comments': 'Remarks',
   'comment': 'Remarks'
 };
+
+function customFieldValue(customFields, key) {
+  if (!customFields || !key) return '';
+  const value = customFields instanceof Map ? customFields.get(key) : customFields[key];
+  if (Array.isArray(value)) return value.join(', ');
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+  if (value == null) return '';
+  return String(value);
+}
 
 function isIndexTenantSlug(tenantSlug) {
   const s = String(tenantSlug || '').trim().toLowerCase();
@@ -755,6 +766,14 @@ exports.createEquipment = async (req, res) => {
         const siteIdForIndex = equipment.Site || null;
         const zoneIdForIndex = equipment.Zone || null;
         updateFields.orderIndex = await getNextOrderIndex(tenantId, siteIdForIndex, zoneIdForIndex);
+      }
+
+      if (Object.prototype.hasOwnProperty.call(updateFields, 'customFields')) {
+        updateFields.customFields = await sanitizeCustomFields({
+          tenantId,
+          entityType: 'equipment',
+          values: updateFields.customFields
+        });
       }
 
       if (existingEquipment) {
@@ -2111,6 +2130,17 @@ exports.exportEquipmentXLSX = async (req, res) => {
       return res.status(404).json({ message: 'No equipment found for export.' });
     }
 
+    const customExportFields = await CustomFieldDefinition.find({
+      tenantId,
+      entityType: 'equipment',
+      active: true,
+      showInExport: true
+    }).sort({ createdAt: 1, label: 1 }).lean();
+    const customExportColumns = customExportFields.map((field) => ({
+      field,
+      header: `Custom: ${field.label || field.key}`
+    }));
+
     // ---- Zóna cache ----
     const zoneIds = [
       ...new Set(
@@ -2213,6 +2243,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
         if (toRemove.has(headers[i])) headers.splice(i, 1);
       }
     }
+    customExportColumns.forEach(({ header }) => headers.push(header));
 
     worksheet.columns = headers.map(header => ({
       header,
@@ -2231,6 +2262,8 @@ exports.exportEquipmentXLSX = async (req, res) => {
     const userEndCol = includeUserRequirement ? (userStartCol + 4) : null;
     const inspectionStartCol = includeUserRequirement ? (userStartCol + 5) : (zoneEndCol + 1);
     const inspectionEndCol = inspectionStartCol + 4;
+    const customStartCol = customExportColumns.length ? inspectionEndCol + 1 : null;
+    const customEndCol = customExportColumns.length ? inspectionEndCol + customExportColumns.length : null;
 
     groupRow.getCell(1).value = 'IDENTIFICATION';
     worksheet.mergeCells(1, 1, 1, 4);
@@ -2252,6 +2285,10 @@ exports.exportEquipmentXLSX = async (req, res) => {
     }
     groupRow.getCell(inspectionStartCol).value = 'INSPECTION DATA';
     worksheet.mergeCells(1, inspectionStartCol, 1, inspectionEndCol);
+    if (customStartCol && customEndCol) {
+      groupRow.getCell(customStartCol).value = 'CUSTOM DATA';
+      worksheet.mergeCells(1, customStartCol, 1, customEndCol);
+    }
 
     const groupColorRanges = [
       { start: 1, end: 4, color: 'FF00AA00' },
@@ -2266,6 +2303,9 @@ exports.exportEquipmentXLSX = async (req, res) => {
       { start: zoneStartCol, end: zoneEndCol, color: 'FFFFFF66' },
       { start: inspectionStartCol, end: inspectionEndCol, color: 'FFB0B0B0' }
     );
+    if (customStartCol && customEndCol) {
+      groupColorRanges.push({ start: customStartCol, end: customEndCol, color: 'FFD9EAD3' });
+    }
     if (includeUserRequirement) {
       groupColorRanges.splice(groupColorRanges.length - 1, 0, {
         start: userStartCol,
@@ -2303,6 +2343,9 @@ exports.exportEquipmentXLSX = async (req, res) => {
       { start: zoneStartCol, end: zoneEndCol, color: 'FFFFFFCC' },
       { start: inspectionStartCol, end: inspectionEndCol, color: 'FFE0E0E0' }
     );
+    if (customStartCol && customEndCol) {
+      headerColorRanges.push({ start: customStartCol, end: customEndCol, color: 'FFEAF4E4' });
+    }
     if (includeUserRequirement) {
       headerColorRanges.splice(headerColorRanges.length - 1, 0, {
         start: userStartCol,
@@ -2509,6 +2552,10 @@ exports.exportEquipmentXLSX = async (req, res) => {
           rowData['Project ID'] = zone?.ProjectID || '';
         }
 
+        customExportColumns.forEach(({ field, header }) => {
+          rowData[header] = customFieldValue(eq.customFields, field.key);
+        });
+
         const row = worksheet.addRow(rowData);
 
         row.eachCell((cell, colNumber) => {
@@ -2651,6 +2698,17 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
       return res.status(404).json({ message: 'No equipment found for export.' });
     }
 
+    const customExportFields = await CustomFieldDefinition.find({
+      tenantId,
+      entityType: 'equipment',
+      active: true,
+      showInExport: true
+    }).sort({ createdAt: 1, label: 1 }).lean();
+    const customExportColumns = customExportFields.map((field) => ({
+      field,
+      header: `Custom: ${field.label || field.key}`
+    }));
+
     let hideAtexSpecific = false;
     if (typeof scheme === 'string' && scheme.toUpperCase() === 'IECEX') {
       hideAtexSpecific = true;
@@ -2679,7 +2737,8 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
       'Certificate No',
       'Max Ambient Temp',
       'Compliance',
-      'Other Info'
+      'Other Info',
+      ...customExportColumns.map((c) => c.header)
     ];
 
     worksheet.columns = headers.map(header => ({ header, key: header, width: 12 }));
@@ -2714,7 +2773,11 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
       'Max Ambient Temp': item?.['Max Ambient Temp'] || '',
       'Compliance': item?.Compliance || '',
       'Other Info': item?.['Other Info'] || '',
-      'IP rating': item?.['IP rating'] || ''
+      'IP rating': item?.['IP rating'] || '',
+      ...customExportColumns.reduce((acc, { field, header }) => {
+        acc[header] = customFieldValue(item?.customFields, field.key);
+        return acc;
+      }, {})
     });
 
     const rows = [];
@@ -3979,6 +4042,13 @@ exports.updateEquipment = async (req, res) => {
     }
 
     delete updatedFields.CreatedBy;
+    if (Object.prototype.hasOwnProperty.call(updatedFields, 'customFields')) {
+      updatedFields.customFields = await sanitizeCustomFields({
+        tenantId,
+        entityType: 'equipment',
+        values: updatedFields.customFields
+      });
+    }
     updatedFields.ModifiedBy = new mongoose.Types.ObjectId(ModifiedBy);
 
     const updatedEquipment = await Equipment.findByIdAndUpdate(

@@ -36,6 +36,12 @@ const SiteSchema = new mongoose.Schema({
       uploadedAt: { type: Date, default: Date.now }
     }
   ]
+  ,
+  customFields: {
+    type: Map,
+    of: mongoose.Schema.Types.Mixed,
+    default: {}
+  }
 
 }, { timestamps: true });
 

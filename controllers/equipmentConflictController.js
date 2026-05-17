@@ -45,12 +45,20 @@ function applyResolutionToSnapshot(serverSnapshot, clientChanges, resolution) {
   const base = clientChanges?.equipment || {};
   const fields = clientChanges?.fields || {};
   const ex = clientChanges?.exMarking || {};
+  const customFields = clientChanges?.customFields || {};
   const protectionTypes = Array.isArray(clientChanges?.protectionTypes) ? clientChanges.protectionTypes : null;
 
+  const customChoice = resolution?.customFields || {};
   const choose = (scope, key, serverVal, clientVal) => {
     if (takeAll === 'client') return pickValue('client', serverVal, clientVal);
     if (takeAll === 'server') return serverVal;
-    const choice = scope === 'base' ? baseChoice?.[key] : scope === 'fields' ? fieldChoice?.[key] : exChoice?.[key];
+    const choice = scope === 'base'
+      ? baseChoice?.[key]
+      : scope === 'fields'
+        ? fieldChoice?.[key]
+        : scope === 'custom'
+          ? customChoice?.[key]
+          : exChoice?.[key];
     return pickValue(choice, serverVal, clientVal);
   };
 
@@ -126,6 +134,16 @@ function applyResolutionToSnapshot(serverSnapshot, clientChanges, resolution) {
     if (marks.length) marks[0] = first;
     else marks.push(first);
     out['Ex Marking'] = marks;
+  }
+
+  if (customFields && typeof customFields === 'object' && (takeAll || customChoice || Object.keys(customFields).length)) {
+    const current = out.customFields && typeof out.customFields === 'object' ? { ...out.customFields } : {};
+    Object.keys(customFields).forEach((key) => {
+      if (takeAll || customChoice?.[key]) {
+        current[key] = choose('custom', key, current[key], customFields[key]);
+      }
+    });
+    out.customFields = current;
   }
 
   return out;
