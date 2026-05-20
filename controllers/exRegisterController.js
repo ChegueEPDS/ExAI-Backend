@@ -426,6 +426,7 @@ function normalizeInspectionType(rawType) {
   const value = String(rawType).trim().toLowerCase();
   if (!value) return 'Detailed';
   if (value.includes('visual')) return 'Visual';
+  if (value.startsWith('initial detailed') || value.startsWith('initial_detailed') || value.startsWith('initial-detailed')) return 'Initial Detailed';
   if (value.startsWith('close') || value.startsWith('closed')) return 'Close';
   if (value.startsWith('detailed')) return 'Detailed';
   return 'Detailed';

@@ -64,7 +64,7 @@ const InspectionAttachmentSchema = new Schema(
 const InspectionSchema = new Schema(
   {
     // Kapcsolatok
-    equipmentId: { type: Schema.Types.ObjectId, ref: 'ExRegister', required: true },
+    equipmentId: { type: Schema.Types.ObjectId, ref: 'ExRegister', required: true }, 
     eqId: { type: String, required: true }, // EqID string, gyors kereséshez
 
     tenantId: { type: Schema.Types.ObjectId, ref: 'Tenant', required: false },
@@ -75,10 +75,10 @@ const InspectionSchema = new Schema(
     inspectionDate: { type: Date, required: true },  // mikor végezték (user adja meg)
     validUntil: { type: Date, required: true },      // meddig érvényes (user adja meg)
     inspectorId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
-    // Type of inspection: Detailed / Close / Visual
+    // Type of inspection: Detailed / Initial Detailed / Close / Visual
     inspectionType: {
       type: String,
-      enum: ['Detailed', 'Close', 'Visual'],
+      enum: ['Detailed', 'Initial Detailed', 'Close', 'Visual'],
       required: true,
     },
 

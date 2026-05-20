@@ -63,7 +63,7 @@ const BORDER_THIN = {
   right: { style: 'thin' }
 };
 
-const INDEX_LOGO_URL = 'https://certs.atexdb.eu/public/index_logo.png';
+const INDEX_LOGO_URL = 'https://certs.atexdb.eu/public/voith-logo.png' //'https://certs.atexdb.eu/public/index_logo.png';
 const REPORT_JOB_TYPES = {
   PROJECT_FULL: 'project_full',
   LATEST_INSPECTIONS: 'latest_inspections'
@@ -996,6 +996,17 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   const tenantName = (options.tenantName || '').toLowerCase();
   const isIndexTenant = tenantName === 'index' || tenantName === 'ind-ex';
   const schemeIsIECEx = typeof scheme === 'string' && scheme.toLowerCase().includes('iecex');
+  const exMarking = Array.isArray(equipment['Ex Marking'])
+    ? equipment['Ex Marking'][0] || {}
+    : {};
+  const protectionTokens = String(exMarking['Type of Protection'] || '')
+    .toLowerCase()
+    .split(/[,\s;/+]+/)
+    .map(token => token.trim())
+    .filter(Boolean);
+  const nonElectricalProtectionTypes = new Set(['b', 'c', 'h', 'k']);
+  const hasNonElectricalProtection = protectionTokens.some(token => nonElectricalProtectionTypes.has(token));
+  const hasElectricalProtection = protectionTokens.some(token => !nonElectricalProtectionTypes.has(token));
 
   // Oldalbeállítás: 1 oldal szélesre igazítás
   ws.pageSetup = ws.pageSetup || {};
@@ -1031,13 +1042,53 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       });
     });
 
-    ws.mergeCells('C1:K2');
+    ws.mergeCells('C1:I2');
     const titleCell = ws.getCell('C1');
     titleCell.value = 'Inspection Test Report';
     titleCell.font = { bold: true, size: 16 };
     titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
     // háttér azonos a dátum cellával
     titleCell.fill = HEADER_FILL;
+
+    ws.mergeCells('J1:K1');
+    ws.getCell('J1').value = 'Electrical';
+    ws.getCell('J1').font = { bold: true, size: 11 };
+    ws.getCell('J1').alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getCell('J1').fill = HEADER_FILL;
+    ws.getCell('L1').value = hasElectricalProtection ? 'x' : '';
+    ws.getCell('L1').font = { size: 11 };
+    ws.getCell('L1').alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getCell('L1').fill = HEADER_FILL;
+
+    ws.mergeCells('J2:K2');
+    ws.getCell('J2').value = 'Non-Electrical';
+    ws.getCell('J2').font = { bold: true, size: 11 };
+    ws.getCell('J2').alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getCell('J2').fill = HEADER_FILL;
+    ws.getCell('L2').value = hasNonElectricalProtection ? 'x' : '';
+    ws.getCell('L2').font = { size: 11 };
+    ws.getCell('L2').alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getCell('L2').fill = HEADER_FILL;
+
+    ws.mergeCells('M1:M2');
+    ws.getCell('M1').value = 'Date:';
+    ws.getCell('M1').font = { bold: true, size: 11 };
+    ws.getCell('M1').alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getCell('M1').fill = HEADER_FILL;
+
+    ws.mergeCells('N1:N2');
+    ws.getCell('N1').value = inspectionDate;
+    ws.getCell('N1').font = { size: 11 };
+    ws.getCell('N1').numFmt = 'yyyy-mm-dd';
+    ws.getCell('N1').alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getCell('N1').fill = HEADER_FILL;
+
+    ['J','K','L','M','N'].forEach(col => {
+      [1,2].forEach(rn => {
+        const cell = ws.getCell(`${col}${rn}`);
+        cell.border = BORDER_THIN;
+      });
+    });
   } else {
     ws.mergeCells('A1:K2');
     const titleCell = ws.getCell('A1');
@@ -1048,18 +1099,20 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
     titleCell.fill = HEADER_FILL;
   }
 
-  ws.mergeCells('L1:L2');
-  ws.getCell('L1').value = 'Date:';
-  ws.getCell('L1').font = { bold: true, size: 16 };
-  ws.getCell('L1').alignment = { horizontal: 'right', vertical: 'middle' };
-  ws.getCell('L1').fill= HEADER_FILL;
+  if (!isIndexTenant) {
+    ws.mergeCells('L1:L2');
+    ws.getCell('L1').value = 'Inspection Date:';
+    ws.getCell('L1').font = { bold: true, size: 16 };
+    ws.getCell('L1').alignment = { horizontal: 'right', vertical: 'middle' };
+    ws.getCell('L1').fill= HEADER_FILL;
 
-  ws.mergeCells('M1:N2');
-  ws.getCell('M1').value = inspectionDate;
-  ws.getCell('M1').font = { size: 16 };
-  ws.getCell('M1').numFmt = 'yyyy-mm-dd';
-  ws.getCell('M1').alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getCell('M1').fill= HEADER_FILL;
+    ws.mergeCells('M1:N2');
+    ws.getCell('M1').value = inspectionDate;
+    ws.getCell('M1').font = { size: 16 };
+    ws.getCell('M1').numFmt = 'yyyy-mm-dd';
+    ws.getCell('M1').alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getCell('M1').fill= HEADER_FILL;
+  }
 
   // Címsorok magassága – kb. 75%-kal nagyobb a defaultnál
   const headerRowHeight = 15;
@@ -1071,17 +1124,17 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   emptyRow3.height = 7;
 
   let currentRow = 4;
-  const topRowHeight = 30;
+  const topRowHeight = 23;
   const spacerHeight = 5;
 
   // Client / Project / Zone
   const clientRow = currentRow;
-  setHeaderCell(`A${clientRow}:B${clientRow}`, 'Client name');
-  setValueCell(`C${clientRow}:E${clientRow}`, site?.Client || '');
-  setHeaderCell(`F${clientRow}:G${clientRow}`, 'Project');
-  setValueCell(`H${clientRow}:J${clientRow}`, site?.Name || '');
-  setHeaderCell(`K${clientRow}:L${clientRow}`, 'Zone');
-  setValueCell(`M${clientRow}:N${clientRow}`, zone?.Name || zone?.ZoneName || '');
+  setHeaderCell(`A${clientRow}:B${clientRow}`, isIndexTenant ? 'Skid ID' : 'Client name');
+  setValueCell(`C${clientRow}:E${clientRow}`, isIndexTenant ? (zone?.SkidID || '') : (site?.Client || ''));
+  setHeaderCell(`F${clientRow}:G${clientRow}`, isIndexTenant ? 'Skid Description' :'Project');
+  setValueCell(`H${clientRow}:J${clientRow}`, isIndexTenant ? (zone?.SkidDescription || zone?.Name || '') : (site?.Name || ''));
+  setHeaderCell(`K${clientRow}:L${clientRow}`, isIndexTenant ? 'Project' : 'Zone');
+  setValueCell(`M${clientRow}:N${clientRow}`, isIndexTenant ? (site?.Name || '') : (zone?.Name || zone?.ZoneName || ''));
   ws.getRow(clientRow).height = topRowHeight;
   currentRow += 1;
 
@@ -1091,10 +1144,10 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
 
   if (hasTagId) {
     tagRowIndex = currentRow;
-    setHeaderCell(`A${tagRowIndex}:B${tagRowIndex}`, 'Tag ID');
+    setHeaderCell(`A${tagRowIndex}:B${tagRowIndex}`, isIndexTenant ? 'Voith ID Tag' : 'Tag ID');
     setValueCell(`C${tagRowIndex}:E${tagRowIndex}`, tagIdValue);
 
-    setHeaderCell(`F${tagRowIndex}:G${tagRowIndex}`, 'Equipment ID');
+    setHeaderCell(`F${tagRowIndex}:G${tagRowIndex}`, isIndexTenant ? 'Project ID Tag' : 'Equipment ID');
     setValueCell(`H${tagRowIndex}:J${tagRowIndex}`, equipment.EqID || '');
 
     setHeaderCell(`K${tagRowIndex}:L${tagRowIndex}`, 'Equipment Description');
@@ -1239,9 +1292,6 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   ws.getCell(`N${areaRow}`).value = zoneEpl;
 
   const equipmentInfoRow = areaRow + 1;
-  const exMarking = Array.isArray(equipment['Ex Marking'])
-    ? equipment['Ex Marking'][0] || {}
-    : {};
 
   ws.mergeCells(`A${equipmentInfoRow}:B${equipmentInfoRow}`);
   ws.getCell(`A${equipmentInfoRow}`).value = 'Equipment';
@@ -1277,6 +1327,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   ws.getCell(`M${equipmentInfoRow}`).font = { bold: true };
   ws.getCell(`M${equipmentInfoRow}`).fill = HEADER_FILL;
   ws.getCell(`N${equipmentInfoRow}`).value = exMarking['Equipment Protection Level'] || '';
+
   ws.getRow(areaRow).height = topRowHeight;
   ws.getRow(equipmentInfoRow).height = topRowHeight;
 
@@ -1493,7 +1544,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
     fgColor: { argb: 'FFD9D9D9' }
   };
 
-  sortedGroupNames.forEach(groupName => {
+  sortedGroupNames.forEach((groupName, groupIndex) => {
     // Csoportcím sor – teljes szélesség merge
     const groupRow = ws.addRow([groupName]);
     const gr = groupRow.number;
@@ -1604,10 +1655,31 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       ws.getRow(rn).height = lineCount * 15; // 15 pont / sor, szükség esetén növelhető
     });
 
-    // Üres sor a csoportok között
-    const emptyRowBetweenGroups = ws.addRow([]);
-    emptyRowBetweenGroups.height = 7;
+    // Üres sor csak a csoportok között, a végső Remarks sor előtt ne legyen hézag.
+    if (groupIndex < sortedGroupNames.length - 1) {
+      const emptyRowBetweenGroups = ws.addRow([]);
+      emptyRowBetweenGroups.height = 7;
+    }
   });
+
+  if (isIndexTenant) {
+    const remarksRow = ws.addRow([]);
+    const remarksR = remarksRow.number;
+    ws.mergeCells(`B${remarksR}:N${remarksR}`);
+    ws.getCell(`A${remarksR}`).value = 'Remarks';
+    ws.getCell(`A${remarksR}`).font = { bold: true };
+    remarksRow.height = 40;
+
+    ['A','B','C','D','E','F','G','H','I','J','K','L','M','N'].forEach(col => {
+      const cell = ws.getCell(`${col}${remarksR}`);
+      cell.border = BORDER_THIN;
+      cell.alignment = {
+        horizontal: col === 'A' ? 'center' : 'left',
+        vertical: 'middle',
+        wrapText: true
+      };
+    });
+  }
 
   // ===== FOOTER: Created by / Signature =====
 
@@ -1917,12 +1989,12 @@ function buildProjectExRegisterWorkbook(equipments, {
     const zoneTempParts = [];
     if (zone?.TempClass) zoneTempParts.push(zone.TempClass);
     if (typeof zone?.MaxTemp === 'number') zoneTempParts.push(`${zone.MaxTemp}°C`);
-    const zoneTempDisplay = zoneTempParts.join(' / ');
+    const zoneTempDisplay = zoneTempParts.join(' - ');
 
     const ambientParts = [];
     if (zone?.AmbientTempMin != null) ambientParts.push(`${zone.AmbientTempMin}°C`);
     if (zone?.AmbientTempMax != null) ambientParts.push(`+${zone.AmbientTempMax}°C`);
-    const ambientDisplay = ambientParts.join(' / ');
+    const ambientDisplay = ambientParts.join(' - ');
 
     let clientReqZoneNumber = '';
     let clientReqGasDustGroup = '';

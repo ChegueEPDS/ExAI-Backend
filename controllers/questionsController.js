@@ -16,6 +16,9 @@ const PROTECTION_TYPE_SET = new Set(PROTECTION_TYPE_VALUES.map(v => v.toLowerCas
 const INSPECTION_TYPE_MAP = new Map([
   ['close', 'Close'],
   ['detailed', 'Detailed'],
+  ['initial detailed', 'Initial Detailed'],
+  ['initial_detailed', 'Initial Detailed'],
+  ['initial-detailed', 'Initial Detailed'],
   ['visual', 'Visual']
 ]);
 
@@ -49,7 +52,7 @@ const QUESTION_HEADER_CONFIG = [
   },
   {
     key: 'inspectionTypes',
-    note: 'Semicolon-separated list of inspection types (Close; Detailed; Visual). At least one required.'
+    note: 'Semicolon-separated list of inspection types (Close; Detailed; Initial Detailed; Visual). At least one required.'
   },
   {
     key: 'equipmentCategories',
