@@ -7,8 +7,10 @@ const ENTITY_TYPES = ['site', 'zone', 'equipment'];
 const EQUIPMENT_TYPES = [
   'General',
   'Motors',
+  'Electrical Machines',
   'Lighting',
   'Installation',
+  'Installation Electrical Machines',
   'Installation Heating System',
   'Installation Motors',
   'Environment'

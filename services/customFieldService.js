@@ -8,8 +8,10 @@ const FIELD_TYPES = ['text', 'textarea', 'number', 'date', 'boolean', 'select', 
 const EQUIPMENT_TYPES = [
   'General',
   'Motors',
+  'Electrical Machines',
   'Lighting',
   'Installation',
+  'Installation Electrical Machines',
   'Installation Heating System',
   'Installation Motors',
   'Environment'

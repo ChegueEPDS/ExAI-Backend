@@ -29,8 +29,10 @@ const QuestionTypeMappingSchema = new Schema(
         enum: [
           'General',
           'Motors',
+          'Electrical Machines',
           'Lighting',
           'Installation',
+          'Installation Electrical Machines',
           'Installation Heating System',
           'Installation Motors',
           'Environment'

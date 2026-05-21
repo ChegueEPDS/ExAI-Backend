@@ -1515,8 +1515,10 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   const preferredGroupOrder = [
     'General',
     'Motors',
+    'Electrical Machines',
     'Lighting',
     'Installation',
+    'Installation Electrical Machines',
     'Installation Heating System',
     'Installation Motors',
     'Environment',

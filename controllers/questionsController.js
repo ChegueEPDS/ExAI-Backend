@@ -25,8 +25,10 @@ const INSPECTION_TYPE_MAP = new Map([
 const EQUIPMENT_TYPES = [
   "General",
   "Motors",
+  "Electrical Machines",
   "Lighting",
   "Installation",
+  "Installation Electrical Machines",
   "Installation Heating System",
   "Installation Motors",
   "Environment",
