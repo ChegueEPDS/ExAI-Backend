@@ -364,9 +364,9 @@ app.use('/api', systemSettingsRoutes);
 app.use('/api', tenantSettingsRoutes);
 app.use('/api', manufacturerRoutes);
 app.use('/api', equipmentConflictRoutes);
-app.use('/api', trainingRoutes);
 app.use('/api', customFieldRoutes);
 app.use('/api/public', publicRotRoutes);
+app.use('/api', trainingRoutes);
 
 const backgroundJobsDisabled =
   process.env.DISABLE_BACKGROUND_JOBS === '1' ||
