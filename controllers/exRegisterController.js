@@ -8,6 +8,7 @@ const Question = require('../models/questions');
 const QuestionTypeMapping = require('../models/questionTypeMapping');
 const CustomFieldDefinition = require('../models/customFieldDefinition');
 const CriteriaSystem = require('../models/criteriaSystem');
+const DeviceCriteriaSystemAssignment = require('../models/deviceCriteriaSystemAssignment');
 const mongoose = require('mongoose');
 const fs = require('fs');
 const azureBlob = require('../services/azureBlobService');
@@ -28,6 +29,7 @@ const EquipmentDataVersion = require('../models/equipmentDataVersion');
 const { createEquipmentDataVersion } = require('../services/equipmentVersioningService');
 const { recordTombstone } = require('../services/syncTombstoneService');
 const { sanitizeCustomFields } = require('../services/customFieldService');
+const { loadRelevantSystemsForEquipment } = require('../services/criteriaSystemService');
 
 const { BlobServiceClient } = require('@azure/storage-blob');
 const path = require('path');
@@ -51,6 +53,11 @@ const HEADER_ALIASES = {
   'temp. range': 'Temp. Range',
   'temperature range': 'Temp. Range',
   'epl': 'EPL',
+  'equipment group': 'Equipment Group',
+  'group': 'Equipment Group',
+  'equipment category': 'Equipment Category',
+  'category': 'Equipment Category',
+  'environment': 'Environment',
   'subgroup': 'SubGroup',
   'sub group': 'SubGroup',
   'temperature class': 'Temperature Class',
@@ -66,8 +73,18 @@ const HEADER_ALIASES = {
   'inspection status': 'Status',
   'status': 'Status',
   'remarks': 'Remarks',
+  'notes': 'Remarks',
+  'note': 'Remarks',
   'comments': 'Remarks',
-  'comment': 'Remarks'
+  'comment': 'Remarks',
+  'criteria systems': 'Criteria systems',
+  'criteria system': 'Criteria systems',
+  'criteria': 'Criteria systems',
+  'szempontrendszerek': 'Criteria systems',
+  'szempontrendszer': 'Criteria systems',
+  'quality check': 'Qualitycheck',
+  'qualitycheck': 'Qualitycheck',
+  'quality': 'Qualitycheck'
 };
 
 function customFieldValue(customFields, key) {
@@ -313,6 +330,20 @@ function getCellDate(row, headerMap, label) {
   return normalizeExcelDateValue(primitive);
 }
 
+function getCellBoolean(row, headerMap, label) {
+  const column = headerMap[label];
+  if (!column) return null;
+  const primitive = cellValueToPrimitive(row.getCell(column)?.value);
+  if (primitive == null || primitive === '') return null;
+  if (typeof primitive === 'boolean') return primitive;
+  if (typeof primitive === 'number') return primitive !== 0;
+  const value = String(primitive || '').trim().toLowerCase();
+  if (!value) return null;
+  if (['yes', 'y', 'true', '1', 'igen'].includes(value)) return true;
+  if (['no', 'n', 'false', '0', 'nem'].includes(value)) return false;
+  return null;
+}
+
 function getCellStringByIndex(row, columnIndex) {
   const primitive = cellValueToPrimitive(row.getCell(columnIndex)?.value);
   if (primitive == null) return '';
@@ -440,6 +471,63 @@ function splitMultiValue(value) {
     .filter(Boolean);
 }
 
+function normalizeCriteriaLookupValue(value) {
+  return String(value || '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+async function loadCriteriaSystemImportOptions(tenantId) {
+  const systems = await CriteriaSystem.find({ tenantId })
+    .select('_id name systemKey active')
+    .sort({ name: 1 })
+    .lean();
+
+  const byToken = new Map();
+  (systems || []).forEach((system) => {
+    [
+      system.name,
+      system.systemKey,
+      system._id?.toString()
+    ].filter(Boolean).forEach((value) => {
+      const key = normalizeCriteriaLookupValue(value);
+      if (key && !byToken.has(key)) byToken.set(key, system);
+    });
+  });
+
+  return {
+    systems: systems || [],
+    byToken
+  };
+}
+
+function parseCriteriaSystemSelections(rawValue, options) {
+  const raw = String(rawValue || '').trim();
+  if (!raw) return { specified: false, ids: [], unknown: [] };
+  const tokens = splitMultiValue(raw);
+  const ids = [];
+  const unknown = [];
+  const seen = new Set();
+
+  tokens.forEach((token) => {
+    const system = options?.byToken?.get(normalizeCriteriaLookupValue(token));
+    if (!system?._id) {
+      unknown.push(token);
+      return;
+    }
+    const id = system._id.toString();
+    if (!seen.has(id)) {
+      seen.add(id);
+      ids.push(system._id);
+    }
+  });
+
+  return { specified: true, ids, unknown };
+}
+
 function importCommentForField(field, prefix = '') {
   const label = field?.label || field?.key || 'Field';
   const required = field?.required ? ' Required.' : '';
@@ -531,6 +619,52 @@ function collectDynamicCustomFieldValues(row, headerMap, dynamicColumns) {
   return values;
 }
 
+async function applyImportedCriteriaAssignments({ tenantId, equipmentId, criteriaSystemIds, userId }) {
+  if (!Array.isArray(criteriaSystemIds) || !criteriaSystemIds.length) return 0;
+  const now = new Date();
+  await Promise.all(criteriaSystemIds.map((criteriaSystemId) =>
+    DeviceCriteriaSystemAssignment.findOneAndUpdate(
+      { tenantId, equipmentId, criteriaSystemId },
+      {
+        $set: {
+          state: 'included',
+          active: true,
+          updatedBy: userId || null,
+          updatedAt: now
+        },
+        $setOnInsert: {
+          tenantId,
+          equipmentId,
+          criteriaSystemId,
+          createdAt: now
+        }
+      },
+      { upsert: true, new: true }
+    )
+  ));
+  return criteriaSystemIds.length;
+}
+
+async function buildCriteriaSystemNameMap(tenantId, equipments = []) {
+  const entries = await Promise.all((equipments || []).map(async (equipment) => {
+    try {
+      const systems = await loadRelevantSystemsForEquipment({ tenantId, equipment });
+      const names = (systems || [])
+        .map((item) => item?.system?.name)
+        .filter(Boolean)
+        .join('; ');
+      return [equipment._id?.toString(), names];
+    } catch (err) {
+      console.warn('⚠️ Failed to resolve criteria systems for export:', {
+        equipmentId: equipment?._id?.toString?.(),
+        err: err?.message || err
+      });
+      return [equipment._id?.toString(), ''];
+    }
+  }));
+  return new Map(entries.filter(([id]) => !!id));
+}
+
 function equipmentImportBaseColumns({ includeProjectSkid }) {
   const columns = [
     { header: '_id', group: 'IDENTIFICATION', width: 26, comment: 'Optional. Keep this value when updating rows exported from the system. Leave empty for new equipment.' },
@@ -543,27 +677,50 @@ function equipmentImportBaseColumns({ includeProjectSkid }) {
     { header: 'Serial Number', group: 'EQUIPMENT DATA', width: 20, comment: 'Serial number.' },
     { header: 'IP rating', group: 'EQUIPMENT DATA', width: 14, comment: 'Ingress protection, for example IP66.' },
     { header: 'Temp. Range', group: 'EQUIPMENT DATA', width: 18, comment: 'Ambient temperature range, for example -40 / +80°C.' },
+    { header: 'Qualitycheck', group: 'EQUIPMENT DATA', width: 16, comment: 'Optional quality check flag. Allowed values: Yes, No, True, False, 1, 0.' },
     { header: 'EPL', group: 'EX DATA', width: 14, comment: 'Equipment Protection Level, for example Ga, Gb, Gc, Da, Db, Dc.' },
+    { header: 'Equipment Group', group: 'EX DATA', width: 18, comment: 'Equipment group, for example I, II or III.' },
+    { header: 'Equipment Category', group: 'EX DATA', width: 20, comment: 'Equipment category, for example 1G, 2G, 3G, 1D, 2D or 3D.' },
+    { header: 'Environment', group: 'EX DATA', width: 16, comment: 'Environment, for example G, D or GD.' },
     { header: 'SubGroup', group: 'EX DATA', width: 16, comment: 'Gas/dust subgroup, for example IIA, IIB, IIC, IIIA, IIIB, IIIC. Multiple values may be separated by comma or slash.' },
     { header: 'Temperature Class', group: 'EX DATA', width: 18, comment: 'Temperature class, for example T1, T2, T3, T4, T5, T6.' },
     { header: 'Protection Concept', group: 'EX DATA', width: 22, comment: 'Type of protection, for example Ex d, Ex e, Ex i, Ex t. Use the same notation as on the dataplate.' },
     { header: 'Certificate No', group: 'CERTIFICATION', width: 24, comment: 'Certificate number. If this is empty, Declaration of conformity may be used as certificate reference.' },
-    { header: 'Declaration of conformity', group: 'CERTIFICATION', width: 28, comment: 'Manufacturer declaration number. Used as certificate reference when Certificate No is empty.' },
-    { header: 'Inspection Date', group: 'INSPECTION DATA', width: 18, comment: 'Optional. Enter a date, preferably YYYY-MM-DD. If Status is Passed, an inspection can be created from this date.' },
-    { header: 'Type', group: 'INSPECTION DATA', width: 18, comment: 'Optional inspection type. Allowed values: Detailed, Visual, Initial Detailed, Close.' },
-    { header: 'Status', group: 'INSPECTION DATA', width: 14, comment: 'Allowed values: Passed, Failed, NA. Passed with Inspection Date creates an inspection.' },
-    { header: 'Remarks', group: 'INSPECTION DATA', width: 28, comment: 'Free text remarks imported into equipment notes.' }
+    { header: 'Declaration of conformity', group: 'CERTIFICATION', width: 28, comment: 'Manufacturer declaration number. Used as certificate reference when Certificate No is empty.' }
   ];
   if (includeProjectSkid) {
-    columns.splice(
-      16,
-      0,
+    columns.push(
       { header: 'Skid ID', group: 'PROJECT / SKID', width: 18, comment: 'Optional project/skid context. When filled, the unit skid value is updated from the latest non-empty value.' },
       { header: 'Skid Description', group: 'PROJECT / SKID', width: 28, comment: 'Optional project/skid description. When filled, the unit skid description is updated from the latest non-empty value.' },
       { header: 'Project ID', group: 'PROJECT / SKID', width: 18, comment: 'Optional project ID. When filled, the unit project value is updated from the latest non-empty value.' }
     );
   }
   return columns;
+}
+
+function equipmentCriteriaAssignmentColumn(criteriaSystems = []) {
+  const available = (criteriaSystems || [])
+    .map((system) => `${system.name}${system.active === false ? ' (inactive)' : ''}`)
+    .join('; ');
+  return {
+    header: 'Criteria systems',
+    group: 'CRITERIA ASSIGNMENT',
+    width: 34,
+    comment: [
+      'Optional. List the criteria systems that apply to this equipment, separated by semicolon (;).',
+      'Importing this value adds manual included assignments. Blank cells do not remove existing assignments.',
+      available ? `Available values: ${available}.` : ''
+    ].filter(Boolean).join(' ')
+  };
+}
+
+function equipmentImportInspectionColumns() {
+  return [
+    { header: 'Inspection Date', group: 'INSPECTION DATA', width: 18, comment: 'Optional. Enter a date, preferably YYYY-MM-DD. If Status is Passed, an inspection can be created from this date.' },
+    { header: 'Type', group: 'INSPECTION DATA', width: 18, comment: 'Optional inspection type. Allowed values: Detailed, Visual, Initial Detailed, Close.' },
+    { header: 'Status', group: 'INSPECTION DATA', width: 14, comment: 'Allowed values: Passed, Failed, NA. Passed with Inspection Date creates an inspection.' },
+    { header: 'Remarks', group: 'INSPECTION DATA', width: 28, comment: 'Free text remarks imported into equipment notes.' }
+  ];
 }
 
 function groupColor(group) {
@@ -573,6 +730,7 @@ function groupColor(group) {
     'EX DATA': 'FF538DD5',
     'CERTIFICATION': 'FF00AA00',
     'PROJECT / SKID': 'FF80DEEA',
+    'CRITERIA ASSIGNMENT': 'FF8E7CC3',
     'INSPECTION DATA': 'FFB0B0B0',
     'CUSTOM DATA': 'FF6AA84F'
   }[group] || 'FF9FC5E8';
@@ -585,6 +743,7 @@ function groupLightColor(group) {
     'EX DATA': 'FFDCE6F1',
     'CERTIFICATION': 'FFCCFFCC',
     'PROJECT / SKID': 'FFE0F7FA',
+    'CRITERIA ASSIGNMENT': 'FFEADCF8',
     'INSPECTION DATA': 'FFE0E0E0',
     'CUSTOM DATA': 'FFEAF4E4'
   }[group] || 'FFD9EAD3';
@@ -652,6 +811,70 @@ function applyImportTemplateStyles(worksheet, columns) {
       }
     });
   }
+}
+
+function equipmentListExportGroupForHeader(header) {
+  if (['_id', '#', 'TagNo', 'EqID'].includes(header)) return 'IDENTIFICATION';
+  if ([
+    'Description',
+    'Equipment Type',
+    'Manufacturer',
+    'Model',
+    'Model/Type',
+    'Serial Number',
+    'IP rating',
+    'Temp. Range',
+    'Max Ambient Temp',
+    'Qualitycheck'
+  ].includes(header)) return 'EQUIPMENT DATA';
+  if ([
+    'Marking',
+    'EPL',
+    'Equipment Group',
+    'Equipment Category',
+    'Environment',
+    'SubGroup',
+    'Type of Protection',
+    'Gas / Dust Group',
+    'Temperature Class',
+    'Equipment Protection Level',
+    'Protection Concept'
+  ].includes(header)) return 'EX DATA';
+  if ([
+    'Certificate No',
+    'Certificate Issue Date',
+    'Special Condition',
+    'Declaration of conformity'
+  ].includes(header)) return 'CERTIFICATION';
+  if ([
+    'Zone',
+    'Gas / Dust Group',
+    'Temp Rating',
+    'Ambient Temp'
+  ].includes(header)) return 'ZONE REQUIREMENTS';
+  if (header.startsWith('Req ')) return 'USER REQUIREMENT';
+  if ([
+    'Inspection Date',
+    'Inspector',
+    'Type',
+    'Status',
+    'Compliance',
+    'Remarks',
+    'Other Info'
+  ].includes(header)) return 'INSPECTION DATA';
+  if (header === 'Criteria systems') return 'CRITERIA ASSIGNMENT';
+  if (header.startsWith('Custom:') || header.startsWith('Criteria:')) return 'CUSTOM DATA';
+  if (['Skid ID', 'Skid Description', 'Project ID'].includes(header)) return 'PROJECT / SKID';
+  return 'CUSTOM DATA';
+}
+
+function buildEquipmentListExportColumns(headers) {
+  return headers.map((header) => ({
+    header,
+    group: equipmentListExportGroupForHeader(header),
+    width: Math.min(Math.max(String(header).length + 4, 14), 42),
+    comment: 'Exported equipment data.'
+  }));
 }
 
 function determineEnvironmentFromSubGroup(value) {
@@ -1280,15 +1503,20 @@ exports.downloadEquipmentImportTemplate = async (req, res) => {
 
     const tenantName = (req.scope?.tenantName || '').toLowerCase();
     const includeProjectSkid = isProjectSkidTenantSlug(tenantName) || isInspExRequestHost(req);
-    const dynamicColumns = await loadEquipmentImportDynamicColumns(tenantId);
+    const [dynamicColumns, criteriaOptions] = await Promise.all([
+      loadEquipmentImportDynamicColumns(tenantId),
+      loadCriteriaSystemImportOptions(tenantId)
+    ]);
     const columns = [
       ...equipmentImportBaseColumns({ includeProjectSkid }),
+      equipmentCriteriaAssignmentColumn(criteriaOptions.systems),
       ...dynamicColumns.map((column) => ({
         header: column.header,
         group: column.kind === 'criteria' ? column.group : 'CUSTOM DATA',
         width: Math.min(Math.max(String(column.header).length + 4, 18), 42),
         comment: column.comment
-      }))
+      })),
+      ...equipmentImportInspectionColumns()
     ];
 
     const workbook = new ExcelJS.Workbook();
@@ -1313,6 +1541,14 @@ exports.downloadEquipmentImportTemplate = async (req, res) => {
         type: 'list',
         allowBlank: true,
         formulae: ['"Detailed,Visual,Initial Detailed,Close"']
+      });
+    }
+    const qualityColumn = columns.findIndex((c) => c.header === 'Qualitycheck') + 1;
+    if (qualityColumn > 0) {
+      worksheet.dataValidations.add(`${worksheet.getColumn(qualityColumn).letter}3:${worksheet.getColumn(qualityColumn).letter}250`, {
+        type: 'list',
+        allowBlank: true,
+        formulae: ['"Yes,No,True,False,1,0"']
       });
     }
 
@@ -1350,6 +1586,10 @@ exports.downloadEquipmentImportTemplate = async (req, res) => {
     instructions.addRow({
       topic: 'Multi-select values',
       guidance: 'Use semicolon (;) between multiple values, for example: Option A; Option B.'
+    });
+    instructions.addRow({
+      topic: 'Criteria systems',
+      guidance: 'Use the Criteria systems column to add manual criteria assignments to equipment. Separate multiple names with semicolon (;). Blank cells do not remove existing assignments.'
     });
     instructions.addRow({
       topic: 'Updates',
@@ -1415,7 +1655,10 @@ exports.importEquipmentXLSX = async (req, res) => {
 
     const equipmentMap = new Map();
     const parseErrors = [];
-    const dynamicImportColumns = await loadEquipmentImportDynamicColumns(tenantId);
+    const [dynamicImportColumns, criteriaImportOptions] = await Promise.all([
+      loadEquipmentImportDynamicColumns(tenantId),
+      loadCriteriaSystemImportOptions(tenantId)
+    ]);
 
     worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
       if (rowNumber <= headerInfo.headerRowNumber) return;
@@ -1431,10 +1674,14 @@ exports.importEquipmentXLSX = async (req, res) => {
       const serialNumber = getCellString(row, headerInfo.headerMap, 'Serial Number');
       const ipRating = getCellString(row, headerInfo.headerMap, 'IP rating');
       const tempRange = getCellString(row, headerInfo.headerMap, 'Temp. Range');
+      const qualitycheck = getCellBoolean(row, headerInfo.headerMap, 'Qualitycheck');
       const certificateNo = getCellString(row, headerInfo.headerMap, 'Certificate No');
       const declarationNo = getCellString(row, headerInfo.headerMap, 'Declaration of conformity');
       const remarks = getCellString(row, headerInfo.headerMap, 'Remarks');
       const epl = getCellString(row, headerInfo.headerMap, 'EPL');
+      const equipmentGroup = getCellString(row, headerInfo.headerMap, 'Equipment Group');
+      const equipmentCategory = getCellString(row, headerInfo.headerMap, 'Equipment Category');
+      const environment = getCellString(row, headerInfo.headerMap, 'Environment');
       const subGroup = getCellString(row, headerInfo.headerMap, 'SubGroup');
       const tempClass = getCellString(row, headerInfo.headerMap, 'Temperature Class');
       const protectionConcept = getCellString(row, headerInfo.headerMap, 'Protection Concept');
@@ -1445,6 +1692,15 @@ exports.importEquipmentXLSX = async (req, res) => {
       const inspectionTypeRaw = getCellString(row, headerInfo.headerMap, 'Type');
       const inspectionType = inspectionTypeRaw ? normalizeInspectionType(inspectionTypeRaw) : null;
       const inspectionDate = getCellDate(row, headerInfo.headerMap, 'Inspection Date');
+      const criteriaSelectionRaw = getCellString(row, headerInfo.headerMap, 'Criteria systems');
+      const criteriaSelection = parseCriteriaSystemSelections(criteriaSelectionRaw, criteriaImportOptions);
+      if (criteriaSelection.unknown.length) {
+        parseErrors.push({
+          row: rowNumber,
+          column: 'Criteria systems',
+          message: `Unknown criteria system(s): ${criteriaSelection.unknown.join(', ')}`
+        });
+      }
       let skidId = '';
       let skidDescription = '';
       let projectId = '';
@@ -1467,13 +1723,15 @@ exports.importEquipmentXLSX = async (req, res) => {
         serialNumber,
         ipRating,
         tempRange,
+        qualitycheck == null ? '' : String(qualitycheck),
         certificateNo,
         declarationNo,
         remarks,
+        criteriaSelectionRaw,
         ...Object.values(customFieldsRaw)
       ].some(Boolean);
 
-      const rowHasExData = [epl, subGroup, tempClass, protectionConcept].some(Boolean);
+      const rowHasExData = [epl, equipmentGroup, equipmentCategory, environment, subGroup, tempClass, protectionConcept].some(Boolean);
 
       if (!rowHasData && !rowHasExData) {
         // teljesen üres sor – kihagyjuk
@@ -1497,6 +1755,7 @@ exports.importEquipmentXLSX = async (req, res) => {
             'Serial Number': serialNumber || '',
             'IP rating': ipRating || '',
             'Max Ambient Temp': tempRange || '',
+            Qualitycheck: qualitycheck === true,
             'Certificate No': certificateNo || declarationNo || '',
             'Other Info': remarks || '',
             Compliance: inspectionStatus || 'NA',
@@ -1506,7 +1765,8 @@ exports.importEquipmentXLSX = async (req, res) => {
           },
           inspectionDate: inspectionDate || null,
           inspectionStatus,
-          inspectionType: inspectionType || null
+          inspectionType: inspectionType || null,
+          criteriaSystemIds: criteriaSelection.specified ? criteriaSelection.ids : null
         });
       }
 
@@ -1525,6 +1785,7 @@ exports.importEquipmentXLSX = async (req, res) => {
       if (serialNumber) entry.base['Serial Number'] = serialNumber;
       if (ipRating) entry.base['IP rating'] = ipRating;
       if (tempRange) entry.base['Max Ambient Temp'] = tempRange;
+      if (qualitycheck != null) entry.base.Qualitycheck = qualitycheck;
       if (certificateNo) entry.base['Certificate No'] = certificateNo;
       if (remarks) entry.base['Other Info'] = remarks;
       if (Object.keys(customFieldsRaw).length) {
@@ -1532,6 +1793,9 @@ exports.importEquipmentXLSX = async (req, res) => {
           ...(entry.base.customFields || {}),
           ...customFieldsRaw
         };
+      }
+      if (criteriaSelection.specified) {
+        entry.criteriaSystemIds = criteriaSelection.ids;
       }
       if (inspectionStatus && inspectionStatus !== 'NA') entry.base.Compliance = inspectionStatus;
       if (!entry.inspectionDate && inspectionDate) entry.inspectionDate = inspectionDate;
@@ -1542,9 +1806,9 @@ exports.importEquipmentXLSX = async (req, res) => {
         entry.inspectionType = inspectionType;
       }
 
-      if (epl || subGroup || tempClass || protectionConcept) {
+      if (epl || equipmentGroup || equipmentCategory || environment || subGroup || tempClass || protectionConcept) {
         const autoMarking = buildMarkingString(protectionConcept, subGroup, tempClass);
-        const inferredEnvironment = determineEnvironmentFromSubGroup(subGroup);
+        const inferredEnvironment = environment || determineEnvironmentFromSubGroup(subGroup);
 
         if (autoMarking && !entry.base.Marking) {
           entry.base.Marking = autoMarking;
@@ -1552,6 +1816,8 @@ exports.importEquipmentXLSX = async (req, res) => {
 
         const markingEntry = {
           'Equipment Protection Level': epl || '',
+          'Equipment Group': equipmentGroup || '',
+          'Equipment Category': equipmentCategory || '',
           'Gas / Dust Group': subGroup || '',
           'Temperature Class': tempClass || '',
           'Type of Protection': protectionConcept || ''
@@ -1569,6 +1835,12 @@ exports.importEquipmentXLSX = async (req, res) => {
     });
 
     const entries = Array.from(equipmentMap.values());
+    if (parseErrors.length) {
+      return res.status(400).json({
+        message: 'The uploaded file contains invalid values.',
+        issues: parseErrors
+      });
+    }
     if (!entries.length) {
       const baseMessage = 'No usable rows detected in the uploaded file.';
       if (parseErrors.length) {
@@ -1577,7 +1849,7 @@ exports.importEquipmentXLSX = async (req, res) => {
       return res.status(400).json({ message: baseMessage });
     }
 
-    const stats = { created: 0, updated: 0, inspections: 0, errors: [] };
+    const stats = { created: 0, updated: 0, inspections: 0, criteriaAssignments: 0, errors: [] };
 
     for (const entry of entries) {
       try {
@@ -1653,6 +1925,15 @@ exports.importEquipmentXLSX = async (req, res) => {
           stats.created += 1;
         }
 
+        if (equipmentDoc && Array.isArray(entry.criteriaSystemIds) && entry.criteriaSystemIds.length) {
+          stats.criteriaAssignments += await applyImportedCriteriaAssignments({
+            tenantId,
+            equipmentId: equipmentDoc._id,
+            criteriaSystemIds: entry.criteriaSystemIds,
+            userId
+          });
+        }
+
         if (
           equipmentDoc &&
           entry.inspectionStatus === 'Passed' &&
@@ -1714,6 +1995,7 @@ exports.importEquipmentXLSX = async (req, res) => {
         summarySheet.addRow(['Created', stats.created]);
         summarySheet.addRow(['Updated', stats.updated]);
         summarySheet.addRow(['Inspections', stats.inspections]);
+        summarySheet.addRow(['Criteria assignments', stats.criteriaAssignments]);
         summarySheet.addRow(['Error items', issues.length]);
         summarySheet.getColumn(1).width = 15;
         summarySheet.getColumn(2).width = 12;
@@ -1767,6 +2049,7 @@ exports.importEquipmentXLSX = async (req, res) => {
           createdCount: stats.created,
           updatedCount: stats.updated,
           inspectionsCreated: stats.inspections,
+          criteriaAssignments: stats.criteriaAssignments,
           issues
         });
       }
@@ -1778,6 +2061,7 @@ exports.importEquipmentXLSX = async (req, res) => {
       createdCount: stats.created,
       updatedCount: stats.updated,
       inspectionsCreated: stats.inspections,
+      criteriaAssignments: stats.criteriaAssignments,
       issues: []
     });
   } catch (error) {
@@ -2491,10 +2775,10 @@ exports.exportEquipmentXLSX = async (req, res) => {
       .select('name customFields')
       .sort({ name: 1 })
       .lean();
-    const customExportColumns = [
-      ...customExportFields.map((field) => ({
-        field,
-        header: `Custom: ${field.label || field.key}`
+	    const customExportColumns = [
+	      ...customExportFields.map((field) => ({
+	        field,
+	        header: `Custom: ${field.label || field.key}`
       })),
       ...(criteriaExportSystems || []).flatMap((system) =>
         (system.customFields || [])
@@ -2503,9 +2787,8 @@ exports.exportEquipmentXLSX = async (req, res) => {
             field,
             header: `Criteria: ${system.name}: ${field.label || field.key}`
           }))
-      )
-    ];
-
+	      )
+	    ];
     // ---- Zóna cache ----
     const zoneIds = [
       ...new Set(
@@ -2544,36 +2827,38 @@ exports.exportEquipmentXLSX = async (req, res) => {
     let certMap = new Map();
     try {
       certMap = await buildCertificateCacheForTenant(tenantId);
-    } catch (e) {
-      console.warn('⚠️ Certificate cache build failed for exportEquipmentXLSX:', e?.message || e);
-      certMap = new Map();
-    }
+	    } catch (e) {
+	      console.warn('⚠️ Certificate cache build failed for exportEquipmentXLSX:', e?.message || e);
+	      certMap = new Map();
+	    }
+    const criteriaSystemNameMap = await buildCriteriaSystemNameMap(tenantId, equipments);
 
-    // ---- Excel workbook ----
+	    // ---- Excel workbook ----
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet('Database');
 
-    const headers = [
-      '_id',
-      '#',
-      'TagNo',
-      'EqID',
-      'Description',
-      'Manufacturer',
-      'Model',
-      'Serial Number',
-      'IP rating',
-      'Temp. Range',
-      'EPL',
-      'SubGroup',
-      'Temperature Class',
-      'Protection Concept',
-      //'Equipment Group',
-      //'Equipment Category',
-      //'Environment',
-      'Certificate No',
-      'Certificate Issue Date',
-      'Special Condition',
+	    const headers = [
+	      '_id',
+	      '#',
+	      'TagNo',
+	      'EqID',
+	      'Description',
+	      'Manufacturer',
+	      'Model',
+	      'Serial Number',
+	      'IP rating',
+	      'Temp. Range',
+	      'Qualitycheck',
+	      'EPL',
+	      'Equipment Group',
+	      'Equipment Category',
+	      'Environment',
+	      'SubGroup',
+	      'Temperature Class',
+	      'Protection Concept',
+	      'Certificate No',
+	      'Certificate Issue Date',
+	      'Special Condition',
       'Declaration of conformity',
       'Zone',
       'Gas / Dust Group',
@@ -2585,15 +2870,17 @@ exports.exportEquipmentXLSX = async (req, res) => {
       'Req Ambient Temp',
       'Req IP Rating',
       'Inspection Date',
-      'Inspector',
-      'Type',
-      'Status',
-      'Remarks'
-    ];
+	      'Inspector',
+	      'Type',
+	      'Status',
+	      'Remarks',
+	      'Criteria systems'
+	    ];
 
-    if (includeProjectSkid) {
-      headers.splice(18, 0, 'Skid ID', 'Skid Description', 'Project ID');
-    }
+	    if (includeProjectSkid) {
+	      const insertAt = headers.indexOf('Zone');
+	      headers.splice(insertAt >= 0 ? insertAt : headers.length, 0, 'Skid ID', 'Skid Description', 'Project ID');
+	    }
 
     if (!includeUserRequirement) {
       // Insp-Ex: keep IndEx-like layout but without USER REQUIREMENT columns.
@@ -2620,28 +2907,31 @@ exports.exportEquipmentXLSX = async (req, res) => {
     // Beszúrunk egy üres sort az első helyre, így az eredeti fejléc a 2. sorba csúszik.
     worksheet.spliceRows(1, 0, []);
 
-    const groupRow = worksheet.getRow(1);
-    const zoneStartCol = includeProjectSkid ? 22 : 19;
-    const zoneEndCol = zoneStartCol + 3;
-    const userStartCol = includeUserRequirement ? zoneStartCol + 4 : null;
-    const userEndCol = includeUserRequirement ? (userStartCol + 4) : null;
-    const inspectionStartCol = includeUserRequirement ? (userStartCol + 5) : (zoneEndCol + 1);
-    const inspectionEndCol = inspectionStartCol + 4;
-    const customStartCol = customExportColumns.length ? inspectionEndCol + 1 : null;
-    const customEndCol = customExportColumns.length ? inspectionEndCol + customExportColumns.length : null;
+	    const groupRow = worksheet.getRow(1);
+	    const columnNumber = (header) => headers.indexOf(header) + 1;
+	    const projectStartCol = includeProjectSkid ? columnNumber('Skid ID') : null;
+	    const projectEndCol = includeProjectSkid ? columnNumber('Project ID') : null;
+	    const zoneStartCol = columnNumber('Zone');
+	    const zoneEndCol = columnNumber('Ambient Temp');
+	    const userStartCol = includeUserRequirement ? columnNumber('Req Zone') : null;
+	    const userEndCol = includeUserRequirement ? columnNumber('Req IP Rating') : null;
+	    const inspectionStartCol = columnNumber('Inspection Date');
+	    const inspectionEndCol = columnNumber('Remarks');
+	    const customStartCol = columnNumber('Criteria systems');
+	    const customEndCol = customStartCol + customExportColumns.length;
 
     groupRow.getCell(1).value = 'IDENTIFICATION';
     worksheet.mergeCells(1, 1, 1, 4);
-    groupRow.getCell(5).value = 'EQUIPMENT DATA';
-    worksheet.mergeCells(1, 5, 1, 9);
-    groupRow.getCell(10).value = 'EX DATA';
-    worksheet.mergeCells(1, 10, 1, 14);
-    groupRow.getCell(15).value = 'CERTIFICATION';
-    worksheet.mergeCells(1, 15, 1, 18);
-    if (includeProjectSkid) {
-      groupRow.getCell(19).value = 'PROJECT / SKID';
-      worksheet.mergeCells(1, 19, 1, 21);
-    }
+	    groupRow.getCell(5).value = 'EQUIPMENT DATA';
+	    worksheet.mergeCells(1, 5, 1, 10);
+	    groupRow.getCell(11).value = 'EX DATA';
+	    worksheet.mergeCells(1, 11, 1, 18);
+	    groupRow.getCell(19).value = 'CERTIFICATION';
+	    worksheet.mergeCells(1, 19, 1, 22);
+	    if (includeProjectSkid) {
+	      groupRow.getCell(projectStartCol).value = 'PROJECT / SKID';
+	      worksheet.mergeCells(1, projectStartCol, 1, projectEndCol);
+	    }
     groupRow.getCell(zoneStartCol).value = 'ZONE REQUIREMENTS';
     worksheet.mergeCells(1, zoneStartCol, 1, zoneEndCol);
     if (includeUserRequirement) {
@@ -2650,20 +2940,22 @@ exports.exportEquipmentXLSX = async (req, res) => {
     }
     groupRow.getCell(inspectionStartCol).value = 'INSPECTION DATA';
     worksheet.mergeCells(1, inspectionStartCol, 1, inspectionEndCol);
-    if (customStartCol && customEndCol) {
-      groupRow.getCell(customStartCol).value = 'CUSTOM / CRITERIA DATA';
-      worksheet.mergeCells(1, customStartCol, 1, customEndCol);
-    }
+	    if (customStartCol && customEndCol) {
+	      groupRow.getCell(customStartCol).value = 'CUSTOM / CRITERIA DATA';
+	      if (customEndCol > customStartCol) {
+	        worksheet.mergeCells(1, customStartCol, 1, customEndCol);
+	      }
+	    }
 
-    const groupColorRanges = [
-      { start: 1, end: 4, color: 'FF00AA00' },
-      { start: 5, end: 9, color: 'FFFF9900' },
-      { start: 10, end: 14, color: 'FF538DD5' },
-      { start: 15, end: 18, color: 'FF00AA00' }
-    ];
-    if (includeProjectSkid) {
-      groupColorRanges.push({ start: 19, end: 21, color: 'FF80DEEA' });
-    }
+	    const groupColorRanges = [
+	      { start: 1, end: 4, color: 'FF00AA00' },
+	      { start: 5, end: 10, color: 'FFFF9900' },
+	      { start: 11, end: 18, color: 'FF538DD5' },
+	      { start: 19, end: 22, color: 'FF00AA00' }
+	    ];
+	    if (includeProjectSkid) {
+	      groupColorRanges.push({ start: projectStartCol, end: projectEndCol, color: 'FF80DEEA' });
+	    }
     groupColorRanges.push(
       { start: zoneStartCol, end: zoneEndCol, color: 'FFFFFF66' },
       { start: inspectionStartCol, end: inspectionEndCol, color: 'FFB0B0B0' }
@@ -2695,15 +2987,15 @@ exports.exportEquipmentXLSX = async (req, res) => {
       cell.alignment = { horizontal: 'center', vertical: 'middle' };
     });
 
-    const headerColorRanges = [
-      { start: 1, end: 4, color: 'FFCCFFCC' },
-      { start: 5, end: 9, color: 'FFFFE0B2' },
-      { start: 10, end: 14, color: 'FFDCE6F1' },
-      { start: 15, end: 18, color: 'FFCCFFCC' }
-    ];
-    if (includeProjectSkid) {
-      headerColorRanges.push({ start: 19, end: 21, color: 'FFE0F7FA' });
-    }
+	    const headerColorRanges = [
+	      { start: 1, end: 4, color: 'FFCCFFCC' },
+	      { start: 5, end: 10, color: 'FFFFE0B2' },
+	      { start: 11, end: 18, color: 'FFDCE6F1' },
+	      { start: 19, end: 22, color: 'FFCCFFCC' }
+	    ];
+	    if (includeProjectSkid) {
+	      headerColorRanges.push({ start: projectStartCol, end: projectEndCol, color: 'FFE0F7FA' });
+	    }
     headerColorRanges.push(
       { start: zoneStartCol, end: zoneEndCol, color: 'FFFFFFCC' },
       { start: inspectionStartCol, end: inspectionEndCol, color: 'FFE0E0E0' }
@@ -2736,11 +3028,12 @@ exports.exportEquipmentXLSX = async (req, res) => {
       cell.alignment = { horizontal: 'center', vertical: 'middle' };
     });
 
-    const centerAlignedColumns = new Set([
-      'Temp. Range',
-      'Equipment Group',
-      'Equipment Category',
-      'Environment',
+	    const centerAlignedColumns = new Set([
+	      'Temp. Range',
+	      'Qualitycheck',
+	      'Equipment Group',
+	      'Equipment Category',
+	      'Environment',
       'Type of Protection',
       'SubGroup',
       'Temperature Class',
@@ -2879,13 +3172,14 @@ exports.exportEquipmentXLSX = async (req, res) => {
           'Serial Number': eq['Serial Number'] || '',
           'IP rating': eq['IP rating'] || '',
           'Temp. Range': eq['Max Ambient Temp'] || '',
+          'Qualitycheck': eq.Qualitycheck ? 'Yes' : 'No',
           'EPL': marking ? marking['Equipment Protection Level'] || '' : '',
+          'Equipment Group': marking ? marking['Equipment Group'] || '' : '',
+          'Equipment Category': marking ? marking['Equipment Category'] || '' : '',
+          'Environment': marking ? marking.Environment || '' : '',
           'SubGroup': marking ? marking['Gas / Dust Group'] || '' : '',
           'Temperature Class': marking ? marking['Temperature Class'] || '' : '',
           'Protection Concept': marking ? marking['Type of Protection'] || '' : '',
-          //'Equipment Group': marking ? marking['Equipment Group'] || '' : '',
-         // 'Equipment Category': marking ? marking['Equipment Category'] || '' : '',
-         // 'Environment': marking ? marking.Environment || '' : '',
           'Certificate No': exportCertNo,
           'Certificate Issue Date': cert?.issueDate || '',
           'Special Condition': hasSpecialCondition ? 'Yes' : 'No',
@@ -2900,7 +3194,8 @@ exports.exportEquipmentXLSX = async (req, res) => {
             : '',
           'Inspector': inspectorName,
           'Type': inspection?.inspectionType || '',
-          'Remarks': eq['Other Info'] || ''
+          'Remarks': eq['Other Info'] || '',
+          'Criteria systems': criteriaSystemNameMap.get(eq._id?.toString()) || ''
         };
 
         if (includeUserRequirement) {
@@ -3085,10 +3380,11 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
             field,
             header: `Criteria: ${system.name}: ${field.label || field.key}`
           }))
-      )
-    ];
+	      )
+	    ];
+    const criteriaSystemNameMap = await buildCriteriaSystemNameMap(tenantId, equipments);
 
-    let hideAtexSpecific = false;
+	    let hideAtexSpecific = false;
     if (typeof scheme === 'string' && scheme.toUpperCase() === 'IECEX') {
       hideAtexSpecific = true;
     } else if (zoneId) {
@@ -3105,35 +3401,39 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
       'Manufacturer',
       'Model/Type',
       'Serial Number',
-      'Equipment Type',
-      'Marking',
-      ...(hideAtexSpecific ? [] : ['Equipment Group', 'Equipment Category', 'Environment']),
+	      'Equipment Type',
+	      'Marking',
+	      'Equipment Group',
+	      'Equipment Category',
+	      'Environment',
       'Type of Protection',
       'Gas / Dust Group',
       'Temperature Class',
       'Equipment Protection Level',
       'IP rating',
-      'Certificate No',
-      'Max Ambient Temp',
-      'Compliance',
-      'Other Info',
-      ...customExportColumns.map((c) => c.header)
-    ];
+	      'Certificate No',
+	      'Max Ambient Temp',
+	      'Qualitycheck',
+	      'Compliance',
+	      'Other Info',
+	      'Criteria systems',
+	      ...customExportColumns.map((c) => c.header)
+	    ];
 
-    worksheet.columns = headers.map(header => ({ header, key: header, width: 12 }));
+	    const exportColumns = buildEquipmentListExportColumns(headers);
+	    worksheet.columns = exportColumns.map(column => ({
+	      header: column.header,
+	      key: column.header,
+	      width: column.width
+	    }));
+	    worksheet.spliceRows(1, 0, []);
+	    applyImportTemplateStyles(worksheet, exportColumns);
 
-    worksheet.getRow(1).eachCell(cell => {
-      cell.font = { bold: true, color: { argb: 'FFFCB040' } };
-      cell.fill = {
-        type: 'pattern',
-        pattern: 'solid',
-        fgColor: { argb: 'FF2E2109' }
-      };
-      cell.alignment = { horizontal: 'center', vertical: 'middle' };
-    });
-
-    const centerAlignedColumns = [
-      ...(hideAtexSpecific ? [] : ['Equipment Group', 'Equipment Category', 'Environment']),
+	    const centerAlignedColumns = [
+	      'Equipment Group',
+	      'Equipment Category',
+	      'Environment',
+	      'Qualitycheck',
       'Type of Protection',
       'Gas / Dust Group',
       'Temperature Class',
@@ -3148,11 +3448,13 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
       'Model/Type': item?.['Model/Type'] || '',
       'Serial Number': item?.['Serial Number'] || '',
       'Equipment Type': item?.['Equipment Type'] || '',
-      'Certificate No': item?.['Certificate No'] || '',
-      'Max Ambient Temp': item?.['Max Ambient Temp'] || '',
-      'Compliance': item?.Compliance || '',
-      'Other Info': item?.['Other Info'] || '',
-      'IP rating': item?.['IP rating'] || '',
+	      'Certificate No': item?.['Certificate No'] || '',
+	      'Max Ambient Temp': item?.['Max Ambient Temp'] || '',
+	      'Qualitycheck': item?.Qualitycheck ? 'Yes' : 'No',
+	      'Compliance': item?.Compliance || '',
+	      'Other Info': item?.['Other Info'] || '',
+	      'IP rating': item?.['IP rating'] || '',
+	      'Criteria systems': criteriaSystemNameMap.get(item?._id?.toString()) || '',
       ...customExportColumns.reduce((acc, { field, header }) => {
         acc[header] = customFieldValue(item?.customFields, field.key);
         return acc;

@@ -227,6 +227,7 @@ module.exports = {
   addCycle,
   ensureExplosionSafetySystem,
   enrichRelevantSystems,
+  loadRelevantSystemsForEquipment,
   normalizeCycle,
   normalizeKey,
   reconcileEquipmentFindings,
