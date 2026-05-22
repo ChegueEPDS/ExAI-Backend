@@ -4,6 +4,8 @@ const Equipment = require('../models/dataplate');
 const MaintenanceEvent = require('../models/maintenanceEvent');
 const Inspection = require('../models/inspection');
 const EquipmentDataVersion = require('../models/equipmentDataVersion');
+const CriteriaSystemCompletion = require('../models/criteriaSystemCompletion');
+const { enrichRelevantSystems } = require('../services/criteriaSystemService');
 
 function toObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
@@ -203,14 +205,12 @@ exports.getEquipmentHistory = async (req, res) => {
     const limitRaw = Number(req.query.limit);
     const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.floor(limitRaw), 500) : 200;
 
-    const equipment = await Equipment.findOne({ _id: equipmentId, tenantId })
-      .select('lastInspectionId lastInspectionDate lastInspectionValidUntil lastInspectionStatus')
-      .lean();
+    const equipment = await Equipment.findOne({ _id: equipmentId, tenantId }).lean();
     if (!equipment) {
       return res.status(404).json({ error: 'Eszköz nem található.' });
     }
 
-    const [maintenanceEvents, inspections, versions] = await Promise.all([
+    const [maintenanceEvents, inspections, versions, criteriaCompletions] = await Promise.all([
       MaintenanceEvent.find({ tenantId, equipmentId })
         .sort({ occurredAt: -1, _id: -1 })
         .limit(limit)
@@ -225,6 +225,12 @@ exports.getEquipmentHistory = async (req, res) => {
         .sort({ changedAt: -1, _id: -1 })
         .limit(limit)
         .populate('changedBy', 'firstName lastName nickname')
+        .lean(),
+      CriteriaSystemCompletion.find({ tenantId, equipmentId })
+        .sort({ completedAt: -1, _id: -1 })
+        .limit(limit)
+        .populate('completedByUserId', 'firstName lastName nickname')
+        .populate('criteriaSystemId', 'name type systemKey')
         .lean()
     ]);
 
@@ -260,6 +266,19 @@ exports.getEquipmentHistory = async (req, res) => {
       });
     }
 
+    for (const c of criteriaCompletions || []) {
+      events.push({
+        type: 'criteria_completed',
+        occurredAt: c.completedAt,
+        sortAt: c.completedAt,
+        criteria: {
+          ...c,
+          system: c.criteriaSystemId || null,
+          actor: c.completedByUserId || null
+        }
+      });
+    }
+
     // Synthetic planned next inspection event (from the latest inspection's validUntil).
     // Show it as a PLANNED item in the same timeline.
     const plannedAt = equipment.lastInspectionValidUntil || null;
@@ -273,20 +292,38 @@ exports.getEquipmentHistory = async (req, res) => {
       if (baseInspection && baseInspection.status && baseInspection.status !== 'Passed') {
         // Safety: equipment summary says Passed, but the inspection doc does not. Don't show PLANNED.
       } else {
-      const baseSortMillis = toMillis(baseInspection?.finalizedAt || baseInspection?.createdAt || baseInspection?.inspectionDate);
-      const plannedSortAt = baseSortMillis ? new Date(baseSortMillis + 1) : new Date(plannedMillis);
-
       events.push({
         type: 'inspection_planned',
         occurredAt: new Date(plannedMillis),
-        sortAt: plannedSortAt,
+        sortAt: new Date(plannedMillis),
         planned: {
+          kind: 'inspection',
+          name: 'Inspection',
           status: 'PLANNED',
           pastDue: Date.now() > plannedMillis,
           basedOnInspectionId: equipment.lastInspectionId || null
         }
       });
       }
+    }
+
+    const criteriaSystems = await enrichRelevantSystems({ tenantId, equipment });
+    for (const system of criteriaSystems || []) {
+      const dueMillis = toMillis(system.nextDueAt);
+      if (!dueMillis) continue;
+      events.push({
+        type: 'criteria_planned',
+        occurredAt: new Date(dueMillis),
+        sortAt: new Date(dueMillis),
+        planned: {
+          kind: 'criteria',
+          name: system.name,
+          criteriaSystemId: system._id,
+          criteriaType: system.type,
+          status: 'PLANNED',
+          pastDue: Date.now() > dueMillis
+        }
+      });
     }
 
     events.sort((a, b) => {
@@ -296,11 +333,7 @@ exports.getEquipmentHistory = async (req, res) => {
       return sortDir === 1 ? ta - tb : tb - ta;
     });
 
-    // UX: keep the synthetic PLANNED item always on top.
-    const planned = events.filter((e) => e && e.type === 'inspection_planned');
-    const rest = events.filter((e) => !e || e.type !== 'inspection_planned');
-
-    return res.json({ items: [...planned, ...rest] });
+    return res.json({ items: events });
   } catch (error) {
     console.error('❌ getEquipmentHistory error:', error);
     return res.status(500).json({ error: 'Nem sikerült lekérni a history-t.' });

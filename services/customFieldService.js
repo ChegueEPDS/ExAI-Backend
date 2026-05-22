@@ -169,7 +169,21 @@ async function sanitizeCustomFields({ tenantId, entityType, values }) {
     entityType,
     active: true
   }).lean();
-  const byKey = new Map(defs.map((d) => [String(d.key), d]));
+  let criteriaDefs = [];
+  if (entityType === 'equipment') {
+    try {
+      const CriteriaSystem = require('../models/criteriaSystem');
+      const systems = await CriteriaSystem.find({ tenantId: tenantObjectId, active: true })
+        .select('customFields')
+        .lean();
+      criteriaDefs = (systems || []).flatMap((s) => (s.customFields || [])
+        .filter((f) => f && f.active !== false && f.key)
+        .map((f) => ({ ...f, entityType: 'equipment' })));
+    } catch (_) {
+      criteriaDefs = [];
+    }
+  }
+  const byKey = new Map([...defs, ...criteriaDefs].map((d) => [String(d.key), d]));
   const out = {};
   Object.keys(values).forEach((key) => {
     const def = byKey.get(key);

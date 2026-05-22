@@ -7,6 +7,10 @@ const multer = require('multer');
 const azureBlob = require('../services/azureBlobService');
 const Question = require('../models/questions');
 const QuestionTypeMapping = require('../models/questionTypeMapping');
+const CriteriaSystem = require('../models/criteriaSystem');
+const CriteriaSystemCompletion = require('../models/criteriaSystemCompletion');
+const CriteriaSystemFinding = require('../models/criteriaSystemFinding');
+const { resolveExpiredFinding, sourceDomainFor } = require('../services/criteriaSystemService');
 const { buildCertificateCacheForTenant, resolveCertificateFromCache } = require('../helpers/certificateMatchHelper');
 const { KNOWN_SET_LOWER, normalizeProtectionTypes } = require('../helpers/protectionTypes');
 
@@ -228,6 +232,7 @@ exports.createInspection = async (req, res) => {
       inspectionDate,
       validUntil,
       inspectionType,
+      criteriaSystemId,
       results = [],
       attachments = []
     } = req.body || {};
@@ -294,6 +299,11 @@ exports.createInspection = async (req, res) => {
     // ---- Összefoglaló és globális státusz számítása ----
     const { summary, status } = buildSummaryAndStatus(normalizedResults);
     const failureSeverity = status === 'Failed' ? computeFailureSeverity(normalizedResults) : null;
+    let criteriaSystem = null;
+    if (criteriaSystemId && mongoose.isValidObjectId(criteriaSystemId)) {
+      criteriaSystem = await CriteriaSystem.findOne({ _id: criteriaSystemId, tenantId, type: 'compliance' });
+      if (!criteriaSystem) return res.status(404).json({ message: 'Criteria system not found.' });
+    }
 
     // ---- Inspection dokumentum létrehozása ----
     const inspection = new Inspection({
@@ -304,7 +314,9 @@ exports.createInspection = async (req, res) => {
       zoneId: equipment.Unit || equipment.Zone || null,
       inspectionDate: new Date(inspectionDate),
       validUntil: new Date(validUntil),
-      inspectionType,
+      inspectionType: criteriaSystem ? 'Criteria' : inspectionType,
+      criteriaSystemId: criteriaSystem?._id || null,
+      criteriaSystemNameSnapshot: criteriaSystem?.name || '',
       inspectorId,
       results: normalizedResults,
       attachments: normalizedAttachments,
@@ -318,6 +330,41 @@ exports.createInspection = async (req, res) => {
     });
 
     await inspection.save();
+
+    if (criteriaSystem) {
+      const completion = await CriteriaSystemCompletion.create({
+        tenantId,
+        equipmentId: equipment._id,
+        criteriaSystemId: criteriaSystem._id,
+        completedAt: new Date(inspectionDate),
+        note: '',
+        completedByUserId: inspectorId,
+        source: 'inspection',
+        inspectionId: inspection._id
+      });
+      await resolveExpiredFinding({
+        tenantId,
+        equipmentId: equipment._id,
+        criteriaSystemId: criteriaSystem._id,
+        userId: inspectorId,
+        completionId: completion._id
+      });
+      const failedResults = normalizedResults.filter((r) => r.status === 'Failed');
+      if (failedResults.length) {
+        await CriteriaSystemFinding.insertMany(failedResults.map((r) => ({
+          tenantId,
+          equipmentId: equipment._id,
+          criteriaSystemId: criteriaSystem._id,
+          sourceDomain: sourceDomainFor(criteriaSystem),
+          reason: 'failed_question',
+          status: 'open',
+          priority: r.severity || 'P3',
+          inspectionId: inspection._id,
+          questionId: r.questionId || null,
+          reasonText: r.questionText?.eng || r.questionText?.hun || criteriaSystem.name
+        })));
+      }
+    }
 
     // ---- Equipment "összegző" mezők frissítése ----
     try {

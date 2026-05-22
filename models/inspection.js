@@ -64,7 +64,7 @@ const InspectionAttachmentSchema = new Schema(
 const InspectionSchema = new Schema(
   {
     // Kapcsolatok
-    equipmentId: { type: Schema.Types.ObjectId, ref: 'ExRegister', required: true }, 
+    equipmentId: { type: Schema.Types.ObjectId, ref: 'Equipment', required: true },
     eqId: { type: String, required: true }, // EqID string, gyors kereséshez
 
     tenantId: { type: Schema.Types.ObjectId, ref: 'Tenant', required: false },
@@ -78,9 +78,11 @@ const InspectionSchema = new Schema(
     // Type of inspection: Detailed / Initial Detailed / Close / Visual
     inspectionType: {
       type: String,
-      enum: ['Detailed', 'Initial Detailed', 'Close', 'Visual'],
+      enum: ['Detailed', 'Initial Detailed', 'Close', 'Visual', 'Criteria'],
       required: true,
     },
+    criteriaSystemId: { type: Schema.Types.ObjectId, ref: 'CriteriaSystem', default: null, index: true },
+    criteriaSystemNameSnapshot: { type: String, default: '' },
 
     // 2. Eredmények (MINDEN kérdés, nem csak Failed/NA)
     results: {
