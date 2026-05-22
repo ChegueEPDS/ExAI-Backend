@@ -33,6 +33,12 @@ router.post(
   exRegisterController.importEquipmentXLSX
 );
 
+router.get(
+  '/exreg/import-template',
+  authMiddleware(),
+  exRegisterController.downloadEquipmentImportTemplate
+);
+
 // Dokumentumok / képek tömeges importja ZIP-ből
 router.post(
   '/exreg/import-documents-zip',

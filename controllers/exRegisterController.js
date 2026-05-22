@@ -7,6 +7,7 @@ const Certificate = require('../models/certificate');
 const Question = require('../models/questions');
 const QuestionTypeMapping = require('../models/questionTypeMapping');
 const CustomFieldDefinition = require('../models/customFieldDefinition');
+const CriteriaSystem = require('../models/criteriaSystem');
 const mongoose = require('mongoose');
 const fs = require('fs');
 const azureBlob = require('../services/azureBlobService');
@@ -430,6 +431,227 @@ function normalizeInspectionType(rawType) {
   if (value.startsWith('close') || value.startsWith('closed')) return 'Close';
   if (value.startsWith('detailed')) return 'Detailed';
   return 'Detailed';
+}
+
+function splitMultiValue(value) {
+  return String(value || '')
+    .split(/[;,]/)
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function importCommentForField(field, prefix = '') {
+  const label = field?.label || field?.key || 'Field';
+  const required = field?.required ? ' Required.' : '';
+  const base = `${prefix}${label}.${required}`;
+  if (field?.fieldType === 'number') return `${base} Enter a number.`;
+  if (field?.fieldType === 'date') return `${base} Enter a date, preferably YYYY-MM-DD.`;
+  if (field?.fieldType === 'boolean') return `${base} Allowed values: Yes, No, True, False, 1, 0.`;
+  if (field?.fieldType === 'select') {
+    const options = (field.options || []).join(', ');
+    return `${base} Select one value${options ? `: ${options}` : '.'}`;
+  }
+  if (field?.fieldType === 'multiselect') {
+    const options = (field.options || []).join(', ');
+    return `${base} Enter one or more values separated by semicolon (;).${options ? ` Allowed values: ${options}.` : ''}`;
+  }
+  return `${base} Free text.`;
+}
+
+async function loadEquipmentImportDynamicColumns(tenantId) {
+  const [customFields, criteriaSystems] = await Promise.all([
+    CustomFieldDefinition.find({
+      tenantId,
+      entityType: 'equipment',
+      active: true
+    }).sort({ createdAt: 1, label: 1 }).lean(),
+    CriteriaSystem.find({ tenantId, active: true })
+      .select('name customFields')
+      .sort({ name: 1 })
+      .lean()
+  ]);
+
+  const customColumns = (customFields || []).map((field) => ({
+    kind: 'custom',
+    key: String(field.key),
+    header: `Custom: ${field.label || field.key}`,
+    aliases: [field.label, field.key, `Custom: ${field.key}`].filter(Boolean),
+    field,
+    group: 'CUSTOM DATA',
+    comment: importCommentForField(field)
+  }));
+
+  const criteriaColumns = [];
+  (criteriaSystems || []).forEach((system) => {
+    (system.customFields || [])
+      .filter((field) => field && field.active !== false && field.key)
+      .forEach((field) => {
+        criteriaColumns.push({
+          kind: 'criteria',
+          key: String(field.key),
+          header: `Criteria: ${system.name}: ${field.label || field.key}`,
+          aliases: [
+            `${system.name}: ${field.label || field.key}`,
+            `${system.name}: ${field.key}`,
+            field.key
+          ].filter(Boolean),
+          field,
+          group: system.name || 'CRITERIA DATA',
+          comment: importCommentForField(field, `${system.name || 'Criteria system'} / `)
+        });
+      });
+  });
+
+  const byKey = new Map();
+  [...customColumns, ...criteriaColumns].forEach((col) => {
+    if (!byKey.has(col.key)) byKey.set(col.key, col);
+  });
+  return Array.from(byKey.values());
+}
+
+function findColumnIndex(headerMap, column) {
+  const labels = [column.header, ...(column.aliases || [])]
+    .map((v) => String(v || '').trim())
+    .filter(Boolean);
+  for (const label of labels) {
+    if (headerMap[label]) return headerMap[label];
+  }
+  return null;
+}
+
+function collectDynamicCustomFieldValues(row, headerMap, dynamicColumns) {
+  const values = {};
+  (dynamicColumns || []).forEach((column) => {
+    const idx = findColumnIndex(headerMap, column);
+    if (!idx) return;
+    const raw = getCellStringByIndex(row, idx);
+    if (raw === '') return;
+    values[column.key] = column.field?.fieldType === 'multiselect' ? splitMultiValue(raw) : raw;
+  });
+  return values;
+}
+
+function equipmentImportBaseColumns({ includeProjectSkid }) {
+  const columns = [
+    { header: '_id', group: 'IDENTIFICATION', width: 26, comment: 'Optional. Keep this value when updating rows exported from the system. Leave empty for new equipment.' },
+    { header: '#', group: 'IDENTIFICATION', width: 8, comment: 'Optional order number inside the unit. Leave empty to auto-assign the next number.' },
+    { header: 'TagNo', group: 'IDENTIFICATION', width: 16, comment: 'Optional tag number.' },
+    { header: 'EqID', group: 'IDENTIFICATION', width: 24, comment: 'Equipment ID. Recommended for every row.' },
+    { header: 'Description', group: 'EQUIPMENT DATA', width: 24, comment: 'Equipment type / description, for example electric motor.' },
+    { header: 'Manufacturer', group: 'EQUIPMENT DATA', width: 22, comment: 'Manufacturer name.' },
+    { header: 'Model', group: 'EQUIPMENT DATA', width: 20, comment: 'Model or type designation.' },
+    { header: 'Serial Number', group: 'EQUIPMENT DATA', width: 20, comment: 'Serial number.' },
+    { header: 'IP rating', group: 'EQUIPMENT DATA', width: 14, comment: 'Ingress protection, for example IP66.' },
+    { header: 'Temp. Range', group: 'EQUIPMENT DATA', width: 18, comment: 'Ambient temperature range, for example -40 / +80°C.' },
+    { header: 'EPL', group: 'EX DATA', width: 14, comment: 'Equipment Protection Level, for example Ga, Gb, Gc, Da, Db, Dc.' },
+    { header: 'SubGroup', group: 'EX DATA', width: 16, comment: 'Gas/dust subgroup, for example IIA, IIB, IIC, IIIA, IIIB, IIIC. Multiple values may be separated by comma or slash.' },
+    { header: 'Temperature Class', group: 'EX DATA', width: 18, comment: 'Temperature class, for example T1, T2, T3, T4, T5, T6.' },
+    { header: 'Protection Concept', group: 'EX DATA', width: 22, comment: 'Type of protection, for example Ex d, Ex e, Ex i, Ex t. Use the same notation as on the dataplate.' },
+    { header: 'Certificate No', group: 'CERTIFICATION', width: 24, comment: 'Certificate number. If this is empty, Declaration of conformity may be used as certificate reference.' },
+    { header: 'Declaration of conformity', group: 'CERTIFICATION', width: 28, comment: 'Manufacturer declaration number. Used as certificate reference when Certificate No is empty.' },
+    { header: 'Inspection Date', group: 'INSPECTION DATA', width: 18, comment: 'Optional. Enter a date, preferably YYYY-MM-DD. If Status is Passed, an inspection can be created from this date.' },
+    { header: 'Type', group: 'INSPECTION DATA', width: 18, comment: 'Optional inspection type. Allowed values: Detailed, Visual, Initial Detailed, Close.' },
+    { header: 'Status', group: 'INSPECTION DATA', width: 14, comment: 'Allowed values: Passed, Failed, NA. Passed with Inspection Date creates an inspection.' },
+    { header: 'Remarks', group: 'INSPECTION DATA', width: 28, comment: 'Free text remarks imported into equipment notes.' }
+  ];
+  if (includeProjectSkid) {
+    columns.splice(
+      16,
+      0,
+      { header: 'Skid ID', group: 'PROJECT / SKID', width: 18, comment: 'Optional project/skid context. When filled, the unit skid value is updated from the latest non-empty value.' },
+      { header: 'Skid Description', group: 'PROJECT / SKID', width: 28, comment: 'Optional project/skid description. When filled, the unit skid description is updated from the latest non-empty value.' },
+      { header: 'Project ID', group: 'PROJECT / SKID', width: 18, comment: 'Optional project ID. When filled, the unit project value is updated from the latest non-empty value.' }
+    );
+  }
+  return columns;
+}
+
+function groupColor(group) {
+  return {
+    'IDENTIFICATION': 'FF00AA00',
+    'EQUIPMENT DATA': 'FFFF9900',
+    'EX DATA': 'FF538DD5',
+    'CERTIFICATION': 'FF00AA00',
+    'PROJECT / SKID': 'FF80DEEA',
+    'INSPECTION DATA': 'FFB0B0B0',
+    'CUSTOM DATA': 'FF6AA84F'
+  }[group] || 'FF9FC5E8';
+}
+
+function groupLightColor(group) {
+  return {
+    'IDENTIFICATION': 'FFCCFFCC',
+    'EQUIPMENT DATA': 'FFFFE0B2',
+    'EX DATA': 'FFDCE6F1',
+    'CERTIFICATION': 'FFCCFFCC',
+    'PROJECT / SKID': 'FFE0F7FA',
+    'INSPECTION DATA': 'FFE0E0E0',
+    'CUSTOM DATA': 'FFEAF4E4'
+  }[group] || 'FFD9EAD3';
+}
+
+function applyImportTemplateStyles(worksheet, columns) {
+  worksheet.views = [{ state: 'frozen', ySplit: 2 }];
+  worksheet.autoFilter = {
+    from: { row: 2, column: 1 },
+    to: { row: 2, column: columns.length }
+  };
+
+  const groupRow = worksheet.getRow(1);
+  const headerRow = worksheet.getRow(2);
+  groupRow.height = 24;
+  headerRow.height = 34;
+
+  let start = 1;
+  while (start <= columns.length) {
+    const group = columns[start - 1].group || '';
+    let end = start;
+    while (end + 1 <= columns.length && columns[end].group === group) end += 1;
+    groupRow.getCell(start).value = group;
+    if (end > start) worksheet.mergeCells(1, start, 1, end);
+    for (let col = start; col <= end; col += 1) {
+      const cell = groupRow.getCell(col);
+      cell.font = { bold: true, color: { argb: 'FF000000' } };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: groupColor(group) } };
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      cell.border = {
+        top: { style: 'thin', color: { argb: 'FFFFFFFF' } },
+        left: { style: 'thin', color: { argb: 'FFFFFFFF' } },
+        bottom: { style: 'thin', color: { argb: 'FFFFFFFF' } },
+        right: { style: 'thin', color: { argb: 'FFFFFFFF' } }
+      };
+    }
+    start = end + 1;
+  }
+
+  columns.forEach((column, idx) => {
+    const colNumber = idx + 1;
+    const cell = headerRow.getCell(colNumber);
+    cell.value = column.header;
+    cell.note = column.comment || 'Enter the value for this column.';
+    cell.font = { bold: true, color: { argb: 'FF000000' } };
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: groupLightColor(column.group) } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+    cell.border = {
+      top: { style: 'thin', color: { argb: 'FFB7B7B7' } },
+      left: { style: 'thin', color: { argb: 'FFB7B7B7' } },
+      bottom: { style: 'thin', color: { argb: 'FFB7B7B7' } },
+      right: { style: 'thin', color: { argb: 'FFB7B7B7' } }
+    };
+    worksheet.getColumn(colNumber).width = column.width || Math.min(Math.max(String(column.header).length + 4, 14), 34);
+  });
+
+  for (let rowNumber = 3; rowNumber <= 250; rowNumber += 1) {
+    const row = worksheet.getRow(rowNumber);
+    row.height = 20;
+    columns.forEach((column, idx) => {
+      const cell = row.getCell(idx + 1);
+      cell.alignment = { vertical: 'middle', wrapText: false };
+      if (rowNumber % 2 === 0) {
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8F9FA' } };
+      }
+    });
+  }
 }
 
 function determineEnvironmentFromSubGroup(value) {
@@ -1049,6 +1271,106 @@ exports.deleteDocumentFromEquipment = async (req, res) => {
   }
 };
 
+exports.downloadEquipmentImportTemplate = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    if (!tenantId) {
+      return res.status(401).json({ message: 'Missing tenantId from auth.' });
+    }
+
+    const tenantName = (req.scope?.tenantName || '').toLowerCase();
+    const includeProjectSkid = isProjectSkidTenantSlug(tenantName) || isInspExRequestHost(req);
+    const dynamicColumns = await loadEquipmentImportDynamicColumns(tenantId);
+    const columns = [
+      ...equipmentImportBaseColumns({ includeProjectSkid }),
+      ...dynamicColumns.map((column) => ({
+        header: column.header,
+        group: column.kind === 'criteria' ? column.group : 'CUSTOM DATA',
+        width: Math.min(Math.max(String(column.header).length + 4, 18), 42),
+        comment: column.comment
+      }))
+    ];
+
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'InspEx';
+    workbook.created = new Date();
+    const worksheet = workbook.addWorksheet('Equipment import');
+    worksheet.columns = columns.map((column) => ({ header: column.header, key: column.header, width: column.width }));
+    worksheet.spliceRows(1, 0, []);
+    applyImportTemplateStyles(worksheet, columns);
+
+    const statusColumn = columns.findIndex((c) => c.header === 'Status') + 1;
+    const typeColumn = columns.findIndex((c) => c.header === 'Type') + 1;
+    if (statusColumn > 0) {
+      worksheet.dataValidations.add(`${worksheet.getColumn(statusColumn).letter}3:${worksheet.getColumn(statusColumn).letter}250`, {
+        type: 'list',
+        allowBlank: true,
+        formulae: ['"Passed,Failed,NA"']
+      });
+    }
+    if (typeColumn > 0) {
+      worksheet.dataValidations.add(`${worksheet.getColumn(typeColumn).letter}3:${worksheet.getColumn(typeColumn).letter}250`, {
+        type: 'list',
+        allowBlank: true,
+        formulae: ['"Detailed,Visual,Initial Detailed,Close"']
+      });
+    }
+
+    dynamicColumns.forEach((column) => {
+      const colIdx = columns.findIndex((c) => c.header === column.header) + 1;
+      if (colIdx <= 0) return;
+      const letter = worksheet.getColumn(colIdx).letter;
+      if (column.field?.fieldType === 'boolean') {
+        worksheet.dataValidations.add(`${letter}3:${letter}250`, {
+          type: 'list',
+          allowBlank: true,
+          formulae: ['"Yes,No,True,False,1,0"']
+        });
+      } else if (column.field?.fieldType === 'select' && Array.isArray(column.field.options) && column.field.options.length) {
+        const csv = column.field.options.join(',');
+        if (csv.length <= 240) {
+          worksheet.dataValidations.add(`${letter}3:${letter}250`, {
+            type: 'list',
+            allowBlank: true,
+            formulae: [`"${csv.replace(/"/g, '""')}"`]
+          });
+        }
+      }
+    });
+
+    const instructions = workbook.addWorksheet('Instructions');
+    instructions.columns = [
+      { header: 'Topic', key: 'topic', width: 24 },
+      { header: 'Guidance', key: 'guidance', width: 90 }
+    ];
+    instructions.addRow({
+      topic: 'Header help',
+      guidance: 'Hover over cells in the header row on the Equipment import sheet to see allowed values and formatting guidance.'
+    });
+    instructions.addRow({
+      topic: 'Multi-select values',
+      guidance: 'Use semicolon (;) between multiple values, for example: Option A; Option B.'
+    });
+    instructions.addRow({
+      topic: 'Updates',
+      guidance: 'Keep the _id column when updating equipment exported from the system. Leave _id empty to create new equipment.'
+    });
+    instructions.getRow(1).font = { bold: true };
+    instructions.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9EAD3' } };
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader('Content-Type', EXCEL_CONTENT_TYPE);
+    res.setHeader('Content-Disposition', 'attachment; filename="equipment-import-template.xlsx"');
+    return res.status(200).send(Buffer.from(buffer));
+  } catch (err) {
+    console.error('❌ downloadEquipmentImportTemplate error:', err);
+    return res.status(500).json({
+      message: 'Failed to generate equipment import template.',
+      error: err.message || String(err)
+    });
+  }
+};
+
 exports.importEquipmentXLSX = async (req, res) => {
   const tenantId = req.scope?.tenantId;
   const userId = req.userId;
@@ -1093,6 +1415,7 @@ exports.importEquipmentXLSX = async (req, res) => {
 
     const equipmentMap = new Map();
     const parseErrors = [];
+    const dynamicImportColumns = await loadEquipmentImportDynamicColumns(tenantId);
 
     worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
       if (rowNumber <= headerInfo.headerRowNumber) return;
@@ -1133,6 +1456,7 @@ exports.importEquipmentXLSX = async (req, res) => {
         if (skidDescription) latestSkidDescription = skidDescription;
         if (projectId) latestProjectId = projectId;
       }
+      const customFieldsRaw = collectDynamicCustomFieldValues(row, headerInfo.headerMap, dynamicImportColumns);
 
       const rowHasData = [
         eqId,
@@ -1145,7 +1469,8 @@ exports.importEquipmentXLSX = async (req, res) => {
         tempRange,
         certificateNo,
         declarationNo,
-        remarks
+        remarks,
+        ...Object.values(customFieldsRaw)
       ].some(Boolean);
 
       const rowHasExData = [epl, subGroup, tempClass, protectionConcept].some(Boolean);
@@ -1176,7 +1501,8 @@ exports.importEquipmentXLSX = async (req, res) => {
             'Other Info': remarks || '',
             Compliance: inspectionStatus || 'NA',
             'Ex Marking': [],
-            'X condition': { X: false, Specific: '' }
+            'X condition': { X: false, Specific: '' },
+            customFields: {}
           },
           inspectionDate: inspectionDate || null,
           inspectionStatus,
@@ -1201,6 +1527,12 @@ exports.importEquipmentXLSX = async (req, res) => {
       if (tempRange) entry.base['Max Ambient Temp'] = tempRange;
       if (certificateNo) entry.base['Certificate No'] = certificateNo;
       if (remarks) entry.base['Other Info'] = remarks;
+      if (Object.keys(customFieldsRaw).length) {
+        entry.base.customFields = {
+          ...(entry.base.customFields || {}),
+          ...customFieldsRaw
+        };
+      }
       if (inspectionStatus && inspectionStatus !== 'NA') entry.base.Compliance = inspectionStatus;
       if (!entry.inspectionDate && inspectionDate) entry.inspectionDate = inspectionDate;
       if (entry.inspectionStatus === 'NA' && inspectionStatus !== 'NA') {
@@ -1256,6 +1588,15 @@ exports.importEquipmentXLSX = async (req, res) => {
         if (entry.orderIndex != null) {
           payload.orderIndex = entry.orderIndex;
         }
+        if (payload.customFields && Object.keys(payload.customFields).length) {
+          payload.customFields = await sanitizeCustomFields({
+            tenantId,
+            entityType: 'equipment',
+            values: payload.customFields
+          });
+        } else {
+          delete payload.customFields;
+        }
         payload['Ex Marking'] = (payload['Ex Marking'] || []).filter(mark =>
           Object.values(mark).some(value => !!String(value || '').trim())
         );
@@ -1271,6 +1612,15 @@ exports.importEquipmentXLSX = async (req, res) => {
           });
           if (equipmentDoc) {
             const updateData = { ...payload, ModifiedBy: userId };
+            if (payload.customFields && Object.keys(payload.customFields).length) {
+              const currentCustomFields = equipmentDoc.customFields instanceof Map
+                ? Object.fromEntries(equipmentDoc.customFields.entries())
+                : (equipmentDoc.customFields && typeof equipmentDoc.customFields === 'object' ? equipmentDoc.customFields : {});
+              updateData.customFields = {
+                ...currentCustomFields,
+                ...payload.customFields
+              };
+            }
             delete updateData.CreatedBy;
             delete updateData.tenantId;
             if (entry.orderIndex == null) {
@@ -2137,10 +2487,24 @@ exports.exportEquipmentXLSX = async (req, res) => {
       active: true,
       showInExport: true
     }).sort({ createdAt: 1, label: 1 }).lean();
-    const customExportColumns = customExportFields.map((field) => ({
-      field,
-      header: `Custom: ${field.label || field.key}`
-    }));
+    const criteriaExportSystems = await CriteriaSystem.find({ tenantId, active: true })
+      .select('name customFields')
+      .sort({ name: 1 })
+      .lean();
+    const customExportColumns = [
+      ...customExportFields.map((field) => ({
+        field,
+        header: `Custom: ${field.label || field.key}`
+      })),
+      ...(criteriaExportSystems || []).flatMap((system) =>
+        (system.customFields || [])
+          .filter((field) => field && field.active !== false && field.key)
+          .map((field) => ({
+            field,
+            header: `Criteria: ${system.name}: ${field.label || field.key}`
+          }))
+      )
+    ];
 
     // ---- Zóna cache ----
     const zoneIds = [
@@ -2287,7 +2651,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
     groupRow.getCell(inspectionStartCol).value = 'INSPECTION DATA';
     worksheet.mergeCells(1, inspectionStartCol, 1, inspectionEndCol);
     if (customStartCol && customEndCol) {
-      groupRow.getCell(customStartCol).value = 'CUSTOM DATA';
+      groupRow.getCell(customStartCol).value = 'CUSTOM / CRITERIA DATA';
       worksheet.mergeCells(1, customStartCol, 1, customEndCol);
     }
 
@@ -2705,10 +3069,24 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
       active: true,
       showInExport: true
     }).sort({ createdAt: 1, label: 1 }).lean();
-    const customExportColumns = customExportFields.map((field) => ({
-      field,
-      header: `Custom: ${field.label || field.key}`
-    }));
+    const criteriaExportSystems = await CriteriaSystem.find({ tenantId, active: true })
+      .select('name customFields')
+      .sort({ name: 1 })
+      .lean();
+    const customExportColumns = [
+      ...customExportFields.map((field) => ({
+        field,
+        header: `Custom: ${field.label || field.key}`
+      })),
+      ...(criteriaExportSystems || []).flatMap((system) =>
+        (system.customFields || [])
+          .filter((field) => field && field.active !== false && field.key)
+          .map((field) => ({
+            field,
+            header: `Criteria: ${system.name}: ${field.label || field.key}`
+          }))
+      )
+    ];
 
     let hideAtexSpecific = false;
     if (typeof scheme === 'string' && scheme.toUpperCase() === 'IECEX') {
