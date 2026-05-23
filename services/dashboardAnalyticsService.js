@@ -317,11 +317,12 @@ function computeRepairsHistogram(maintenanceIncidents, fromMs, toMs) {
   return hist;
 }
 
-function computeSlaCompliance(incidents, fromMs, toMs, slaTargets, targetKey) {
+function computeSlaCompliance(incidents, fromMs, toMs, slaTargets, targetKey, equipmentsById = new Map(), kind = 'maintenance') {
   const closed = filterByWindowResolved(incidents, fromMs, toMs);
   const bySeverity = { P1: { within: 0, breach: 0 }, P2: { within: 0, breach: 0 }, P3: { within: 0, breach: 0 }, P4: { within: 0, breach: 0 } };
   let withinAll = 0;
   let breachAll = 0;
+  const breachItems = [];
 
   for (const inc of closed) {
     if (inc.startMs == null || inc.endMs == null) continue;
@@ -335,12 +336,26 @@ function computeSlaCompliance(incidents, fromMs, toMs, slaTargets, targetKey) {
     } else {
       bySeverity[sev].breach += 1;
       breachAll += 1;
+      const eqId = inc.equipmentId ? String(inc.equipmentId) : null;
+      const eq = eqId ? equipmentsById.get(eqId) : null;
+      breachItems.push({
+        kind,
+        equipmentId: eqId,
+        eqId: eq?.EqID || null,
+        tagNo: eq?.TagNo || null,
+        severity: sev,
+        startedAt: new Date(inc.startMs).toISOString(),
+        resolvedAt: new Date(inc.endMs).toISOString(),
+        durationHours: Math.round(durH * 10) / 10,
+        targetHours: targetH
+      });
     }
   }
 
   const total = withinAll + breachAll;
   const rate = total ? withinAll / total : null;
-  return { total, within: withinAll, breach: breachAll, rate, bySeverity, targets: slaTargets };
+  breachItems.sort((a, b) => Number(b.durationHours || 0) - Number(a.durationHours || 0));
+  return { total, within: withinAll, breach: breachAll, rate, bySeverity, targets: slaTargets, items: breachItems };
 }
 
 function computeRecurrenceRate(incidents, windowMs = 30 * 24 * 3600 * 1000) {
@@ -490,8 +505,8 @@ async function computeDashboardAnalytics({ tenantId, siteId = null, zoneId = nul
   const throughputCompliance = computeThroughput(complianceIncidents, fromMs, toMs);
 
   const repairsHistogram = computeRepairsHistogram(maintenanceIncidents, fromMs, toMs);
-  const sla = computeSlaCompliance(maintenanceIncidents, fromMs, toMs, slaTargets, 'maintenanceHours');
-  const inspectionSla = computeSlaCompliance(complianceIncidents, fromMs, toMs, slaTargets, 'inspectionHours');
+  const sla = computeSlaCompliance(maintenanceIncidents, fromMs, toMs, slaTargets, 'maintenanceHours', equipmentsById, 'maintenance');
+  const inspectionSla = computeSlaCompliance(complianceIncidents, fromMs, toMs, slaTargets, 'inspectionHours', equipmentsById, 'compliance');
 
   const recurrenceMaintenance = computeRecurrenceRate(maintenanceIncidents);
   const recurrenceCompliance = computeRecurrenceRate(complianceIncidents);

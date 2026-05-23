@@ -4,6 +4,8 @@ const authMiddleware = require('../middlewares/authMiddleware');
 const controller = require('../controllers/criteriaSystemController');
 
 router.get('/criteria-systems', authMiddleware(), controller.list);
+router.get('/criteria-systems/statistics', authMiddleware(), controller.statistics);
+router.get('/criteria-systems/attention', authMiddleware(), controller.attention);
 router.post('/criteria-systems', authMiddleware(['SuperAdmin']), express.json(), controller.create);
 router.put('/criteria-systems/:id', authMiddleware(['SuperAdmin']), express.json(), controller.update);
 

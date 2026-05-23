@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 
 const Equipment = require('../models/dataplate');
+const Unit = require('../models/unit');
 const CriteriaSystem = require('../models/criteriaSystem');
 const DeviceAssignment = require('../models/deviceCriteriaSystemAssignment');
 const Completion = require('../models/criteriaSystemCompletion');
@@ -35,6 +36,77 @@ function tenantIdOr400(req, res) {
     return null;
   }
   return tenantId;
+}
+
+function parseLimit(raw, fallback = 20, max = 50) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(max, Math.floor(n));
+}
+
+function normalizeScope(scope) {
+  const s = String(scope || '').toLowerCase();
+  if (s === 'site' || s === 'zone') return s;
+  return 'global';
+}
+
+function parseDate(raw) {
+  if (!raw) return null;
+  const d = new Date(raw);
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+
+function dateRangeMatch(field, from, to) {
+  const range = {};
+  if (from) range.$gte = from;
+  if (to) range.$lte = to;
+  return Object.keys(range).length ? { [field]: range } : {};
+}
+
+async function buildScopedEquipmentQuery(req, tenantId) {
+  const scope = normalizeScope(req.query.scope);
+  const siteId = req.query.siteId;
+  const zoneId = req.query.zoneId;
+  const query = { tenantId, isProcessed: true };
+
+  if (scope === 'site') {
+    const siteObjectId = toObjectId(siteId);
+    if (!siteObjectId) {
+      const err = new Error('Invalid siteId.');
+      err.status = 400;
+      throw err;
+    }
+    query.Site = siteObjectId;
+  }
+
+  if (scope === 'zone') {
+    const siteObjectId = toObjectId(siteId);
+    const zoneObjectId = toObjectId(zoneId);
+    if (!siteObjectId) {
+      const err = new Error('Invalid siteId.');
+      err.status = 400;
+      throw err;
+    }
+    if (!zoneObjectId) {
+      const err = new Error('Invalid zoneId.');
+      err.status = 400;
+      throw err;
+    }
+    query.Site = siteObjectId;
+    const unitIds = await Unit.find({
+      tenantId,
+      $or: [{ _id: zoneObjectId }, { ancestors: zoneObjectId }]
+    }).select('_id').lean();
+    const ids = unitIds.map((u) => u._id);
+    query.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
+  }
+
+  return {
+    scope,
+    siteId: scope === 'global' ? null : String(siteId || ''),
+    zoneId: scope === 'zone' ? String(zoneId || '') : null,
+    query
+  };
 }
 
 function sanitizeFields(fields) {
@@ -81,6 +153,161 @@ exports.list = async (req, res) => {
     res.json(items);
   } catch (err) {
     res.status(500).json({ message: err.message || 'Failed to list criteria systems.' });
+  }
+};
+
+exports.statistics = async (req, res) => {
+  try {
+    const tenantId = tenantIdOr400(req, res);
+    if (!tenantId) return;
+    await ensureExplosionSafetySystem(tenantId, req.userId || null);
+
+    const systems = await CriteriaSystem.find({ tenantId, active: { $ne: false } })
+      .sort({ isSystemProvided: -1, name: 1 })
+      .lean();
+    const ids = systems.map((s) => s._id);
+    const scoped = await buildScopedEquipmentQuery(req, tenantId);
+    const from = parseDate(req.query.from);
+    const to = parseDate(req.query.to);
+    let scopedEquipmentIds = null;
+    if (scoped.scope !== 'global') {
+      const rows = await Equipment.find(scoped.query).select('_id').lean();
+      scopedEquipmentIds = rows.map((eq) => eq._id);
+    }
+    const scopedMatch = scopedEquipmentIds ? { equipmentId: { $in: scopedEquipmentIds } } : {};
+
+    const [assignments, completions, openFindings, overdueFindings, startedFindings] = await Promise.all([
+      DeviceAssignment.aggregate([
+        { $match: { tenantId, criteriaSystemId: { $in: ids }, state: 'included', active: { $ne: false }, ...scopedMatch } },
+        { $group: { _id: '$criteriaSystemId', count: { $sum: 1 } } }
+      ]),
+      Completion.aggregate([
+        { $match: { tenantId, criteriaSystemId: { $in: ids }, ...scopedMatch, ...dateRangeMatch('completedAt', from, to) } },
+        { $group: { _id: '$criteriaSystemId', count: { $sum: 1 }, lastCompletedAt: { $max: '$completedAt' } } }
+      ]),
+      Finding.aggregate([
+        { $match: { tenantId, criteriaSystemId: { $in: ids }, status: 'open', ...scopedMatch } },
+        { $group: { _id: '$criteriaSystemId', count: { $sum: 1 } } }
+      ]),
+      Finding.aggregate([
+        { $match: { tenantId, criteriaSystemId: { $in: ids }, status: 'open', dueAt: { $lt: new Date() }, ...scopedMatch } },
+        { $group: { _id: '$criteriaSystemId', count: { $sum: 1 } } }
+      ]),
+      Finding.aggregate([
+        { $match: { tenantId, criteriaSystemId: { $in: ids }, ...scopedMatch, ...dateRangeMatch('createdAt', from, to) } },
+        { $group: { _id: '$criteriaSystemId', count: { $sum: 1 } } }
+      ])
+    ]);
+
+    const byId = (rows) => new Map((rows || []).map((r) => [String(r._id), r]));
+    const assignmentById = byId(assignments);
+    const completionById = byId(completions);
+    const openById = byId(openFindings);
+    const overdueById = byId(overdueFindings);
+    const startedById = byId(startedFindings);
+
+    const items = systems.map((s) => {
+      const id = String(s._id);
+      const c = completionById.get(id) || {};
+      return {
+        criteriaSystemId: id,
+        name: s.name,
+        type: s.type,
+        assignmentScope: s.assignmentScope,
+        assignedEquipmentCount: Number(assignmentById.get(id)?.count || 0),
+        startedFindingCount: Number(startedById.get(id)?.count || 0),
+        completionCount: Number(c.count || 0),
+        openFindingCount: Number(openById.get(id)?.count || 0),
+        overdueFindingCount: Number(overdueById.get(id)?.count || 0),
+        lastCompletedAt: c.lastCompletedAt || null
+      };
+    });
+
+    res.json({
+      scope: { scope: scoped.scope, siteId: scoped.siteId, zoneId: scoped.zoneId },
+      items
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message || 'Failed to load criteria statistics.' });
+  }
+};
+
+exports.attention = async (req, res) => {
+  try {
+    const tenantId = tenantIdOr400(req, res);
+    if (!tenantId) return;
+    await ensureExplosionSafetySystem(tenantId, req.userId || null);
+
+    const limit = parseLimit(req.query.limit, 20, 50);
+    const scoped = await buildScopedEquipmentQuery(req, tenantId);
+    let scopedEquipmentIds = null;
+    if (scoped.scope !== 'global') {
+      const rows = await Equipment.find(scoped.query).select('_id').lean();
+      scopedEquipmentIds = rows.map((eq) => eq._id);
+    }
+
+    const findingQuery = {
+        tenantId,
+        status: 'open',
+        dueAt: { $ne: null, $lt: new Date() }
+    };
+    if (scopedEquipmentIds) findingQuery.equipmentId = { $in: scopedEquipmentIds };
+
+    const findings = !scopedEquipmentIds || scopedEquipmentIds.length
+      ? await Finding.find(findingQuery)
+          .select('_id equipmentId criteriaSystemId reason status priority dueAt reasonText sourceDomain createdAt')
+          .sort({ dueAt: 1, createdAt: 1, _id: 1 })
+          .limit(limit)
+          .lean()
+      : [];
+
+    const equipmentIds = [...new Set(findings.map((f) => String(f.equipmentId)).filter(Boolean))];
+    const equipmentRows = equipmentIds.length
+      ? await Equipment.find({ tenantId, _id: { $in: equipmentIds } })
+          .select('_id EqID TagNo Site Unit Zone')
+          .populate({ path: 'Site', select: 'Name', options: { lean: true } })
+          .populate({ path: 'Unit', select: 'Name', options: { lean: true } })
+          .populate({ path: 'Zone', select: 'Name', options: { lean: true } })
+          .lean()
+      : [];
+    const equipmentById = new Map((equipmentRows || []).map((eq) => [String(eq._id), eq]));
+
+    const systemIds = [...new Set(findings.map((f) => String(f.criteriaSystemId)).filter(Boolean))];
+    const systems = systemIds.length
+      ? await CriteriaSystem.find({ tenantId, _id: { $in: systemIds } })
+        .select('_id name type assignmentScope')
+        .lean()
+      : [];
+    const systemsById = new Map((systems || []).map((s) => [String(s._id), s]));
+
+    const items = findings.map((f) => {
+      const eq = equipmentById.get(String(f.equipmentId)) || {};
+      const system = systemsById.get(String(f.criteriaSystemId)) || {};
+      return {
+        findingId: String(f._id),
+        criteriaSystemId: String(f.criteriaSystemId),
+        criteriaSystemName: system.name || 'Criteria system',
+        criteriaSystemType: system.type || null,
+        equipmentId: String(f.equipmentId),
+        eqId: eq.EqID || null,
+        tagNo: eq.TagNo || null,
+        priority: f.priority || null,
+        reason: f.reason || null,
+        reasonText: f.reasonText || '',
+        dueAt: f.dueAt || null,
+        siteName: eq.Site?.Name || null,
+        zoneName: eq.Unit?.Name || eq.Zone?.Name || null
+      };
+    });
+
+    res.json({
+      scope: { scope: scoped.scope, siteId: scoped.siteId, zoneId: scoped.zoneId },
+      limit,
+      items
+    });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ message: err.message || 'Failed to load criteria attention.' });
   }
 };
 
