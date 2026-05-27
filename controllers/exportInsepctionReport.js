@@ -69,6 +69,10 @@ const REPORT_JOB_TYPES = {
   LATEST_INSPECTIONS: 'latest_inspections'
 };
 const REPORT_BLOB_PREFIX = 'report-exports';
+function displayInspectionTypeForReport(type) {
+  return String(type || '') === 'Initial Detailed (Index)' ? 'Initial Detailed' : (type || '');
+}
+
 function getReportExportRetentionDays() {
   const n = Number(systemSettings.getNumber('REPORT_EXPORT_RETENTION_DAYS'));
   return Number.isFinite(n) && n > 0 ? n : 7;
@@ -519,6 +523,9 @@ function deriveQuestionReference(result) {
   }
   if (tableVal && groupVal && (numRaw || numRaw === 0)) {
     return `${tableVal}-${groupVal}-${numRaw}`;
+  }
+  if (numRaw || numRaw === 0) {
+    return `${numRaw}`;
   }
   return result.reference || '';
 }
@@ -2069,7 +2076,7 @@ function buildProjectExRegisterWorkbook(equipments, {
         'Status': eq['Compliance'] || '',
         'Inspection Date': inspectionDate ? new Date(inspectionDate) : '',
         'Inspector': inspectorName,
-        'Type': inspection?.inspectionType || '',
+        'Type': displayInspectionTypeForReport(inspection?.inspectionType),
         'Remarks': eq['Other Info'] || ''
       };
       if (includeUserRequirement) {

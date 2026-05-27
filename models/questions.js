@@ -34,7 +34,7 @@ const QuestionsSchema = new mongoose.Schema({
 
   inspectionTypes: [{
     type: String, // pl. "D", "C", "V"
-    enum: ["Detailed", "Initial Detailed", "Close", "Visual"],
+    enum: ["Detailed", "Initial Detailed", "Initial Detailed (Index)", "Close", "Visual"],
     required: true
   }],
 

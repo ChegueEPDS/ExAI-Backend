@@ -75,10 +75,10 @@ const InspectionSchema = new Schema(
     inspectionDate: { type: Date, required: true },  // mikor végezték (user adja meg)
     validUntil: { type: Date, required: true },      // meddig érvényes (user adja meg)
     inspectorId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
-    // Type of inspection: Detailed / Initial Detailed / Close / Visual
+    // Type of inspection: Detailed / Initial Detailed / Initial Detailed (Index) / Close / Visual
     inspectionType: {
       type: String,
-      enum: ['Detailed', 'Initial Detailed', 'Close', 'Visual', 'Criteria'],
+      enum: ['Detailed', 'Initial Detailed', 'Initial Detailed (Index)', 'Close', 'Visual', 'Criteria'],
       required: true,
     },
     criteriaSystemId: { type: Schema.Types.ObjectId, ref: 'CriteriaSystem', default: null, index: true },

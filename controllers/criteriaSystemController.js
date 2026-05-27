@@ -80,9 +80,9 @@ async function buildScopedEquipmentQuery(req, tenantId) {
   }
 
   if (scope === 'zone') {
-    const siteObjectId = toObjectId(siteId);
+    const siteObjectId = siteId ? toObjectId(siteId) : null;
     const zoneObjectId = toObjectId(zoneId);
-    if (!siteObjectId) {
+    if (siteId && !siteObjectId) {
       const err = new Error('Invalid siteId.');
       err.status = 400;
       throw err;
@@ -92,7 +92,7 @@ async function buildScopedEquipmentQuery(req, tenantId) {
       err.status = 400;
       throw err;
     }
-    query.Site = siteObjectId;
+    if (siteObjectId) query.Site = siteObjectId;
     const unitIds = await Unit.find({
       tenantId,
       $or: [{ _id: zoneObjectId }, { ancestors: zoneObjectId }]
@@ -103,7 +103,7 @@ async function buildScopedEquipmentQuery(req, tenantId) {
 
   return {
     scope,
-    siteId: scope === 'global' ? null : String(siteId || ''),
+    siteId: scope === 'global' ? null : (siteId ? String(siteId) : null),
     zoneId: scope === 'zone' ? String(zoneId || '') : null,
     query
   };
@@ -228,7 +228,7 @@ exports.statistics = async (req, res) => {
       items
     });
   } catch (err) {
-    res.status(500).json({ message: err.message || 'Failed to load criteria statistics.' });
+    res.status(err.status || 500).json({ message: err.message || 'Failed to load criteria statistics.' });
   }
 };
 

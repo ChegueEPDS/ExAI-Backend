@@ -458,10 +458,21 @@ function normalizeInspectionType(rawType) {
   const value = String(rawType).trim().toLowerCase();
   if (!value) return 'Detailed';
   if (value.includes('visual')) return 'Visual';
+  if (
+    value.startsWith('initial detailed (index)') ||
+    value.startsWith('initial detailed index') ||
+    value.startsWith('initial_detailed_index') ||
+    value.startsWith('initial-detailed-index') ||
+    value.startsWith('initial detailed-index')
+  ) return 'Initial Detailed (Index)';
   if (value.startsWith('initial detailed') || value.startsWith('initial_detailed') || value.startsWith('initial-detailed')) return 'Initial Detailed';
   if (value.startsWith('close') || value.startsWith('closed')) return 'Close';
   if (value.startsWith('detailed')) return 'Detailed';
   return 'Detailed';
+}
+
+function displayInspectionTypeForReport(type) {
+  return String(type || '') === 'Initial Detailed (Index)' ? 'Initial Detailed' : (type || '');
 }
 
 function splitMultiValue(value) {
@@ -717,7 +728,7 @@ function equipmentCriteriaAssignmentColumn(criteriaSystems = []) {
 function equipmentImportInspectionColumns() {
   return [
     { header: 'Inspection Date', group: 'INSPECTION DATA', width: 18, comment: 'Optional. Enter a date, preferably YYYY-MM-DD. If Status is Passed, an inspection can be created from this date.' },
-    { header: 'Type', group: 'INSPECTION DATA', width: 18, comment: 'Optional inspection type. Allowed values: Detailed, Visual, Initial Detailed, Close.' },
+    { header: 'Type', group: 'INSPECTION DATA', width: 18, comment: 'Optional inspection type. Allowed values: Detailed, Visual, Initial Detailed, Initial Detailed (Index), Close.' },
     { header: 'Status', group: 'INSPECTION DATA', width: 14, comment: 'Allowed values: Passed, Failed, NA. Passed with Inspection Date creates an inspection.' },
     { header: 'Remarks', group: 'INSPECTION DATA', width: 28, comment: 'Free text remarks imported into equipment notes.' }
   ];
@@ -1540,7 +1551,7 @@ exports.downloadEquipmentImportTemplate = async (req, res) => {
       worksheet.dataValidations.add(`${worksheet.getColumn(typeColumn).letter}3:${worksheet.getColumn(typeColumn).letter}250`, {
         type: 'list',
         allowBlank: true,
-        formulae: ['"Detailed,Visual,Initial Detailed,Close"']
+        formulae: ['"Detailed,Visual,Initial Detailed,Initial Detailed (Index),Close"']
       });
     }
     const qualityColumn = columns.findIndex((c) => c.header === 'Qualitycheck') + 1;
@@ -3193,7 +3204,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
             ? new Date(inspectionDate)
             : '',
           'Inspector': inspectorName,
-          'Type': inspection?.inspectionType || '',
+          'Type': displayInspectionTypeForReport(inspection?.inspectionType),
           'Remarks': eq['Other Info'] || '',
           'Criteria systems': criteriaSystemNameMap.get(eq._id?.toString()) || ''
         };
@@ -3396,6 +3407,7 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
     const worksheet = workbook.addWorksheet('Database');
 
     const headers = [
+      '_id',
       'EqID',
       'TagNo',
       'Manufacturer',
@@ -3428,6 +3440,9 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
 	    }));
 	    worksheet.spliceRows(1, 0, []);
 	    applyImportTemplateStyles(worksheet, exportColumns);
+	    // This is an export, not a blank import template. The shared styling helper
+	    // prepares empty input rows, so remove them before appending exported data.
+	    worksheet.spliceRows(3, 248);
 
 	    const centerAlignedColumns = [
 	      'Equipment Group',
@@ -3442,6 +3457,7 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
     ];
 
     const buildRowBase = (item) => ({
+      '_id': item?._id ? item._id.toString() : '',
       'EqID': item?.EqID || '',
       'TagNo': item?.TagNo || '',
       'Manufacturer': item?.Manufacturer || '',
