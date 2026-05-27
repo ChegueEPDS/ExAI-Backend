@@ -5,6 +5,7 @@ const {
   register,
   login,
   logout,
+  me,
   renewToken,
   microsoftLogin,
   forgotPassword,
@@ -28,8 +29,10 @@ router.post('/register', [
 
 router.post('/login', captchaVerify,login);
 router.post('/microsoft-login', microsoftLogin);
-router.post('/renew-token', requireAuth, renewToken);
-router.post('/logout', requireAuth, logout);
+router.post('/renew-token', renewToken);
+router.post('/auth/refresh', renewToken);
+router.post('/logout', logout);
+router.get('/auth/me', requireAuth, me);
 router.post('/auth/forgot-password', captchaVerify, forgotPassword);
 router.post('/auth/change-password', requireAuth, changePassword);
 router.post('/auth/verify-email', verifyEmail);

@@ -189,6 +189,7 @@ const corsOptionsBase = {
     'x-ms-graph-token',
     'x-captcha-token',
     'x-captcha-bypass',
+    'x-csrf-token',
     'x-no-redirect-on-401',
     'x-client',        // mobile vs web client hint
     'x-user-id',        // frontend legacy header (allowed for backwards-compat)

@@ -1,8 +1,9 @@
 // middlewares/authMiddleware.js
-const jwt = require('jsonwebtoken');
-const User = require('../models/user');
-const Tenant = require('../models/tenant');
-const { computePermissions, getEffectiveProfessions } = require('../helpers/rbac');
+const {
+  authenticateAccessToken,
+  getAccessTokenFromRequest,
+  validateCsrf,
+} = require('../services/authSessionService');
 
 /**
  * authMiddleware(roles?: string[])
@@ -14,102 +15,28 @@ const { computePermissions, getEffectiveProfessions } = require('../helpers/rbac
 const authMiddleware = (roles = []) => {
   return async (req, res, next) => {
     try {
-      const authHeader = req.headers['authorization'] || '';
-      if (!authHeader.startsWith('Bearer ')) {
+      const { token, source } = getAccessTokenFromRequest(req);
+      if (!token) {
         return res.status(401).json({ error: 'No token provided' });
       }
+      if (!validateCsrf(req, source)) {
+        return res.status(403).json({ error: 'Invalid CSRF token' });
+      }
 
-      const token = authHeader.slice(7).trim();
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const { decoded, session, user } = await authenticateAccessToken(token);
 
       // Szerepkör ellenőrzés (ha szükséges)
-      if (roles.length && !roles.includes(decoded.role)) {
+      if (roles.length && !roles.includes(user.role)) {
         return res.status(403).json({ error: 'Access denied: Insufficient role' });
       }
 
-      const decodedUserId = decoded.userId || decoded._id || decoded.sub;
-      let userDoc = null;
-
-      // Tenant ID kötelező – ha hiányzik a régi tokenből, töltsük DB-ből
-      let tenantId = decoded.tenantId;
-      if (!tenantId) {
-        userDoc =
-          userDoc ||
-          (await User.findById(decodedUserId).select('tenantId role nickname professions').lean());
-        if (!userDoc || !userDoc.tenantId) return res.status(403).json({ error: 'No tenant assigned' });
-        tenantId = String(userDoc.tenantId);
-      }
-
-      // Professions: from token (v3+) or from DB fallback
-      let professions = decoded.professions;
-      if (!Array.isArray(professions)) {
-        userDoc =
-          userDoc ||
-          (await User.findById(decodedUserId).select('tenantId role nickname professions').lean());
-        professions = userDoc?.professions || undefined;
-      }
-
-      // Tenant meta (név, típus): tokenből, ha nincs akkor betöltjük
-      let tenantName = decoded.tenantName || null;
-      let tenantType = decoded.tenantType || null; // 'company' | 'personal' | stb.
-      let professionRbacEnabled =
-        typeof decoded.professionRbacEnabled === 'boolean' ? decoded.professionRbacEnabled : null;
-
-      if (!tenantName || !tenantType || professionRbacEnabled === null) {
-        try {
-          const t = await Tenant.findById(tenantId).select('name type professionRbacEnabled').lean();
-          if (t) {
-            tenantName = tenantName || t.name || null;
-            tenantType = tenantType || t.type || null;
-            if (professionRbacEnabled === null) {
-              professionRbacEnabled = Boolean(t.professionRbacEnabled);
-            }
-          }
-        } catch (_) {
-          // swallow – nem blokkoljuk, csak meta hiányzik
-        }
-      }
-      if (professionRbacEnabled === null) professionRbacEnabled = false;
-
-      const effectiveProfessions = professionRbacEnabled
-        ? getEffectiveProfessions({ role: decoded.role, professions })
-        : ['manager'];
-      const permissions = professionRbacEnabled
-        ? computePermissions({ role: decoded.role, professions: effectiveProfessions })
-        : ['*:*'];
-
       // --- Attach full decoded JWT and normalize subscription/plan snapshot ---
       req.auth = decoded;
-      const subscriptionSnap = decoded.subscription || null;
-      const planFromToken =
-        (subscriptionSnap && (subscriptionSnap.plan || subscriptionSnap.tier)) ||
-        decoded.plan ||
-        null;
+      req.auth.subscription = user.subscription || null;
+      req.auth.plan = user.plan || null;
+      req.auth.sessionId = String(session._id);
 
-      // Keep these on req.auth for convenience, too
-      req.auth.subscription = subscriptionSnap || null;
-      req.auth.plan = planFromToken;
-
-      // egységes user objektum (company kivezetve – csak akkor adjuk vissza, ha a token tartalmazta)
-      req.user = {
-        id: decodedUserId,
-        role: decoded.role,
-        nickname: decoded.nickname || null,
-        azureId: decoded.azureId || null,
-        tenantId,
-        tenantName,
-        tenantType,
-        professionRbacEnabled: Boolean(professionRbacEnabled),
-        professions: effectiveProfessions,
-        permissions,
-        tokenType: decoded.type || 'access',
-        // normalized subscription snapshot from JWT (if present)
-        subscription: subscriptionSnap || null,
-        // convenience: derived plan from subscription snapshot (plan or tier)
-        plan: planFromToken || undefined,
-        // backward-compat: ha régi token tartalmazta, átadjuk, de az új kódban ne használd már
-        company: Object.prototype.hasOwnProperty.call(decoded, 'company') ? decoded.company : undefined,
-      };
+      req.user = { ...user, tokenType: 'access' };
 
       // Backward-compat convenience
       req.userId = req.user.id;
@@ -121,12 +48,13 @@ const authMiddleware = (roles = []) => {
       // Egységes szkóp (új)
       req.scope = {
         userId: req.user.id,
-        tenantId,
-        tenantName,
-        tenantType,
-        professionRbacEnabled: Boolean(professionRbacEnabled),
+        tenantId: req.user.tenantId,
+        tenantName: req.user.tenantName,
+        tenantType: req.user.tenantType,
+        professionRbacEnabled: Boolean(req.user.professionRbacEnabled),
         // expose plan so downstream controllers can quickly check entitlements
-        plan: planFromToken || null,
+        plan: req.user.plan || null,
+        sessionId: String(session._id),
       };
 
       next();

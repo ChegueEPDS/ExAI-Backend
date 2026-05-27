@@ -132,9 +132,16 @@ async function allocateRecordOfTrainingNo({ tenantKey, tenantId, year }) {
   // 1) Ensure counter exists and catches up to any existing trainings (manual overrides, legacy data).
   await TrainingRecordCounter.findOneAndUpdate(
     { tenantKey, year },
-    { $setOnInsert: { lastSeq: 0 }, $max: { lastSeq: existingMax } },
+    { $setOnInsert: { lastSeq: existingMax } },
     { upsert: true, new: false }
   );
+  if (existingMax > 0) {
+    await TrainingRecordCounter.findOneAndUpdate(
+      { tenantKey, year },
+      { $max: { lastSeq: existingMax } },
+      { new: false }
+    );
+  }
   // 2) Atomically increment to reserve the next value.
   const doc = await TrainingRecordCounter.findOneAndUpdate(
     { tenantKey, year },
@@ -337,8 +344,13 @@ exports.createTraining = [
           if (Number.isFinite(manualSeq)) {
             await TrainingRecordCounter.findOneAndUpdate(
               { tenantKey, year },
-              { $setOnInsert: { lastSeq: 0 }, $max: { lastSeq: manualSeq } },
+              { $setOnInsert: { lastSeq: manualSeq } },
               { upsert: true, new: false }
+            );
+            await TrainingRecordCounter.findOneAndUpdate(
+              { tenantKey, year },
+              { $max: { lastSeq: manualSeq } },
+              { new: false }
             );
           }
         }

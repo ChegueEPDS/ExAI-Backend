@@ -6,12 +6,23 @@ const { validationResult } = require('express-validator');
 const User = require('../models/user');
 const Tenant = require('../models/tenant');
 const Subscription = require('../models/subscription');
+const Session = require('../models/session');
 const mailService = require('../services/mailService');
 const { registrationEmailHtml, emailVerificationEmailHtml, forgotPasswordEmailHtml } = require('../services/mailTemplates');
 const { resolvePublicBaseUrl, persistPublicBaseUrlIfMissing } = require('../helpers/publicBaseUrl');
 const Stripe = require('stripe');
 const { ensureStripeCustomerForTenant } = require('../services/stripeCustomerProvisioning');
 const { computePermissions, getEffectiveProfessions } = require('../helpers/rbac');
+const {
+  buildUserContext,
+  clearAuthCookies,
+  createSession,
+  getRefreshTokenFromRequest,
+  revokeSession,
+  revokeRefreshToken,
+  rotateRefreshToken,
+  setAuthCookies,
+} = require('../services/authSessionService');
 
 let stripe = null;
 const stripeKey = process.env.STRIPE_SECRET_KEY;
@@ -236,6 +247,23 @@ function getAccessTokenExpiresIn(req) {
   return process.env.JWT_EXPIRES_IN_WEB || process.env.JWT_EXPIRES_IN || '1h';
 }
 
+function getClientType(req) {
+  return String(req?.headers?.['x-client'] || '').toLowerCase() === 'mobile' ? 'mobile' : 'web';
+}
+
+function sendAuthResult(req, res, result, extra = {}) {
+  if (result.session.clientType === 'web') {
+    setAuthCookies(res, req, result);
+    return res.status(200).json({ user: result.user, ...extra });
+  }
+  return res.status(200).json({
+    accessToken: result.accessToken,
+    refreshToken: result.refreshToken,
+    user: result.user,
+    ...extra,
+  });
+}
+
 // ----------------------
 // 🔹 Felhasználó regisztráció (email + jelszó)
 //   Body elvárt / opcionális mezők: firstName, lastName, email, password, nickname?, role?, tenantName?
@@ -406,10 +434,10 @@ exports.login = async (req, res) => {
     }
 
     stepLog('sign-token-start');
-    const token = await signAccessTokenWithSubscription(user, { expiresIn: getAccessTokenExpiresIn(req) });
+    const authResult = await createSession({ user, clientType: getClientType(req), req });
     stepLog('sign-token-done');
     stepLog('success-response');
-    return res.status(200).json({ token });
+    return sendAuthResult(req, res, authResult);
   } catch (error) {
     console.error('❌ Login error:', error);
     return res.status(500).json({ error: 'Internal server error' });
@@ -479,11 +507,10 @@ exports.verifyEmail = async (req, res) => {
       }
     }
 
-    const accessToken = await signAccessTokenWithSubscription(user, { expiresIn: getAccessTokenExpiresIn(req) });
+    const authResult = await createSession({ user, clientType: getClientType(req), req });
 
-    return res.status(200).json({
+    return sendAuthResult(req, res, authResult, {
       message: 'Email verified successfully',
-      token: accessToken,
       pendingCheckout,
     });
   } catch (error) {
@@ -612,8 +639,8 @@ exports.microsoftLogin = async (req, res) => {
       user = ensured.user;
     }
 
-    const token = await signAccessTokenWithSubscription(user, { expiresIn: getAccessTokenExpiresIn(req) });
-    return res.status(200).json({ token });
+    const authResult = await createSession({ user, clientType: getClientType(req), req });
+    return sendAuthResult(req, res, authResult);
   } catch (error) {
     console.error('❌ Microsoft login error:', error);
     return res.status(500).json({ error: 'Internal server error' });
@@ -624,48 +651,37 @@ exports.microsoftLogin = async (req, res) => {
 // 🔹 Token megújítása
 // ----------------------
 exports.renewToken = async (req, res) => {
-  const oldToken = req.headers.authorization?.split(' ')[1];
-  if (!oldToken) {
-    return res.status(401).json({ error: 'Token is required' });
-  }
-
   try {
-    const decoded = jwt.verify(oldToken, process.env.JWT_SECRET);
-
-    // Biztonság kedvéért töltsük be a usert
-    let user = await User.findById(decoded.userId || decoded.sub);
-    if (!user) return res.status(401).json({ error: 'Invalid token (user missing)' });
-
-    // ha valamiért még nincs tenant → kapjon (personal)
-    if (!user.tenantId) {
-      const ensured = await ensureTenantForUserFromName(user, null);
-      user = ensured.user;
-    }
-
-    const newToken = await signAccessTokenWithSubscription(user, { expiresIn: getAccessTokenExpiresIn(req) });
-    return res.status(200).json({ token: newToken });
+    const refreshToken = getRefreshTokenFromRequest(req);
+    if (!refreshToken) return res.status(401).json({ error: 'Refresh token is required' });
+    const authResult = await rotateRefreshToken({ refreshToken, req });
+    return sendAuthResult(req, res, authResult);
   } catch (error) {
-    if (error.name === 'TokenExpiredError') {
-      return res.status(401).json({ error: 'Token has expired, please log in again' });
-    }
-    return res.status(401).json({ error: 'Invalid token' });
+    return res.status(401).json({ error: 'Invalid or expired session' });
   }
 };
 
 // ----------------------
 // 🔹 Kilépés
 // ----------------------
-exports.logout = (req, res) => {
-  if (req.session) {
-    req.session.destroy(err => {
-      if (err) {
-        return res.status(500).json({ error: 'Failed to log out' });
-      }
-      return res.status(200).json({ message: 'Successfully logged out' });
-    });
-  } else {
+exports.logout = async (req, res) => {
+  try {
+    const refreshToken = getRefreshTokenFromRequest(req);
+    if (req.scope?.sessionId || req.auth?.sessionId || req.auth?.sid) {
+      await revokeSession(req.scope?.sessionId || req.auth?.sessionId || req.auth?.sid);
+    } else if (refreshToken) {
+      await revokeRefreshToken(refreshToken);
+    }
+    clearAuthCookies(res, req);
+    return res.status(200).json({ message: 'Successfully logged out' });
+  } catch {
+    clearAuthCookies(res, req);
     return res.status(200).json({ message: 'Successfully logged out' });
   }
+};
+
+exports.me = async (req, res) => {
+  return res.json({ user: req.user });
 };
 
 // ----------------------

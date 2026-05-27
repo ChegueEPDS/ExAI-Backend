@@ -13,6 +13,7 @@ if (stripeKey) {
 }
 
 const { ensureStripeCustomerForTenant } = require('../services/stripeCustomerProvisioning');
+const { createSession, setAuthCookies } = require('../services/authSessionService');
 
 const brevoService = require('../services/brevoService');
 
@@ -1592,7 +1593,7 @@ exports.handleBillingPortalReturn = async (req, res) => {
   try {
     const { state, jwt: jwtFromQuery, to } = req.query || {};
 
-    // 1) Shortcut: if we already have a JWT in the query, persist it and bounce to the target.
+    // 1) Legacy shortcut: do not persist query JWTs client-side anymore; just bounce to the target.
     if (typeof jwtFromQuery === 'string' && jwtFromQuery.length > 0) {
       // Determine destination:
       // - if ?to is absolute (http/https) -> use as is
@@ -1616,7 +1617,7 @@ exports.handleBillingPortalReturn = async (req, res) => {
         }
       }
 
-      // Respond with a tiny HTML that stores the token then redirects.
+      // Respond with a tiny HTML that redirects without touching localStorage.
       res.status(200).type('html').send(`
 <!doctype html>
 <html>
@@ -1624,7 +1625,6 @@ exports.handleBillingPortalReturn = async (req, res) => {
   <body>
     <script>
       (function(){
-        try { localStorage.setItem('token', ${JSON.stringify(jwtFromQuery)}); } catch(e) {}
         location.replace(${JSON.stringify(dest)});
       })();
     </script>
@@ -1633,7 +1633,7 @@ exports.handleBillingPortalReturn = async (req, res) => {
       return;
     }
 
-    // 2) Normal flow with signed state: verify, wait (optional), mint fresh JWT, redirect with ?jwt=
+    // 2) Normal flow with signed state: verify, wait (optional), mint a web session cookie, then redirect.
     if (!state || typeof state !== 'string') {
       return res.status(400).json({ message: 'Missing state or jwt' });
     }
@@ -1662,13 +1662,18 @@ exports.handleBillingPortalReturn = async (req, res) => {
       await new Promise(r => setTimeout(r, waitMs));
     }
 
-    // Issue fresh access token from current DB snapshot
-    const freshJwt = await issueAccessTokenForUserTenant(userId, tenantId);
+    // Issue a fresh web session cookie from current DB snapshot, then redirect without exposing a JWT in the URL.
+    const user = await User.findById(userId);
+    if (!user) return res.status(400).json({ message: 'Invalid user' });
+    if (!user.tenantId || String(user.tenantId) !== String(tenantId)) {
+      user.tenantId = tenantId;
+      await user.save();
+    }
+    const authResult = await createSession({ user, clientType: 'web', req });
+    setAuthCookies(res, req, authResult);
 
-    // Redirect to frontend with the new token in query
     const frontBase = (process.env.FRONTEND_BASE_URL || 'http://localhost:4200').replace(/\/+$/,'');
-    const sep = toPath.includes('?') ? '&' : '?';
-    const redirectUrl = `${frontBase}${toPath}${sep}jwt=${encodeURIComponent(freshJwt)}`;
+    const redirectUrl = `${frontBase}${toPath}`;
 
     res.redirect(302, redirectUrl);
   } catch (e) {
