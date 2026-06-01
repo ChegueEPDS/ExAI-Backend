@@ -11,6 +11,11 @@ const { ensureRbSchema, loadLegacyRbQuestions } = require('../services/schemaSee
 const { buildCertificateCacheForTenant, resolveCertificateFromCache } = require('../helpers/certificateMatchHelper');
 const { KNOWN_SET_LOWER, normalizeProtectionTypes } = require('../helpers/protectionTypes');
 const { certificateNo, getRbValues, ensureRbAssignment, protectionText } = require('../services/rbSchemaValueService');
+const {
+  addCycle,
+  assignmentCycle,
+  markAssignmentInspectionCompleted
+} = require('../services/schemaCycleService');
 
 const upload = multer({ dest: 'uploads/' });
 
@@ -43,6 +48,18 @@ async function updateEquipmentRbCompliance(equipment, status, userId = null) {
   const rbSchema = await ensureRbSchema();
   ensureRbAssignment(equipment, rbSchema, { ...getRbValues(equipment), compliance: status || 'NA' }, userId);
   if (equipment.markModified) equipment.markModified('schemaAssignments');
+}
+
+function findSchemaAssignment(equipment, schema) {
+  return (equipment?.schemaAssignments || []).find((assignment) =>
+    String(assignment?.schemaId || '') === String(schema?._id || '') ||
+    (!!schema?.systemKey && assignment?.schemaKey === schema.systemKey)
+  );
+}
+
+function schemaValidUntil(equipment, schema, inspectionDate) {
+  const cycle = assignmentCycle(findSchemaAssignment(equipment, schema), schema);
+  return addCycle(inspectionDate, cycle.value, cycle.unit);
 }
 
 function computeFailureSeverity(results = []) {
@@ -236,7 +253,7 @@ exports.createInspection = async (req, res) => {
       attachments = []
     } = req.body || {};
 
-    if (!inspectionDate || !validUntil) {
+    if (!inspectionDate || (!validUntil && !schemaId)) {
       return res.status(400).json({ message: 'inspectionDate és validUntil kötelező mezők.' });
     }
 
@@ -304,7 +321,6 @@ exports.createInspection = async (req, res) => {
     if (schemaId && mongoose.isValidObjectId(schemaId)) {
       schemaDefinition = await SchemaDefinition.findOne({
         _id: schemaId,
-        type: 'compliance',
         status: 'published',
         active: { $ne: false },
         $or: [
@@ -315,6 +331,11 @@ exports.createInspection = async (req, res) => {
       if (!schemaDefinition) return res.status(404).json({ message: 'Schema not found.' });
     }
 
+    const effectiveInspectionDate = new Date(inspectionDate);
+    const effectiveValidUntil = schemaDefinition
+      ? schemaValidUntil(equipment, schemaDefinition, effectiveInspectionDate)
+      : new Date(validUntil);
+
     // ---- Inspection dokumentum létrehozása ----
     const inspection = new Inspection({
       equipmentId: equipment._id,
@@ -322,8 +343,8 @@ exports.createInspection = async (req, res) => {
       tenantId,
       siteId: equipment.Site || null,
       zoneId: equipment.Unit || equipment.Zone || null,
-      inspectionDate: new Date(inspectionDate),
-      validUntil: new Date(validUntil),
+      inspectionDate: effectiveInspectionDate,
+      validUntil: effectiveValidUntil,
       inspectionType: schemaDefinition ? 'Criteria' : inspectionType,
       schemaId: schemaDefinition?._id || null,
       schemaKeySnapshot: schemaDefinition?.systemKey || '',
@@ -348,6 +369,9 @@ exports.createInspection = async (req, res) => {
       // FIGYELEM: ehhez érdemes a dataplate/Equipment sémát kiegészíteni
       // lastInspectionDate, lastInspectionValidUntil, lastInspectionStatus, lastInspectionId mezőkkel.
       await updateEquipmentRbCompliance(equipment, status, inspectorId);
+      if (schemaDefinition) {
+        markAssignmentInspectionCompleted(equipment, schemaDefinition, inspection, inspectorId);
+      }
       equipment.lastInspectionDate = inspection.inspectionDate;
       // Failed inspectionnek nincs "next inspection date"-je (UI: ne jelenjen meg PLANNED).
       equipment.lastInspectionValidUntil = status === 'Failed' ? null : inspection.validUntil;
@@ -423,7 +447,23 @@ exports.updateInspection = async (req, res) => {
     const effectiveInspectionDate = finalize
       ? (finalizedNow || new Date())
       : (inspectionDate ? new Date(inspectionDate) : null);
-    const effectiveValidUntil = finalize
+    const schemaDefinition = inspection.schemaId
+      ? await SchemaDefinition.findOne({
+        _id: inspection.schemaId,
+        status: 'published',
+        active: { $ne: false },
+        $or: [
+          { scope: 'system' },
+          { scope: 'tenant', tenantId }
+        ]
+      })
+      : null;
+    const equipmentForCycle = schemaDefinition
+      ? await Equipment.findOne({ _id: inspection.equipmentId, tenantId })
+      : null;
+    const effectiveValidUntil = finalize && schemaDefinition
+      ? schemaValidUntil(equipmentForCycle, schemaDefinition, effectiveInspectionDate)
+      : finalize
       ? (() => {
         const d = new Date(effectiveInspectionDate);
         d.setFullYear(d.getFullYear() + 3);
@@ -440,6 +480,8 @@ exports.updateInspection = async (req, res) => {
 
     const normalizedResults = results.map(r => ({
       questionId: r.questionId ? new mongoose.Types.ObjectId(r.questionId) : undefined,
+      schemaQuestionKey: r.schemaQuestionKey || r.questionKey || r.key || undefined,
+      questionOrigin: ['system', 'tenant', 'legacy'].includes(r.questionOrigin) ? r.questionOrigin : null,
       table: r.table || r.Table || undefined,
       group: r.group || r.Group || undefined,
       number: r.number ?? r.Number,
@@ -489,12 +531,15 @@ exports.updateInspection = async (req, res) => {
     await inspection.save();
 
     if (finalize) {
-      const equipment = await Equipment.findOne({ _id: inspection.equipmentId, tenantId });
+      const equipment = equipmentForCycle || await Equipment.findOne({ _id: inspection.equipmentId, tenantId });
       if (equipment) {
         equipment.lastInspectionDate = inspection.inspectionDate;
         equipment.lastInspectionValidUntil = inspection.status === 'Failed' ? null : inspection.validUntil;
         equipment.lastInspectionStatus = inspection.status;
         equipment.lastInspectionId = inspection._id;
+        if (schemaDefinition) {
+          markAssignmentInspectionCompleted(equipment, schemaDefinition, inspection, userId);
+        }
         await updateEquipmentRbCompliance(equipment, inspection.status, userId);
         equipment.pendingReview = false;
         equipment.pendingInspectionId = null;

@@ -39,9 +39,34 @@ const {
   zoneView
 } = require('../services/rbSchemaValueService');
 const { ensureRbSchema } = require('../services/schemaSeedService');
+const SchemaDefinition = require('../models/schemaDefinition');
+const { applySchemaCycleDefaults } = require('../services/schemaCycleService');
+const { validateSchemaValues } = require('../services/schemaValidationService');
 
 const { BlobServiceClient } = require('@azure/storage-blob');
 const path = require('path');
+
+async function sanitizeEquipmentSchemaAssignmentsForSave(assignments, tenantId) {
+  if (!Array.isArray(assignments) || !assignments.length) return assignments;
+  const ids = assignments
+    .map((assignment) => assignment?.schemaId)
+    .filter((id) => mongoose.Types.ObjectId.isValid(id));
+  const schemas = await SchemaDefinition.find({
+    _id: { $in: ids },
+    active: { $ne: false },
+    $or: [{ scope: 'system' }, { scope: 'tenant', tenantId }]
+  }).lean();
+  const byId = new Map(schemas.map((schema) => [String(schema._id), schema]));
+  return assignments.map((assignment) => {
+    const schema = byId.get(String(assignment?.schemaId || ''));
+    if (!schema) return assignment;
+    return {
+      ...assignment,
+      schemaKey: schema.systemKey || null,
+      values: applySchemaCycleDefaults(schema, assignment.values || {})
+    };
+  });
+}
 
 const HEADER_ALIASES = {
   '#': '#',
@@ -505,11 +530,22 @@ function importCommentForField(field, prefix = '') {
 }
 
 async function loadEquipmentImportDynamicColumns(tenantId) {
-  const customFields = await CustomFieldDefinition.find({
-    tenantId,
-    entityType: 'equipment',
-    active: true
-  }).sort({ createdAt: 1, label: 1 }).lean();
+  const [customFields, schemas] = await Promise.all([
+    CustomFieldDefinition.find({
+      tenantId,
+      entityType: 'equipment',
+      active: true
+    }).sort({ createdAt: 1, label: 1 }).lean(),
+    SchemaDefinition.find({
+      status: 'published',
+      active: { $ne: false },
+      targetLevels: 'equipment',
+      $or: [
+        { scope: 'system' },
+        { scope: 'tenant', tenantId }
+      ]
+    }).sort({ scope: 1, systemProvided: -1, name: 1 }).lean()
+  ]);
 
   const customColumns = (customFields || []).map((field) => ({
     kind: 'custom',
@@ -525,7 +561,73 @@ async function loadEquipmentImportDynamicColumns(tenantId) {
   customColumns.forEach((col) => {
     if (!byKey.has(col.key)) byKey.set(col.key, col);
   });
-  return Array.from(byKey.values());
+  const schemaColumns = (schemas || [])
+    .filter((schema) => schema?.systemKey !== 'rb')
+    .flatMap((schema) => {
+      const schemaId = String(schema._id);
+      const schemaName = schema.name || schema.systemKey || schemaId;
+      const prefix = `Schema: ${schemaName}`;
+      const columns = [
+        {
+          kind: 'schema',
+          schema,
+          schemaId,
+          key: '__enabled',
+          header: prefix,
+          aliases: [`Schema: ${schema.systemKey || schemaName}`, schemaName].filter(Boolean),
+          field: { fieldType: 'boolean', label: schemaName },
+          group: 'SCHEMA DATA',
+          comment: `Attach ${schemaName} to this equipment. Allowed values: Yes, No, True, False, 1, 0.`
+        },
+        {
+          kind: 'schema',
+          schema,
+          schemaId,
+          key: 'cycleValue',
+          header: `${prefix}: Cycle value`,
+          aliases: [`${prefix}: cycleValue`],
+          field: { fieldType: 'number', label: 'Cycle value' },
+          group: 'SCHEMA DATA',
+          comment: `Optional cycle value for ${schemaName}. Leave empty to use the schema default.`
+        },
+        {
+          kind: 'schema',
+          schema,
+          schemaId,
+          key: 'cycleUnit',
+          header: `${prefix}: Cycle unit`,
+          aliases: [`${prefix}: cycleUnit`],
+          field: { fieldType: 'select', label: 'Cycle unit', options: ['day', 'month', 'year'] },
+          group: 'SCHEMA DATA',
+          comment: `Optional cycle unit for ${schemaName}. Allowed values: day, month, year. Leave empty to use the schema default.`
+        }
+      ];
+
+      const dataFields = (Array.isArray(schema.dataFields) ? schema.dataFields : [])
+        .filter((field) => field?.active !== false)
+        .filter((field) => !['cycleValue', 'cycleUnit', 'startDate'].includes(String(field?.key || '')));
+
+      dataFields
+        .sort((a, b) => (Number(a.order) || 0) - (Number(b.order) || 0))
+        .forEach((field) => {
+          const label = field.label || field.key;
+          columns.push({
+            kind: 'schema',
+            schema,
+            schemaId,
+            key: String(field.key),
+            header: `${prefix}: ${label}`,
+            aliases: [`${prefix}: ${field.key}`].filter(Boolean),
+            field,
+            group: 'SCHEMA DATA',
+            comment: importCommentForField(field, `${schemaName}: `)
+          });
+        });
+
+      return columns;
+    });
+
+  return [...Array.from(byKey.values()), ...schemaColumns];
 }
 
 function findColumnIndex(headerMap, column) {
@@ -540,7 +642,7 @@ function findColumnIndex(headerMap, column) {
 
 function collectDynamicCustomFieldValues(row, headerMap, dynamicColumns) {
   const values = {};
-  (dynamicColumns || []).forEach((column) => {
+  (dynamicColumns || []).filter((column) => column.kind === 'custom').forEach((column) => {
     const idx = findColumnIndex(headerMap, column);
     if (!idx) return;
     const raw = getCellStringByIndex(row, idx);
@@ -548,6 +650,95 @@ function collectDynamicCustomFieldValues(row, headerMap, dynamicColumns) {
     values[column.key] = column.field?.fieldType === 'multiselect' ? splitMultiValue(raw) : raw;
   });
   return values;
+}
+
+function coerceImportFieldValue(field, raw) {
+  if (raw === '') return undefined;
+  if (field?.fieldType === 'boolean') {
+    const normalized = String(raw || '').trim().toLowerCase();
+    if (['yes', 'y', 'true', '1', 'igen', 'on'].includes(normalized)) return true;
+    if (['no', 'n', 'false', '0', 'nem', 'off'].includes(normalized)) return false;
+    return undefined;
+  }
+  if (field?.fieldType === 'number') {
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : raw;
+  }
+  if (field?.fieldType === 'multiselect') return splitMultiValue(raw);
+  return raw;
+}
+
+function collectDynamicSchemaAssignments(row, headerMap, dynamicColumns, userId) {
+  const grouped = new Map();
+  (dynamicColumns || []).filter((column) => column.kind === 'schema').forEach((column) => {
+    const idx = findColumnIndex(headerMap, column);
+    if (!idx) return;
+    const raw = getCellStringByIndex(row, idx);
+    if (raw === '') return;
+
+    if (!grouped.has(column.schemaId)) {
+      grouped.set(column.schemaId, {
+        schema: column.schema,
+        enabled: null,
+        values: {},
+        hasValues: false
+      });
+    }
+    const state = grouped.get(column.schemaId);
+    const value = coerceImportFieldValue(column.field, raw);
+    if (column.key === '__enabled') {
+      if (value !== undefined) state.enabled = value;
+      return;
+    }
+    if (value === undefined) return;
+    state.values[column.key] = value;
+    state.hasValues = true;
+  });
+
+  return Array.from(grouped.values())
+    .filter((state) => state.enabled !== false && (state.enabled === true || state.hasValues))
+    .map((state) => {
+      const { cycleValue, cycleUnit, ...schemaValues } = state.values;
+      const validatedValues = validateSchemaValues(state.schema, schemaValues);
+      const values = applySchemaCycleDefaults(state.schema, {
+        ...validatedValues,
+        ...(cycleValue !== undefined ? { cycleValue } : {}),
+        ...(cycleUnit !== undefined ? { cycleUnit } : {})
+      });
+      return {
+        schemaId: state.schema._id,
+        schemaKey: state.schema.systemKey || null,
+        attachedAt: new Date(),
+        attachedBy: userId || null,
+        values
+      };
+    });
+}
+
+function mergeImportedSchemaAssignments(existingAssignments = [], importedAssignments = []) {
+  const next = Array.isArray(existingAssignments) ? [...existingAssignments] : [];
+  (importedAssignments || []).forEach((assignment) => {
+    const idx = next.findIndex((current) =>
+      String(current?.schemaId || '') === String(assignment?.schemaId || '') ||
+      (!!assignment?.schemaKey && current?.schemaKey === assignment.schemaKey)
+    );
+    if (idx >= 0) {
+      next[idx] = {
+        ...next[idx],
+        schemaId: next[idx].schemaId || assignment.schemaId,
+        schemaKey: assignment.schemaKey || next[idx].schemaKey || null,
+        attachedAt: next[idx].attachedAt || assignment.attachedAt,
+        attachedBy: next[idx].attachedBy || assignment.attachedBy || null,
+        values: {
+          ...(next[idx].values || {}),
+          ...(assignment.values || {})
+        }
+      };
+    } else {
+      next.push(assignment);
+    }
+  });
+  return next;
 }
 
 function equipmentImportBaseColumns({ includeProjectSkid }) {
@@ -600,6 +791,7 @@ function groupColor(group) {
     'CERTIFICATION': 'FF00AA00',
     'PROJECT / SKID': 'FF80DEEA',
     'CRITERIA ASSIGNMENT': 'FF8E7CC3',
+    'SCHEMA DATA': 'FF8E7CC3',
     'INSPECTION DATA': 'FFB0B0B0',
     'CUSTOM DATA': 'FF6AA84F'
   }[group] || 'FF9FC5E8';
@@ -613,6 +805,7 @@ function groupLightColor(group) {
     'CERTIFICATION': 'FFCCFFCC',
     'PROJECT / SKID': 'FFE0F7FA',
     'CRITERIA ASSIGNMENT': 'FFEADCF8',
+    'SCHEMA DATA': 'FFEADCF8',
     'INSPECTION DATA': 'FFE0E0E0',
     'CUSTOM DATA': 'FFEAF4E4'
   }[group] || 'FFD9EAD3';
@@ -1417,7 +1610,7 @@ exports.downloadEquipmentImportTemplate = async (req, res) => {
       ...equipmentImportBaseColumns({ includeProjectSkid }),
       ...dynamicColumns.map((column) => ({
         header: column.header,
-        group: 'CUSTOM DATA',
+        group: column.group || 'CUSTOM DATA',
         width: Math.min(Math.max(String(column.header).length + 4, 18), 42),
         comment: column.comment
       })),
@@ -1491,6 +1684,10 @@ exports.downloadEquipmentImportTemplate = async (req, res) => {
     instructions.addRow({
       topic: 'Multi-select values',
       guidance: 'Use semicolon (;) between multiple values, for example: Option A; Option B.'
+    });
+    instructions.addRow({
+      topic: 'Schema columns',
+      guidance: 'Schema columns show every equipment-level schema available to the tenant. Fill the Schema column with Yes or fill any schema value column to attach it; No or empty schema columns are ignored.'
     });
     instructions.addRow({
       topic: 'Updates',
@@ -1602,6 +1799,16 @@ exports.importEquipmentXLSX = async (req, res) => {
         if (projectId) latestProjectId = projectId;
       }
       const customFieldsRaw = collectDynamicCustomFieldValues(row, headerInfo.headerMap, dynamicImportColumns);
+      let schemaAssignmentsRaw = [];
+      try {
+        schemaAssignmentsRaw = collectDynamicSchemaAssignments(row, headerInfo.headerMap, dynamicImportColumns, userId);
+      } catch (schemaError) {
+        parseErrors.push({
+          row: rowNumber,
+          message: schemaError.message || String(schemaError)
+        });
+        return;
+      }
 
       const rowHasData = [
         eqId,
@@ -1616,7 +1823,8 @@ exports.importEquipmentXLSX = async (req, res) => {
         certificateNo,
         declarationNo,
         remarks,
-        ...Object.values(customFieldsRaw)
+        ...Object.values(customFieldsRaw),
+        ...schemaAssignmentsRaw.flatMap((assignment) => Object.values(assignment.values || {}))
       ].some(Boolean);
 
       const rowHasExData = [epl, equipmentGroup, equipmentCategory, environment, subGroup, tempClass, protectionConcept].some(Boolean);
@@ -1652,6 +1860,7 @@ exports.importEquipmentXLSX = async (req, res) => {
           inspectionDate: inspectionDate || null,
           inspectionStatus,
           inspectionType: inspectionType || null,
+          schemaAssignments: [],
           rbCertificateNo: certificateNo || declarationNo || '',
           rbCompliance: inspectionStatus || 'NA'
         });
@@ -1680,6 +1889,9 @@ exports.importEquipmentXLSX = async (req, res) => {
           ...(entry.base.customFields || {}),
           ...customFieldsRaw
         };
+      }
+      if (schemaAssignmentsRaw.length) {
+        entry.schemaAssignments = mergeImportedSchemaAssignments(entry.schemaAssignments || [], schemaAssignmentsRaw);
       }
       if (inspectionStatus && inspectionStatus !== 'NA') entry.rbCompliance = inspectionStatus;
       if (!entry.inspectionDate && inspectionDate) entry.inspectionDate = inspectionDate;
@@ -1790,8 +2002,13 @@ exports.importEquipmentXLSX = async (req, res) => {
             }
             delete updateData.CreatedBy;
             delete updateData.tenantId;
+            if (rbSchema || entry.schemaAssignments?.length) {
+              updateData.schemaAssignments = mergeImportedSchemaAssignments(
+                Array.isArray(equipmentDoc.schemaAssignments) ? equipmentDoc.schemaAssignments : [],
+                entry.schemaAssignments || []
+              );
+            }
             if (rbSchema) {
-              updateData.schemaAssignments = Array.isArray(equipmentDoc.schemaAssignments) ? equipmentDoc.schemaAssignments : [];
               ensureRbAssignment(updateData, rbSchema, rbValues, userId);
             }
             if (entry.orderIndex == null) {
@@ -1813,6 +2030,9 @@ exports.importEquipmentXLSX = async (req, res) => {
             tenantId,
             CreatedBy: userId
           };
+          if (entry.schemaAssignments?.length) {
+            createData.schemaAssignments = mergeImportedSchemaAssignments(createData.schemaAssignments || [], entry.schemaAssignments);
+          }
           if (rbSchema) {
             ensureRbAssignment(createData, rbSchema, rbValues, userId);
           }
@@ -4533,6 +4753,9 @@ exports.updateEquipment = async (req, res) => {
         entityType: 'equipment',
         values: updatedFields.customFields
       });
+    }
+    if (Object.prototype.hasOwnProperty.call(updatedFields, 'schemaAssignments')) {
+      updatedFields.schemaAssignments = await sanitizeEquipmentSchemaAssignmentsForSave(updatedFields.schemaAssignments, tenantId);
     }
     updatedFields.ModifiedBy = new mongoose.Types.ObjectId(ModifiedBy);
 

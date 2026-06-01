@@ -7,10 +7,15 @@ const Unit = require('../models/unit');
 const Equipment = require('../models/dataplate');
 const { ensureRbSchema, loadLegacyRbQuestions } = require('../services/schemaSeedService');
 const {
-  sanitizeDataFields,
   sanitizeQuestions,
+  withDefaultMaintenanceFields,
   validateSchemaValues
 } = require('../services/schemaValidationService');
+const {
+  applySchemaCycleDefaults,
+  normalizeCycleUnit,
+  normalizeCycleValue
+} = require('../services/schemaCycleService');
 
 function toObjectId(value) {
   return value && mongoose.Types.ObjectId.isValid(value) ? new mongoose.Types.ObjectId(value) : null;
@@ -75,6 +80,16 @@ function assignmentPayload(schema, values, userId) {
     attachedAt: new Date(),
     attachedBy: userId || null,
     values
+  };
+}
+
+function defaultCyclePayload(schema, body = {}) {
+  if (schema?.systemKey === 'rb' || body.systemKey === 'rb') {
+    return { defaultCycleValue: 3, defaultCycleUnit: 'year' };
+  }
+  return {
+    defaultCycleValue: normalizeCycleValue(body.defaultCycleValue, 1),
+    defaultCycleUnit: normalizeCycleUnit(body.defaultCycleUnit, 'year')
   };
 }
 
@@ -147,7 +162,8 @@ exports.create = async (req, res) => {
       systemProvided: scope === 'system',
       targetLevels: Array.isArray(body.targetLevels) && body.targetLevels.length ? body.targetLevels : ['site', 'zone', 'equipment'],
       ruleset: scope === 'system' ? (body.ruleset || null) : null,
-      dataFields: sanitizeDataFields(body.dataFields),
+      ...defaultCyclePayload({ systemKey: scope === 'system' ? body.systemKey : null }, body),
+      dataFields: withDefaultMaintenanceFields(type, body.dataFields),
       questions: type === 'compliance' ? sanitizeQuestions(body.questions, scope === 'system' ? 'system' : 'tenant') : [],
       active: body.active !== false,
       createdBy: req.userId || null,
@@ -178,13 +194,27 @@ exports.update = async (req, res) => {
       schema.name = name;
     }
     if (body.description !== undefined) schema.description = String(body.description || '');
-    if (body.type !== undefined && !schema.systemProvided) schema.type = body.type === 'maintenance' ? 'maintenance' : 'compliance';
+    const typeChanged = body.type !== undefined && !schema.systemProvided;
+    if (typeChanged) schema.type = body.type === 'maintenance' ? 'maintenance' : 'compliance';
     if (body.status !== undefined) schema.status = body.status === 'published' ? 'published' : 'draft';
     if (body.targetLevels !== undefined) schema.targetLevels = Array.isArray(body.targetLevels) ? body.targetLevels : schema.targetLevels;
+    if (body.defaultCycleValue !== undefined || body.defaultCycleUnit !== undefined) {
+      const cycle = defaultCyclePayload(schema, {
+        defaultCycleValue: body.defaultCycleValue ?? schema.defaultCycleValue,
+        defaultCycleUnit: body.defaultCycleUnit ?? schema.defaultCycleUnit
+      });
+      schema.defaultCycleValue = cycle.defaultCycleValue;
+      schema.defaultCycleUnit = cycle.defaultCycleUnit;
+    }
     if (body.active !== undefined) {
       schema.active = schema.systemKey === 'rb' ? true : !!body.active;
     }
-    if (body.dataFields !== undefined) schema.dataFields = sanitizeDataFields(body.dataFields);
+    if (body.dataFields !== undefined || typeChanged) {
+      schema.dataFields = withDefaultMaintenanceFields(
+        schema.type,
+        body.dataFields !== undefined ? body.dataFields : schema.dataFields
+      );
+    }
     if (body.questions !== undefined) {
       schema.questions = schema.type === 'compliance'
         ? sanitizeQuestions(body.questions, schema.scope === 'system' ? 'system' : 'tenant')
@@ -313,7 +343,7 @@ exports.attach = async (req, res) => {
     if (!schema.targetLevels.includes(level)) return res.status(400).json({ message: `Schema cannot be attached to ${level}.` });
     const entity = await loadEntity(level, req.params.entityId, tenantId);
     if (!entity) return res.status(404).json({ message: `${level} not found.` });
-    const values = validateSchemaValues(schema, req.body?.values || {});
+    const values = applySchemaCycleDefaults(schema, validateSchemaValues(schema, req.body?.values || {}));
     const next = Array.isArray(entity.schemaAssignments) ? [...entity.schemaAssignments] : [];
     const idx = next.findIndex((a) => String(a.schemaId) === String(schema._id) || (schema.systemKey && a.schemaKey === schema.systemKey));
     const payload = assignmentPayload(schema, values, req.userId);

@@ -1,12 +1,66 @@
-/.env
+# Secrets / local config
+.env
+.env.*
+!.env.example
 /appsettings.appservice.json
-/node_modules
 /KEYVAULT.md
 /TESTING*.md
+
+# Dependencies
+/node_modules/
+
+# Logs / runtime output
+/logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Uploads and generated local files
 /uploads/*
-/logs/*
-**/prod.archive.gz
-!.gitkeep
+!/uploads/.gitkeep
+/results/
+/tmp/
+/temp/
+
+# Build / coverage output
+/dist/
+/build/
+/coverage/
+/.nyc_output/
+
+# Local database backups / MongoDB dumps
+*.archive
+*.archive.gz
+backup-*
+backup-*.gz
+*.dump
+dump/
+backups/
+mongodump/
+*.bson
+*.metadata.json
+
+# Python local environments / caches
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
 
 # Local-only signing certs (ROT PDF signing)
 /.certs/

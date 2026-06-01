@@ -1,4 +1,5 @@
 const { normalizeRbValues } = require('./schemaRules/rbRules');
+const { stripCycleDataFields } = require('./schemaCycleService');
 
 const FIELD_TYPES = new Set(['text', 'textarea', 'number', 'date', 'boolean', 'select', 'multiselect']);
 
@@ -67,6 +68,10 @@ function sanitizeDataFields(fields = []) {
     .filter((f) => f.key && f.label);
 }
 
+function withDefaultMaintenanceFields(type, fields = []) {
+  return stripCycleDataFields(sanitizeDataFields(fields));
+}
+
 function sanitizeQuestions(questions = [], origin = 'tenant') {
   return (Array.isArray(questions) ? questions : [])
     .map((q, idx) => {
@@ -124,5 +129,6 @@ module.exports = {
   normalizeKey,
   sanitizeDataFields,
   sanitizeQuestions,
+  withDefaultMaintenanceFields,
   validateSchemaValues
 };

@@ -12,36 +12,6 @@ const { normalizeKey } = require('../services/schemaValidationService');
 const archiveOld = process.argv.includes('--archive-old');
 const includeInherited = !process.argv.includes('--explicit-only');
 
-function cycleFields() {
-  return [
-    {
-      key: 'cycleValue',
-      label: 'Cycle value',
-      fieldType: 'number',
-      required: false,
-      active: true,
-      order: 1
-    },
-    {
-      key: 'cycleUnit',
-      label: 'Cycle unit',
-      fieldType: 'select',
-      options: ['day', 'month', 'year'],
-      required: false,
-      active: true,
-      order: 2
-    },
-    {
-      key: 'startDate',
-      label: 'Start date',
-      fieldType: 'date',
-      required: false,
-      active: true,
-      order: 3
-    }
-  ];
-}
-
 function schemaFieldsFromCriteria(criteria) {
   const seen = new Set(['cycleValue', 'cycleUnit', 'startDate']);
   const custom = (criteria.customFields || [])
@@ -57,10 +27,10 @@ function schemaFieldsFromCriteria(criteria) {
         options: Array.isArray(field.options) ? field.options : [],
         required: !!field.required,
         active: field.active !== false,
-        order: idx + 4
+        order: idx + 1
       };
     });
-  return [...cycleFields(), ...custom];
+  return custom;
 }
 
 function schemaQuestionsFromCriteria(criteria) {
@@ -89,6 +59,8 @@ async function upsertSchema(criteria) {
     systemProvided: false,
     targetLevels: ['equipment'],
     ruleset: null,
+    defaultCycleValue: criteria.cycle?.value || 1,
+    defaultCycleUnit: criteria.cycle?.unit || 'year',
     dataFields: schemaFieldsFromCriteria(criteria),
     questions: criteria.type === 'compliance' ? schemaQuestionsFromCriteria(criteria) : [],
     active: criteria.active !== false,
@@ -102,6 +74,8 @@ async function upsertSchema(criteria) {
     existing.description = payload.description;
     existing.status = 'published';
     existing.targetLevels = payload.targetLevels;
+    existing.defaultCycleValue = payload.defaultCycleValue;
+    existing.defaultCycleUnit = payload.defaultCycleUnit;
     existing.dataFields = payload.dataFields;
     existing.questions = payload.questions;
     existing.active = payload.active;
@@ -119,7 +93,6 @@ function assignmentValues(criteria, assignment, equipment) {
     cycleValue: cycle.value || criteria.cycle?.value || 1,
     cycleUnit: cycle.unit || criteria.cycle?.unit || 'year'
   };
-  if (assignment?.startDate) values.startDate = assignment.startDate;
 
   const customFields = equipment?.customFields instanceof Map
     ? Object.fromEntries(equipment.customFields.entries())

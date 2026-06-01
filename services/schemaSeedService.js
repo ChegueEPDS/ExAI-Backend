@@ -66,6 +66,8 @@ async function ensureRbSchema({ refreshQuestions = false, userId = null } = {}) 
       systemProvided: true,
       targetLevels: ['site', 'zone', 'equipment'],
       ruleset: 'rb_v1',
+      defaultCycleValue: 3,
+      defaultCycleUnit: 'year',
       dataFields: RB_DATA_FIELDS,
       questions: await loadLegacyRbQuestions(),
       active: true,
@@ -87,6 +89,11 @@ async function ensureRbSchema({ refreshQuestions = false, userId = null } = {}) 
   }
   if (rb.active === false) {
     rb.active = true;
+    changed = true;
+  }
+  if (rb.defaultCycleValue !== 3 || rb.defaultCycleUnit !== 'year') {
+    rb.defaultCycleValue = 3;
+    rb.defaultCycleUnit = 'year';
     changed = true;
   }
   const existingKeys = new Set((rb.dataFields || []).map((field) => field?.key).filter(Boolean));

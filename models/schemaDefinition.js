@@ -54,6 +54,8 @@ const SchemaDefinitionSchema = new Schema(
     systemProvided: { type: Boolean, default: false, index: true },
     targetLevels: { type: [String], enum: TARGET_LEVELS, default: ['site', 'zone', 'equipment'] },
     ruleset: { type: String, default: null, trim: true },
+    defaultCycleValue: { type: Number, default: 1 },
+    defaultCycleUnit: { type: String, enum: ['day', 'month', 'year'], default: 'year' },
     dataFields: { type: [SchemaDataFieldSchema], default: [] },
     questions: { type: [SchemaQuestionSchema], default: [] },
     active: { type: Boolean, default: true, index: true },
@@ -64,8 +66,12 @@ const SchemaDefinitionSchema = new Schema(
 );
 
 SchemaDefinitionSchema.index(
-  { scope: 1, systemKey: 1 },
-  { unique: true, sparse: true, name: 'uniq_system_schema_key' }
+  { systemKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { scope: 'system' },
+    name: 'uniq_system_schema_key'
+  }
 );
 SchemaDefinitionSchema.index(
   { tenantId: 1, name: 1 },
@@ -80,6 +86,16 @@ SchemaDefinitionSchema.pre('validate', function (next) {
   if (this.scope === 'system') {
     this.tenantId = null;
     this.systemProvided = true;
+  }
+  if (this.systemKey === 'rb') {
+    this.defaultCycleValue = 3;
+    this.defaultCycleUnit = 'year';
+  } else {
+    const cycleValue = Number(this.defaultCycleValue);
+    this.defaultCycleValue = Number.isFinite(cycleValue) && cycleValue > 0 ? cycleValue : 1;
+    if (!['day', 'month', 'year'].includes(this.defaultCycleUnit)) {
+      this.defaultCycleUnit = 'year';
+    }
   }
   if (this.type !== 'compliance') {
     this.questions = [];
