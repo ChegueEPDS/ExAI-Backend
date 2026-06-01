@@ -5,6 +5,7 @@
 /TESTING*.md
 /uploads/*
 /logs/*
+**/prod.archive.gz
 !.gitkeep
 
 # Local-only signing certs (ROT PDF signing)
