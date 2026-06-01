@@ -1,15 +1,15 @@
 const mongoose = require('mongoose');
 
-const ExMarkingSchema = new mongoose.Schema({
-  "Marking": { type: String },
-  "Equipment Group": { type: String },
-  "Equipment Category": { type: String },
-  "Environment": { type: String },
-  "Type of Protection": { type: String },
-  "Gas / Dust Group": { type: String },
-  "Temperature Class": { type: String },
-  "Equipment Protection Level": { type: String }
-});
+const SchemaAssignmentSchema = new mongoose.Schema(
+  {
+    schemaId: { type: mongoose.Schema.Types.ObjectId, ref: 'SchemaDefinition', required: true },
+    schemaKey: { type: String, default: null, index: true },
+    attachedAt: { type: Date, default: Date.now },
+    attachedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    values: { type: mongoose.Schema.Types.Mixed, default: {} }
+  },
+  { _id: false }
+);
 
 const EquipmentSchema = new mongoose.Schema({
   "EqID": { type: String },
@@ -20,10 +20,8 @@ const EquipmentSchema = new mongoose.Schema({
   "Model/Type": { type: String },
   "Serial Number": { type: String },
   "Equipment Type": { type: String, default: "-" },
-  "Ex Marking": { type: [ExMarkingSchema], default: [] },
   "IP rating": String,
   "Max Ambient Temp": { type: String },
-  "Certificate No": String,
   "X condition": {
     "X": Boolean,
     "Specific": String 
@@ -43,11 +41,6 @@ const EquipmentSchema = new mongoose.Schema({
   // Mobile sync review workflow: the auto-generated inspection is pending until reviewed in web.
   pendingReview: { type: Boolean, default: false, index: true },
   pendingInspectionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Inspection', default: null },
-  "Compliance": { 
-    type: String, 
-    enum: ["NA", "Passed", "Failed"], 
-    default: "NA" 
-  },
   "Qualitycheck": { type: Boolean, default: false },
   "CreatedBy": { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   "ModifiedBy": { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // 🆕 Módosító felhasználó
@@ -104,6 +97,10 @@ const EquipmentSchema = new mongoose.Schema({
     type: Map,
     of: mongoose.Schema.Types.Mixed,
     default: {}
+  },
+  schemaAssignments: {
+    type: [SchemaAssignmentSchema],
+    default: []
   }
 }, { timestamps: true }); // ⏳ Timestamps (createdAt, updatedAt)
 

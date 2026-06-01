@@ -242,17 +242,17 @@ exports.getSiteSummary = async (req, res) => {
             total: { $sum: 1 },
             passed: {
               $sum: {
-                $cond: [{ $eq: ['$Compliance', 'Passed'] }, 1, 0]
+                $cond: [{ $eq: ['$lastInspectionStatus', 'Passed'] }, 1, 0]
               }
             },
             failed: {
               $sum: {
-                $cond: [{ $eq: ['$Compliance', 'Failed'] }, 1, 0]
+                $cond: [{ $eq: ['$lastInspectionStatus', 'Failed'] }, 1, 0]
               }
             },
             na: {
               $sum: {
-                $cond: [{ $eq: ['$Compliance', 'NA'] }, 1, 0]
+                $cond: [{ $in: ['$lastInspectionStatus', ['NA', null]] }, 1, 0]
               }
             }
           }

@@ -4,8 +4,6 @@ const Equipment = require('../models/dataplate');
 const MaintenanceEvent = require('../models/maintenanceEvent');
 const Inspection = require('../models/inspection');
 const EquipmentDataVersion = require('../models/equipmentDataVersion');
-const CriteriaSystemCompletion = require('../models/criteriaSystemCompletion');
-const { enrichRelevantSystems } = require('../services/criteriaSystemService');
 
 function toObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
@@ -174,9 +172,8 @@ exports.completeRepair = async (req, res) => {
       equipment.operationalStatusChangedAt = occurredAt;
       equipment.operationalStatusChangedBy = actorId;
 
-      // After maintenance, EX compliance must be treated as non-compliant until a new detailed review/inspection is done.
-      // We keep lastInspection* fields intact (audit/history), and use these flags to drive UX reminders.
-      equipment.Compliance = 'Failed';
+      // After maintenance, EX compliance must be reviewed again. We keep lastInspection*
+      // fields intact for audit/history and use pendingReview to drive UX reminders.
       equipment.pendingReview = true;
       equipment.pendingInspectionId = null;
     }
@@ -210,7 +207,7 @@ exports.getEquipmentHistory = async (req, res) => {
       return res.status(404).json({ error: 'Eszköz nem található.' });
     }
 
-    const [maintenanceEvents, inspections, versions, criteriaCompletions] = await Promise.all([
+    const [maintenanceEvents, inspections, versions] = await Promise.all([
       MaintenanceEvent.find({ tenantId, equipmentId })
         .sort({ occurredAt: -1, _id: -1 })
         .limit(limit)
@@ -226,12 +223,6 @@ exports.getEquipmentHistory = async (req, res) => {
         .limit(limit)
         .populate('changedBy', 'firstName lastName nickname')
         .lean(),
-      CriteriaSystemCompletion.find({ tenantId, equipmentId })
-        .sort({ completedAt: -1, _id: -1 })
-        .limit(limit)
-        .populate('completedByUserId', 'firstName lastName nickname')
-        .populate('criteriaSystemId', 'name type systemKey')
-        .lean()
     ]);
 
     const events = [];
@@ -266,19 +257,6 @@ exports.getEquipmentHistory = async (req, res) => {
       });
     }
 
-    for (const c of criteriaCompletions || []) {
-      events.push({
-        type: 'criteria_completed',
-        occurredAt: c.completedAt,
-        sortAt: c.completedAt,
-        criteria: {
-          ...c,
-          system: c.criteriaSystemId || null,
-          actor: c.completedByUserId || null
-        }
-      });
-    }
-
     // Synthetic planned next inspection event (from the latest inspection's validUntil).
     // Show it as a PLANNED item in the same timeline.
     const plannedAt = equipment.lastInspectionValidUntil || null;
@@ -305,25 +283,6 @@ exports.getEquipmentHistory = async (req, res) => {
         }
       });
       }
-    }
-
-    const criteriaSystems = await enrichRelevantSystems({ tenantId, equipment });
-    for (const system of criteriaSystems || []) {
-      const dueMillis = toMillis(system.nextDueAt);
-      if (!dueMillis) continue;
-      events.push({
-        type: 'criteria_planned',
-        occurredAt: new Date(dueMillis),
-        sortAt: new Date(dueMillis),
-        planned: {
-          kind: 'criteria',
-          name: system.name,
-          criteriaSystemId: system._id,
-          criteriaType: system.type,
-          status: 'PLANNED',
-          pastDue: Date.now() > dueMillis
-        }
-      });
     }
 
     events.sort((a, b) => {

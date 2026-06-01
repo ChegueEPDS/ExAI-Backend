@@ -24,7 +24,7 @@ async function computeComplianceStatusSummary({ tenantId, siteId = null, zoneId 
     { $match: match },
     {
       $group: {
-        _id: '$Compliance',
+        _id: '$lastInspectionStatus',
         count: { $sum: 1 }
       }
     }

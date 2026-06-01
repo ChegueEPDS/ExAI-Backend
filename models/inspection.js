@@ -6,6 +6,8 @@ const InspectionResultSchema = new Schema(
   {
     // Kapcsolat a kérdéshez
     questionId: { type: Schema.Types.ObjectId, ref: 'Question', required: false },
+    schemaQuestionKey: { type: String, required: false },
+    questionOrigin: { type: String, enum: ['legacy', 'system', 'tenant', null], default: null },
 
     // Azonosítók (snapshot, hogy később is érthető maradjon)
     table: { type: String, required: false },   // pl. "T1"
@@ -81,8 +83,10 @@ const InspectionSchema = new Schema(
       enum: ['Detailed', 'Initial Detailed', 'Initial Detailed (Index)', 'Close', 'Visual', 'Criteria'],
       required: true,
     },
-    criteriaSystemId: { type: Schema.Types.ObjectId, ref: 'CriteriaSystem', default: null, index: true },
-    criteriaSystemNameSnapshot: { type: String, default: '' },
+    schemaId: { type: Schema.Types.ObjectId, ref: 'SchemaDefinition', default: null, index: true },
+    schemaKeySnapshot: { type: String, default: '' },
+    schemaNameSnapshot: { type: String, default: '' },
+    schemaTypeSnapshot: { type: String, enum: ['compliance', 'maintenance', null], default: null },
 
     // 2. Eredmények (MINDEN kérdés, nem csak Failed/NA)
     results: {

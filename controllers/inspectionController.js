@@ -5,14 +5,12 @@ const Equipment = require('../models/dataplate');
 const mongoose = require('mongoose');
 const multer = require('multer');
 const azureBlob = require('../services/azureBlobService');
-const Question = require('../models/questions');
 const QuestionTypeMapping = require('../models/questionTypeMapping');
-const CriteriaSystem = require('../models/criteriaSystem');
-const CriteriaSystemCompletion = require('../models/criteriaSystemCompletion');
-const CriteriaSystemFinding = require('../models/criteriaSystemFinding');
-const { resolveExpiredFinding, sourceDomainFor } = require('../services/criteriaSystemService');
+const SchemaDefinition = require('../models/schemaDefinition');
+const { ensureRbSchema, loadLegacyRbQuestions } = require('../services/schemaSeedService');
 const { buildCertificateCacheForTenant, resolveCertificateFromCache } = require('../helpers/certificateMatchHelper');
 const { KNOWN_SET_LOWER, normalizeProtectionTypes } = require('../helpers/protectionTypes');
+const { certificateNo, getRbValues, ensureRbAssignment, protectionText } = require('../services/rbSchemaValueService');
 
 const upload = multer({ dest: 'uploads/' });
 
@@ -40,6 +38,13 @@ function buildSummaryAndStatus(results = []) {
   };
 }
 
+async function updateEquipmentRbCompliance(equipment, status, userId = null) {
+  if (!equipment) return;
+  const rbSchema = await ensureRbSchema();
+  ensureRbAssignment(equipment, rbSchema, { ...getRbValues(equipment), compliance: status || 'NA' }, userId);
+  if (equipment.markModified) equipment.markModified('schemaAssignments');
+}
+
 function computeFailureSeverity(results = []) {
   // Highest severity wins: P1 > P2 > P3 > P4
   const rank = { P1: 4, P2: 3, P3: 2, P4: 1 };
@@ -59,12 +64,8 @@ function computeFailureSeverity(results = []) {
   return best && ['P1', 'P2', 'P3', 'P4'].includes(best) ? best : null;
 }
 
-function escapeRegex(s) {
-  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 function extractProtectionTokens(equipmentDoc) {
-  const protection = equipmentDoc?.['Ex Marking']?.[0]?.['Type of Protection'] || '';
+  const protection = protectionText(equipmentDoc) || '';
   if (!protection) return [];
   const tokens = normalizeProtectionTypes(protection).map((v) => String(v).trim().toLowerCase());
   const hasKnown = tokens.some((t) => KNOWN_SET_LOWER.has(t));
@@ -112,7 +113,7 @@ async function buildSpecialConditionResultFromEquipment(equipmentDoc, tenantId) 
 
   let text = equipmentSpecific;
   if (!text) {
-    const certNo = equipmentDoc?.['Certificate No'] || equipmentDoc?.CertificateNo;
+    const certNo = certificateNo(equipmentDoc);
     if (certNo) {
       const certMap = await buildCertificateCacheForTenant(tenantId);
       const cert = resolveCertificateFromCache(certMap, String(certNo));
@@ -136,19 +137,15 @@ async function buildSpecialConditionResultFromEquipment(equipmentDoc, tenantId) 
 
 async function generateInspectionResultsForEquipment({ equipmentDoc, tenantId, inspectionType }) {
   const protections = extractProtectionTokens(equipmentDoc);
-  const filter = {};
-  const tenantObjectId = tenantId && mongoose.Types.ObjectId.isValid(tenantId) ? new mongoose.Types.ObjectId(tenantId) : null;
-  if (tenantObjectId) filter.tenantId = tenantObjectId;
-  if (protections.length) {
-    filter.protectionTypes = { $in: protections.map((t) => new RegExp(`^${escapeRegex(t)}$`, 'i')) };
-  }
-
-  let questions = await Question.find(filter).lean();
-  if ((!questions || !questions.length) && tenantObjectId) {
-    const fallbackFilter = { ...filter };
-    delete fallbackFilter.tenantId;
-    questions = await Question.find(fallbackFilter).lean();
-  }
+  const questions = (await loadLegacyRbQuestions())
+    .map((q) => (q?.toObject ? q.toObject() : q))
+    .filter((q) => {
+      const qProtections = Array.isArray(q.protectionTypes)
+        ? q.protectionTypes.map((t) => String(t || '').trim().toLowerCase()).filter(Boolean)
+        : [];
+      if (!protections.length || !qProtections.length) return true;
+      return qProtections.some((t) => protections.includes(t));
+    });
 
   const relevantTypes = await computeRelevantEquipmentTypes(equipmentDoc, tenantId);
   const basePassedTypes = new Set(['general', 'environment', 'additional checks', 'installation']);
@@ -162,7 +159,9 @@ async function generateInspectionResultsForEquipment({ equipmentDoc, tenantId, i
       const eqType = (q.equipmentType || '').toLowerCase();
       const shouldBePassed = basePassedTypes.has(eqType) || relevantTypes.has(eqType);
       return {
-        questionId: q._id ? new mongoose.Types.ObjectId(q._id) : undefined,
+        questionId: undefined,
+        schemaQuestionKey: q.key || undefined,
+        questionOrigin: 'system',
         table: q.table || q.Table || '',
         group: q.group || q.Group || '',
         number: q.number ?? q.Number ?? null,
@@ -170,7 +169,7 @@ async function generateInspectionResultsForEquipment({ equipmentDoc, tenantId, i
         protectionTypes: Array.isArray(q.protectionTypes) ? q.protectionTypes : [],
         status: shouldBePassed ? 'Passed' : 'NA',
         note: '',
-        questionText: { eng: q.questionText?.eng || '', hun: q.questionText?.hun || '' }
+        questionText: { eng: q.textI18n?.eng || q.questionText?.eng || q.text || '', hun: q.textI18n?.hun || q.questionText?.hun || '' }
       };
     });
 
@@ -232,7 +231,7 @@ exports.createInspection = async (req, res) => {
       inspectionDate,
       validUntil,
       inspectionType,
-      criteriaSystemId,
+      schemaId,
       results = [],
       attachments = []
     } = req.body || {};
@@ -267,6 +266,8 @@ exports.createInspection = async (req, res) => {
     // ---- Eredmények normalizálása ----
     const normalizedResults = results.map(r => ({
       questionId: r.questionId ? new mongoose.Types.ObjectId(r.questionId) : undefined,
+      schemaQuestionKey: r.schemaQuestionKey || r.questionKey || r.key || undefined,
+      questionOrigin: ['system', 'tenant', 'legacy'].includes(r.questionOrigin) ? r.questionOrigin : null,
       table: r.table || r.Table || undefined,
       group: r.group || r.Group || undefined,
       number: r.number ?? r.Number,
@@ -299,10 +300,19 @@ exports.createInspection = async (req, res) => {
     // ---- Összefoglaló és globális státusz számítása ----
     const { summary, status } = buildSummaryAndStatus(normalizedResults);
     const failureSeverity = status === 'Failed' ? computeFailureSeverity(normalizedResults) : null;
-    let criteriaSystem = null;
-    if (criteriaSystemId && mongoose.isValidObjectId(criteriaSystemId)) {
-      criteriaSystem = await CriteriaSystem.findOne({ _id: criteriaSystemId, tenantId, type: 'compliance' });
-      if (!criteriaSystem) return res.status(404).json({ message: 'Criteria system not found.' });
+    let schemaDefinition = null;
+    if (schemaId && mongoose.isValidObjectId(schemaId)) {
+      schemaDefinition = await SchemaDefinition.findOne({
+        _id: schemaId,
+        type: 'compliance',
+        status: 'published',
+        active: { $ne: false },
+        $or: [
+          { scope: 'system' },
+          { scope: 'tenant', tenantId }
+        ]
+      });
+      if (!schemaDefinition) return res.status(404).json({ message: 'Schema not found.' });
     }
 
     // ---- Inspection dokumentum létrehozása ----
@@ -314,9 +324,11 @@ exports.createInspection = async (req, res) => {
       zoneId: equipment.Unit || equipment.Zone || null,
       inspectionDate: new Date(inspectionDate),
       validUntil: new Date(validUntil),
-      inspectionType: criteriaSystem ? 'Criteria' : inspectionType,
-      criteriaSystemId: criteriaSystem?._id || null,
-      criteriaSystemNameSnapshot: criteriaSystem?.name || '',
+      inspectionType: schemaDefinition ? 'Criteria' : inspectionType,
+      schemaId: schemaDefinition?._id || null,
+      schemaKeySnapshot: schemaDefinition?.systemKey || '',
+      schemaNameSnapshot: schemaDefinition?.name || '',
+      schemaTypeSnapshot: schemaDefinition?.type || null,
       inspectorId,
       results: normalizedResults,
       attachments: normalizedAttachments,
@@ -331,46 +343,11 @@ exports.createInspection = async (req, res) => {
 
     await inspection.save();
 
-    if (criteriaSystem) {
-      const completion = await CriteriaSystemCompletion.create({
-        tenantId,
-        equipmentId: equipment._id,
-        criteriaSystemId: criteriaSystem._id,
-        completedAt: new Date(inspectionDate),
-        note: '',
-        completedByUserId: inspectorId,
-        source: 'inspection',
-        inspectionId: inspection._id
-      });
-      await resolveExpiredFinding({
-        tenantId,
-        equipmentId: equipment._id,
-        criteriaSystemId: criteriaSystem._id,
-        userId: inspectorId,
-        completionId: completion._id
-      });
-      const failedResults = normalizedResults.filter((r) => r.status === 'Failed');
-      if (failedResults.length) {
-        await CriteriaSystemFinding.insertMany(failedResults.map((r) => ({
-          tenantId,
-          equipmentId: equipment._id,
-          criteriaSystemId: criteriaSystem._id,
-          sourceDomain: sourceDomainFor(criteriaSystem),
-          reason: 'failed_question',
-          status: 'open',
-          priority: r.severity || 'P3',
-          inspectionId: inspection._id,
-          questionId: r.questionId || null,
-          reasonText: r.questionText?.eng || r.questionText?.hun || criteriaSystem.name
-        })));
-      }
-    }
-
     // ---- Equipment "összegző" mezők frissítése ----
     try {
       // FIGYELEM: ehhez érdemes a dataplate/Equipment sémát kiegészíteni
       // lastInspectionDate, lastInspectionValidUntil, lastInspectionStatus, lastInspectionId mezőkkel.
-      equipment.Compliance = status; // ahogy eddig is
+      await updateEquipmentRbCompliance(equipment, status, inspectorId);
       equipment.lastInspectionDate = inspection.inspectionDate;
       // Failed inspectionnek nincs "next inspection date"-je (UI: ne jelenjen meg PLANNED).
       equipment.lastInspectionValidUntil = status === 'Failed' ? null : inspection.validUntil;
@@ -518,7 +495,7 @@ exports.updateInspection = async (req, res) => {
         equipment.lastInspectionValidUntil = inspection.status === 'Failed' ? null : inspection.validUntil;
         equipment.lastInspectionStatus = inspection.status;
         equipment.lastInspectionId = inspection._id;
-        equipment.Compliance = inspection.status;
+        await updateEquipmentRbCompliance(equipment, inspection.status, userId);
         equipment.pendingReview = false;
         equipment.pendingInspectionId = null;
         await equipment.save();
@@ -558,14 +535,18 @@ exports.regenerateInspection = async (req, res) => {
     });
 
     const existingByQuestionId = new Map();
+    const existingBySchemaKey = new Map();
     (inspection.results || []).forEach((r) => {
       const idStr = r?.questionId ? String(r.questionId) : '';
       if (idStr) existingByQuestionId.set(idStr, r);
+      const schemaKey = r?.schemaQuestionKey ? String(r.schemaQuestionKey) : '';
+      if (schemaKey) existingBySchemaKey.set(schemaKey, r);
     });
 
     const merged = generated.map((r) => {
       const idStr = r?.questionId ? String(r.questionId) : '';
-      const prev = idStr ? existingByQuestionId.get(idStr) : null;
+      const schemaKey = r?.schemaQuestionKey ? String(r.schemaQuestionKey) : '';
+      const prev = idStr ? existingByQuestionId.get(idStr) : (schemaKey ? existingBySchemaKey.get(schemaKey) : null);
       if (!prev) return r;
       return { ...r, status: prev.status, note: prev.note || '', severity: prev.severity ?? null };
     });
@@ -869,13 +850,13 @@ exports.deleteInspection = async (req, res) => {
               .lean();
 
             if (latest) {
-              equipment.Compliance = latest.status;
+              await updateEquipmentRbCompliance(equipment, latest.status, userId);
               equipment.lastInspectionDate = latest.inspectionDate;
               equipment.lastInspectionValidUntil = latest.status === 'Failed' ? null : latest.validUntil;
               equipment.lastInspectionStatus = latest.status;
               equipment.lastInspectionId = latest._id;
             } else {
-              equipment.Compliance = 'NA';
+              await updateEquipmentRbCompliance(equipment, 'NA', userId);
               equipment.lastInspectionDate = null;
               equipment.lastInspectionValidUntil = null;
               equipment.lastInspectionStatus = null;

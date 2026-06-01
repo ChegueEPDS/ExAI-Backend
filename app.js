@@ -59,7 +59,7 @@ const equipmentConflictRoutes = require('./routes/equipmentConflictRoutes');
 const trainingRoutes = require('./routes/trainingRoutes');
 const publicRotRoutes = require('./routes/publicRotRoutes');
 const customFieldRoutes = require('./routes/customFieldRoutes');
-const criteriaSystemRoutes = require('./routes/criteriaSystemRoutes');
+const schemaRoutes = require('./routes/schemaRoutes');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -367,7 +367,7 @@ app.use('/api', tenantSettingsRoutes);
 app.use('/api', manufacturerRoutes);
 app.use('/api', equipmentConflictRoutes);
 app.use('/api', customFieldRoutes);
-app.use('/api', criteriaSystemRoutes);
+app.use('/api', schemaRoutes);
 app.use('/api/public', publicRotRoutes);
 app.use('/api', trainingRoutes);
 

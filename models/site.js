@@ -1,5 +1,16 @@
 const mongoose = require('mongoose');
 
+const SchemaAssignmentSchema = new mongoose.Schema(
+  {
+    schemaId: { type: mongoose.Schema.Types.ObjectId, ref: 'SchemaDefinition', required: true },
+    schemaKey: { type: String, default: null, index: true },
+    attachedAt: { type: Date, default: Date.now },
+    attachedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    values: { type: mongoose.Schema.Types.Mixed, default: {} }
+  },
+  { _id: false }
+);
+
 const SiteSchema = new mongoose.Schema({
   Name: { type: String, required: true },
   Client: { type: String, required: true },
@@ -41,6 +52,10 @@ const SiteSchema = new mongoose.Schema({
     type: Map,
     of: mongoose.Schema.Types.Mixed,
     default: {}
+  },
+  schemaAssignments: {
+    type: [SchemaAssignmentSchema],
+    default: []
   }
 
 }, { timestamps: true });

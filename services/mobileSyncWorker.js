@@ -10,6 +10,7 @@ const { KNOWN_SET_LOWER, normalizeProtectionTypes } = require('../helpers/protec
 const { buildCertificateCacheForTenant, resolveCertificateFromCache } = require('../helpers/certificateMatchHelper');
 const { notifyAndStore } = require('../lib/notifications/notifier');
 const { processDataplateForEquipment } = require('./dataplateProcessingService');
+const { certificateNo, complianceStatus, protectionText } = require('./rbSchemaValueService');
 
 let isRunning = false;
 const certCacheByTenant = new Map(); // tenantId -> { ts, map }
@@ -25,7 +26,7 @@ function escapeRegex(s) {
 }
 
 function extractProtectionTypesFromEquipment(equipmentDoc) {
-  const protection = equipmentDoc?.['Ex Marking']?.[0]?.['Type of Protection'] || '';
+  const protection = protectionText(equipmentDoc) || '';
   if (!protection) return [];
 
   const tokens = normalizeProtectionTypes(protection).map((v) => String(v).trim().toLowerCase());
@@ -122,7 +123,7 @@ async function buildSpecialConditionResult(equipmentDoc, tenantId) {
 
   let text = equipmentSpecific;
   if (!text) {
-    const certNo = equipmentDoc?.['Certificate No'] || equipmentDoc?.CertificateNo;
+    const certNo = certificateNo(equipmentDoc);
     if (certNo) {
       const certMap = await getCertMapForTenant(tenantId);
       const certificate = resolveCertificateFromCache(certMap, String(certNo));
@@ -231,7 +232,7 @@ async function ensureAutoInspectionFromMobileSync({
     : null;
   if (already) return;
 
-  const compliance = String(equipmentDoc.Compliance || 'NA');
+  const compliance = complianceStatus(equipmentDoc);
   if (compliance !== 'Passed' && compliance !== 'Failed') return;
 
   const inspectionDate = new Date();
@@ -423,48 +424,52 @@ async function processOneJob(job) {
       }
 
       let hadErrors = false;
+      const itemMeta = metaByEquipmentId?.[String(equipmentId)] || {};
+      const skipDataplateProcessing = itemMeta?.skipDataplateProcessing === true;
 
       // Dataplate reader: OCR -> assistant table -> fill fields (only if empty).
-      try {
-        const r = await processDataplateForEquipment({ equipmentDoc, tenantId, tenantKey, userId });
-        if (!r?.processed) {
+      if (!skipDataplateProcessing) {
+        try {
+          const r = await processDataplateForEquipment({ equipmentDoc, tenantId, tenantKey, userId });
+          if (!r?.processed) {
+            hadErrors = true;
+            const reason = String(r?.reason || 'unknown');
+            const message =
+              reason === 'no_dataplate_image'
+                ? 'No dataplate-tagged image found. Tag one photo as "dataplate" in the mobile app.'
+                : `Dataplate processing skipped/failed: ${reason}`;
+            await ProcessingJob.updateOne(
+              { _id: job._id },
+              {
+                $push: {
+                  errorItems: {
+                    equipmentId,
+                    message
+                  }
+                }
+              }
+            );
+          }
+        } catch (e) {
           hadErrors = true;
-          const reason = String(r?.reason || 'unknown');
-          const message =
-            reason === 'no_dataplate_image'
-              ? 'No dataplate-tagged image found. Tag one photo as "dataplate" in the mobile app.'
-              : `Dataplate processing skipped/failed: ${reason}`;
           await ProcessingJob.updateOne(
             { _id: job._id },
             {
               $push: {
                 errorItems: {
                   equipmentId,
-                  message
+                  message: `Dataplate processing failed: ${e?.message || String(e)}`
                 }
               }
             }
           );
         }
-      } catch (e) {
-        hadErrors = true;
-        await ProcessingJob.updateOne(
-          { _id: job._id },
-          {
-            $push: {
-              errorItems: {
-                equipmentId,
-                message: `Dataplate processing failed: ${e?.message || String(e)}`
-              }
-            }
-          }
-        );
       }
 
-      // Auto inspection for mobile-created equipment (Passed or Failed).
+      // Auto inspection for mobile-created equipment or mobile failure reports (Passed or Failed).
       try {
-        const failureNoteFromJob = metaByEquipmentId?.[String(equipmentId)]?.failureNote;
-        const failureSeverityFromJob = metaByEquipmentId?.[String(equipmentId)]?.failureSeverity;
+        const failureNoteFromJob = itemMeta?.failureNote;
+        const failureSeverityFromJob = itemMeta?.failureSeverity;
         await ensureAutoInspectionFromMobileSync({
           equipmentDoc,
           tenantId,
@@ -599,4 +604,4 @@ function start({ intervalMs = 5000 } = {}) {
   setTimeout(() => tick().catch(() => {}), 1500);
 }
 
-module.exports = { start };
+module.exports = { start, ensureAutoInspectionFromMobileSync };

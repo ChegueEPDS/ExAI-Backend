@@ -14,6 +14,9 @@ const sharp = require('sharp');
 const heicConvert = require('heic-convert');
 const { computeOperationalSummary, computeMaintenanceSeveritySummary } = require('../services/operationalSummaryService');
 const { sanitizeCustomFields } = require('../services/customFieldService');
+const { ensureRbSchema } = require('../services/schemaSeedService');
+const { ensureRbAssignment } = require('../services/rbSchemaValueService');
+const { normalizeRbValues } = require('../services/schemaRules/rbRules');
 
 // Helper: convert string tenantId to ObjectId safely
 const toObjectId = (id) => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null);
@@ -89,14 +92,8 @@ exports.createZone = async (req, res) => {
     const createdBy = req.user.id;
     const modifiedBy = req.user.id;
 
-    const {
-      IpRating,
-      EPL,
-      AmbientTempMin,
-      AmbientTempMax,
-      mobileSync,
-      ...rest
-    } = req.body || {};
+    const { mobileSync, ...restRaw } = req.body || {};
+    const rest = { ...restRaw };
 
     const parentUnitIdRaw = rest.parentUnitId || rest.parentUnitId === null ? rest.parentUnitId : null;
     const parentUnitId = parentUnitIdRaw ? toObjectId(parentUnitIdRaw) : null;
@@ -159,14 +156,6 @@ exports.createZone = async (req, res) => {
       parentUnitId: parentUnit ? parentUnit._id : null,
       ancestors: parentUnit ? [...(parentUnit.ancestors || []), parentUnit._id] : [],
       depth: parentUnit ? Number(parentUnit.depth || 0) + 1 : 0,
-      IpRating: typeof IpRating === 'string' ? IpRating : '',
-      EPL: Array.isArray(EPL) ? EPL : (EPL ? [EPL] : []),
-      AmbientTempMin: AmbientTempMin !== undefined && AmbientTempMin !== null
-        ? Number(AmbientTempMin)
-        : undefined,
-      AmbientTempMax: AmbientTempMax !== undefined && AmbientTempMax !== null
-        ? Number(AmbientTempMax)
-        : undefined,
       mobileSync: tempId
         ? {
             tempId,
@@ -180,7 +169,6 @@ exports.createZone = async (req, res) => {
       ModifiedBy: modifiedBy,
       tenantId: tenantObjectId,
     });
-
     try {
       await unit.save();
     } catch (e) {
@@ -357,13 +345,7 @@ exports.updateZone = async (req, res) => {
     const zone = await Unit.findOne({ _id: req.params.id, tenantId: tenantObjectId });
     if (!zone) return res.status(404).json({ error: 'Zone not found' });
 
-    const {
-      IpRating,
-      EPL,
-      AmbientTempMin,
-      AmbientTempMax,
-      ...restBody
-    } = req.body || {};
+    const restBody = { ...(req.body || {}) };
 
     if (Object.prototype.hasOwnProperty.call(restBody, 'customFields')) {
       restBody.customFields = await sanitizeCustomFields({
@@ -375,21 +357,6 @@ exports.updateZone = async (req, res) => {
 
     Object.assign(zone, restBody);
 
-    if (IpRating !== undefined) {
-      zone.IpRating = IpRating;
-    }
-
-    if (EPL !== undefined) {
-      zone.EPL = Array.isArray(EPL) ? EPL : (EPL ? [EPL] : []);
-    }
-
-    if (AmbientTempMin !== undefined) {
-      zone.AmbientTempMin = AmbientTempMin !== null ? Number(AmbientTempMin) : undefined;
-    }
-
-    if (AmbientTempMax !== undefined) {
-      zone.AmbientTempMax = AmbientTempMax !== null ? Number(AmbientTempMax) : undefined;
-    }
     zone.ModifiedBy = req.userId;
     await zone.save();
     return res.status(200).json({ message: 'Zone updated successfully', zone });
@@ -581,7 +548,6 @@ exports.importZonesFromXlsx = async (req, res) => {
       const subGroupRaw = row['SubGroup'] ?? row['Subgroups'] ?? '';
       const tempClassRaw = String(row['TempClass'] || row['Temp Class'] || '').trim();
       const maxTempRaw = row['MaxTemp'] ?? row['Max Temp'] ?? '';
-      const ipRatingRaw = String(row['IpRating'] || row['IP rating'] || '').trim();
       const eplRaw = row['EPL'] ?? '';
       const ambMinRaw = row['AmbientTempMin'] ?? row['Ambient Min'] ?? '';
       const ambMaxRaw = row['AmbientTempMax'] ?? row['Ambient Max'] ?? '';
@@ -654,7 +620,6 @@ exports.importZonesFromXlsx = async (req, res) => {
       const MaxTemp = maxTempRaw !== '' && maxTempRaw !== null ? Number(maxTempRaw) : undefined;
       const AmbientTempMin = ambMinRaw !== '' && ambMinRaw !== null ? Number(ambMinRaw) : undefined;
       const AmbientTempMax = ambMaxRaw !== '' && ambMaxRaw !== null ? Number(ambMaxRaw) : undefined;
-      const IpRating = ipRatingRaw || undefined;
 
       try {
         const existing = await Unit.findOne({
@@ -663,19 +628,20 @@ exports.importZonesFromXlsx = async (req, res) => {
           Name: name
         });
 
+        const rbValuesInput = {
+          scheme: Scheme,
+          environment: Environment,
+          zone: ZoneValues,
+          subGroup: SubGroup,
+          tempClass: TempClass,
+          maxTemp: MaxTemp,
+          epl: EPL,
+          ambientTempMin: AmbientTempMin,
+          ambientTempMax: AmbientTempMax
+        };
         const payload = {
           Name: name,
           Description: description || undefined,
-          Environment,
-          Scheme,
-          Zone: ZoneValues,
-          SubGroup,
-          TempClass,
-          MaxTemp,
-          IpRating,
-          EPL,
-          AmbientTempMin,
-          AmbientTempMax,
           Site: site._id
         };
 
@@ -686,7 +652,6 @@ exports.importZonesFromXlsx = async (req, res) => {
           const crSubGroupRaw = row['ClientReq SubGroup'] ?? row['ClientReq Subgroups'] ?? '';
           const crTempClassRaw = String(row['ClientReq TempClass'] || row['ClientReq Temp Class'] || '').trim();
           const crMaxTempRaw = row['ClientReq MaxTemp'] ?? row['ClientReq Max Temp'] ?? '';
-          const crIpRatingRaw = String(row['ClientReq IpRating'] || row['ClientReq IP rating'] || '').trim();
           const crEplRaw = row['ClientReq EPL'] ?? '';
           const crAmbMinRaw = row['ClientReq AmbientTempMin'] ?? row['ClientReq Ambient Min'] ?? '';
           const crAmbMaxRaw = row['ClientReq AmbientTempMax'] ?? row['ClientReq Ambient Max'] ?? '';
@@ -699,33 +664,32 @@ exports.importZonesFromXlsx = async (req, res) => {
           const crMaxTemp = crMaxTempRaw !== '' && crMaxTempRaw !== null ? Number(crMaxTempRaw) : undefined;
           const crAmbMin = crAmbMinRaw !== '' && crAmbMinRaw !== null ? Number(crAmbMinRaw) : undefined;
           const crAmbMax = crAmbMaxRaw !== '' && crAmbMaxRaw !== null ? Number(crAmbMaxRaw) : undefined;
-          const crIpRating = crIpRatingRaw || undefined;
 
           const hasClientReqData =
             (crZoneValues && crZoneValues.length) ||
             (crSubGroup && crSubGroup.length) ||
             crTempClass ||
             (typeof crMaxTemp === 'number') ||
-            crIpRating ||
             (crEpl && crEpl.length) ||
             (typeof crAmbMin === 'number') ||
             (typeof crAmbMax === 'number');
 
           if (hasClientReqData) {
-            payload.clientReq = [{
+            rbValuesInput.clientRequirements = [{
               Zone: crZoneValues,
               SubGroup: crSubGroup,
               TempClass: crTempClass,
               MaxTemp: crMaxTemp,
-              IpRating: crIpRating,
               EPL: crEpl,
               AmbientTempMin: crAmbMin,
               AmbientTempMax: crAmbMax
             }];
           }
         }
+        const rbSchema = await ensureRbSchema();
 
         if (existing) {
+          ensureRbAssignment(existing, rbSchema, normalizeRbValues(rbValuesInput), req.user?.id || req.userId || null);
           Object.assign(existing, payload, { ModifiedBy: req.user?.id || req.userId || null });
           await existing.save();
           stats.updated += 1;
@@ -736,6 +700,7 @@ exports.importZonesFromXlsx = async (req, res) => {
             ModifiedBy: req.user?.id || req.userId || null,
             tenantId: tenantObjectId
           });
+          ensureRbAssignment(zone, rbSchema, normalizeRbValues(rbValuesInput), req.user?.id || req.userId || null);
           await zone.save();
           stats.created += 1;
         }

@@ -30,16 +30,27 @@ function parseDurationMs(input, fallbackMs) {
 
 function accessTtl(clientType) {
   if (clientType === 'mobile') {
-    return process.env.ACCESS_TOKEN_TTL_MOBILE || process.env.JWT_EXPIRES_IN_MOBILE_ACCESS || '15m';
+    return process.env.ACCESS_TOKEN_TTL_MOBILE || '15m';
   }
-  return process.env.ACCESS_TOKEN_TTL_WEB || process.env.JWT_EXPIRES_IN_WEB || process.env.JWT_EXPIRES_IN || '15m';
+  return process.env.ACCESS_TOKEN_TTL_WEB || '15m';
 }
 
 function refreshTtlMs(clientType) {
   if (clientType === 'mobile') {
     return parseDurationMs(process.env.REFRESH_TOKEN_TTL_MOBILE || '30d', 30 * 86_400_000);
   }
-  return parseDurationMs(process.env.REFRESH_TOKEN_TTL_WEB || '24h', 24 * 3_600_000);
+  return parseDurationMs(process.env.REFRESH_TOKEN_TTL_WEB || '12h', 12 * 3_600_000);
+}
+
+function absoluteTtlMs(clientType) {
+  if (clientType === 'mobile') {
+    return parseDurationMs(process.env.SESSION_ABSOLUTE_TTL_MOBILE || process.env.REFRESH_TOKEN_TTL_MOBILE || '30d', 30 * 86_400_000);
+  }
+  return parseDurationMs(process.env.SESSION_ABSOLUTE_TTL_WEB || '24h', 24 * 3_600_000);
+}
+
+function minDate(a, b) {
+  return new Date(Math.min(new Date(a).getTime(), new Date(b).getTime()));
 }
 
 function cookieSecure(req) {
@@ -212,13 +223,16 @@ async function signAccessToken(user, session) {
 
 async function createSession({ user, clientType, req }) {
   const refreshToken = randomToken();
-  const expiresAt = new Date(Date.now() + refreshTtlMs(clientType));
+  const now = Date.now();
+  const absoluteExpiresAt = new Date(now + absoluteTtlMs(clientType));
+  const expiresAt = minDate(new Date(now + refreshTtlMs(clientType)), absoluteExpiresAt);
   const session = await Session.create({
     userId: user._id,
     tenantId: user.tenantId,
     clientType,
     refreshTokenHash: hashToken(refreshToken),
     expiresAt,
+    absoluteExpiresAt,
     userAgent: String(req?.headers?.['user-agent'] || '').slice(0, 500),
     ip: String(req?.ip || req?.connection?.remoteAddress || ''),
   });
@@ -235,12 +249,25 @@ async function rotateRefreshToken({ refreshToken, req }) {
   });
   if (!session) throw new Error('Invalid refresh token');
 
+  const now = Date.now();
+  let absoluteExpiresAt = session.absoluteExpiresAt;
+  if (!absoluteExpiresAt) {
+    absoluteExpiresAt = new Date(new Date(session.createdAt || now).getTime() + absoluteTtlMs(session.clientType));
+    session.absoluteExpiresAt = absoluteExpiresAt;
+  }
+  if (new Date(absoluteExpiresAt).getTime() <= now) {
+    session.revokedAt = new Date();
+    await session.save();
+    throw new Error('Session absolute lifetime expired');
+  }
+
   const user = await User.findById(session.userId);
   if (!user || !user.tenantId) throw new Error('Invalid session user');
 
   const nextRefreshToken = randomToken();
   session.refreshTokenHash = hashToken(nextRefreshToken);
   session.lastSeenAt = new Date();
+  session.expiresAt = minDate(new Date(now + refreshTtlMs(session.clientType)), absoluteExpiresAt);
   session.userAgent = String(req?.headers?.['user-agent'] || session.userAgent || '').slice(0, 500);
   session.ip = String(req?.ip || req?.connection?.remoteAddress || session.ip || '');
   await session.save();
@@ -264,6 +291,10 @@ async function authenticateAccessToken(token) {
     expiresAt: { $gt: new Date() },
   });
   if (!session) throw new Error('Session revoked or expired');
+  if (session.absoluteExpiresAt && new Date(session.absoluteExpiresAt).getTime() <= Date.now()) {
+    await Session.findByIdAndUpdate(session._id, { revokedAt: new Date() });
+    throw new Error('Session absolute lifetime expired');
+  }
 
   const user = await User.findById(session.userId).lean();
   if (!user || !user.tenantId) throw new Error('Invalid session user');

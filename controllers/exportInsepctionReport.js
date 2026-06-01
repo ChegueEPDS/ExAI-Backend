@@ -23,7 +23,13 @@ const {
   buildCertificateCacheForTenant,
   resolveCertificateFromCache
 } = require('../helpers/certificateMatchHelper');
+const { certificateNo, complianceStatus } = require('../services/rbSchemaValueService');
 const systemSettings = require('../services/systemSettingsStore');
+const {
+  equipmentMarkings,
+  primaryEquipmentMarking,
+  zoneView
+} = require('../services/rbSchemaValueService');
 
 const EXCEL_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const DEFAULT_COLUMNS = [
@@ -71,6 +77,46 @@ const REPORT_JOB_TYPES = {
 const REPORT_BLOB_PREFIX = 'report-exports';
 function displayInspectionTypeForReport(type) {
   return String(type || '') === 'Initial Detailed (Index)' ? 'Initial Detailed' : (type || '');
+}
+
+function listDisplay(value) {
+  if (Array.isArray(value)) return value.join(', ');
+  return value != null ? String(value) : '';
+}
+
+function zoneRbDisplays(zone) {
+  const rb = zoneView(zone);
+  const tempParts = [];
+  if (rb.TempClass) tempParts.push(rb.TempClass);
+  if (rb.MaxTemp !== '' && rb.MaxTemp !== null && rb.MaxTemp !== undefined) tempParts.push(`${rb.MaxTemp}°C`);
+  const ambientParts = [];
+  if (rb.AmbientTempMin !== null && rb.AmbientTempMin !== undefined) ambientParts.push(`${rb.AmbientTempMin}°C`);
+  if (rb.AmbientTempMax !== null && rb.AmbientTempMax !== undefined) ambientParts.push(`+${rb.AmbientTempMax}°C`);
+  return {
+    ...rb,
+    zoneNumber: listDisplay(rb.Zone),
+    subGroup: listDisplay(rb.SubGroup),
+    temp: tempParts.join(' / '),
+    ambient: ambientParts.join(' - '),
+    epl: listDisplay(rb.EPL),
+    clientReq: Array.isArray(rb.clientReq) ? rb.clientReq : []
+  };
+}
+
+function clientReqDisplays(clientReq) {
+  const req = clientReq || {};
+  const tempParts = [];
+  if (req.TempClass) tempParts.push(req.TempClass);
+  if (typeof req.MaxTemp === 'number') tempParts.push(`${req.MaxTemp}°C`);
+  const ambientParts = [];
+  if (req.AmbientTempMin != null) ambientParts.push(`${req.AmbientTempMin}°C`);
+  if (req.AmbientTempMax != null) ambientParts.push(`+${req.AmbientTempMax}°C`);
+  return {
+    zone: listDisplay(req.Zone),
+    subGroup: listDisplay(req.SubGroup),
+    temp: tempParts.join(' / '),
+    ambient: ambientParts.join(' / ')
+  };
 }
 
 function getReportExportRetentionDays() {
@@ -297,7 +343,7 @@ async function addZoneScopeToEquipmentFilter({ tenantId, zoneId, equipmentFilter
 
 async function resolveSchemeFromEquipment(equipment, certificateCache) {
   let scheme = '';
-  const equipmentCertNo = equipment?.['Certificate No'];
+  const equipmentCertNo = certificateNo(equipment);
 
   if (!equipmentCertNo) {
     return scheme;
@@ -500,7 +546,7 @@ function buildEquipmentIdentifier(equipment, context = {}) {
     context.certificateNo ||
     equipment.certificateNo ||
     equipment.CertificateNo ||
-    equipment['Certificate No'] ||
+    certificateNo(equipment) ||
     equipment['Declaration of conformity'] ||
     null;
 
@@ -1003,9 +1049,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   const tenantName = (options.tenantName || '').toLowerCase();
   const isIndexTenant = tenantName === 'index' || tenantName === 'ind-ex';
   const schemeIsIECEx = typeof scheme === 'string' && scheme.toLowerCase().includes('iecex');
-  const exMarking = Array.isArray(equipment['Ex Marking'])
-    ? equipment['Ex Marking'][0] || {}
-    : {};
+  const exMarking = primaryEquipmentMarking(equipment);
   const protectionTokens = String(exMarking['Type of Protection'] || '')
     .toLowerCase()
     .split(/[,\s;/+]+/)
@@ -1185,7 +1229,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   // ========= Certificate / Ex scheme =========
   const certificateRow = currentRow;
   setHeaderCell(`A${certificateRow}:B${certificateRow}`, 'Certificate no');
-  setValueCell(`C${certificateRow}:E${certificateRow}`, equipment['Certificate No'] || '');
+  setValueCell(`C${certificateRow}:E${certificateRow}`, certificateNo(equipment) || '');
   setHeaderCell(`F${certificateRow}:G${certificateRow}`, 'Ex scheme');
   setValueCell(`H${certificateRow}:J${certificateRow}`, scheme || '');
   setHeaderCell(`K${certificateRow}:L${certificateRow}`, 'Status');
@@ -1214,41 +1258,12 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
 
   // ========= Area vs Equipment =========
 
-  // Segéd: Area sorhoz Temp Class mező (TempClass + MaxTemp, ha van)
-  const zoneNumber =
-    Array.isArray(zone?.Zone) && zone.Zone.length > 0
-      ? zone.Zone.join(', ')
-      : zone?.Zone || '';
-
-  const zoneSubGroup = Array.isArray(zone?.SubGroup)
-    ? zone.SubGroup.join(', ')
-    : zone?.SubGroup || '';
-
-  const zoneTempClass = zone?.TempClass || '';
-  const zoneMaxTemp = zone?.MaxTemp ?? '';
-
-  const zoneTempParts = [];
-  if (zoneTempClass) zoneTempParts.push(zoneTempClass);
-  if (zoneMaxTemp !== '' && zoneMaxTemp !== null && zoneMaxTemp !== undefined) {
-    zoneTempParts.push(`${zoneMaxTemp}°C`);
-  }
-  const zoneTempDisplay = zoneTempParts.join(' / ');
-
-  const ambientMin = zone?.AmbientTempMin;
-  const ambientMax = zone?.AmbientTempMax;
-  const ambientParts = [];
-  if (ambientMin !== null && ambientMin !== undefined) {
-    ambientParts.push(`${ambientMin}°C`);
-  }
-  if (ambientMax !== null && ambientMax !== undefined) {
-    ambientParts.push(`${ambientMax}°C`);
-  }
-  const ambientDisplay = ambientParts.join(' - ');
-
-  const zoneIpRating = zone?.IpRating || '';
-  const zoneEpl = Array.isArray(zone?.EPL)
-    ? zone.EPL.join(', ')
-    : (zone?.EPL || '');
+  const zoneDisplays = zoneRbDisplays(zone);
+  const zoneNumber = zoneDisplays.zoneNumber;
+  const zoneSubGroup = zoneDisplays.subGroup;
+  const zoneTempDisplay = zoneDisplays.temp;
+  const ambientDisplay = zoneDisplays.ambient;
+  const zoneEpl = zoneDisplays.epl;
 
   const areaLabelFill = {
     type: 'pattern',
@@ -1291,7 +1306,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   ws.getCell(`K${areaRow}`).value = 'IP Rating';
   ws.getCell(`K${areaRow}`).font = { bold: true };
   ws.getCell(`K${areaRow}`).fill = HEADER_FILL;
-  ws.getCell(`L${areaRow}`).value = zoneIpRating;
+  ws.getCell(`L${areaRow}`).value = '';
 
   ws.getCell(`M${areaRow}`).value = 'EPL';
   ws.getCell(`M${areaRow}`).font = { bold: true };
@@ -1799,7 +1814,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       certificateNo:
         equipment?.certificateNo ||
         equipment?.CertificateNo ||
-        equipment?.['Certificate No'] ||
+        certificateNo(equipment) ||
         equipment?.['Declaration of conformity']
     }) ||
     equipment.EqID ||
@@ -1988,54 +2003,28 @@ function buildProjectExRegisterWorkbook(equipments, {
       eq.lastInspectionDate ||
       null;
 
-    const zoneNumber = Array.isArray(zone?.Zone)
-      ? zone.Zone.join(', ')
-      : (zone?.Zone != null ? String(zone.Zone) : '');
-    const zoneSubGroup = Array.isArray(zone?.SubGroup)
-      ? zone.SubGroup.join(', ')
-      : (zone?.SubGroup != null ? String(zone.SubGroup) : '');
-
-    const zoneTempParts = [];
-    if (zone?.TempClass) zoneTempParts.push(zone.TempClass);
-    if (typeof zone?.MaxTemp === 'number') zoneTempParts.push(`${zone.MaxTemp}°C`);
-    const zoneTempDisplay = zoneTempParts.join(' - ');
-
-    const ambientParts = [];
-    if (zone?.AmbientTempMin != null) ambientParts.push(`${zone.AmbientTempMin}°C`);
-    if (zone?.AmbientTempMax != null) ambientParts.push(`+${zone.AmbientTempMax}°C`);
-    const ambientDisplay = ambientParts.join(' - ');
+    const zoneDisplays = zoneRbDisplays(zone);
+    const zoneNumber = zoneDisplays.zoneNumber;
+    const zoneSubGroup = zoneDisplays.subGroup;
+    const zoneTempDisplay = zoneDisplays.temp;
+    const ambientDisplay = zoneDisplays.ambient;
 
     let clientReqZoneNumber = '';
     let clientReqGasDustGroup = '';
     let clientReqTempDisplay = '';
     let clientReqAmbientDisplay = '';
-    let clientReqIpRating = '';
     if (includeUserRequirement) {
-      const clientReq = Array.isArray(zone?.clientReq) && zone.clientReq.length
-        ? zone.clientReq[0]
-        : null;
-      clientReqZoneNumber = Array.isArray(clientReq?.Zone)
-        ? clientReq.Zone.join(', ')
-        : (clientReq?.Zone != null ? String(clientReq.Zone) : '');
-      clientReqGasDustGroup = Array.isArray(clientReq?.SubGroup)
-        ? clientReq.SubGroup.join(', ')
-        : (clientReq?.SubGroup != null ? String(clientReq.SubGroup) : '');
-      const clientReqTempParts = [];
-      if (clientReq?.TempClass) clientReqTempParts.push(clientReq.TempClass);
-      if (typeof clientReq?.MaxTemp === 'number') clientReqTempParts.push(`${clientReq.MaxTemp}°C`);
-      clientReqTempDisplay = clientReqTempParts.join(' / ');
-
-      const clientReqAmbientParts = [];
-      if (clientReq?.AmbientTempMin != null) clientReqAmbientParts.push(`${clientReq.AmbientTempMin}°C`);
-      if (clientReq?.AmbientTempMax != null) clientReqAmbientParts.push(`+${clientReq.AmbientTempMax}°C`);
-      clientReqAmbientDisplay = clientReqAmbientParts.join(' / ');
-      clientReqIpRating = clientReq?.IpRating || '';
+      const req = clientReqDisplays(zoneDisplays.clientReq[0]);
+      clientReqZoneNumber = req.zone;
+      clientReqGasDustGroup = req.subGroup;
+      clientReqTempDisplay = req.temp;
+      clientReqAmbientDisplay = req.ambient;
     }
 
-    const cert = resolveCertificateFromCache(certMap, eq['Certificate No']);
+    const cert = resolveCertificateFromCache(certMap, certificateNo(eq));
     const hasSpecialCondition = !!(cert && (cert.specCondition || cert.xcondition));
 
-    const rawCertNo = eq['Certificate No'] || '';
+    const rawCertNo = certificateNo(eq) || '';
     let exportCertNo = rawCertNo;
     let exportDocNo = '';
     if (cert && cert.docType === 'manufacturer_declaration') {
@@ -2043,9 +2032,7 @@ function buildProjectExRegisterWorkbook(equipments, {
       exportDocNo = rawCertNo;
     }
 
-    const exMarkings = Array.isArray(eq['Ex Marking']) && eq['Ex Marking'].length
-      ? eq['Ex Marking']
-      : [null];
+    const exMarkings = equipmentMarkings(eq).length ? equipmentMarkings(eq) : [null];
 
     for (const marking of exMarkings) {
       const rowData = {
@@ -2073,7 +2060,7 @@ function buildProjectExRegisterWorkbook(equipments, {
         'Gas / Dust Group': zoneSubGroup,
         'Temp Rating': zoneTempDisplay,
         'Ambient Temp': ambientDisplay,
-        'Status': eq['Compliance'] || '',
+        'Status': complianceStatus(eq) || '',
         'Inspection Date': inspectionDate ? new Date(inspectionDate) : '',
         'Inspector': inspectorName,
         'Type': displayInspectionTypeForReport(inspection?.inspectionType),
@@ -2084,7 +2071,7 @@ function buildProjectExRegisterWorkbook(equipments, {
         rowData['Req Gas / Dust Group'] = clientReqGasDustGroup;
         rowData['Req Temp Rating'] = clientReqTempDisplay;
         rowData['Req Ambient Temp'] = clientReqAmbientDisplay;
-        rowData['Req IP Rating'] = clientReqIpRating;
+        rowData['Req IP Rating'] = '';
       }
 
       const row = worksheet.addRow(rowData);
@@ -2230,40 +2217,12 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
 
   // ========= Area blokk az ITR-ből (közvetlenül a fejléc után) =========
   if (zone) {
-    const zoneNumber =
-      Array.isArray(zone.Zone) && zone.Zone.length > 0
-        ? zone.Zone.join(', ')
-        : zone.Zone || '';
-
-    const zoneSubGroup = Array.isArray(zone.SubGroup)
-      ? zone.SubGroup.join(', ')
-      : zone.SubGroup || '';
-
-    const zoneTempClass = zone.TempClass || '';
-    const zoneMaxTemp = zone.MaxTemp ?? '';
-
-    const zoneTempParts = [];
-    if (zoneTempClass) zoneTempParts.push(zoneTempClass);
-    if (zoneMaxTemp !== '' && zoneMaxTemp !== null && zoneMaxTemp !== undefined) {
-      zoneTempParts.push(`${zoneMaxTemp}°C`);
-    }
-    const zoneTempDisplay = zoneTempParts.join(' / ');
-
-    const ambientMin = zone.AmbientTempMin;
-    const ambientMax = zone.AmbientTempMax;
-    const ambientParts = [];
-    if (ambientMin !== null && ambientMin !== undefined) {
-      ambientParts.push(`${ambientMin}°C`);
-    }
-    if (ambientMax !== null && ambientMax !== undefined) {
-      ambientParts.push(`${ambientMax}°C`);
-    }
-    const ambientDisplay = ambientParts.join(' - ');
-
-    const zoneIpRating = zone.IpRating || '';
-    const zoneEpl = Array.isArray(zone.EPL)
-      ? zone.EPL.join(', ')
-      : (zone.EPL || '');
+    const zoneDisplays = zoneRbDisplays(zone);
+    const zoneNumber = zoneDisplays.zoneNumber;
+    const zoneSubGroup = zoneDisplays.subGroup;
+    const zoneTempDisplay = zoneDisplays.temp;
+    const ambientDisplay = zoneDisplays.ambient;
+    const zoneEpl = zoneDisplays.epl;
 
     const areaLabelFill = {
       type: 'pattern',
@@ -2302,7 +2261,7 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
     ws.getCell(`K${ar}`).value = 'IP Rating';
     ws.getCell(`K${ar}`).font = { bold: true };
     ws.getCell(`K${ar}`).fill = HEADER_FILL;
-    ws.getCell(`L${ar}`).value = zoneIpRating;
+    ws.getCell(`L${ar}`).value = '';
 
     ws.getCell(`M${ar}`).value = 'EPL';
     ws.getCell(`M${ar}`).font = { bold: true };
@@ -2528,7 +2487,7 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName, requ
         certificateNo:
           eq?.certificateNo ||
           eq?.CertificateNo ||
-          eq?.['Certificate No'] ||
+          certificateNo(eq) ||
           eq?.['Declaration of conformity']
       }) ||
       eq['EqID'] ||
@@ -2596,14 +2555,14 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName, requ
       await appendDocumentsToArchive(archive, combinedDocs, PROJECT_REPORT_DIRS.DOCUMENTS);
     }
 
-    const certDoc = resolveCertificateFromCache(certMap, eq['Certificate No']);
+    const certDoc = resolveCertificateFromCache(certMap, certificateNo(eq));
     const certificateSource =
       certDoc?.fileUrl ||
       certDoc?.sharePointFileUrl ||
       certDoc?.docxUrl ||
       certDoc?.sharePointDocxUrl;
     const certNumberRaw =
-      eq['Certificate No'] ||
+      certificateNo(eq) ||
       eq['CertNo'] ||
       eq['certNo'] ||
       eq['certificateNumber'] ||
@@ -2770,7 +2729,7 @@ async function generateLatestInspectionArchive(
         certificateNo:
           context.equipment?.certificateNo ||
           context.equipment?.CertificateNo ||
-          context.equipment?.['Certificate No'] ||
+          certificateNo(context.equipment) ||
           context.equipment?.['Declaration of conformity']
       }) ||
       context.equipment?.EqID ||
@@ -3068,7 +3027,7 @@ exports.exportInspectionXLSX = async (req, res) => {
         certificateNo:
           context.equipment?.certificateNo ||
           context.equipment?.CertificateNo ||
-          context.equipment?.['Certificate No'] ||
+          certificateNo(context.equipment) ||
           context.equipment?.['Declaration of conformity']
       }) ||
       context.equipment?.EqID ||
@@ -3205,7 +3164,7 @@ exports.exportPunchlistXLSX = async (req, res) => {
           certificateNo:
             context.equipment?.certificateNo ||
             context.equipment?.CertificateNo ||
-            context.equipment?.['Certificate No'] ||
+            certificateNo(context.equipment) ||
             context.equipment?.['Declaration of conformity']
         }) ||
         context.equipment?.EqID ||

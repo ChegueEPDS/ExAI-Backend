@@ -27,16 +27,6 @@ const SYSTEM_FIELDS = {
   zone: [
     { fieldKey: 'Name', label: 'Zone name', section: 'Basic', required: true },
     { fieldKey: 'Description', label: 'Description', section: 'Basic' },
-    { fieldKey: 'Scheme', label: 'Scheme', section: 'Basic' },
-    { fieldKey: 'Environment', label: 'Environment', section: 'Basic', required: true },
-    { fieldKey: 'Zone', label: 'Zone', section: 'Basic' },
-    { fieldKey: 'SubGroup', label: 'Sub-Group', section: 'Basic' },
-    { fieldKey: 'TempClass', label: 'Temperature Class', section: 'Basic' },
-    { fieldKey: 'MaxTemp', label: 'Max Temperature', section: 'Basic' },
-    { fieldKey: 'IpRating', label: 'IP Rating', section: 'Basic' },
-    { fieldKey: 'EPL', label: 'EPL', section: 'Basic' },
-    { fieldKey: 'AmbientTempMin', label: 'Ambient Temp. min', section: 'Basic' },
-    { fieldKey: 'AmbientTempMax', label: 'Ambient Temp. max', section: 'Basic' },
     { fieldKey: 'SkidID', label: 'Skid ID', section: 'Basic' },
     { fieldKey: 'SkidDescription', label: 'Skid Description', section: 'Basic' },
     { fieldKey: 'ProjectID', label: 'Project ID', section: 'Basic' }
@@ -49,19 +39,9 @@ const SYSTEM_FIELDS = {
     { fieldKey: 'Manufacturer', label: 'Manufacturer', section: 'Basic' },
     { fieldKey: 'Model/Type', label: 'Model/Type', section: 'Basic' },
     { fieldKey: 'Serial Number', label: 'Serial Number', section: 'Basic' },
-    { fieldKey: 'Certificate No', label: 'Certificate No', section: 'Basic' },
     { fieldKey: 'IP rating', label: 'IP rating', section: 'Basic' },
     { fieldKey: 'Max Ambient Temp', label: 'Max Ambient Temp', section: 'Basic' },
-    { fieldKey: 'Compliance', label: 'Compliance', section: 'Basic' },
-    { fieldKey: 'Other Info', label: 'Notes', section: 'Basic' },
-    { fieldKey: 'Marking', label: 'Marking', section: 'Ex Data' },
-    { fieldKey: 'Equipment Group', label: 'Equipment Group', section: 'Ex Data' },
-    { fieldKey: 'Equipment Category', label: 'Equipment Category', section: 'Ex Data' },
-    { fieldKey: 'Environment', label: 'Environment', section: 'Ex Data' },
-    { fieldKey: 'Type of Protection', label: 'Type of Protection', section: 'Ex Data' },
-    { fieldKey: 'Gas / Dust Group', label: 'Gas / Dust Group', section: 'Ex Data' },
-    { fieldKey: 'Temperature Class', label: 'Temperature Class', section: 'Ex Data' },
-    { fieldKey: 'Equipment Protection Level', label: 'Equipment Protection Level', section: 'Ex Data' }
+    { fieldKey: 'Other Info', label: 'Notes', section: 'Basic' }
   ]
 };
 
@@ -169,21 +149,7 @@ async function sanitizeCustomFields({ tenantId, entityType, values }) {
     entityType,
     active: true
   }).lean();
-  let criteriaDefs = [];
-  if (entityType === 'equipment') {
-    try {
-      const CriteriaSystem = require('../models/criteriaSystem');
-      const systems = await CriteriaSystem.find({ tenantId: tenantObjectId, active: true })
-        .select('customFields')
-        .lean();
-      criteriaDefs = (systems || []).flatMap((s) => (s.customFields || [])
-        .filter((f) => f && f.active !== false && f.key)
-        .map((f) => ({ ...f, entityType: 'equipment' })));
-    } catch (_) {
-      criteriaDefs = [];
-    }
-  }
-  const byKey = new Map([...defs, ...criteriaDefs].map((d) => [String(d.key), d]));
+  const byKey = new Map(defs.map((d) => [String(d.key), d]));
   const out = {};
   Object.keys(values).forEach((key) => {
     const def = byKey.get(key);

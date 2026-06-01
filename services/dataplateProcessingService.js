@@ -3,6 +3,8 @@ const { ocrImageBufferToDataplatePrompt } = require('../helpers/azureVisionOcr')
 const { extractDataplateFieldsFromOcrText } = require('../helpers/dataplateJsonExtractor');
 const { normalizeProtectionTypes } = require('../helpers/protectionTypes');
 const tenantSettingsStore = require('./tenantSettingsStore');
+const { ensureRbSchema } = require('./schemaSeedService');
+const { attachEquipmentMarkings, equipmentMarkings, getRbValues, ensureRbAssignment } = require('./rbSchemaValueService');
 
 function pickFirstDataplateImage(equipmentDoc) {
   const docs = Array.isArray(equipmentDoc?.documents) ? equipmentDoc.documents : [];
@@ -106,23 +108,22 @@ async function processDataplateForEquipment({ equipmentDoc, tenantId, tenantKey,
   changed = setNestedIfEmpty(equipmentDoc, 'Serial Number', parsed['Serial Number']) || changed;
   changed = setNestedIfEmpty(equipmentDoc, 'Equipment Type', parsed['Equipment Type']) || changed;
   changed = setNestedIfEmpty(equipmentDoc, 'IP rating', parsed['IP rating']) || changed;
-  changed = setNestedIfEmpty(equipmentDoc, 'Certificate No', parsed['Certificate No']) || changed;
   changed = setNestedIfEmpty(equipmentDoc, 'Max Ambient Temp', parsed['Max Ambient Temp']) || changed;
 
   // Other Info: append only if equipment Other Info is empty (avoid overriding user notes)
   changed = setNestedIfEmpty(equipmentDoc, 'Other Info', parsed['Other Info']) || changed;
 
-  // Ex Marking: only set if currently empty
-  const currentMarks = equipmentDoc.get ? equipmentDoc.get('Ex Marking') : equipmentDoc['Ex Marking'];
-  const hasMarks = Array.isArray(currentMarks) && currentMarks.length > 0;
+  // RB Ex marking is stored under schemaAssignments; only fill missing cells.
+  const currentMarks = equipmentMarkings(equipmentDoc);
+  const hasMarks = currentMarks.length > 0;
   const parsedMarks = Array.isArray(parsed['Ex Marking']) ? parsed['Ex Marking'] : [];
   if (parsedMarks.length) {
+    const rbSchema = await ensureRbSchema();
     if (!hasMarks) {
-      if (equipmentDoc.set) equipmentDoc.set('Ex Marking', parsedMarks);
-      else equipmentDoc['Ex Marking'] = parsedMarks;
+      attachEquipmentMarkings(equipmentDoc, rbSchema, parsedMarks, userId || null);
       changed = true;
     } else {
-      const existingMarks = Array.isArray(currentMarks) ? currentMarks : [];
+      const existingMarks = Array.isArray(currentMarks) ? [...currentMarks] : [];
       const existingFirst = existingMarks[0] && typeof existingMarks[0] === 'object' ? existingMarks[0] : {};
       const parsedFirst = parsedMarks[0] && typeof parsedMarks[0] === 'object' ? parsedMarks[0] : {};
       const nextFirst = { ...existingFirst };
@@ -134,21 +135,31 @@ async function processDataplateForEquipment({ equipmentDoc, tenantId, tenantKey,
       });
 
       existingMarks[0] = nextFirst;
-      if (equipmentDoc.set) equipmentDoc.set('Ex Marking', existingMarks);
-      else equipmentDoc['Ex Marking'] = existingMarks;
-      if (equipmentDoc.markModified) equipmentDoc.markModified('Ex Marking');
+      attachEquipmentMarkings(equipmentDoc, rbSchema, existingMarks, userId || null);
       changed = true;
     }
   }
 
-  // Compliance from assistant only if current is NA
+  const rbValues = { ...getRbValues(equipmentDoc) };
+  const parsedCertificateNo = String(parsed['Certificate No'] || '').trim();
+  if (parsedCertificateNo && !String(rbValues.certificateNo || '').trim()) {
+    rbValues.certificateNo = parsedCertificateNo;
+    const rbSchema = await ensureRbSchema();
+    ensureRbAssignment(equipmentDoc, rbSchema, rbValues, userId || null);
+    changed = true;
+  }
+
+  // Compliance from assistant only if current RB compliance is NA/missing.
   const compliance = coerceCompliance(parsed.Compliance);
-  if (compliance && String(equipmentDoc.Compliance || 'NA') === 'NA') {
-    equipmentDoc.Compliance = compliance;
+  const currentCompliance = String(getRbValues(equipmentDoc).compliance || 'NA');
+  if (compliance && currentCompliance === 'NA') {
+    const rbSchema = await ensureRbSchema();
+    ensureRbAssignment(equipmentDoc, rbSchema, { ...getRbValues(equipmentDoc), compliance }, userId || null);
     changed = true;
   }
 
   if (changed) {
+    if (equipmentDoc.markModified) equipmentDoc.markModified('schemaAssignments');
     if (userId) {
       equipmentDoc.ModifiedBy = userId;
     }

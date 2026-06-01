@@ -131,7 +131,7 @@ async function computeOverallStatusSummary({ tenantId, siteId = null, zoneId = n
     eqFilter.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
   }
 
-  const equipments = await Equipment.find(eqFilter).select('_id operationalStatus Compliance').lean();
+  const equipments = await Equipment.find(eqFilter).select('_id operationalStatus lastInspectionStatus').lean();
   const equipmentIds = (equipments || []).map((e) => e._id).filter(Boolean);
   const total = equipmentIds.length;
 
@@ -155,7 +155,7 @@ async function computeOverallStatusSummary({ tenantId, siteId = null, zoneId = n
     }
 
     const op = eq.operationalStatus || 'operating';
-    const compliance = eq.Compliance || 'NA';
+    const compliance = eq.lastInspectionStatus || 'NA';
 
     if (op === 'failed' || compliance === 'Failed') {
       failed += 1;

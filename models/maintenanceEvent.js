@@ -28,6 +28,10 @@ const MaintenanceEventSchema = new mongoose.Schema(
     // Link repair lifecycle events together
     repairId: { type: mongoose.Schema.Types.ObjectId, default: null, index: true },
 
+    // Idempotency for external/system-created events such as mobile sync retries.
+    source: { type: String, default: null, index: true },
+    sourceId: { type: String, default: null, index: true },
+
     // For repair_completed
     completedWorking: { type: Boolean, default: null }
   },
@@ -36,5 +40,6 @@ const MaintenanceEventSchema = new mongoose.Schema(
 
 MaintenanceEventSchema.index({ tenantId: 1, equipmentId: 1, occurredAt: -1 });
 MaintenanceEventSchema.index({ tenantId: 1, equipmentId: 1, kind: 1, occurredAt: -1 });
+MaintenanceEventSchema.index({ tenantId: 1, source: 1, sourceId: 1, kind: 1 });
 
 module.exports = mongoose.model('MaintenanceEvent', MaintenanceEventSchema);

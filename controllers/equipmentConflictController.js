@@ -5,6 +5,8 @@ const User = require('../models/user');
 const azureBlob = require('../services/azureBlobService');
 const { createEquipmentDataVersion, sanitizeEquipmentSnapshot } = require('../services/equipmentVersioningService');
 const { notifyAndStore } = require('../lib/notifications/notifier');
+const { ensureRbSchema } = require('../services/schemaSeedService');
+const { equipmentMarkings, getRbValues, ensureRbAssignment } = require('../services/rbSchemaValueService');
 
 const toObjectId = (value) => {
   if (!value) return null;
@@ -46,7 +48,13 @@ function applyResolutionToSnapshot(serverSnapshot, clientChanges, resolution) {
   const fields = clientChanges?.fields || {};
   const ex = clientChanges?.exMarking || {};
   const customFields = clientChanges?.customFields || {};
-  const protectionTypes = Array.isArray(clientChanges?.protectionTypes) ? clientChanges.protectionTypes : null;
+  const clientRbAssignment = Array.isArray(clientChanges?.schemaAssignments)
+    ? clientChanges.schemaAssignments.find((a) => a?.schemaKey === 'rb')
+    : null;
+  const clientRbValues = clientRbAssignment?.values || {};
+  const clientExMarking = Array.isArray(clientRbValues.exMarking) && clientRbValues.exMarking.length
+    ? clientRbValues.exMarking[0] || {}
+    : {};
 
   const customChoice = resolution?.customFields || {};
   const choose = (scope, key, serverVal, clientVal) => {
@@ -69,9 +77,6 @@ function applyResolutionToSnapshot(serverSnapshot, clientChanges, resolution) {
   if (base?.equipmentType !== undefined || baseChoice?.equipmentType || takeAll) {
     out['Equipment Type'] = choose('base', 'equipmentType', out['Equipment Type'], base?.equipmentType);
   }
-  if (base?.Compliance !== undefined || baseChoice?.Compliance || takeAll) {
-    out.Compliance = choose('base', 'Compliance', out.Compliance, base?.Compliance);
-  }
   if (base?.otherInfo !== undefined || baseChoice?.otherInfo || takeAll) {
     out['Other Info'] = choose('base', 'otherInfo', out['Other Info'], base?.otherInfo);
   }
@@ -85,7 +90,6 @@ function applyResolutionToSnapshot(serverSnapshot, clientChanges, resolution) {
     'Manufacturer',
     'Model/Type',
     'Serial Number',
-    'Certificate No',
     'IP rating',
     'Max Ambient Temp'
   ];
@@ -95,45 +99,61 @@ function applyResolutionToSnapshot(serverSnapshot, clientChanges, resolution) {
     }
   }
 
-  // Ex Marking
+  // RB schema values
   const exKeys = [
     'Marking',
     'Equipment Group',
     'Equipment Category',
     'Environment',
+    'Type of Protection',
     'Gas / Dust Group',
     'Temperature Class',
     'Equipment Protection Level'
   ];
-  const marks = Array.isArray(out['Ex Marking']) ? [...out['Ex Marking']] : [];
+  const rbValues = { ...getRbValues(out) };
+  const marks = equipmentMarkings(out).map((marking) => ({ ...(marking || {}) }));
   const first = (marks[0] && typeof marks[0] === 'object') ? { ...(marks[0] || {}) } : {};
-  let touched = false;
+  let rbTouched = false;
+
+  if (exChoice?.['Certificate No'] || takeAll) {
+    rbValues.certificateNo = choose('ex', 'Certificate No', rbValues.certificateNo, clientRbValues.certificateNo);
+    rbTouched = true;
+  }
+  if (exChoice?.Compliance || takeAll) {
+    rbValues.compliance = choose('ex', 'Compliance', rbValues.compliance, clientRbValues.compliance);
+    rbTouched = true;
+  }
+
   for (const k of exKeys) {
-    if (ex[k] !== undefined || exChoice?.[k] || takeAll) {
-      first[k] = choose('ex', k, first[k], ex[k]);
-      touched = true;
+    const clientValue = ex[k] !== undefined ? ex[k] : clientExMarking[k];
+    if (clientValue !== undefined || exChoice?.[k] || takeAll) {
+      first[k] = choose('ex', k, first[k], clientValue);
+      rbTouched = true;
     }
   }
 
-  // Protection types (stored on Ex Marking -> Type of Protection)
-  if (protectionTypes || baseChoice?.protectionTypes || takeAll) {
-    const serverProt = first['Type of Protection'];
-    const clientProt = Array.isArray(protectionTypes) ? protectionTypes.join('; ') : undefined;
-    const chosen = (takeAll === 'client')
-      ? pickValue('client', serverProt, clientProt)
-      : (takeAll === 'server')
-        ? serverProt
-        : pickValue(baseChoice?.protectionTypes, serverProt, clientProt);
-    if (chosen !== undefined) {
-      first['Type of Protection'] = chosen;
-      touched = true;
-    }
-  }
-
-  if (touched) {
+  if (rbTouched) {
     if (marks.length) marks[0] = first;
     else marks.push(first);
-    out['Ex Marking'] = marks;
+    rbValues.exMarking = marks;
+    rbValues.protectionTypes = String(first['Type of Protection'] || '').split(/[;,\n/]+/).map((v) => v.trim()).filter(Boolean);
+    rbValues.subGroup = String(first['Gas / Dust Group'] || '').split(/[;,\n/]+/).map((v) => v.trim()).filter(Boolean);
+    rbValues.tempClass = first['Temperature Class'] || '';
+    rbValues.epl = String(first['Equipment Protection Level'] || '').split(/[;,\n/]+/).map((v) => v.trim()).filter(Boolean);
+    const env = String(first.Environment || '').trim().toUpperCase();
+    rbValues.environment = env === 'G' ? 'Gas' : env === 'D' ? 'Dust' : env === 'GD' ? 'Hybrid' : (rbValues.environment || 'NonEx');
+    const currentAssignments = Array.isArray(out.schemaAssignments) ? [...out.schemaAssignments] : [];
+    const idx = currentAssignments.findIndex((a) => a?.schemaKey === 'rb');
+    const existing = idx >= 0 ? currentAssignments[idx] : (clientRbAssignment || {});
+    const nextAssignment = {
+      ...existing,
+      schemaId: existing.schemaId || clientRbAssignment?.schemaId,
+      schemaKey: 'rb',
+      values: rbValues
+    };
+    if (idx >= 0) currentAssignments[idx] = nextAssignment;
+    else currentAssignments.push(nextAssignment);
+    out.schemaAssignments = currentAssignments;
   }
 
   if (customFields && typeof customFields === 'object' && (takeAll || customChoice || Object.keys(customFields).length)) {
@@ -242,6 +262,12 @@ exports.resolveConflict = async (req, res) => {
 
   const serverSnapshot = sanitizeEquipmentSnapshot(conflict.serverSnapshot || {});
   const merged = applyResolutionToSnapshot(serverSnapshot, conflict.clientChanges || {}, resolution);
+  if (Array.isArray(merged?.schemaAssignments) && merged.schemaAssignments.some((a) => a?.schemaKey === 'rb')) {
+    const rbSchema = await ensureRbSchema();
+    const rbAssignment = merged.schemaAssignments.find((a) => a?.schemaKey === 'rb');
+    ensureRbAssignment(equipment, rbSchema, rbAssignment?.values || {}, userId);
+    delete merged.schemaAssignments;
+  }
 
   // Apply merged data to equipment
   const mergedKeys = Object.keys(merged || {});

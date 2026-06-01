@@ -10,12 +10,13 @@ const ProcessingJob = require('../models/processingJob');
 const EquipmentConflict = require('../models/equipmentConflict');
 const User = require('../models/user');
 const azureBlob = require('../services/azureBlobService');
-const { createEquipmentDataVersion, sanitizeEquipmentSnapshot } = require('../services/equipmentVersioningService');
-const { normalizeProtectionTypes } = require('../helpers/protectionTypes');
+const { createEquipmentDataVersion, sanitizeEquipmentSnapshot, computeChangedPaths } = require('../services/equipmentVersioningService');
 const SyncTombstone = require('../models/syncTombstone');
 const { parseSinceDate } = require('../services/syncTombstoneService');
 const { notifyAndStore } = require('../lib/notifications/notifier');
 const { sanitizeCustomFields } = require('../services/customFieldService');
+const { ensureRbSchema } = require('../services/schemaSeedService');
+const { ensureRbAssignment, getRbValues } = require('../services/rbSchemaValueService');
 
 const toObjectId = (value) => {
   if (!value) return null;
@@ -68,32 +69,81 @@ function normalizeImageTag(tag, fallback = 'general') {
   return allowed.includes(value) ? value : fallback;
 }
 
-function normalizeCompliance(value, fallback = 'NA') {
-  const allowed = new Set(['NA', 'Passed', 'Failed']);
-  const v = typeof value === 'string' ? value.trim() : value;
-  if (allowed.has(v)) return v;
-  const lower = typeof v === 'string' ? v.toLowerCase() : '';
-  if (lower === 'na') return 'NA';
-  if (lower.startsWith('pass')) return 'Passed';
-  if (lower.startsWith('fail')) return 'Failed';
-  return fallback;
-}
-
 function normalizeSeverity(input) {
   const raw = typeof input === 'string' ? input.trim().toUpperCase() : '';
   if (raw === 'P1' || raw === 'P2' || raw === 'P3' || raw === 'P4') return raw;
   return null;
 }
 
+function hasFaultDocument(item) {
+  const docs = Array.isArray(item?.documents) ? item.documents : Array.isArray(item?.images) ? item.images : [];
+  return docs.some((doc) => normalizeImageTag(doc?.tag, null) === 'fault');
+}
+
+function hasFailedRbCompliance(assignments) {
+  return (Array.isArray(assignments) ? assignments : []).some((assignment) => {
+    if (!assignment || assignment.schemaKey !== 'rb') return false;
+    return String(assignment.values?.compliance || '').trim() === 'Failed';
+  });
+}
+
+function forceRbCompliance(assignments, compliance = 'Failed') {
+  let changed = false;
+  const next = (Array.isArray(assignments) ? assignments : []).map((assignment) => {
+    if (!assignment || assignment.schemaKey !== 'rb') return assignment;
+    changed = true;
+    return {
+      ...assignment,
+      values: {
+        ...(assignment.values || {}),
+        compliance
+      }
+    };
+  });
+  return { assignments: next, changed };
+}
+
+function hasMobileFailureReport({ item, failureNote, failureSeverity, schemaAssignments }) {
+  return Boolean(
+    String(failureNote || '').trim() ||
+    failureSeverity ||
+    hasFaultDocument(item) ||
+    hasFailedRbCompliance(schemaAssignments)
+  );
+}
+
+async function applyMobileInspectionFailureState({
+  equipment,
+  userId,
+}) {
+  if (!equipment?._id) return;
+
+  const rbSchema = await ensureRbSchema({ userId });
+  const currentValues = getRbValues(equipment);
+  ensureRbAssignment(equipment, rbSchema, { ...currentValues, compliance: 'Failed' }, userId);
+  if (equipment.markModified) equipment.markModified('schemaAssignments');
+
+  equipment.ModifiedBy = userId;
+}
+
+function isMobileFaultOnlyVersionChange(changedPaths) {
+  const paths = Array.isArray(changedPaths) ? changedPaths : [];
+  if (!paths.length) return true;
+  return paths.every((path) =>
+    /^schemaAssignments\.\d+\.attachedAt$/.test(path) ||
+    /^schemaAssignments\.\d+\.attachedBy$/.test(path) ||
+    /^schemaAssignments\.\d+\.values\.compliance$/.test(path)
+  );
+}
+
 function buildClientChanges({
   eqIdRaw,
   equipmentTypeRaw,
-  compliance,
   otherInfo,
   failureNote,
   failureSeverity,
-  normalizedProtectionTypes,
   customFields,
+  schemaAssignments,
   clearBaseFields,
   otherInfoPresent,
   failureNotePresent,
@@ -104,7 +154,6 @@ function buildClientChanges({
   const shouldClear = (key) => clearBaseFields && clearBaseFields.has(key);
   if (eqIdRaw || shouldClear('EqID')) equipment.EqID = eqIdRaw;
   if (equipmentTypeRaw || shouldClear('equipmentType')) equipment.equipmentType = equipmentTypeRaw;
-  equipment.Compliance = compliance;
   if (otherInfoPresent || shouldClear('otherInfo')) equipment.otherInfo = otherInfo;
   if (failureNotePresent || shouldClear('failureNote')) equipment.failureNote = failureNote;
   if (failureSeverity != null) equipment.failureSeverity = failureSeverity;
@@ -129,10 +178,24 @@ function buildClientChanges({
   if (customFields && typeof customFields === 'object' && Object.keys(customFields).length) {
     out.customFields = { ...customFields };
   }
-  if (Array.isArray(normalizedProtectionTypes) && (normalizedProtectionTypes.length || shouldClear('protectionTypes'))) {
-    out.protectionTypes = normalizedProtectionTypes;
+  if (Array.isArray(schemaAssignments) && schemaAssignments.length) {
+    out.schemaAssignments = schemaAssignments;
   }
   return out;
+}
+
+function mergeSchemaAssignments(existingAssignments, incomingAssignments) {
+  const next = Array.isArray(existingAssignments) ? [...existingAssignments] : [];
+  (Array.isArray(incomingAssignments) ? incomingAssignments : []).forEach((assignment) => {
+    if (!assignment || (!assignment.schemaId && !assignment.schemaKey)) return;
+    const idx = next.findIndex((item) =>
+      (assignment.schemaKey && item?.schemaKey === assignment.schemaKey) ||
+      (assignment.schemaId && String(item?.schemaId) === String(assignment.schemaId))
+    );
+    if (idx >= 0) next[idx] = assignment;
+    else next.push(assignment);
+  });
+  return next;
 }
 
 function parseClientTimestamp(input) {
@@ -284,8 +347,10 @@ exports.mobileSync = async (req, res) => {
 
   const tempIdToEquipmentId = {};
   const conflicts = [];
-  // Only newly created equipment should be post-processed (OCR + auto inspection).
+  // Newly created equipment is post-processed for OCR + auto inspection.
+  // Existing equipment with a mobile failure report is also post-processed for auto inspection.
   const newlyCreatedEquipmentIds = [];
+  const processingEquipmentIds = [];
   const metaByEquipmentId = {};
 
   for (const item of items) {
@@ -320,7 +385,6 @@ exports.mobileSync = async (req, res) => {
 
     const eqIdRaw = typeof item?.EqID === 'string' ? item.EqID.trim() : '';
     const EqID = eqIdRaw || `MOB_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
-    const compliance = normalizeCompliance(item?.Compliance ?? item?.compliance, 'NA');
     const otherInfoPresent = hasOwn(item, 'Other Info') || hasOwn(item, 'otherInfo');
     const otherInfo = item?.['Other Info'] ?? item?.otherInfo ?? '';
     const equipmentTypeRaw =
@@ -342,9 +406,6 @@ exports.mobileSync = async (req, res) => {
       normalizeSeverity(item?.failureSeverity) ||
       normalizeSeverity(item?.severity) ||
       null;
-    const protectionTypesRaw = Array.isArray(item?.protectionTypes) ? item.protectionTypes : null;
-    const normalizedProtectionTypes = protectionTypesRaw ? normalizeProtectionTypes(protectionTypesRaw) : [];
-
     const clientUpdatedAt = parseClientTimestamp(item?.clientUpdatedAt ?? item?.updatedAt);
     const baseUpdatedAt = parseClientTimestamp(item?.baseUpdatedAt);
 
@@ -358,6 +419,22 @@ exports.mobileSync = async (req, res) => {
     const customFields = rawCustomFields
       ? await sanitizeCustomFields({ tenantId, entityType: 'equipment', values: rawCustomFields })
       : null;
+    let schemaAssignments = Array.isArray(item?.schemaAssignments)
+      ? item.schemaAssignments
+          .filter((a) => a && (a.schemaId || a.schemaKey) && a.values && typeof a.values === 'object')
+          .map((a) => ({
+            schemaId: a.schemaId,
+            schemaKey: a.schemaKey || null,
+            attachedAt: a.attachedAt ? new Date(a.attachedAt) : new Date(),
+            attachedBy: userId,
+            values: a.values
+          }))
+      : [];
+    const isMobileFailureReport = hasMobileFailureReport({ item, failureNote, failureSeverity, schemaAssignments });
+    if (isMobileFailureReport) {
+      const forced = forceRbCompliance(schemaAssignments, 'Failed');
+      schemaAssignments = forced.assignments;
+    }
 
     const pickManualString = (obj, key) => {
       if (!hasOwn(obj, key)) return { present: false, value: '' };
@@ -369,25 +446,9 @@ exports.mobileSync = async (req, res) => {
       'Manufacturer',
       'Model/Type',
       'Serial Number',
-      'Certificate No',
       'IP rating',
       'Max Ambient Temp'
     ];
-    const allowedExKeys = [
-      'Marking',
-      'Equipment Group',
-      'Equipment Category',
-      'Environment',
-      'Gas / Dust Group',
-      'Temperature Class',
-      'Equipment Protection Level'
-    ];
-
-    const exUpdates = {};
-    for (const k of allowedExKeys) {
-      const { present, value } = pickManualString(manualExMarking, k);
-      if (present) exUpdates[k] = value;
-    }
 
     let saved = null;
     if (existingEquipmentId) {
@@ -406,12 +467,11 @@ exports.mobileSync = async (req, res) => {
           const clientChanges = buildClientChanges({
             eqIdRaw,
             equipmentTypeRaw,
-            compliance,
             otherInfo,
             failureNote,
             failureSeverity,
-            normalizedProtectionTypes,
             customFields,
+            schemaAssignments,
             clearBaseFields,
             otherInfoPresent,
             failureNotePresent,
@@ -590,11 +650,20 @@ exports.mobileSync = async (req, res) => {
       if (!existing.mobileSync.tempId) existing.mobileSync.tempId = tempId;
       if (eqIdRaw || clearBaseFields.has('EqID')) existing.EqID = eqIdRaw;
       if (equipmentTypeRaw || clearBaseFields.has('equipmentType')) existing['Equipment Type'] = equipmentTypeRaw;
-      existing.Compliance = compliance;
       if (otherInfoPresent || clearBaseFields.has('otherInfo')) existing['Other Info'] = String(otherInfo || '').trim();
       if (customFields) {
         existing.customFields = customFields;
         if (existing.markModified) existing.markModified('customFields');
+      }
+      if (schemaAssignments.length) {
+        existing.schemaAssignments = mergeSchemaAssignments(existing.schemaAssignments, schemaAssignments);
+        if (existing.markModified) existing.markModified('schemaAssignments');
+      }
+      if (isMobileFailureReport) {
+        await applyMobileInspectionFailureState({
+          equipment: existing,
+          userId
+        });
       }
 
       // Apply manual field edits (including clearing to '').
@@ -607,17 +676,29 @@ exports.mobileSync = async (req, res) => {
 
       saved = await existing.save();
       tempIdToEquipmentId[tempId] = String(saved._id);
+      if (isMobileFailureReport) {
+        processingEquipmentIds.push(saved._id);
+        metaByEquipmentId[String(saved._id)] = {
+          ...(failureNote ? { failureNote } : {}),
+          ...(failureSeverity ? { failureSeverity } : {}),
+          skipDataplateProcessing: true
+        };
+      }
       try {
-        await createEquipmentDataVersion({
-          tenantId,
-          equipmentId: saved._id,
-          changedBy: userId,
-          changedAt: clientUpdatedAt || new Date(),
-          source: 'import',
-          oldSnapshot,
-          newSnapshot: saved?.toObject?.({ depopulate: true }) || saved,
-          ensureBaseline: true
-        });
+        const newSnapshot = saved?.toObject?.({ depopulate: true }) || saved;
+        const changedPaths = computeChangedPaths(oldSnapshot, newSnapshot);
+        if (!(isMobileFailureReport && isMobileFaultOnlyVersionChange(changedPaths))) {
+          await createEquipmentDataVersion({
+            tenantId,
+            equipmentId: saved._id,
+            changedBy: userId,
+            changedAt: clientUpdatedAt || new Date(),
+            source: 'import',
+            oldSnapshot,
+            newSnapshot,
+            ensureBaseline: true
+          });
+        }
       } catch {}
     } else {
       const equipmentPayload = {
@@ -625,7 +706,6 @@ exports.mobileSync = async (req, res) => {
         Site: siteId,
         Zone: zoneId,
         Unit: zoneId,
-        Compliance: compliance,
         'Other Info': otherInfo,
         isProcessed: false,
         mobileSync: { status: 'queued', tempId },
@@ -635,6 +715,7 @@ exports.mobileSync = async (req, res) => {
         orderIndex: await getNextOrderIndex(tenantId, siteId, zoneId)
       };
       if (customFields) equipmentPayload.customFields = customFields;
+      if (schemaAssignments.length) equipmentPayload.schemaAssignments = schemaAssignments;
       if (equipmentTypeRaw) equipmentPayload['Equipment Type'] = equipmentTypeRaw;
       if (otherInfoPresent || clearBaseFields.has('otherInfo')) equipmentPayload['Other Info'] = String(otherInfo || '').trim();
 
@@ -649,8 +730,14 @@ exports.mobileSync = async (req, res) => {
 
       saved = await equipmentDoc.save();
       newlyCreatedEquipmentIds.push(saved._id);
+      processingEquipmentIds.push(saved._id);
       tempIdToEquipmentId[tempId] = String(saved._id);
-      if (failureNote || failureSeverity) {
+      if (isMobileFailureReport) {
+        await applyMobileInspectionFailureState({
+          equipment: saved,
+          userId
+        });
+        await saved.save();
         metaByEquipmentId[String(saved._id)] = {
           ...(failureNote ? { failureNote } : {}),
           ...(failureSeverity ? { failureSeverity } : {})
@@ -669,31 +756,6 @@ exports.mobileSync = async (req, res) => {
           ensureBaseline: false
         });
       } catch {}
-    }
-
-    // Manual protection selection from mobile (applies to existing + new).
-    // If empty, we leave it untouched (OCR may fill for newly created equipment later).
-    if ((normalizedProtectionTypes.length || clearBaseFields.has('protectionTypes') || Object.keys(exUpdates).length) && saved) {
-      try {
-        const marks = Array.isArray(saved['Ex Marking']) ? saved['Ex Marking'] : [];
-        if (!marks.length) marks.push({});
-        const first = marks[0] && typeof marks[0] === 'object' ? marks[0] : {};
-        const nextFirst = { ...(first || {}) };
-        if (Object.keys(exUpdates).length) {
-          Object.keys(exUpdates).forEach((k) => {
-            nextFirst[k] = exUpdates[k];
-          });
-        }
-        if (normalizedProtectionTypes.length || clearBaseFields.has('protectionTypes')) {
-          nextFirst['Type of Protection'] = normalizedProtectionTypes.join('; ');
-        }
-        marks[0] = nextFirst;
-        saved['Ex Marking'] = marks;
-        if (saved.markModified) saved.markModified('Ex Marking');
-        await saved.save();
-      } catch {
-        // ignore
-      }
     }
 
     // Attach files that belong to this tempId
@@ -781,7 +843,12 @@ exports.mobileSync = async (req, res) => {
     await saved.save();
   }
 
-  const totalToProcess = newlyCreatedEquipmentIds.length;
+  const processIdMap = new Map();
+  processingEquipmentIds.forEach((id) => {
+    if (id) processIdMap.set(String(id), id);
+  });
+  const equipmentIdsToProcess = Array.from(processIdMap.values());
+  const totalToProcess = equipmentIdsToProcess.length;
   const job =
     totalToProcess > 0
       ? await ProcessingJob.create({
@@ -791,7 +858,7 @@ exports.mobileSync = async (req, res) => {
           status: 'queued',
           total: totalToProcess,
           processed: 0,
-          equipmentIds: newlyCreatedEquipmentIds,
+          equipmentIds: equipmentIdsToProcess,
           metaByEquipmentId
         })
       : await ProcessingJob.create({
@@ -806,11 +873,11 @@ exports.mobileSync = async (req, res) => {
           finishedAt: new Date()
         });
 
-  // Attach jobId to newly created equipment for traceability.
+  // Attach jobId to equipment that needs post-processing for traceability.
   if (totalToProcess > 0) {
     try {
       await Equipment.updateMany(
-        { _id: { $in: newlyCreatedEquipmentIds }, tenantId },
+        { _id: { $in: equipmentIdsToProcess }, tenantId },
         { $set: { 'mobileSync.jobId': String(job._id), 'mobileSync.status': 'queued', isProcessed: false } }
       );
     } catch {

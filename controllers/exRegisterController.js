@@ -7,8 +7,6 @@ const Certificate = require('../models/certificate');
 const Question = require('../models/questions');
 const QuestionTypeMapping = require('../models/questionTypeMapping');
 const CustomFieldDefinition = require('../models/customFieldDefinition');
-const CriteriaSystem = require('../models/criteriaSystem');
-const DeviceCriteriaSystemAssignment = require('../models/deviceCriteriaSystemAssignment');
 const mongoose = require('mongoose');
 const fs = require('fs');
 const azureBlob = require('../services/azureBlobService');
@@ -29,7 +27,18 @@ const EquipmentDataVersion = require('../models/equipmentDataVersion');
 const { createEquipmentDataVersion } = require('../services/equipmentVersioningService');
 const { recordTombstone } = require('../services/syncTombstoneService');
 const { sanitizeCustomFields } = require('../services/customFieldService');
-const { loadRelevantSystemsForEquipment } = require('../services/criteriaSystemService');
+const {
+  equipmentMarkings,
+  certificateNo,
+  complianceStatus,
+  ensureRbAssignment,
+  getRbValues,
+  primaryEquipmentMarking,
+  protectionText,
+  valuesFromEquipmentMarkings,
+  zoneView
+} = require('../services/rbSchemaValueService');
+const { ensureRbSchema } = require('../services/schemaSeedService');
 
 const { BlobServiceClient } = require('@azure/storage-blob');
 const path = require('path');
@@ -77,11 +86,6 @@ const HEADER_ALIASES = {
   'note': 'Remarks',
   'comments': 'Remarks',
   'comment': 'Remarks',
-  'criteria systems': 'Criteria systems',
-  'criteria system': 'Criteria systems',
-  'criteria': 'Criteria systems',
-  'szempontrendszerek': 'Criteria systems',
-  'szempontrendszer': 'Criteria systems',
   'quality check': 'Qualitycheck',
   'qualitycheck': 'Qualitycheck',
   'quality': 'Qualitycheck'
@@ -482,63 +486,6 @@ function splitMultiValue(value) {
     .filter(Boolean);
 }
 
-function normalizeCriteriaLookupValue(value) {
-  return String(value || '')
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
-}
-
-async function loadCriteriaSystemImportOptions(tenantId) {
-  const systems = await CriteriaSystem.find({ tenantId })
-    .select('_id name systemKey active')
-    .sort({ name: 1 })
-    .lean();
-
-  const byToken = new Map();
-  (systems || []).forEach((system) => {
-    [
-      system.name,
-      system.systemKey,
-      system._id?.toString()
-    ].filter(Boolean).forEach((value) => {
-      const key = normalizeCriteriaLookupValue(value);
-      if (key && !byToken.has(key)) byToken.set(key, system);
-    });
-  });
-
-  return {
-    systems: systems || [],
-    byToken
-  };
-}
-
-function parseCriteriaSystemSelections(rawValue, options) {
-  const raw = String(rawValue || '').trim();
-  if (!raw) return { specified: false, ids: [], unknown: [] };
-  const tokens = splitMultiValue(raw);
-  const ids = [];
-  const unknown = [];
-  const seen = new Set();
-
-  tokens.forEach((token) => {
-    const system = options?.byToken?.get(normalizeCriteriaLookupValue(token));
-    if (!system?._id) {
-      unknown.push(token);
-      return;
-    }
-    const id = system._id.toString();
-    if (!seen.has(id)) {
-      seen.add(id);
-      ids.push(system._id);
-    }
-  });
-
-  return { specified: true, ids, unknown };
-}
-
 function importCommentForField(field, prefix = '') {
   const label = field?.label || field?.key || 'Field';
   const required = field?.required ? ' Required.' : '';
@@ -558,17 +505,11 @@ function importCommentForField(field, prefix = '') {
 }
 
 async function loadEquipmentImportDynamicColumns(tenantId) {
-  const [customFields, criteriaSystems] = await Promise.all([
-    CustomFieldDefinition.find({
-      tenantId,
-      entityType: 'equipment',
-      active: true
-    }).sort({ createdAt: 1, label: 1 }).lean(),
-    CriteriaSystem.find({ tenantId, active: true })
-      .select('name customFields')
-      .sort({ name: 1 })
-      .lean()
-  ]);
+  const customFields = await CustomFieldDefinition.find({
+    tenantId,
+    entityType: 'equipment',
+    active: true
+  }).sort({ createdAt: 1, label: 1 }).lean();
 
   const customColumns = (customFields || []).map((field) => ({
     kind: 'custom',
@@ -580,29 +521,8 @@ async function loadEquipmentImportDynamicColumns(tenantId) {
     comment: importCommentForField(field)
   }));
 
-  const criteriaColumns = [];
-  (criteriaSystems || []).forEach((system) => {
-    (system.customFields || [])
-      .filter((field) => field && field.active !== false && field.key)
-      .forEach((field) => {
-        criteriaColumns.push({
-          kind: 'criteria',
-          key: String(field.key),
-          header: `Criteria: ${system.name}: ${field.label || field.key}`,
-          aliases: [
-            `${system.name}: ${field.label || field.key}`,
-            `${system.name}: ${field.key}`,
-            field.key
-          ].filter(Boolean),
-          field,
-          group: system.name || 'CRITERIA DATA',
-          comment: importCommentForField(field, `${system.name || 'Criteria system'} / `)
-        });
-      });
-  });
-
   const byKey = new Map();
-  [...customColumns, ...criteriaColumns].forEach((col) => {
+  customColumns.forEach((col) => {
     if (!byKey.has(col.key)) byKey.set(col.key, col);
   });
   return Array.from(byKey.values());
@@ -628,52 +548,6 @@ function collectDynamicCustomFieldValues(row, headerMap, dynamicColumns) {
     values[column.key] = column.field?.fieldType === 'multiselect' ? splitMultiValue(raw) : raw;
   });
   return values;
-}
-
-async function applyImportedCriteriaAssignments({ tenantId, equipmentId, criteriaSystemIds, userId }) {
-  if (!Array.isArray(criteriaSystemIds) || !criteriaSystemIds.length) return 0;
-  const now = new Date();
-  await Promise.all(criteriaSystemIds.map((criteriaSystemId) =>
-    DeviceCriteriaSystemAssignment.findOneAndUpdate(
-      { tenantId, equipmentId, criteriaSystemId },
-      {
-        $set: {
-          state: 'included',
-          active: true,
-          updatedBy: userId || null,
-          updatedAt: now
-        },
-        $setOnInsert: {
-          tenantId,
-          equipmentId,
-          criteriaSystemId,
-          createdAt: now
-        }
-      },
-      { upsert: true, new: true }
-    )
-  ));
-  return criteriaSystemIds.length;
-}
-
-async function buildCriteriaSystemNameMap(tenantId, equipments = []) {
-  const entries = await Promise.all((equipments || []).map(async (equipment) => {
-    try {
-      const systems = await loadRelevantSystemsForEquipment({ tenantId, equipment });
-      const names = (systems || [])
-        .map((item) => item?.system?.name)
-        .filter(Boolean)
-        .join('; ');
-      return [equipment._id?.toString(), names];
-    } catch (err) {
-      console.warn('⚠️ Failed to resolve criteria systems for export:', {
-        equipmentId: equipment?._id?.toString?.(),
-        err: err?.message || err
-      });
-      return [equipment._id?.toString(), ''];
-    }
-  }));
-  return new Map(entries.filter(([id]) => !!id));
 }
 
 function equipmentImportBaseColumns({ includeProjectSkid }) {
@@ -707,22 +581,6 @@ function equipmentImportBaseColumns({ includeProjectSkid }) {
     );
   }
   return columns;
-}
-
-function equipmentCriteriaAssignmentColumn(criteriaSystems = []) {
-  const available = (criteriaSystems || [])
-    .map((system) => `${system.name}${system.active === false ? ' (inactive)' : ''}`)
-    .join('; ');
-  return {
-    header: 'Criteria systems',
-    group: 'CRITERIA ASSIGNMENT',
-    width: 34,
-    comment: [
-      'Optional. List the criteria systems that apply to this equipment, separated by semicolon (;).',
-      'Importing this value adds manual included assignments. Blank cells do not remove existing assignments.',
-      available ? `Available values: ${available}.` : ''
-    ].filter(Boolean).join(' ')
-  };
 }
 
 function equipmentImportInspectionColumns() {
@@ -873,8 +731,7 @@ function equipmentListExportGroupForHeader(header) {
     'Remarks',
     'Other Info'
   ].includes(header)) return 'INSPECTION DATA';
-  if (header === 'Criteria systems') return 'CRITERIA ASSIGNMENT';
-  if (header.startsWith('Custom:') || header.startsWith('Criteria:')) return 'CUSTOM DATA';
+  if (header.startsWith('Custom:')) return 'CUSTOM DATA';
   if (['Skid ID', 'Skid Description', 'Project ID'].includes(header)) return 'PROJECT / SKID';
   return 'CUSTOM DATA';
 }
@@ -924,7 +781,7 @@ function buildMarkingString(protectionConcept, subGroup, tempClass) {
 }
 
 function extractProtectionTypesFromEquipment(equipmentDoc) {
-  const protection = equipmentDoc?.['Ex Marking']?.[0]?.['Type of Protection'] || '';
+  const protection = protectionText(equipmentDoc) || '';
   if (!protection) return [];
 
   try {
@@ -943,6 +800,47 @@ function extractProtectionTypesFromEquipment(equipmentDoc) {
       .map(token => token.trim().toLowerCase())
       .filter(Boolean);
   }
+}
+
+function listDisplay(value) {
+  if (Array.isArray(value)) return value.join(', ');
+  return value != null ? String(value) : '';
+}
+
+function zoneRbDisplays(zone) {
+  const rb = zoneView(zone);
+  const tempParts = [];
+  if (rb.TempClass) tempParts.push(rb.TempClass);
+  if (typeof rb.MaxTemp === 'number') tempParts.push(`${rb.MaxTemp}°C`);
+  const ambientParts = [];
+  if (rb.AmbientTempMin != null) ambientParts.push(`${rb.AmbientTempMin}°C`);
+  if (rb.AmbientTempMax != null) ambientParts.push(`+${rb.AmbientTempMax}°C`);
+  return {
+    ...rb,
+    zoneNumber: rb.Zone?.length ? `Zone ${listDisplay(rb.Zone)}` : '',
+    zoneNumberRaw: listDisplay(rb.Zone),
+    subGroup: listDisplay(rb.SubGroup),
+    temp: tempParts.join(' / '),
+    ambient: ambientParts.join(' / '),
+    epl: listDisplay(rb.EPL),
+    clientReq: Array.isArray(rb.clientReq) ? rb.clientReq : []
+  };
+}
+
+function clientReqDisplays(clientReq) {
+  const req = clientReq || {};
+  const tempParts = [];
+  if (req.TempClass) tempParts.push(req.TempClass);
+  if (typeof req.MaxTemp === 'number') tempParts.push(`${req.MaxTemp}°C`);
+  const ambientParts = [];
+  if (req.AmbientTempMin != null) ambientParts.push(`${req.AmbientTempMin}°C`);
+  if (req.AmbientTempMax != null) ambientParts.push(`+${req.AmbientTempMax}°C`);
+  return {
+    zone: listDisplay(req.Zone),
+    subGroup: listDisplay(req.SubGroup),
+    temp: tempParts.join(' / '),
+    ambient: ambientParts.join(' / ')
+  };
 }
 
 async function loadAutoInspectionQuestions(equipmentDoc, tenantId, inspectionType = 'Detailed') {
@@ -1054,7 +952,7 @@ async function buildSpecialConditionResult(equipmentDoc, tenantId) {
   let text = equipmentSpecific;
 
   if (!text) {
-    const certNo = equipmentDoc?.['Certificate No'] || equipmentDoc?.CertificateNo;
+    const certNo = certificateNo(equipmentDoc);
     if (certNo) {
       const certificate = await findCertificateByCertNoForTenant(certNo, tenantId);
       text = certificate?.specCondition?.trim() || '';
@@ -1514,16 +1412,12 @@ exports.downloadEquipmentImportTemplate = async (req, res) => {
 
     const tenantName = (req.scope?.tenantName || '').toLowerCase();
     const includeProjectSkid = isProjectSkidTenantSlug(tenantName) || isInspExRequestHost(req);
-    const [dynamicColumns, criteriaOptions] = await Promise.all([
-      loadEquipmentImportDynamicColumns(tenantId),
-      loadCriteriaSystemImportOptions(tenantId)
-    ]);
+    const dynamicColumns = await loadEquipmentImportDynamicColumns(tenantId);
     const columns = [
       ...equipmentImportBaseColumns({ includeProjectSkid }),
-      equipmentCriteriaAssignmentColumn(criteriaOptions.systems),
       ...dynamicColumns.map((column) => ({
         header: column.header,
-        group: column.kind === 'criteria' ? column.group : 'CUSTOM DATA',
+        group: 'CUSTOM DATA',
         width: Math.min(Math.max(String(column.header).length + 4, 18), 42),
         comment: column.comment
       })),
@@ -1599,10 +1493,6 @@ exports.downloadEquipmentImportTemplate = async (req, res) => {
       guidance: 'Use semicolon (;) between multiple values, for example: Option A; Option B.'
     });
     instructions.addRow({
-      topic: 'Criteria systems',
-      guidance: 'Use the Criteria systems column to add manual criteria assignments to equipment. Separate multiple names with semicolon (;). Blank cells do not remove existing assignments.'
-    });
-    instructions.addRow({
       topic: 'Updates',
       guidance: 'Keep the _id column when updating equipment exported from the system. Leave _id empty to create new equipment.'
     });
@@ -1666,10 +1556,7 @@ exports.importEquipmentXLSX = async (req, res) => {
 
     const equipmentMap = new Map();
     const parseErrors = [];
-    const [dynamicImportColumns, criteriaImportOptions] = await Promise.all([
-      loadEquipmentImportDynamicColumns(tenantId),
-      loadCriteriaSystemImportOptions(tenantId)
-    ]);
+    const dynamicImportColumns = await loadEquipmentImportDynamicColumns(tenantId);
 
     worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
       if (rowNumber <= headerInfo.headerRowNumber) return;
@@ -1703,15 +1590,6 @@ exports.importEquipmentXLSX = async (req, res) => {
       const inspectionTypeRaw = getCellString(row, headerInfo.headerMap, 'Type');
       const inspectionType = inspectionTypeRaw ? normalizeInspectionType(inspectionTypeRaw) : null;
       const inspectionDate = getCellDate(row, headerInfo.headerMap, 'Inspection Date');
-      const criteriaSelectionRaw = getCellString(row, headerInfo.headerMap, 'Criteria systems');
-      const criteriaSelection = parseCriteriaSystemSelections(criteriaSelectionRaw, criteriaImportOptions);
-      if (criteriaSelection.unknown.length) {
-        parseErrors.push({
-          row: rowNumber,
-          column: 'Criteria systems',
-          message: `Unknown criteria system(s): ${criteriaSelection.unknown.join(', ')}`
-        });
-      }
       let skidId = '';
       let skidDescription = '';
       let projectId = '';
@@ -1738,7 +1616,6 @@ exports.importEquipmentXLSX = async (req, res) => {
         certificateNo,
         declarationNo,
         remarks,
-        criteriaSelectionRaw,
         ...Object.values(customFieldsRaw)
       ].some(Boolean);
 
@@ -1767,9 +1644,7 @@ exports.importEquipmentXLSX = async (req, res) => {
             'IP rating': ipRating || '',
             'Max Ambient Temp': tempRange || '',
             Qualitycheck: qualitycheck === true,
-            'Certificate No': certificateNo || declarationNo || '',
             'Other Info': remarks || '',
-            Compliance: inspectionStatus || 'NA',
             'Ex Marking': [],
             'X condition': { X: false, Specific: '' },
             customFields: {}
@@ -1777,7 +1652,8 @@ exports.importEquipmentXLSX = async (req, res) => {
           inspectionDate: inspectionDate || null,
           inspectionStatus,
           inspectionType: inspectionType || null,
-          criteriaSystemIds: criteriaSelection.specified ? criteriaSelection.ids : null
+          rbCertificateNo: certificateNo || declarationNo || '',
+          rbCompliance: inspectionStatus || 'NA'
         });
       }
 
@@ -1797,7 +1673,7 @@ exports.importEquipmentXLSX = async (req, res) => {
       if (ipRating) entry.base['IP rating'] = ipRating;
       if (tempRange) entry.base['Max Ambient Temp'] = tempRange;
       if (qualitycheck != null) entry.base.Qualitycheck = qualitycheck;
-      if (certificateNo) entry.base['Certificate No'] = certificateNo;
+      if (certificateNo && !entry.rbCertificateNo) entry.rbCertificateNo = certificateNo;
       if (remarks) entry.base['Other Info'] = remarks;
       if (Object.keys(customFieldsRaw).length) {
         entry.base.customFields = {
@@ -1805,10 +1681,7 @@ exports.importEquipmentXLSX = async (req, res) => {
           ...customFieldsRaw
         };
       }
-      if (criteriaSelection.specified) {
-        entry.criteriaSystemIds = criteriaSelection.ids;
-      }
-      if (inspectionStatus && inspectionStatus !== 'NA') entry.base.Compliance = inspectionStatus;
+      if (inspectionStatus && inspectionStatus !== 'NA') entry.rbCompliance = inspectionStatus;
       if (!entry.inspectionDate && inspectionDate) entry.inspectionDate = inspectionDate;
       if (entry.inspectionStatus === 'NA' && inspectionStatus !== 'NA') {
         entry.inspectionStatus = inspectionStatus;
@@ -1860,7 +1733,7 @@ exports.importEquipmentXLSX = async (req, res) => {
       return res.status(400).json({ message: baseMessage });
     }
 
-    const stats = { created: 0, updated: 0, inspections: 0, criteriaAssignments: 0, errors: [] };
+    const stats = { created: 0, updated: 0, inspections: 0, errors: [] };
 
     for (const entry of entries) {
       try {
@@ -1880,9 +1753,20 @@ exports.importEquipmentXLSX = async (req, res) => {
         } else {
           delete payload.customFields;
         }
-        payload['Ex Marking'] = (payload['Ex Marking'] || []).filter(mark =>
+        const importedExMarkings = (payload['Ex Marking'] || []).filter(mark =>
           Object.values(mark).some(value => !!String(value || '').trim())
         );
+        const rbValues = valuesFromEquipmentMarkings(importedExMarkings);
+        rbValues.certificateNo = entry.rbCertificateNo || payload['Certificate No'] || '';
+        rbValues.compliance = entry.rbCompliance || payload.Compliance || 'NA';
+        delete payload['Ex Marking'];
+        delete payload['Certificate No'];
+        delete payload.Compliance;
+        const hasRbValues =
+          importedExMarkings.length ||
+          String(rbValues.certificateNo || '').trim() ||
+          String(rbValues.compliance || 'NA') !== 'NA';
+        const rbSchema = hasRbValues ? await ensureRbSchema() : null;
 
         let equipmentDoc = null;
 
@@ -1906,6 +1790,10 @@ exports.importEquipmentXLSX = async (req, res) => {
             }
             delete updateData.CreatedBy;
             delete updateData.tenantId;
+            if (rbSchema) {
+              updateData.schemaAssignments = Array.isArray(equipmentDoc.schemaAssignments) ? equipmentDoc.schemaAssignments : [];
+              ensureRbAssignment(updateData, rbSchema, rbValues, userId);
+            }
             if (entry.orderIndex == null) {
               delete updateData.orderIndex;
             }
@@ -1925,6 +1813,9 @@ exports.importEquipmentXLSX = async (req, res) => {
             tenantId,
             CreatedBy: userId
           };
+          if (rbSchema) {
+            ensureRbAssignment(createData, rbSchema, rbValues, userId);
+          }
           if (createData.orderIndex == null) {
             createData.orderIndex = await getNextOrderIndex(
               tenantId,
@@ -1934,15 +1825,6 @@ exports.importEquipmentXLSX = async (req, res) => {
           }
           equipmentDoc = await Equipment.create(createData);
           stats.created += 1;
-        }
-
-        if (equipmentDoc && Array.isArray(entry.criteriaSystemIds) && entry.criteriaSystemIds.length) {
-          stats.criteriaAssignments += await applyImportedCriteriaAssignments({
-            tenantId,
-            equipmentId: equipmentDoc._id,
-            criteriaSystemIds: entry.criteriaSystemIds,
-            userId
-          });
         }
 
         if (
@@ -2006,7 +1888,6 @@ exports.importEquipmentXLSX = async (req, res) => {
         summarySheet.addRow(['Created', stats.created]);
         summarySheet.addRow(['Updated', stats.updated]);
         summarySheet.addRow(['Inspections', stats.inspections]);
-        summarySheet.addRow(['Criteria assignments', stats.criteriaAssignments]);
         summarySheet.addRow(['Error items', issues.length]);
         summarySheet.getColumn(1).width = 15;
         summarySheet.getColumn(2).width = 12;
@@ -2060,7 +1941,6 @@ exports.importEquipmentXLSX = async (req, res) => {
           createdCount: stats.created,
           updatedCount: stats.updated,
           inspectionsCreated: stats.inspections,
-          criteriaAssignments: stats.criteriaAssignments,
           issues
         });
       }
@@ -2072,7 +1952,6 @@ exports.importEquipmentXLSX = async (req, res) => {
       createdCount: stats.created,
       updatedCount: stats.updated,
       inspectionsCreated: stats.inspections,
-      criteriaAssignments: stats.criteriaAssignments,
       issues: []
     });
   } catch (error) {
@@ -2714,7 +2593,14 @@ async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspe
 
   await inspection.save();
 
-  equipmentDoc.Compliance = status;
+  {
+    const rbSchema = await ensureRbSchema();
+    ensureRbAssignment(equipmentDoc, rbSchema, {
+      ...getRbValues(equipmentDoc),
+      compliance: status
+    }, inspectorId);
+    if (equipmentDoc.markModified) equipmentDoc.markModified('schemaAssignments');
+  }
   equipmentDoc.lastInspectionDate = date;
   equipmentDoc.lastInspectionValidUntil = validUntil;
   equipmentDoc.lastInspectionStatus = status;
@@ -2782,23 +2668,11 @@ exports.exportEquipmentXLSX = async (req, res) => {
       active: true,
       showInExport: true
     }).sort({ createdAt: 1, label: 1 }).lean();
-    const criteriaExportSystems = await CriteriaSystem.find({ tenantId, active: true })
-      .select('name customFields')
-      .sort({ name: 1 })
-      .lean();
 	    const customExportColumns = [
 	      ...customExportFields.map((field) => ({
 	        field,
 	        header: `Custom: ${field.label || field.key}`
-      })),
-      ...(criteriaExportSystems || []).flatMap((system) =>
-        (system.customFields || [])
-          .filter((field) => field && field.active !== false && field.key)
-          .map((field) => ({
-            field,
-            header: `Criteria: ${system.name}: ${field.label || field.key}`
-          }))
-	      )
+      }))
 	    ];
     // ---- Zóna cache ----
     const zoneIds = [
@@ -2842,8 +2716,6 @@ exports.exportEquipmentXLSX = async (req, res) => {
 	      console.warn('⚠️ Certificate cache build failed for exportEquipmentXLSX:', e?.message || e);
 	      certMap = new Map();
 	    }
-    const criteriaSystemNameMap = await buildCriteriaSystemNameMap(tenantId, equipments);
-
 	    // ---- Excel workbook ----
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet('Database');
@@ -2884,8 +2756,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
 	      'Inspector',
 	      'Type',
 	      'Status',
-	      'Remarks',
-	      'Criteria systems'
+	      'Remarks'
 	    ];
 
 	    if (includeProjectSkid) {
@@ -2928,8 +2799,8 @@ exports.exportEquipmentXLSX = async (req, res) => {
 	    const userEndCol = includeUserRequirement ? columnNumber('Req IP Rating') : null;
 	    const inspectionStartCol = columnNumber('Inspection Date');
 	    const inspectionEndCol = columnNumber('Remarks');
-	    const customStartCol = columnNumber('Criteria systems');
-	    const customEndCol = customStartCol + customExportColumns.length;
+	    const customStartCol = customExportColumns.length ? columnNumber(customExportColumns[0].header) : 0;
+	    const customEndCol = customStartCol ? customStartCol + customExportColumns.length - 1 : 0;
 
     groupRow.getCell(1).value = 'IDENTIFICATION';
     worksheet.mergeCells(1, 1, 1, 4);
@@ -2952,7 +2823,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
     groupRow.getCell(inspectionStartCol).value = 'INSPECTION DATA';
     worksheet.mergeCells(1, inspectionStartCol, 1, inspectionEndCol);
 	    if (customStartCol && customEndCol) {
-	      groupRow.getCell(customStartCol).value = 'CUSTOM / CRITERIA DATA';
+	      groupRow.getCell(customStartCol).value = 'CUSTOM DATA';
 	      if (customEndCol > customStartCol) {
 	        worksheet.mergeCells(1, customStartCol, 1, customEndCol);
 	      }
@@ -3085,78 +2956,30 @@ exports.exportEquipmentXLSX = async (req, res) => {
         eq.lastInspectionDate ||
         null;
 
-      const zoneNumberRaw = Array.isArray(zone?.Zone)
-        ? zone.Zone.join(', ')
-        : (zone?.Zone != null ? String(zone.Zone) : '');
-      const zoneNumber = zoneNumberRaw ? `Zone ${zoneNumberRaw}` : '';
-
-      const zoneSubGroup = Array.isArray(zone?.SubGroup)
-        ? zone.SubGroup.join(', ')
-        : (zone?.SubGroup != null ? String(zone.SubGroup) : '');
-
-      const zoneTempParts = [];
-      if (zone?.TempClass) zoneTempParts.push(zone.TempClass);
-      if (typeof zone?.MaxTemp === 'number') {
-        zoneTempParts.push(`${zone.MaxTemp}°C`);
-      }
-      const zoneTempDisplay = zoneTempParts.join(' / ');
-
-      const ambientParts = [];
-      if (zone?.AmbientTempMin != null) {
-        ambientParts.push(`${zone.AmbientTempMin}°C`);
-      }
-      if (zone?.AmbientTempMax != null) {
-        ambientParts.push(`+${zone.AmbientTempMax}°C`);
-      }
-      const ambientDisplay = ambientParts.join(' / ');
+      const zoneDisplays = zoneRbDisplays(zone);
+      const zoneNumber = zoneDisplays.zoneNumber;
+      const zoneSubGroup = zoneDisplays.subGroup;
+      const zoneTempDisplay = zoneDisplays.temp;
+      const ambientDisplay = zoneDisplays.ambient;
 
       let clientReqZoneNumber = '';
       let clientReqGasDustGroup = '';
       let clientReqTempDisplay = '';
       let clientReqAmbientDisplay = '';
-      let clientReqIpRating = '';
       if (includeUserRequirement) {
-        // ---- Client requirement (user requirement) derived from zone.clientReq[0] ----
-        const clientReq = Array.isArray(zone?.clientReq) && zone.clientReq.length
-          ? zone.clientReq[0]
-          : null;
-
-        clientReqZoneNumber = Array.isArray(clientReq?.Zone)
-          ? clientReq.Zone.join(', ')
-          : (clientReq?.Zone != null ? String(clientReq.Zone) : '');
-
-        clientReqGasDustGroup = Array.isArray(clientReq?.SubGroup)
-          ? clientReq.SubGroup.join(', ')
-          : (clientReq?.SubGroup != null ? String(clientReq.SubGroup) : '');
-
-        // User requirement temp rating: same logic as zone (TempClass + MaxTemp)
-        const clientReqTempParts = [];
-        if (clientReq?.TempClass) {
-          clientReqTempParts.push(clientReq.TempClass);
-        }
-        if (typeof clientReq?.MaxTemp === 'number') {
-          clientReqTempParts.push(`${clientReq.MaxTemp}°C`);
-        }
-        clientReqTempDisplay = clientReqTempParts.join(' / ');
-
-        const clientReqAmbientParts = [];
-        if (clientReq?.AmbientTempMin != null) {
-          clientReqAmbientParts.push(`${clientReq.AmbientTempMin}°C`);
-        }
-        if (clientReq?.AmbientTempMax != null) {
-          clientReqAmbientParts.push(`+${clientReq.AmbientTempMax}°C`);
-        }
-        clientReqAmbientDisplay = clientReqAmbientParts.join(' / ');
-
-        clientReqIpRating = clientReq?.IpRating || '';
+        const req = clientReqDisplays(zoneDisplays.clientReq[0]);
+        clientReqZoneNumber = req.zone;
+        clientReqGasDustGroup = req.subGroup;
+        clientReqTempDisplay = req.temp;
+        clientReqAmbientDisplay = req.ambient;
       }
 
-      const cert = resolveCertificateFromCache(certMap, eq['Certificate No']);
+      const cert = resolveCertificateFromCache(certMap, certificateNo(eq));
       const hasSpecialCondition =
         !!(cert && (cert.specCondition || cert.xcondition));
 
       // Certificate vs Declaration of conformity megjelenítés
-      const rawCertNo = eq['Certificate No'] || '';
+      const rawCertNo = certificateNo(eq) || '';
       let exportCertNo = rawCertNo;
       let exportDocNo = '';
 
@@ -3165,9 +2988,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
         exportDocNo = rawCertNo;
       }
 
-      const exMarkings = Array.isArray(eq['Ex Marking']) && eq['Ex Marking'].length
-        ? eq['Ex Marking']
-        : [null];
+      const exMarkings = equipmentMarkings(eq).length ? equipmentMarkings(eq) : [null];
 
       for (const marking of exMarkings) {
         const rowData = {
@@ -3199,14 +3020,13 @@ exports.exportEquipmentXLSX = async (req, res) => {
           'Gas / Dust Group': zoneSubGroup,
           'Temp Rating': zoneTempDisplay,
           'Ambient Temp': ambientDisplay,
-          'Status': eq['Compliance'] || '',
+          'Status': complianceStatus(eq) || '',
           'Inspection Date': inspectionDate
             ? new Date(inspectionDate)
             : '',
           'Inspector': inspectorName,
           'Type': displayInspectionTypeForReport(inspection?.inspectionType),
-          'Remarks': eq['Other Info'] || '',
-          'Criteria systems': criteriaSystemNameMap.get(eq._id?.toString()) || ''
+          'Remarks': eq['Other Info'] || ''
         };
 
         if (includeUserRequirement) {
@@ -3214,7 +3034,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
           rowData['Req Gas / Dust Group'] = clientReqGasDustGroup;
           rowData['Req Temp Rating'] = clientReqTempDisplay;
           rowData['Req Ambient Temp'] = clientReqAmbientDisplay;
-          rowData['Req IP Rating'] = clientReqIpRating;
+          rowData['Req IP Rating'] = '';
         }
 
         if (includeProjectSkid) {
@@ -3375,32 +3195,19 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
       active: true,
       showInExport: true
     }).sort({ createdAt: 1, label: 1 }).lean();
-    const criteriaExportSystems = await CriteriaSystem.find({ tenantId, active: true })
-      .select('name customFields')
-      .sort({ name: 1 })
-      .lean();
     const customExportColumns = [
       ...customExportFields.map((field) => ({
         field,
         header: `Custom: ${field.label || field.key}`
-      })),
-      ...(criteriaExportSystems || []).flatMap((system) =>
-        (system.customFields || [])
-          .filter((field) => field && field.active !== false && field.key)
-          .map((field) => ({
-            field,
-            header: `Criteria: ${system.name}: ${field.label || field.key}`
-          }))
-	      )
+      }))
 	    ];
-    const criteriaSystemNameMap = await buildCriteriaSystemNameMap(tenantId, equipments);
 
 	    let hideAtexSpecific = false;
     if (typeof scheme === 'string' && scheme.toUpperCase() === 'IECEX') {
       hideAtexSpecific = true;
     } else if (zoneId) {
       const zoneDoc = await Zone.findOne({ _id: zoneId, tenantId }).lean();
-      hideAtexSpecific = (zoneDoc?.Scheme || '').toUpperCase() === 'IECEX';
+      hideAtexSpecific = (zoneView(zoneDoc).Scheme || '').toUpperCase() === 'IECEX';
     }
 
     const workbook = new ExcelJS.Workbook();
@@ -3428,7 +3235,6 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
 	      'Qualitycheck',
 	      'Compliance',
 	      'Other Info',
-	      'Criteria systems',
 	      ...customExportColumns.map((c) => c.header)
 	    ];
 
@@ -3464,13 +3270,12 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
       'Model/Type': item?.['Model/Type'] || '',
       'Serial Number': item?.['Serial Number'] || '',
       'Equipment Type': item?.['Equipment Type'] || '',
-	      'Certificate No': item?.['Certificate No'] || '',
+	      'Certificate No': certificateNo(item) || '',
 	      'Max Ambient Temp': item?.['Max Ambient Temp'] || '',
 	      'Qualitycheck': item?.Qualitycheck ? 'Yes' : 'No',
-	      'Compliance': item?.Compliance || '',
+	      'Compliance': complianceStatus(item) || '',
 	      'Other Info': item?.['Other Info'] || '',
 	      'IP rating': item?.['IP rating'] || '',
-	      'Criteria systems': criteriaSystemNameMap.get(item?._id?.toString()) || '',
       ...customExportColumns.reduce((acc, { field, header }) => {
         acc[header] = customFieldValue(item?.customFields, field.key);
         return acc;
@@ -3479,7 +3284,7 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
 
     const rows = [];
     equipments.forEach(item => {
-      const exMarkings = Array.isArray(item['Ex Marking']) ? item['Ex Marking'] : [];
+      const exMarkings = equipmentMarkings(item);
       if (!exMarkings.length) {
         rows.push({
           ...buildRowBase(item),
@@ -3600,8 +3405,8 @@ exports.exportZoneCertificateSummary = async (req, res) => {
 
     const groupMap = new Map();
     equipments.forEach(eq => {
-      const rawCert = typeof eq['Certificate No'] === 'string'
-        ? eq['Certificate No'].trim()
+      const rawCert = typeof certificateNo(eq) === 'string'
+        ? certificateNo(eq).trim()
         : '';
       const key = rawCert ? rawCert.toLowerCase() : '__no_cert__';
       if (!groupMap.has(key)) {
@@ -3792,9 +3597,7 @@ exports.exportZoneCertificateSummary = async (req, res) => {
       const groupStartRow = worksheet.lastRow ? worksheet.lastRow.number + 1 : headerEndRow + 1;
 
       eqs.forEach(eq => {
-        const marking = Array.isArray(eq['Ex Marking']) && eq['Ex Marking'].length
-          ? eq['Ex Marking'][0]
-          : null;
+        const marking = primaryEquipmentMarking(eq);
         const orderIndexValue = getEquipmentOrderIndex(eq);
 
         const rowValues = [
@@ -3807,14 +3610,8 @@ exports.exportZoneCertificateSummary = async (req, res) => {
           (marking && (marking['Type of Protection'] || marking['Type Of Protection'])) || '',
           (marking && (marking['Temperature Class'] || marking['Temp Class'])) || '',
           eq['Max Ambient Temp'] || '',
-          eq['IP Rating'] ||
-            eq['IP rating'] ||
-            eq.IPRating ||
-            eq.IpRating ||
-            eq.ipRating ||
-            eq['Req IP Rating'] ||
-            '',
-          eq.lastInspectionStatus || eq.Compliance || ''
+          eq['IP rating'] || '',
+          eq.lastInspectionStatus || complianceStatus(eq) || ''
         ];
 
         const row = worksheet.addRow(rowValues);
@@ -4053,8 +3850,8 @@ exports.exportZoneCertificateSummaryCompact = async (req, res) => {
     // ---- Csoportosítás cert szám szerint ----
     const groupMap = new Map();
     equipments.forEach(eq => {
-      const rawCert = typeof eq['Certificate No'] === 'string'
-        ? eq['Certificate No'].trim()
+      const rawCert = typeof certificateNo(eq) === 'string'
+        ? certificateNo(eq).trim()
         : '';
       const key = rawCert ? rawCert.toLowerCase() : '__no_cert__';
       if (!groupMap.has(key)) {
@@ -4284,21 +4081,12 @@ exports.exportZoneCertificateSummaryCompact = async (req, res) => {
         }
 
         const ip =
-          eq['IP Rating'] ||
-          eq['IP rating'] ||
-          eq.IPRating ||
-          eq.IpRating ||
-          eq.ipRating ||
-          eq['Req IP Rating'] ||
-          '';
+          eq['IP rating'] || '';
         if (!ipRating && ip) {
           ipRating = ip;
         }
 
-        const markingArr =
-          Array.isArray(eq['Ex Marking']) && eq['Ex Marking'].length
-            ? eq['Ex Marking']
-            : null;
+        const markingArr = equipmentMarkings(eq).length ? equipmentMarkings(eq) : null;
 
         if (markingArr && !env && !gasDust && !protection && !tempClass) {
           const marking = markingArr[0];
@@ -4646,7 +4434,7 @@ exports.listEquipment = async (req, res) => {
         eq.Pictures?.find?.(p => p.blobUrl)?.blobUrl ||
         eq.documents?.find?.(d => (d.type === 'image' || d.type === undefined) && d.blobUrl)?.blobUrl ||
         null;
-      const certDoc = resolveCertificateFromCache(certMap, eq['Certificate No']);
+      const certDoc = resolveCertificateFromCache(certMap, certificateNo(eq));
 
       let xCondition = eq['X condition'];
       if (!xCondition || typeof xCondition !== 'object') {

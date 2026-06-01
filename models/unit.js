@@ -1,5 +1,16 @@
 const mongoose = require('mongoose');
 
+const SchemaAssignmentSchema = new mongoose.Schema(
+  {
+    schemaId: { type: mongoose.Schema.Types.ObjectId, ref: 'SchemaDefinition', required: true },
+    schemaKey: { type: String, default: null, index: true },
+    attachedAt: { type: Date, default: Date.now },
+    attachedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    values: { type: mongoose.Schema.Types.Mixed, default: {} }
+  },
+  { _id: false }
+);
+
 function normalizeUnitNameKey(name) {
   const raw = String(name || '').trim();
   if (!raw) return '';
@@ -16,42 +27,9 @@ const UnitSchema = new mongoose.Schema(
     Name: { type: String, required: true },
     nameKey: { type: String, index: true },
     Description: { type: String },
-    Environment: {
-      type: String,
-      required: true,
-      enum: ['Gas', 'Dust', 'Hybrid', 'NonEx']
-    },
-    Scheme: {
-      type: String,
-      enum: ['ATEX', 'IECEx', 'NA'],
-      default: 'ATEX'
-    },
-    Zone: {
-      type: [Number],
-      enum: [0, 1, 2, 20, 21, 22],
-      default: []
-    },
-    SubGroup: {
-      type: [String],
-      enum: ['IIA', 'IIB', 'IIC', 'IIIA', 'IIIB', 'IIIC'],
-      default: []
-    },
     SkidID: { type: String, trim: true },
     SkidDescription: { type: String },
     ProjectID: { type: String, trim: true },
-    TempClass: {
-      type: String,
-      enum: ['T1', 'T2', 'T3', 'T4', 'T5', 'T6']
-    },
-    MaxTemp: { type: Number },
-    IpRating: { type: String },
-    EPL: {
-      type: [String],
-      enum: ['Ga', 'Gb', 'Gc', 'Da', 'Db', 'Dc'],
-      default: []
-    },
-    AmbientTempMin: { type: Number },
-    AmbientTempMax: { type: Number },
     CreatedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
@@ -102,37 +80,14 @@ const UnitSchema = new mongoose.Schema(
         size: { type: Number }
       }
     ],
-    clientReq: [
-      {
-        Zone: {
-          type: [Number],
-          enum: [0, 1, 2, 20, 21, 22],
-          default: []
-        },
-        SubGroup: {
-          type: [String],
-          enum: ['IIA', 'IIB', 'IIC', 'IIIA', 'IIIB', 'IIIC'],
-          default: []
-        },
-        TempClass: {
-          type: String,
-          enum: ['T1', 'T2', 'T3', 'T4', 'T5', 'T6']
-        },
-        MaxTemp: { type: Number },
-        IpRating: { type: String },
-        EPL: {
-          type: [String],
-          enum: ['Ga', 'Gb', 'Gc', 'Da', 'Db', 'Dc'],
-          default: []
-        },
-        AmbientTempMin: { type: Number },
-        AmbientTempMax: { type: Number },
-      }
-    ],
     customFields: {
       type: Map,
       of: mongoose.Schema.Types.Mixed,
       default: {}
+    },
+    schemaAssignments: {
+      type: [SchemaAssignmentSchema],
+      default: []
     }
   },
   { timestamps: true, collection: 'zones' }
