@@ -537,12 +537,10 @@ async function loadEquipmentImportDynamicColumns(tenantId) {
       active: true
     }).sort({ createdAt: 1, label: 1 }).lean(),
     SchemaDefinition.find({
-      status: 'published',
-      active: { $ne: false },
       targetLevels: 'equipment',
       $or: [
-        { scope: 'system' },
-        { scope: 'tenant', tenantId }
+        { scope: 'system', status: 'published', active: true },
+        { scope: 'tenant', tenantId, active: true }
       ]
     }).sort({ scope: 1, systemProvided: -1, name: 1 }).lean()
   ]);
@@ -875,6 +873,58 @@ function applyImportTemplateStyles(worksheet, columns) {
   }
 }
 
+function applyEquipmentExportHeaderStyles(worksheet, columns) {
+  worksheet.views = [{ state: 'frozen', ySplit: 2 }];
+  worksheet.autoFilter = {
+    from: { row: 2, column: 1 },
+    to: { row: 2, column: columns.length }
+  };
+
+  const groupRow = worksheet.getRow(1);
+  const headerRow = worksheet.getRow(2);
+  groupRow.height = 24;
+  headerRow.height = 34;
+
+  let start = 1;
+  while (start <= columns.length) {
+    const group = columns[start - 1].group || '';
+    let end = start;
+    while (end + 1 <= columns.length && columns[end].group === group) end += 1;
+    groupRow.getCell(start).value = group;
+    if (end > start) worksheet.mergeCells(1, start, 1, end);
+    for (let col = start; col <= end; col += 1) {
+      const cell = groupRow.getCell(col);
+      cell.font = { bold: true, color: { argb: 'FF000000' } };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: groupColor(group) } };
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      cell.border = {
+        top: { style: 'thin', color: { argb: 'FFFFFFFF' } },
+        left: { style: 'thin', color: { argb: 'FFFFFFFF' } },
+        bottom: { style: 'thin', color: { argb: 'FFFFFFFF' } },
+        right: { style: 'thin', color: { argb: 'FFFFFFFF' } }
+      };
+    }
+    start = end + 1;
+  }
+
+  columns.forEach((column, idx) => {
+    const colNumber = idx + 1;
+    const cell = headerRow.getCell(colNumber);
+    cell.value = column.header;
+    cell.note = column.comment || 'Exported equipment data.';
+    cell.font = { bold: true, color: { argb: 'FF000000' } };
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: groupLightColor(column.group) } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+    cell.border = {
+      top: { style: 'thin', color: { argb: 'FFB7B7B7' } },
+      left: { style: 'thin', color: { argb: 'FFB7B7B7' } },
+      bottom: { style: 'thin', color: { argb: 'FFB7B7B7' } },
+      right: { style: 'thin', color: { argb: 'FFB7B7B7' } }
+    };
+    worksheet.getColumn(colNumber).width = column.width || Math.min(Math.max(String(column.header).length + 4, 14), 42);
+  });
+}
+
 function equipmentListExportGroupForHeader(header) {
   if (['_id', '#', 'TagNo', 'EqID'].includes(header)) return 'IDENTIFICATION';
   if ([
@@ -925,6 +975,7 @@ function equipmentListExportGroupForHeader(header) {
     'Other Info'
   ].includes(header)) return 'INSPECTION DATA';
   if (header.startsWith('Custom:')) return 'CUSTOM DATA';
+  if (header.startsWith('Schema:')) return 'SCHEMA DATA';
   if (['Skid ID', 'Skid Description', 'Project ID'].includes(header)) return 'PROJECT / SKID';
   return 'CUSTOM DATA';
 }
@@ -936,6 +987,45 @@ function buildEquipmentListExportColumns(headers) {
     width: Math.min(Math.max(String(header).length + 4, 14), 42),
     comment: 'Exported equipment data.'
   }));
+}
+
+async function loadEquipmentExportSchemaColumns(tenantId) {
+  return (await loadEquipmentImportDynamicColumns(tenantId)).filter((column) => column.kind === 'schema');
+}
+
+function schemaAssignmentForExport(entity, schema) {
+  const assignments = Array.isArray(entity?.schemaAssignments) ? entity.schemaAssignments : [];
+  return assignments.find((assignment) =>
+    String(assignment?.schemaId || '') === String(schema?._id || '') ||
+    (!!schema?.systemKey && assignment?.schemaKey === schema.systemKey)
+  ) || null;
+}
+
+function exportSchemaFieldValue(value) {
+  if (Array.isArray(value)) return value.join('; ');
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+  if (value instanceof Date) return value.toISOString().split('T')[0];
+  if (value && typeof value === 'object') return JSON.stringify(value);
+  if (value == null) return '';
+  return value;
+}
+
+function appendSchemaExportValues(rowData, entity, schemaColumns) {
+  const assignmentCache = new Map();
+  (schemaColumns || []).forEach((column) => {
+    if (!assignmentCache.has(column.schemaId)) {
+      assignmentCache.set(column.schemaId, schemaAssignmentForExport(entity, column.schema));
+    }
+    const assignment = assignmentCache.get(column.schemaId);
+    if (column.key === '__enabled') {
+      rowData[column.header] = assignment ? 'Yes' : '';
+      return;
+    }
+    rowData[column.header] = assignment
+      ? exportSchemaFieldValue(assignment.values?.[column.key])
+      : '';
+  });
+  return rowData;
 }
 
 function determineEnvironmentFromSubGroup(value) {
@@ -2888,12 +2978,13 @@ exports.exportEquipmentXLSX = async (req, res) => {
       active: true,
       showInExport: true
     }).sort({ createdAt: 1, label: 1 }).lean();
-	    const customExportColumns = [
-	      ...customExportFields.map((field) => ({
-	        field,
-	        header: `Custom: ${field.label || field.key}`
+    const customExportColumns = [
+      ...customExportFields.map((field) => ({
+        field,
+        header: `Custom: ${field.label || field.key}`
       }))
-	    ];
+    ];
+    const schemaExportColumns = await loadEquipmentExportSchemaColumns(tenantId);
     // ---- Zóna cache ----
     const zoneIds = [
       ...new Set(
@@ -2998,6 +3089,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
       }
     }
     customExportColumns.forEach(({ header }) => headers.push(header));
+    schemaExportColumns.forEach(({ header }) => headers.push(header));
 
     worksheet.columns = headers.map(header => ({
       header,
@@ -3021,6 +3113,8 @@ exports.exportEquipmentXLSX = async (req, res) => {
 	    const inspectionEndCol = columnNumber('Remarks');
 	    const customStartCol = customExportColumns.length ? columnNumber(customExportColumns[0].header) : 0;
 	    const customEndCol = customStartCol ? customStartCol + customExportColumns.length - 1 : 0;
+	    const schemaStartCol = schemaExportColumns.length ? columnNumber(schemaExportColumns[0].header) : 0;
+	    const schemaEndCol = schemaStartCol ? schemaStartCol + schemaExportColumns.length - 1 : 0;
 
     groupRow.getCell(1).value = 'IDENTIFICATION';
     worksheet.mergeCells(1, 1, 1, 4);
@@ -3048,6 +3142,12 @@ exports.exportEquipmentXLSX = async (req, res) => {
 	        worksheet.mergeCells(1, customStartCol, 1, customEndCol);
 	      }
 	    }
+	    if (schemaStartCol && schemaEndCol) {
+	      groupRow.getCell(schemaStartCol).value = 'SCHEMA DATA';
+	      if (schemaEndCol > schemaStartCol) {
+	        worksheet.mergeCells(1, schemaStartCol, 1, schemaEndCol);
+	      }
+	    }
 
 	    const groupColorRanges = [
 	      { start: 1, end: 4, color: 'FF00AA00' },
@@ -3064,6 +3164,9 @@ exports.exportEquipmentXLSX = async (req, res) => {
     );
     if (customStartCol && customEndCol) {
       groupColorRanges.push({ start: customStartCol, end: customEndCol, color: 'FFD9EAD3' });
+    }
+    if (schemaStartCol && schemaEndCol) {
+      groupColorRanges.push({ start: schemaStartCol, end: schemaEndCol, color: 'FF8E7CC3' });
     }
     if (includeUserRequirement) {
       groupColorRanges.splice(groupColorRanges.length - 1, 0, {
@@ -3104,6 +3207,9 @@ exports.exportEquipmentXLSX = async (req, res) => {
     );
     if (customStartCol && customEndCol) {
       headerColorRanges.push({ start: customStartCol, end: customEndCol, color: 'FFEAF4E4' });
+    }
+    if (schemaStartCol && schemaEndCol) {
+      headerColorRanges.push({ start: schemaStartCol, end: schemaEndCol, color: 'FFEADCF8' });
     }
     if (includeUserRequirement) {
       headerColorRanges.splice(headerColorRanges.length - 1, 0, {
@@ -3266,6 +3372,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
         customExportColumns.forEach(({ field, header }) => {
           rowData[header] = customFieldValue(eq.customFields, field.key);
         });
+        appendSchemaExportValues(rowData, eq, schemaExportColumns);
 
         const row = worksheet.addRow(rowData);
 
@@ -3421,6 +3528,7 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
         header: `Custom: ${field.label || field.key}`
       }))
 	    ];
+    const schemaExportColumns = await loadEquipmentExportSchemaColumns(tenantId);
 
 	    let hideAtexSpecific = false;
     if (typeof scheme === 'string' && scheme.toUpperCase() === 'IECEX') {
@@ -3455,7 +3563,8 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
 	      'Qualitycheck',
 	      'Compliance',
 	      'Other Info',
-	      ...customExportColumns.map((c) => c.header)
+	      ...customExportColumns.map((c) => c.header),
+	      ...schemaExportColumns.map((c) => c.header)
 	    ];
 
 	    const exportColumns = buildEquipmentListExportColumns(headers);
@@ -3465,10 +3574,7 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
 	      width: column.width
 	    }));
 	    worksheet.spliceRows(1, 0, []);
-	    applyImportTemplateStyles(worksheet, exportColumns);
-	    // This is an export, not a blank import template. The shared styling helper
-	    // prepares empty input rows, so remove them before appending exported data.
-	    worksheet.spliceRows(3, 248);
+	    applyEquipmentExportHeaderStyles(worksheet, exportColumns);
 
 	    const centerAlignedColumns = [
 	      'Equipment Group',
@@ -3504,10 +3610,11 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
 
     const rows = [];
     equipments.forEach(item => {
+      const baseRow = appendSchemaExportValues(buildRowBase(item), item, schemaExportColumns);
       const exMarkings = equipmentMarkings(item);
       if (!exMarkings.length) {
         rows.push({
-          ...buildRowBase(item),
+          ...baseRow,
           'Marking': '',
           'Equipment Group': '',
           'Equipment Category': '',
@@ -3520,7 +3627,7 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
       } else {
         exMarkings.forEach(marking => {
           rows.push({
-            ...buildRowBase(item),
+            ...baseRow,
             'Marking': marking?.Marking || '',
             'Equipment Group': marking?.['Equipment Group'] || '',
             'Equipment Category': marking?.['Equipment Category'] || '',

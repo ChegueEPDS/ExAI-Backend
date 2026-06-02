@@ -67,7 +67,7 @@ Típusok:
 
 ## Schema oszlopok
 
-A template-be bekerül minden aktív, publikált, equipment szinten attacholható schema, ami a tenant számára látható. Ez lehet system schema vagy tenant schema.
+A template-be bekerül minden aktív, equipment szinten attacholható tenant schema, ami a tenant számára látható. System schema esetén csak a publikált schemák kerülnek be.
 
 Az RB schema nem jelenik meg külön `Schema: Explosion Safety / RB` oszlopként, mert az RB importja az `EX DATA` és `CERTIFICATION` oszlopokon keresztül történik.
 
