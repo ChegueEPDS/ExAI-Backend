@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const inspectionController = require('../controllers/inspectionController');
-const exportInspectioReport = require('../controllers/exportInsepctionReport');
+const exportInspectionReport = require('../controllers/exportInspectionReport');
 const authMiddleware = require('../middlewares/authMiddleware');
 const { requirePermission } = require('../middlewares/permissionMiddleware');
 
@@ -18,13 +18,13 @@ router.delete('/inspections/attachment', authMiddleware(), requirePermission('in
 // GET /api/inspections
 router.get('/inspections', authMiddleware(), inspectionController.listInspections);
 
-router.get('/inspections/punchlist', authMiddleware(), exportInspectioReport.exportPunchlistXLSX);
-router.get('/inspections/project-report', authMiddleware(), exportInspectioReport.exportProjectFullReport);
-router.get('/inspections/export-zip', authMiddleware(), exportInspectioReport.exportLatestInspectionReportsZip);
-router.get('/inspections/export-jobs', authMiddleware(), exportInspectioReport.listInspectionExportJobs);
-router.get('/inspections/export-jobs/:jobId', authMiddleware(), exportInspectioReport.getInspectionExportJob);
-router.delete('/inspections/export-jobs/:jobId', authMiddleware(), requirePermission('inspection:manage'), exportInspectioReport.deleteInspectionExportJob);
-router.get('/inspections/:id/export-xlsx', authMiddleware(), exportInspectioReport.exportInspectionXLSX);
+router.get('/inspections/punchlist', authMiddleware(), exportInspectionReport.exportPunchlistXLSX);
+router.get('/inspections/project-report', authMiddleware(), exportInspectionReport.exportProjectFullReport);
+router.get('/inspections/export-zip', authMiddleware(), exportInspectionReport.exportLatestInspectionReportsZip);
+router.get('/inspections/export-jobs', authMiddleware(), exportInspectionReport.listInspectionExportJobs);
+router.get('/inspections/export-jobs/:jobId', authMiddleware(), exportInspectionReport.getInspectionExportJob);
+router.delete('/inspections/export-jobs/:jobId', authMiddleware(), requirePermission('inspection:manage'), exportInspectionReport.deleteInspectionExportJob);
+router.get('/inspections/:id/export-xlsx', authMiddleware(), exportInspectionReport.exportInspectionXLSX);
 
 // Konkrét inspection lekérése ID alapján
 // GET /api/inspections/:id

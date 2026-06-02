@@ -1,4 +1,4 @@
-// controllers/exportInsepctionReport.js
+// controllers/exportInspectionReport.js
 
 const ExcelJS = require('exceljs');
 const archiver = require('archiver');
