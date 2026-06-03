@@ -6,6 +6,8 @@ const SessionSchema = new mongoose.Schema(
     tenantId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', required: true, index: true },
     clientType: { type: String, enum: ['web', 'mobile'], default: 'web', index: true },
     refreshTokenHash: { type: String, required: true, index: true },
+    previousRefreshTokenHash: { type: String, default: null, index: true },
+    previousRefreshTokenGraceUntil: { type: Date, default: null },
     revokedAt: { type: Date, default: null, index: true },
     expiresAt: { type: Date, required: true },
     absoluteExpiresAt: { type: Date, required: false, index: true },

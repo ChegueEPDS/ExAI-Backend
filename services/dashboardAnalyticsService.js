@@ -4,6 +4,7 @@ const Unit = require('../models/unit');
 const Inspection = require('../models/inspection');
 const MaintenanceEvent = require('../models/maintenanceEvent');
 const Tenant = require('../models/tenant');
+const { buildMaintenanceSchemaIncidents, buildComplianceSchemaIncidents } = require('./schemaMaintenanceService');
 
 function toObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
@@ -124,7 +125,8 @@ async function buildComplianceIncidents({ tenantId, equipmentIds }) {
 
   const inspections = await Inspection.find({
     tenantId: tenantObjectId,
-    equipmentId: { $in: ids }
+    equipmentId: { $in: ids },
+    $or: [{ schemaId: null }, { schemaId: { $exists: false } }]
   })
     .select('equipmentId status reviewStatus finalizedAt createdAt inspectionDate failureSeverity')
     .sort({ equipmentId: 1, finalizedAt: 1, createdAt: 1, inspectionDate: 1, _id: 1 })
@@ -452,6 +454,47 @@ async function computeTopOffenders({ equipmentsById, incidents, fromMs, toMs, li
   return rows;
 }
 
+function computeTopOffendersBySchema({ equipmentsById, incidents, fromMs, toMs, limit = 5 }) {
+  const bySchema = new Map();
+  for (const inc of incidents || []) {
+    const schemaId = inc.schemaId ? String(inc.schemaId) : '';
+    if (!schemaId) continue;
+    const eqId = inc.equipmentId ? String(inc.equipmentId) : '';
+    if (!eqId) continue;
+    const ms = overlapMs(inc.startMs, inc.endMs, fromMs, toMs);
+    if (!ms) continue;
+
+    if (!bySchema.has(schemaId)) {
+      bySchema.set(schemaId, {
+        schemaId,
+        name: inc.schemaName || 'Schema',
+        offenderMs: new Map()
+      });
+    }
+    const schema = bySchema.get(schemaId);
+    schema.offenderMs.set(eqId, (schema.offenderMs.get(eqId) || 0) + ms);
+  }
+
+  return Array.from(bySchema.values())
+    .map((schema) => ({
+      schemaId: schema.schemaId,
+      name: schema.name,
+      topOffenders: Array.from(schema.offenderMs.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, limit)
+        .map(([eqId, ms]) => {
+          const eq = equipmentsById.get(eqId) || null;
+          return {
+            equipmentId: eqId,
+            eqId: eq?.EqID || null,
+            tagNo: eq?.TagNo || null,
+            downtimeHours: toHours(ms)
+          };
+        })
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
 function computeSeverityWeightedImpact(maintenanceIncidents, fromMs, toMs) {
   const weights = { P1: 4, P2: 3, P3: 2, P4: 1 };
   let score = 0;
@@ -479,10 +522,12 @@ async function computeDashboardAnalytics({ tenantId, siteId = null, zoneId = nul
   const equipmentIds = equipments.map((e) => e._id).filter(Boolean);
   const equipmentsById = new Map(equipments.map((e) => [String(e._id), e]));
 
-  const [slaTargets, complianceIncidents, maintenanceIncidents] = await Promise.all([
+  const [slaTargets, complianceIncidents, complianceSchemaIncidents, maintenanceIncidents, maintenanceSchemaIncidents] = await Promise.all([
     loadSlaTargets(tenantObjectId),
     buildComplianceIncidents({ tenantId: tenantObjectId, equipmentIds }),
-    buildMaintenanceIncidents({ tenantId: tenantObjectId, equipmentIds })
+    buildComplianceSchemaIncidents({ tenantId: tenantObjectId, equipmentIds }),
+    buildMaintenanceIncidents({ tenantId: tenantObjectId, equipmentIds }),
+    buildMaintenanceSchemaIncidents({ tenantId: tenantObjectId, equipmentIds })
   ]);
 
   // Process MTTR view: closed durations of incidents that started in window
@@ -491,36 +536,63 @@ async function computeDashboardAnalytics({ tenantId, siteId = null, zoneId = nul
       .filter((x) => x.endMs != null)
       .map((x) => x.endMs - x.startMs)
   );
+  const mttrMaintenanceSchemas = formatStats(
+    filterByWindowStart(maintenanceSchemaIncidents, fromMs, toMs)
+      .filter((x) => x.endMs != null)
+      .map((x) => x.endMs - x.startMs)
+  );
   const mttrCompliance = formatStats(
     filterByWindowStart(complianceIncidents, fromMs, toMs)
       .filter((x) => x.endMs != null)
       .map((x) => x.endMs - x.startMs)
   );
+  const mttrComplianceSchemas = formatStats(
+    filterByWindowStart(complianceSchemaIncidents, fromMs, toMs)
+      .filter((x) => x.endMs != null)
+      .map((x) => x.endMs - x.startMs)
+  );
 
   const openAgingMaintenance = computeOpenAging(maintenanceIncidents, nowMs);
+  const openAgingMaintenanceSchemas = computeOpenAging(maintenanceSchemaIncidents, nowMs);
   const openAgingCompliance = computeOpenAging(complianceIncidents, nowMs);
-  const openAgingOverall = computeOpenAging([...maintenanceIncidents, ...complianceIncidents], nowMs);
+  const openAgingComplianceSchemas = computeOpenAging(complianceSchemaIncidents, nowMs);
+  const openAgingOverall = computeOpenAging([...maintenanceIncidents, ...maintenanceSchemaIncidents, ...complianceIncidents, ...complianceSchemaIncidents], nowMs);
 
   const throughputMaintenance = computeThroughput(maintenanceIncidents, fromMs, toMs);
+  const throughputMaintenanceSchemas = computeThroughput(maintenanceSchemaIncidents, fromMs, toMs);
   const throughputCompliance = computeThroughput(complianceIncidents, fromMs, toMs);
+  const throughputComplianceSchemas = computeThroughput(complianceSchemaIncidents, fromMs, toMs);
 
   const repairsHistogram = computeRepairsHistogram(maintenanceIncidents, fromMs, toMs);
   const sla = computeSlaCompliance(maintenanceIncidents, fromMs, toMs, slaTargets, 'maintenanceHours', equipmentsById, 'maintenance');
+  const schemaSla = computeSlaCompliance(maintenanceSchemaIncidents, fromMs, toMs, slaTargets, 'maintenanceHours', equipmentsById, 'maintenance-schema');
   const inspectionSla = computeSlaCompliance(complianceIncidents, fromMs, toMs, slaTargets, 'inspectionHours', equipmentsById, 'compliance');
+  const schemaInspectionSla = computeSlaCompliance(complianceSchemaIncidents, fromMs, toMs, slaTargets, 'inspectionHours', equipmentsById, 'compliance-schema');
 
   const recurrenceMaintenance = computeRecurrenceRate(maintenanceIncidents);
+  const recurrenceMaintenanceSchemas = computeRecurrenceRate(maintenanceSchemaIncidents);
   const recurrenceCompliance = computeRecurrenceRate(complianceIncidents);
+  const recurrenceComplianceSchemas = computeRecurrenceRate(complianceSchemaIncidents);
 
   const mtbfMaintenance = computeMtbf(maintenanceIncidents);
+  const mtbfMaintenanceSchemas = computeMtbf(maintenanceSchemaIncidents);
   const mtbfCompliance = computeMtbf(complianceIncidents);
+  const mtbfComplianceSchemas = computeMtbf(complianceSchemaIncidents);
 
   const availabilityMaintenance = computeAvailability(maintenanceIncidents, equipmentCount, fromMs, toMs, nowMs);
+  const availabilityMaintenanceSchemas = computeAvailability(maintenanceSchemaIncidents, equipmentCount, fromMs, toMs, nowMs);
   const availabilityCompliance = computeAvailability(complianceIncidents, equipmentCount, fromMs, toMs, nowMs);
+  const availabilityComplianceSchemas = computeAvailability(complianceSchemaIncidents, equipmentCount, fromMs, toMs, nowMs);
 
   const topMaintenance = await computeTopOffenders({ equipmentsById, incidents: maintenanceIncidents, fromMs, toMs, limit: 10 });
+  const topMaintenanceSchemas = await computeTopOffenders({ equipmentsById, incidents: maintenanceSchemaIncidents, fromMs, toMs, limit: 10 });
   const topCompliance = await computeTopOffenders({ equipmentsById, incidents: complianceIncidents, fromMs, toMs, limit: 10 });
+  const topComplianceSchemas = await computeTopOffenders({ equipmentsById, incidents: complianceSchemaIncidents, fromMs, toMs, limit: 10 });
+  const maintenanceSchemaOffenders = computeTopOffendersBySchema({ equipmentsById, incidents: maintenanceSchemaIncidents, fromMs, toMs, limit: 5 });
+  const complianceSchemaOffenders = computeTopOffendersBySchema({ equipmentsById, incidents: complianceSchemaIncidents, fromMs, toMs, limit: 5 });
 
   const severityImpact = computeSeverityWeightedImpact(maintenanceIncidents, fromMs, toMs);
+  const schemaSeverityImpact = computeSeverityWeightedImpact(maintenanceSchemaIncidents, fromMs, toMs);
 
   return {
     scope: {
@@ -546,6 +618,19 @@ async function computeDashboardAnalytics({ tenantId, siteId = null, zoneId = nul
       severityImpact,
       topOffenders: topMaintenance
     },
+    maintenanceSchemas: {
+      mttr: mttrMaintenanceSchemas,
+      openAging: openAgingMaintenanceSchemas,
+      throughput: throughputMaintenanceSchemas,
+      repairsHistogram: { '1': 0, '2': 0, '3plus': 0 },
+      sla: schemaSla,
+      recurrence: recurrenceMaintenanceSchemas,
+      mtbf: mtbfMaintenanceSchemas,
+      availability: availabilityMaintenanceSchemas,
+      severityImpact: schemaSeverityImpact,
+      topOffenders: topMaintenanceSchemas,
+      bySchemaTopOffenders: maintenanceSchemaOffenders
+    },
     compliance: {
       mttr: mttrCompliance,
       openAging: openAgingCompliance,
@@ -555,6 +640,17 @@ async function computeDashboardAnalytics({ tenantId, siteId = null, zoneId = nul
       mtbf: mtbfCompliance,
       availability: availabilityCompliance,
       topOffenders: topCompliance
+    },
+    complianceSchemas: {
+      mttr: mttrComplianceSchemas,
+      openAging: openAgingComplianceSchemas,
+      throughput: throughputComplianceSchemas,
+      sla: schemaInspectionSla,
+      recurrence: recurrenceComplianceSchemas,
+      mtbf: mtbfComplianceSchemas,
+      availability: availabilityComplianceSchemas,
+      topOffenders: topComplianceSchemas,
+      bySchemaTopOffenders: complianceSchemaOffenders
     }
   };
 }

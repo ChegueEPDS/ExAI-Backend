@@ -3,6 +3,7 @@ const Equipment = require('../models/dataplate');
 const Inspection = require('../models/inspection');
 const Unit = require('../models/unit');
 const MaintenanceEvent = require('../models/maintenanceEvent');
+const { buildMaintenanceSchemaIncidents, buildComplianceSchemaIncidents } = require('./schemaMaintenanceService');
 
 function toObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
@@ -50,6 +51,14 @@ function formatStats(valuesMs) {
     medianHours: toHours(q.medianMs),
     p90Hours: toHours(q.p90Ms)
   };
+}
+
+function metricStatsFromIncidents(incidents) {
+  const closedDurations = (incidents || []).filter((x) => x.endMs != null).map((x) => x.endMs - x.startMs);
+  const openCount = (incidents || []).filter((x) => x.endMs == null).length;
+  const out = { ...formatStats(closedDurations), countOpen: openCount, meanRepairsPerIncident: 0 };
+  Object.defineProperty(out, '__durationsMs', { value: closedDurations, enumerable: false });
+  return out;
 }
 
 function normalizeSeverities(input) {
@@ -119,7 +128,8 @@ async function computeComplianceMetrics({ tenantId, equipmentIds, fromMs = null,
 
   const inspections = await Inspection.find({
     tenantId: tenantObjectId,
-    equipmentId: { $in: ids }
+    equipmentId: { $in: ids },
+    $or: [{ schemaId: null }, { schemaId: { $exists: false } }]
   })
     .select('equipmentId status reviewStatus finalizedAt createdAt inspectionDate')
     .sort({ equipmentId: 1, finalizedAt: 1, createdAt: 1, inspectionDate: 1, _id: 1 })
@@ -287,6 +297,82 @@ async function computeMaintenanceMetrics({
   return out;
 }
 
+async function computeMaintenanceSchemaMetrics({
+  tenantId,
+  equipmentIds,
+  fromMs = null,
+  toMs = null,
+  mode = 'start',
+  severities = null
+}) {
+  const tenantObjectId = toObjectId(tenantId) || tenantId;
+  const incidents = await buildMaintenanceSchemaIncidents({ tenantId: tenantObjectId, equipmentIds });
+  const severitiesNorm = normalizeSeverities(severities);
+  const filtered = incidents
+    .filter((inc) => applyWindow(inc, { fromMs, toMs, mode }))
+    .filter((inc) => {
+      if (!severitiesNorm) return true;
+      return inc.severity && severitiesNorm.includes(String(inc.severity).toUpperCase());
+    });
+
+  const out = metricStatsFromIncidents(filtered);
+  const bySchemaMap = new Map();
+  for (const inc of filtered) {
+    const schemaId = inc.schemaId ? String(inc.schemaId) : '';
+    if (!schemaId) continue;
+    if (!bySchemaMap.has(schemaId)) {
+      bySchemaMap.set(schemaId, {
+        schemaId,
+        name: inc.schemaName || 'Maintenance schema',
+        incidents: []
+      });
+    }
+    bySchemaMap.get(schemaId).incidents.push(inc);
+  }
+  out.bySchema = Array.from(bySchemaMap.values())
+    .map((item) => ({
+      schemaId: item.schemaId,
+      name: item.name,
+      ...metricStatsFromIncidents(item.incidents)
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+async function computeComplianceSchemaMetrics({
+  tenantId,
+  equipmentIds,
+  fromMs = null,
+  toMs = null,
+  mode = 'start'
+}) {
+  const tenantObjectId = toObjectId(tenantId) || tenantId;
+  const incidents = await buildComplianceSchemaIncidents({ tenantId: tenantObjectId, equipmentIds });
+  const filtered = incidents.filter((inc) => applyWindow(inc, { fromMs, toMs, mode }));
+  const out = metricStatsFromIncidents(filtered);
+  const bySchemaMap = new Map();
+  for (const inc of filtered) {
+    const schemaId = inc.schemaId ? String(inc.schemaId) : '';
+    if (!schemaId) continue;
+    if (!bySchemaMap.has(schemaId)) {
+      bySchemaMap.set(schemaId, {
+        schemaId,
+        name: inc.schemaName || 'Compliance schema',
+        incidents: []
+      });
+    }
+    bySchemaMap.get(schemaId).incidents.push(inc);
+  }
+  out.bySchema = Array.from(bySchemaMap.values())
+    .map((item) => ({
+      schemaId: item.schemaId,
+      name: item.name,
+      ...metricStatsFromIncidents(item.incidents)
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
 async function computeHealthMetrics({
   tenantId,
   siteId = null,
@@ -300,9 +386,18 @@ async function computeHealthMetrics({
   const fromMs = from ? toMillis(from) : null;
   const toMs = to ? toMillis(to) : null;
   const normalizedMode = normalizeMode(mode);
-  const [compliance, maintenance] = await Promise.all([
+  const [compliance, complianceSchemas, maintenance, maintenanceSchemas] = await Promise.all([
     computeComplianceMetrics({ tenantId, equipmentIds, fromMs, toMs, mode: normalizedMode }),
+    computeComplianceSchemaMetrics({ tenantId, equipmentIds, fromMs, toMs, mode: normalizedMode }),
     computeMaintenanceMetrics({
+      tenantId,
+      equipmentIds,
+      fromMs,
+      toMs,
+      mode: normalizedMode,
+      severities: severity
+    }),
+    computeMaintenanceSchemaMetrics({
       tenantId,
       equipmentIds,
       fromMs,
@@ -313,8 +408,10 @@ async function computeHealthMetrics({
   ]);
 
   const complianceDurations = Array.isArray(compliance.__durationsMs) ? compliance.__durationsMs : [];
+  const complianceSchemaDurations = Array.isArray(complianceSchemas.__durationsMs) ? complianceSchemas.__durationsMs : [];
   const maintenanceDurations = Array.isArray(maintenance.__durationsMs) ? maintenance.__durationsMs : [];
-  const combinedDurations = [...complianceDurations, ...maintenanceDurations];
+  const maintenanceSchemaDurations = Array.isArray(maintenanceSchemas.__durationsMs) ? maintenanceSchemas.__durationsMs : [];
+  const combinedDurations = [...complianceDurations, ...complianceSchemaDurations, ...maintenanceDurations, ...maintenanceSchemaDurations];
   const overallStats = formatStats(combinedDurations);
 
   return {
@@ -328,10 +425,12 @@ async function computeHealthMetrics({
       severity: normalizeSeverities(severity)
     },
     compliance,
+    complianceSchemas,
     maintenance,
+    maintenanceSchemas,
     overall: {
       ...overallStats,
-      countOpen: (compliance.countOpen || 0) + (maintenance.countOpen || 0)
+      countOpen: (compliance.countOpen || 0) + (complianceSchemas.countOpen || 0) + (maintenance.countOpen || 0) + (maintenanceSchemas.countOpen || 0)
     }
   };
 }

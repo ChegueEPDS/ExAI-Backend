@@ -33,6 +33,7 @@ router.post('/renew-token', renewToken);
 router.post('/auth/refresh', renewToken);
 router.post('/logout', logout);
 router.get('/auth/me', requireAuth, me);
+router.get('/auth/session', requireAuth, me);
 router.post('/auth/forgot-password', captchaVerify, forgotPassword);
 router.post('/auth/change-password', requireAuth, changePassword);
 router.post('/auth/verify-email', verifyEmail);

@@ -4,6 +4,7 @@ const exRegisterController = require('../controllers/exRegisterController');
 const maintenanceController = require('../controllers/maintenanceController');
 const authMiddleware = require('../middlewares/authMiddleware');
 const { requirePermission } = require('../middlewares/permissionMiddleware');
+const { requireTenantFeature } = require('../middlewares/tenantFeatureMiddleware');
 const multer = require('multer'); 
 const upload = multer({ dest: 'uploads/' });
 
@@ -117,9 +118,9 @@ router.get('/exreg/:id/versions/:versionId', authMiddleware(), exRegisterControl
 router.get('/exreg/:id/history', authMiddleware(), maintenanceController.getEquipmentHistory);
 
 // Maintenance actions
-router.post('/exreg/:id/maintenance/faults', authMiddleware(), requirePermission(['maintenance:manage', 'maintenance:fault:report']), maintenanceController.reportFault);
-router.post('/exreg/:id/maintenance/repairs/start', authMiddleware(), requirePermission('maintenance:manage'), maintenanceController.startRepair);
-router.post('/exreg/:id/maintenance/repairs/:repairId/complete', authMiddleware(), requirePermission('maintenance:manage'), maintenanceController.completeRepair);
+router.post('/exreg/:id/maintenance/faults', authMiddleware(), requireTenantFeature('maintenance'), requirePermission(['maintenance:manage', 'maintenance:fault:report']), maintenanceController.reportFault);
+router.post('/exreg/:id/maintenance/repairs/start', authMiddleware(), requireTenantFeature('maintenance'), requirePermission('maintenance:manage'), maintenanceController.startRepair);
+router.post('/exreg/:id/maintenance/repairs/:repairId/complete', authMiddleware(), requireTenantFeature('maintenance'), requirePermission('maintenance:manage'), maintenanceController.completeRepair);
 
 // Módosítás
 router.put('/exreg/:id', authMiddleware(), requirePermission('asset:write'), upload.array('pictures'), exRegisterController.updateEquipment);

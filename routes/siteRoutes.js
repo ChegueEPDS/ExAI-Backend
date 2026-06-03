@@ -4,6 +4,7 @@ const siteController = require('../controllers/siteController');
 const healthMetricsController = require('../controllers/healthMetricsController');
 const authMiddleware = require('../middlewares/authMiddleware');
 const { requirePermission } = require('../middlewares/permissionMiddleware');
+const { requireTenantFeature } = require('../middlewares/tenantFeatureMiddleware');
 const multer = require('multer');
 const upload = multer({ dest: 'uploads/' }); // ideiglenes mappa
 
@@ -14,7 +15,7 @@ router.get('/', authMiddleware(), siteController.getAllSites);        // Összes
 router.get('/:id/summary', authMiddleware(), siteController.getSiteSummary); // Site összefoglaló
 router.get('/:id/operational-summary', authMiddleware(), siteController.getSiteOperationalSummary); // Operational status summary
 router.get('/:id/overall-status-summary', authMiddleware(), siteController.getSiteOverallStatusSummary); // Overall status summary (combined maintenance + compliance)
-router.get('/:id/maintenance-severity-summary', authMiddleware(), siteController.getSiteMaintenanceSeveritySummary); // Maintenance severity summary
+router.get('/:id/maintenance-severity-summary', authMiddleware(), requireTenantFeature('maintenance'), siteController.getSiteMaintenanceSeveritySummary); // Maintenance severity summary
 router.get('/:id/health-metrics', authMiddleware(), healthMetricsController.getSiteHealthMetrics); // Failed→Passed / Fault→Repaired metrics
 router.get('/:id', authMiddleware(), siteController.getSiteById);     // Egyedi site lekérése
 router.put('/:id', authMiddleware(), requirePermission('site:write'), siteController.updateSite);      // Site módosítása

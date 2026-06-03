@@ -4,6 +4,7 @@ const zoneController = require('../controllers/zoneController');
 const healthMetricsController = require('../controllers/healthMetricsController');
 const authMiddleware = require('../middlewares/authMiddleware');
 const { requirePermission } = require('../middlewares/permissionMiddleware');
+const { requireTenantFeature } = require('../middlewares/tenantFeatureMiddleware');
 const multer = require('multer');
 const upload = multer({ dest: 'uploads/' });
 
@@ -18,7 +19,7 @@ router.get('/:id', authMiddleware(), zoneController.getZoneById);
 
 // Operational status summary (maintenance states)
 router.get('/:id/operational-summary', authMiddleware(), zoneController.getZoneOperationalSummary);
-router.get('/:id/maintenance-severity-summary', authMiddleware(), zoneController.getZoneMaintenanceSeveritySummary);
+router.get('/:id/maintenance-severity-summary', authMiddleware(), requireTenantFeature('maintenance'), zoneController.getZoneMaintenanceSeveritySummary);
 router.get('/:id/health-metrics', authMiddleware(), healthMetricsController.getZoneHealthMetrics);
 
 // Projekt módosítása ID alapján

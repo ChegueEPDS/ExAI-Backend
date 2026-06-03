@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const Equipment = require('../models/dataplate');
 const Unit = require('../models/unit');
 const MaintenanceEvent = require('../models/maintenanceEvent');
+const { computeMaintenanceSchemaStatusSummary, computeComplianceSchemaStatusSummary } = require('./schemaMaintenanceService');
 
 function toObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
@@ -82,7 +83,7 @@ async function computeOperationalSummary({ tenantId, siteId = null, zoneId = nul
     eqFilter.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
   }
 
-  const equipments = await Equipment.find(eqFilter).select('_id operationalStatus').lean();
+  const equipments = await Equipment.find(eqFilter).select('_id operationalStatus schemaAssignments').lean();
   const equipmentIds = (equipments || []).map((e) => e._id).filter(Boolean);
   const total = equipmentIds.length;
 
@@ -131,7 +132,7 @@ async function computeOverallStatusSummary({ tenantId, siteId = null, zoneId = n
     eqFilter.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
   }
 
-  const equipments = await Equipment.find(eqFilter).select('_id operationalStatus lastInspectionStatus').lean();
+  const equipments = await Equipment.find(eqFilter).select('_id operationalStatus lastInspectionStatus schemaAssignments').lean();
   const equipmentIds = (equipments || []).map((e) => e._id).filter(Boolean);
   const total = equipmentIds.length;
 
@@ -179,6 +180,39 @@ async function computeOverallStatusSummary({ tenantId, siteId = null, zoneId = n
   }
 
   return { total, counts: { passedOperating, failed, naPending } };
+}
+
+async function computeMaintenanceSchemaSummary({ tenantId, siteId = null, zoneId = null }) {
+  return computeSchemaSummary({ tenantId, siteId, zoneId, type: 'maintenance' });
+}
+
+async function computeComplianceSchemaSummary({ tenantId, siteId = null, zoneId = null }) {
+  return computeSchemaSummary({ tenantId, siteId, zoneId, type: 'compliance' });
+}
+
+async function computeSchemaSummary({ tenantId, siteId = null, zoneId = null, type }) {
+  const tenantObjectId = toObjectId(tenantId) || tenantId;
+  const siteObjectId = siteId ? toObjectId(siteId) : null;
+  const zoneObjectId = zoneId ? toObjectId(zoneId) : null;
+  if (!tenantObjectId) throw new Error('Missing tenantId');
+  if (siteId && !siteObjectId) throw new Error('Invalid siteId');
+  if (zoneId && !zoneObjectId) throw new Error('Invalid zoneId');
+
+  const eqFilter = { tenantId: tenantObjectId };
+  if (siteObjectId) eqFilter.Site = siteObjectId;
+  if (zoneObjectId) {
+    const unitIds = await Unit.find({
+      tenantId: tenantObjectId,
+      $or: [{ _id: zoneObjectId }, { ancestors: zoneObjectId }]
+    }).select('_id').lean();
+    const ids = unitIds.map(u => u._id);
+    eqFilter.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
+  }
+
+  const equipments = await Equipment.find(eqFilter).select('_id schemaAssignments').lean();
+  return type === 'maintenance'
+    ? computeMaintenanceSchemaStatusSummary({ tenantId: tenantObjectId, equipments })
+    : computeComplianceSchemaStatusSummary({ tenantId: tenantObjectId, equipments });
 }
 
 async function computeMaintenanceSeveritySummary({ tenantId, siteId = null, zoneId = null }) {
@@ -262,4 +296,10 @@ async function computeMaintenanceSeveritySummary({ tenantId, siteId = null, zone
   return { totalAffected, counts };
 }
 
-module.exports = { computeOperationalSummary, computeOverallStatusSummary, computeMaintenanceSeveritySummary };
+module.exports = {
+  computeOperationalSummary,
+  computeOverallStatusSummary,
+  computeMaintenanceSeveritySummary,
+  computeMaintenanceSchemaSummary,
+  computeComplianceSchemaSummary
+};

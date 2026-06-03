@@ -2,9 +2,11 @@ const mongoose = require('mongoose');
 
 const SchemaDefinition = require('../models/schemaDefinition');
 const SchemaExtension = require('../models/schemaExtension');
+const Tenant = require('../models/tenant');
 const Site = require('../models/site');
 const Unit = require('../models/unit');
 const Equipment = require('../models/dataplate');
+const { isFeatureEnabled } = require('../middlewares/tenantFeatureMiddleware');
 const { ensureRbSchema, loadLegacyRbQuestions } = require('../services/schemaSeedService');
 const {
   sanitizeQuestions,
@@ -37,6 +39,20 @@ function tenantIdOr400(req, res) {
     return null;
   }
   return tenantId;
+}
+
+async function isTenantMaintenanceFeatureEnabled(tenantId) {
+  const tenant = await Tenant.findById(tenantId).select('type features').lean();
+  return isFeatureEnabled(tenant, 'maintenance');
+}
+
+async function rejectMaintenanceSchemaWhenDisabled(res, tenantId, type) {
+  if (type !== 'maintenance') return false;
+  if (await isTenantMaintenanceFeatureEnabled(tenantId)) return false;
+  res.status(403).json({
+    message: 'Maintenance schemas can only be managed when the maintenance feature is enabled for this tenant.'
+  });
+  return true;
 }
 
 async function findVisibleSchema(req, schemaIdOrKey, tenantId) {
@@ -151,6 +167,7 @@ exports.create = async (req, res) => {
     const name = String(body.name || '').trim();
     if (!name) return res.status(400).json({ message: 'name is required.' });
     const type = body.type === 'maintenance' ? 'maintenance' : 'compliance';
+    if (await rejectMaintenanceSchemaWhenDisabled(res, tenantId, type)) return;
     const schema = await SchemaDefinition.create({
       scope,
       tenantId: scope === 'tenant' ? tenantId : null,
@@ -195,7 +212,11 @@ exports.update = async (req, res) => {
     }
     if (body.description !== undefined) schema.description = String(body.description || '');
     const typeChanged = body.type !== undefined && !schema.systemProvided;
-    if (typeChanged) schema.type = body.type === 'maintenance' ? 'maintenance' : 'compliance';
+    if (typeChanged) {
+      const nextType = body.type === 'maintenance' ? 'maintenance' : 'compliance';
+      if (await rejectMaintenanceSchemaWhenDisabled(res, tenantId, nextType)) return;
+      schema.type = nextType;
+    }
     if (body.status !== undefined) schema.status = body.status === 'published' ? 'published' : 'draft';
     if (body.targetLevels !== undefined) schema.targetLevels = Array.isArray(body.targetLevels) ? body.targetLevels : schema.targetLevels;
     if (body.defaultCycleValue !== undefined || body.defaultCycleUnit !== undefined) {
@@ -258,6 +279,7 @@ exports.publish = async (req, res) => {
     if (schema.scope === 'tenant' && !canManageTenantSchemas(req)) {
       return res.status(403).json({ message: 'Insufficient role to publish schemas.' });
     }
+    if (await rejectMaintenanceSchemaWhenDisabled(res, tenantId, schema.type)) return;
     schema.status = 'published';
     schema.active = true;
     schema.updatedBy = req.userId || null;

@@ -201,8 +201,8 @@ async function generateInspectionResultsForEquipment({ equipmentDoc, tenantId, i
  *
  * Várható body (minimum):
  * {
- *   equipmentId?: string,  // Mongo _id
- *   eqId?: string,         // EqID string, ha equipmentId nincs
+ *   equipmentId?: string,  // Mongo _id, primary identifier
+ *   eqId?: string,         // legacy/display fallback, if equipmentId is missing
  *   inspectionDate: string/Date,
  *   validUntil: string/Date,
  *   results: [
@@ -270,15 +270,23 @@ exports.createInspection = async (req, res) => {
     if (equipmentId && mongoose.isValidObjectId(equipmentId)) {
       equipment = await Equipment.findOne({ _id: equipmentId, tenantId });
     } else if (eqId) {
-      equipment = await Equipment.findOne({ EqID: eqId, tenantId });
+      if (mongoose.isValidObjectId(eqId)) {
+        equipment = await Equipment.findOne({ _id: eqId, tenantId });
+      }
+      if (!equipment) {
+        equipment = await Equipment.findOne({
+          tenantId,
+          $or: [{ EqID: eqId }, { TagNo: eqId }]
+        });
+      }
     }
 
     if (!equipment) {
       return res.status(404).json({ message: 'Nem található eszköz a megadott azonosítóval.' });
     }
 
-    // EqID string biztosítása
-    const eqIdString = equipment.EqID || eqId;
+    // Required legacy field: store the stable equipment _id first, then human identifiers as fallback.
+    const eqIdString = String(equipment._id || '') || equipment.EqID || equipment.TagNo || eqId;
 
     // ---- Eredmények normalizálása ----
     const normalizedResults = results.map(r => ({
@@ -368,18 +376,20 @@ exports.createInspection = async (req, res) => {
     try {
       // FIGYELEM: ehhez érdemes a dataplate/Equipment sémát kiegészíteni
       // lastInspectionDate, lastInspectionValidUntil, lastInspectionStatus, lastInspectionId mezőkkel.
-      await updateEquipmentRbCompliance(equipment, status, inspectorId);
       if (schemaDefinition) {
         markAssignmentInspectionCompleted(equipment, schemaDefinition, inspection, inspectorId);
       }
-      equipment.lastInspectionDate = inspection.inspectionDate;
-      // Failed inspectionnek nincs "next inspection date"-je (UI: ne jelenjen meg PLANNED).
-      equipment.lastInspectionValidUntil = status === 'Failed' ? null : inspection.validUntil;
-      equipment.lastInspectionStatus = status;
-      equipment.lastInspectionId = inspection._id;
-      // Any finalized inspection clears "pending review" flags (mobile-sync or post-maintenance).
-      equipment.pendingReview = false;
-      equipment.pendingInspectionId = null;
+      if (!schemaDefinition || schemaDefinition.type !== 'maintenance') {
+        await updateEquipmentRbCompliance(equipment, status, inspectorId);
+        equipment.lastInspectionDate = inspection.inspectionDate;
+        // Failed inspectionnek nincs "next inspection date"-je (UI: ne jelenjen meg PLANNED).
+        equipment.lastInspectionValidUntil = status === 'Failed' ? null : inspection.validUntil;
+        equipment.lastInspectionStatus = status;
+        equipment.lastInspectionId = inspection._id;
+        // Any finalized inspection clears "pending review" flags (mobile-sync or post-maintenance).
+        equipment.pendingReview = false;
+        equipment.pendingInspectionId = null;
+      }
 
       const imageAttachments = normalizedAttachments.filter(att => att.type === 'image' && att.blobPath && att.blobUrl);
       if (imageAttachments.length) {
@@ -533,16 +543,18 @@ exports.updateInspection = async (req, res) => {
     if (finalize) {
       const equipment = equipmentForCycle || await Equipment.findOne({ _id: inspection.equipmentId, tenantId });
       if (equipment) {
-        equipment.lastInspectionDate = inspection.inspectionDate;
-        equipment.lastInspectionValidUntil = inspection.status === 'Failed' ? null : inspection.validUntil;
-        equipment.lastInspectionStatus = inspection.status;
-        equipment.lastInspectionId = inspection._id;
         if (schemaDefinition) {
           markAssignmentInspectionCompleted(equipment, schemaDefinition, inspection, userId);
         }
-        await updateEquipmentRbCompliance(equipment, inspection.status, userId);
-        equipment.pendingReview = false;
-        equipment.pendingInspectionId = null;
+        if (!schemaDefinition || schemaDefinition.type !== 'maintenance') {
+          equipment.lastInspectionDate = inspection.inspectionDate;
+          equipment.lastInspectionValidUntil = inspection.status === 'Failed' ? null : inspection.validUntil;
+          equipment.lastInspectionStatus = inspection.status;
+          equipment.lastInspectionId = inspection._id;
+          await updateEquipmentRbCompliance(equipment, inspection.status, userId);
+          equipment.pendingReview = false;
+          equipment.pendingInspectionId = null;
+        }
         await equipment.save();
       }
     }

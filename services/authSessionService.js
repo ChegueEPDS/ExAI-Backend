@@ -66,13 +66,16 @@ function cookieSameSite() {
 }
 
 function cookieOptions(req, maxAge, httpOnly = true) {
-  return {
+  const opts = {
     httpOnly,
     secure: cookieSecure(req),
     sameSite: cookieSameSite(),
     path: '/',
     maxAge,
   };
+  const domain = String(process.env.AUTH_COOKIE_DOMAIN || '').trim();
+  if (domain) opts.domain = domain;
+  return opts;
 }
 
 function parseCookies(req) {
@@ -221,6 +224,22 @@ async function signAccessToken(user, session) {
   return jwt.sign(payload, mustJwtSecret(), { expiresIn: accessTtl(session.clientType) });
 }
 
+function buildSessionMetadata(session, accessToken = null) {
+  let accessExpiresAt = null;
+  if (accessToken) {
+    const decoded = jwt.decode(accessToken);
+    if (decoded?.exp) accessExpiresAt = new Date(decoded.exp * 1000).toISOString();
+  }
+  return {
+    sessionId: session ? String(session._id) : null,
+    clientType: session?.clientType || null,
+    accessExpiresAt,
+    refreshExpiresAt: session?.expiresAt ? new Date(session.expiresAt).toISOString() : null,
+    absoluteExpiresAt: session?.absoluteExpiresAt ? new Date(session.absoluteExpiresAt).toISOString() : null,
+    serverNow: new Date().toISOString(),
+  };
+}
+
 async function createSession({ user, clientType, req }) {
   const refreshToken = randomToken();
   const now = Date.now();
@@ -238,26 +257,55 @@ async function createSession({ user, clientType, req }) {
   });
   const accessToken = await signAccessToken(user, session);
   const userContext = await buildUserContext(user, session);
-  return { session, accessToken, refreshToken, user: userContext };
+  return { session, accessToken, refreshToken, user: userContext, sessionMeta: buildSessionMetadata(session, accessToken) };
 }
 
 async function rotateRefreshToken({ refreshToken, req }) {
-  const session = await Session.findOne({
-    refreshTokenHash: hashToken(refreshToken),
-    revokedAt: null,
-    expiresAt: { $gt: new Date() },
-  });
-  if (!session) throw new Error('Invalid refresh token');
-
+  const refreshHash = hashToken(refreshToken);
   const now = Date.now();
+  const nowDate = new Date(now);
+  const graceMs = parseDurationMs(process.env.REFRESH_ROTATION_GRACE || '10s', 10_000);
+  let session = await Session.findOne({
+    refreshTokenHash: refreshHash,
+    revokedAt: null,
+    expiresAt: { $gt: nowDate },
+  });
+
+  if (!session) {
+    session = await Session.findOne({
+      previousRefreshTokenHash: refreshHash,
+      previousRefreshTokenGraceUntil: { $gt: nowDate },
+      revokedAt: null,
+      expiresAt: { $gt: nowDate },
+    });
+    if (!session) throw new Error('Invalid refresh token');
+    if (session.clientType !== 'web') throw new Error('Refresh token rotation conflict');
+
+    if (session.absoluteExpiresAt && new Date(session.absoluteExpiresAt).getTime() <= now) {
+      await Session.findByIdAndUpdate(session._id, { revokedAt: nowDate });
+      throw new Error('Session absolute lifetime expired');
+    }
+
+    const user = await User.findById(session.userId);
+    if (!user || !user.tenantId) throw new Error('Invalid session user');
+    const accessToken = await signAccessToken(user, session);
+    const userContext = await buildUserContext(user, session);
+    return {
+      session,
+      accessToken,
+      refreshToken: null,
+      user: userContext,
+      sessionMeta: buildSessionMetadata(session, accessToken),
+      refreshRotated: false,
+    };
+  }
+
   let absoluteExpiresAt = session.absoluteExpiresAt;
   if (!absoluteExpiresAt) {
     absoluteExpiresAt = new Date(new Date(session.createdAt || now).getTime() + absoluteTtlMs(session.clientType));
-    session.absoluteExpiresAt = absoluteExpiresAt;
   }
   if (new Date(absoluteExpiresAt).getTime() <= now) {
-    session.revokedAt = new Date();
-    await session.save();
+    await Session.findByIdAndUpdate(session._id, { revokedAt: nowDate, absoluteExpiresAt });
     throw new Error('Session absolute lifetime expired');
   }
 
@@ -265,16 +313,40 @@ async function rotateRefreshToken({ refreshToken, req }) {
   if (!user || !user.tenantId) throw new Error('Invalid session user');
 
   const nextRefreshToken = randomToken();
-  session.refreshTokenHash = hashToken(nextRefreshToken);
-  session.lastSeenAt = new Date();
-  session.expiresAt = minDate(new Date(now + refreshTtlMs(session.clientType)), absoluteExpiresAt);
-  session.userAgent = String(req?.headers?.['user-agent'] || session.userAgent || '').slice(0, 500);
-  session.ip = String(req?.ip || req?.connection?.remoteAddress || session.ip || '');
-  await session.save();
+  const nextExpiresAt = minDate(new Date(now + refreshTtlMs(session.clientType)), absoluteExpiresAt);
+  const updated = await Session.findOneAndUpdate(
+    {
+      _id: session._id,
+      refreshTokenHash: refreshHash,
+      revokedAt: null,
+      expiresAt: { $gt: nowDate },
+    },
+    {
+      $set: {
+        refreshTokenHash: hashToken(nextRefreshToken),
+        previousRefreshTokenHash: refreshHash,
+        previousRefreshTokenGraceUntil: new Date(now + graceMs),
+        lastSeenAt: nowDate,
+        expiresAt: nextExpiresAt,
+        absoluteExpiresAt,
+        userAgent: String(req?.headers?.['user-agent'] || session.userAgent || '').slice(0, 500),
+        ip: String(req?.ip || req?.connection?.remoteAddress || session.ip || ''),
+      },
+    },
+    { new: true }
+  );
+  if (!updated) throw new Error('Refresh token rotation conflict');
 
-  const accessToken = await signAccessToken(user, session);
-  const userContext = await buildUserContext(user, session);
-  return { session, accessToken, refreshToken: nextRefreshToken, user: userContext };
+  const accessToken = await signAccessToken(user, updated);
+  const userContext = await buildUserContext(user, updated);
+  return {
+    session: updated,
+    accessToken,
+    refreshToken: nextRefreshToken,
+    user: userContext,
+    sessionMeta: buildSessionMetadata(updated, accessToken),
+    refreshRotated: true,
+  };
 }
 
 async function authenticateAccessToken(token) {
@@ -320,8 +392,10 @@ function setAuthCookies(res, req, result) {
   const accessMs = parseDurationMs(accessTtl('web'), 15 * 60_000);
   const csrf = randomToken(24);
   res.cookie(ACCESS_COOKIE, result.accessToken, cookieOptions(req, accessMs, true));
-  res.cookie(REFRESH_COOKIE, result.refreshToken, cookieOptions(req, refreshMs, true));
-  res.cookie(CSRF_COOKIE, csrf, cookieOptions(req, refreshMs, false));
+  if (result.refreshToken) {
+    res.cookie(REFRESH_COOKIE, result.refreshToken, cookieOptions(req, refreshMs, true));
+    res.cookie(CSRF_COOKIE, csrf, cookieOptions(req, refreshMs, false));
+  }
 }
 
 function clearAuthCookies(res, req) {
@@ -341,6 +415,13 @@ function getRefreshTokenFromRequest(req) {
   );
 }
 
+function getRefreshTokenSourceFromRequest(req) {
+  if (req.body?.refreshToken || req.headers?.['x-refresh-token']) return 'bearer';
+  const cookies = parseCookies(req);
+  if (cookies[REFRESH_COOKIE]) return 'cookie';
+  return null;
+}
+
 function getAccessTokenFromRequest(req) {
   const authHeader = req.headers?.authorization || req.headers?.Authorization || '';
   if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
@@ -353,7 +434,9 @@ function getAccessTokenFromRequest(req) {
 }
 
 function validateCsrf(req, tokenSource) {
-  if (String(process.env.AUTH_REQUIRE_CSRF || 'false').toLowerCase() !== 'true') return true;
+  const configured = String(process.env.AUTH_REQUIRE_CSRF || '').trim().toLowerCase();
+  const required = configured ? configured === 'true' : process.env.NODE_ENV === 'production';
+  if (!required) return true;
   if (tokenSource !== 'cookie') return true;
   if (['GET', 'HEAD', 'OPTIONS'].includes(String(req.method || '').toUpperCase())) return true;
   const cookies = parseCookies(req);
@@ -368,10 +451,12 @@ module.exports = {
   CSRF_COOKIE,
   authenticateAccessToken,
   buildUserContext,
+  buildSessionMetadata,
   clearAuthCookies,
   createSession,
   getAccessTokenFromRequest,
   getRefreshTokenFromRequest,
+  getRefreshTokenSourceFromRequest,
   revokeSession,
   revokeRefreshToken,
   rotateRefreshToken,

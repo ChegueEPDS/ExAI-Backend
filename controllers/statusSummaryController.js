@@ -1,6 +1,11 @@
 const mongoose = require('mongoose');
 const Equipment = require('../models/dataplate');
-const { computeOperationalSummary, computeOverallStatusSummary } = require('../services/operationalSummaryService');
+const {
+  computeOperationalSummary,
+  computeOverallStatusSummary,
+  computeMaintenanceSchemaSummary,
+  computeComplianceSchemaSummary
+} = require('../services/operationalSummaryService');
 const Unit = require('../models/unit');
 
 function toObjectId(id) {
@@ -55,15 +60,19 @@ exports.getTenantStatusStackedSummary = async (req, res) => {
     if (siteId && !siteObjectId) return res.status(400).json({ message: 'Invalid siteId.' });
     if (zoneId && !zoneObjectId) return res.status(400).json({ message: 'Invalid zoneId.' });
 
-    const [maintenance, compliance, overall] = await Promise.all([
+    const [maintenance, maintenanceSchemas, compliance, complianceSchemas, overall] = await Promise.all([
       computeOperationalSummary({ tenantId, siteId: siteObjectId, zoneId: zoneObjectId }),
+      computeMaintenanceSchemaSummary({ tenantId, siteId: siteObjectId, zoneId: zoneObjectId }),
       computeComplianceStatusSummary({ tenantId, siteId: siteObjectId, zoneId: zoneObjectId }),
+      computeComplianceSchemaSummary({ tenantId, siteId: siteObjectId, zoneId: zoneObjectId }),
       computeOverallStatusSummary({ tenantId, siteId: siteObjectId, zoneId: zoneObjectId })
     ]);
 
     return res.json({
       maintenance,
+      maintenanceSchemas,
       compliance,
+      complianceSchemas,
       overall
     });
   } catch (error) {

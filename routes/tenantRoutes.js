@@ -3,7 +3,13 @@ const express = require('express');
 const router = express.Router();
 
 const { authMiddleware } = require('../middlewares/authMiddleware');
-const { searchTenants, createTenant, listTenants, getTenantById, updateTenant, deleteTenant } = require('../controllers/tenantController');
+const { searchTenants, createTenant, listTenants, getTenantById, updateTenant, deleteTenant, getCurrentTenantFeatures } = require('../controllers/tenantController');
+
+router.get(
+  '/tenant-features',
+  authMiddleware(),
+  getCurrentTenantFeatures
+);
 
 /**
  * GET /api/tenants

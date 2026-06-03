@@ -14,15 +14,19 @@ const Stripe = require('stripe');
 const { ensureStripeCustomerForTenant } = require('../services/stripeCustomerProvisioning');
 const { computePermissions, getEffectiveProfessions } = require('../helpers/rbac');
 const {
+  buildSessionMetadata,
   buildUserContext,
   clearAuthCookies,
   createSession,
   getRefreshTokenFromRequest,
+  getRefreshTokenSourceFromRequest,
   revokeSession,
   revokeRefreshToken,
   rotateRefreshToken,
   setAuthCookies,
+  validateCsrf,
 } = require('../services/authSessionService');
+const { verifyMicrosoftAccessToken } = require('../services/microsoftTokenVerifier');
 
 let stripe = null;
 const stripeKey = process.env.STRIPE_SECRET_KEY;
@@ -254,12 +258,13 @@ function getClientType(req) {
 function sendAuthResult(req, res, result, extra = {}) {
   if (result.session.clientType === 'web') {
     setAuthCookies(res, req, result);
-    return res.status(200).json({ user: result.user, ...extra });
+    return res.status(200).json({ user: result.user, session: result.sessionMeta, ...extra });
   }
   return res.status(200).json({
     accessToken: result.accessToken,
     refreshToken: result.refreshToken,
     user: result.user,
+    session: result.sessionMeta,
     ...extra,
   });
 }
@@ -606,16 +611,12 @@ exports.microsoftLogin = async (req, res) => {
       return res.status(400).json({ error: 'Access token is required' });
     }
 
-    // Microsoft JWT dekódolás (lokális decode)
-    const decodedToken = jwt.decode(accessToken);
-    if (!decodedToken) {
-      return res.status(401).json({ error: 'Invalid Microsoft token' });
-    }
+    const decodedToken = await verifyMicrosoftAccessToken(accessToken);
 
-    const email = decodedToken.upn || decodedToken.email || null;
+    const email = decodedToken.upn || decodedToken.email || decodedToken.preferred_username || null;
     const firstName = decodedToken.given_name || 'N/A';
     const lastName = decodedToken.family_name || 'N/A';
-    const azureId = decodedToken.oid; // Azure AD egyedi ID
+    const azureId = decodedToken.oid || decodedToken.sub; // Azure AD egyedi ID
 
     if (!azureId) {
       return res.status(400).json({ error: 'Azure ID is missing in the token' });
@@ -654,6 +655,9 @@ exports.renewToken = async (req, res) => {
   try {
     const refreshToken = getRefreshTokenFromRequest(req);
     if (!refreshToken) return res.status(401).json({ error: 'Refresh token is required' });
+    if (getRefreshTokenSourceFromRequest(req) === 'cookie' && !validateCsrf(req, 'cookie')) {
+      return res.status(403).json({ error: 'Invalid CSRF token' });
+    }
     const authResult = await rotateRefreshToken({ refreshToken, req });
     return sendAuthResult(req, res, authResult);
   } catch (error) {
@@ -667,6 +671,10 @@ exports.renewToken = async (req, res) => {
 exports.logout = async (req, res) => {
   try {
     const refreshToken = getRefreshTokenFromRequest(req);
+    if (getRefreshTokenSourceFromRequest(req) === 'cookie' && !validateCsrf(req, 'cookie')) {
+      clearAuthCookies(res, req);
+      return res.status(403).json({ error: 'Invalid CSRF token' });
+    }
     if (req.scope?.sessionId || req.auth?.sessionId || req.auth?.sid) {
       await revokeSession(req.scope?.sessionId || req.auth?.sessionId || req.auth?.sid);
     } else if (refreshToken) {
@@ -681,7 +689,12 @@ exports.logout = async (req, res) => {
 };
 
 exports.me = async (req, res) => {
-  return res.json({ user: req.user });
+  const session = buildSessionMetadata(req.session || null);
+  if (req.auth?.exp) session.accessExpiresAt = new Date(req.auth.exp * 1000).toISOString();
+  return res.json({
+    user: req.user,
+    session,
+  });
 };
 
 // ----------------------

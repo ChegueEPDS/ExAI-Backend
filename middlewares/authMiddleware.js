@@ -35,6 +35,7 @@ const authMiddleware = (roles = []) => {
       req.auth.subscription = user.subscription || null;
       req.auth.plan = user.plan || null;
       req.auth.sessionId = String(session._id);
+      req.session = session;
 
       req.user = { ...user, tokenType: 'access' };
 

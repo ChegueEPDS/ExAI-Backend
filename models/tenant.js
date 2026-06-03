@@ -68,6 +68,14 @@ const TenantSchema = new mongoose.Schema(
       }
     }
     ,
+    // Tenant-level feature flags. Defaults keep existing tenants on the current behavior.
+    features: {
+      maintenance: {
+        type: Boolean,
+        default: false
+      }
+    },
+
     // Feature toggle: profession-based RBAC enabled for this tenant (off => legacy behavior)
     professionRbacEnabled: { type: Boolean, default: false, index: true },
 
@@ -92,6 +100,12 @@ TenantSchema.pre('validate', function (next) {
   }
   if (this.type === 'personal' && !['free', 'pro'].includes(this.plan)) {
     return next(new Error('Personal tenant must use free or pro plan.'));
+  }
+  if (this.type === 'personal') {
+    this.features = {
+      ...(this.features || {}),
+      maintenance: false
+    };
   }
   next();
 });

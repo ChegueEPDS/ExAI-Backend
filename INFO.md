@@ -129,9 +129,6 @@ All routes below are mounted under `/api` unless noted.
 - POST `/api/vision/upload` (multipart: `image`)
 - POST `/api/vision/analyze`
 
-### Fire (Custom Vision)
-- POST `/api/fire/analyze` (multipart: `image`)
-
 ### Certificates
 - POST `/api/certificates/upload`
 - POST `/api/certificates/preview-atex`

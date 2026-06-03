@@ -19,6 +19,23 @@ function slugify(name) {
     .substring(0, 64);
 }
 
+function normalizeFeatures(features, tenantType) {
+  const hasMaintenance = features && Object.prototype.hasOwnProperty.call(features, 'maintenance');
+  return {
+    maintenance: String(tenantType || '').toLowerCase() === 'personal'
+      ? false
+      : (hasMaintenance ? Boolean(features.maintenance) : false)
+  };
+}
+
+function normalizeTenantFeaturesForResponse(tenant) {
+  if (!tenant) return tenant;
+  return {
+    ...tenant,
+    features: normalizeFeatures(tenant.features, tenant.type)
+  };
+}
+
 async function ensureUniqueTenantName(base) {
   const raw = base && base.trim() ? base : `tenant-${Math.random().toString(36).slice(2,8)}`;
   let candidate = slugify(raw);
@@ -48,13 +65,45 @@ exports.listTenants = async (req, res) => {
     }
 
     const tenants = await Tenant.find(query)
-      .select('_id name type plan seats seatsManaged ownerUserId professionRbacEnabled createdAt updatedAt')
+      .select('_id name type plan seats seatsManaged ownerUserId professionRbacEnabled features createdAt updatedAt')
       .lean();
 
-    return res.json({ items: tenants, total: tenants.length });
+    return res.json({
+      items: tenants.map(normalizeTenantFeaturesForResponse),
+      total: tenants.length
+    });
   } catch (e) {
     console.error('[tenants/list] error', e);
     return res.status(500).json({ message: 'List tenants failed.' });
+  }
+};
+
+/**
+ * GET /api/tenant-features
+ * Any authenticated user can read feature flags for their own tenant.
+ */
+exports.getCurrentTenantFeatures = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId || null;
+    if (!tenantId) {
+      return res.status(403).json({ message: 'Missing tenantId' });
+    }
+
+    const tenant = await Tenant.findById(tenantId)
+      .select('_id type features')
+      .lean();
+
+    if (!tenant) {
+      return res.status(404).json({ message: 'Tenant not found' });
+    }
+
+    return res.json({
+      tenantId: String(tenant._id),
+      features: normalizeFeatures(tenant.features, tenant.type)
+    });
+  } catch (e) {
+    console.error('[tenants/features] error', e);
+    return res.status(500).json({ message: 'Get tenant features failed.' });
   }
 };
 
@@ -72,11 +121,11 @@ exports.searchTenants = async (req, res) => {
     const items = await Tenant.find({
       name: { $regex: q, $options: 'i' }
     })
-      .select('_id name type plan seats professionRbacEnabled')
+      .select('_id name type plan seats professionRbacEnabled features')
       .limit(20)
       .lean();
 
-    return res.json({ items });
+    return res.json({ items: items.map(normalizeTenantFeaturesForResponse) });
   } catch (e) {
     console.error('[tenants/search] error', e);
     return res.status(500).json({ message: 'Search failed.' });
@@ -135,7 +184,8 @@ exports.createTenant = async (req, res) => {
       plan,
       ownerUserId: ownerUserId || undefined,
       seats: { max: seatsMax, used: 0 },
-      seatsManaged
+      seatsManaged,
+      features: { maintenance: false }
     });
 
     return res.status(201).json(t);
@@ -161,14 +211,14 @@ exports.getTenantById = async (req, res) => {
     }
 
     const tenant = await Tenant.findById(id)
-      .select('_id name type plan seats seatsManaged ownerUserId professionRbacEnabled createdAt updatedAt')
+      .select('_id name type plan seats seatsManaged ownerUserId professionRbacEnabled features createdAt updatedAt')
       .lean();
 
     if (!tenant) {
       return res.status(404).json({ message: 'Tenant not found' });
     }
 
-    return res.json(tenant);
+    return res.json(normalizeTenantFeaturesForResponse(tenant));
   } catch (e) {
     console.error('[tenants/getById] error', e);
     return res.status(500).json({ message: 'Get tenant failed.' });
@@ -197,7 +247,7 @@ exports.updateTenant = async (req, res) => {
       return res.status(404).json({ message: 'Tenant not found' });
     }
 
-    const { name, seatsMax, seatsManaged, plan, professionRbacEnabled } = req.body || {};
+    const { name, seatsMax, seatsManaged, plan, professionRbacEnabled, features } = req.body || {};
     const updates = {};
 
     // name (slug + ensure unique)
@@ -282,8 +332,26 @@ exports.updateTenant = async (req, res) => {
       updates.professionRbacEnabled = Boolean(professionRbacEnabled);
     }
 
+    // Tenant feature flags (SuperAdmin only)
+    if (features !== undefined) {
+      if (role !== 'SuperAdmin') {
+        return res.status(403).json({ message: 'Only SuperAdmin can change tenant feature settings.' });
+      }
+      if (features && typeof features === 'object' && !Array.isArray(features)) {
+        if (features.maintenance !== undefined) {
+          if (tenant.type === 'personal' && Boolean(features.maintenance)) {
+            return res.status(400).json({ message: 'Maintenance cannot be enabled for personal tenants.' });
+          }
+          updates['features.maintenance'] = Boolean(features.maintenance);
+        }
+      } else {
+        return res.status(400).json({ message: 'Invalid features payload.' });
+      }
+    }
+
     // Végrehajtás
     const updated = await Tenant.findByIdAndUpdate(id, updates, { new: true });
+    const updatedJson = updated ? normalizeTenantFeaturesForResponse(updated.toObject ? updated.toObject() : updated) : updated;
 
     // Best-effort: keep Stripe Customer name in sync (if configured)
     if (updates.name && stripe && updated?.stripeCustomerId) {
@@ -297,7 +365,7 @@ exports.updateTenant = async (req, res) => {
       }
     }
 
-    return res.json(updated);
+    return res.json(updatedJson);
   } catch (e) {
     console.error('[tenants/update] error', e);
     return res.status(500).json({ message: 'Update tenant failed.' });
