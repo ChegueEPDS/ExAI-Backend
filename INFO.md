@@ -93,7 +93,6 @@ All routes below are mounted under `/api` unless noted.
 - GET `/api/conversations`
 - GET `/api/conversation`
 - POST `/api/conversation/standard-explorer`
-- POST `/api/aisearch`
 
 ### Assistant Instructions + Vector Store Files
 - GET `/api/instructions`

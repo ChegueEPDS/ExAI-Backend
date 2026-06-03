@@ -8,7 +8,6 @@ const {
   deleteConversation,
   getConversations,
   getConversationById,
-  searchAndRespond,
   uploadAndAskStream,
   sendMessageStream,
   setStandardExplorer
@@ -54,7 +53,6 @@ router.post('/rate-message', authMiddleware(), rateMessage);
 router.post('/save-feedback', authMiddleware(), saveFeedback);
 router.delete('/conversation/:threadId', authMiddleware(), deleteConversation);
 router.get('/conversations', authMiddleware(), getConversations);
-router.post('/aisearch', authMiddleware(), searchAndRespond);
 
 // Korábbi beszélgetés betöltése
 router.get('/conversation', authMiddleware(), getConversationById);
