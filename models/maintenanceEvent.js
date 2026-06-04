@@ -42,4 +42,16 @@ MaintenanceEventSchema.index({ tenantId: 1, equipmentId: 1, occurredAt: -1 });
 MaintenanceEventSchema.index({ tenantId: 1, equipmentId: 1, kind: 1, occurredAt: -1 });
 MaintenanceEventSchema.index({ tenantId: 1, source: 1, sourceId: 1, kind: 1 });
 
+MaintenanceEventSchema.post('save', function scheduleDashboardIncidentRefresh(doc) {
+  try {
+    if (!doc?.tenantId || !doc?.equipmentId) return;
+    require('../services/dashboardIncidentService').scheduleRecomputeEquipmentIncidents({
+      tenantId: doc.tenantId,
+      equipmentId: doc.equipmentId
+    });
+  } catch {
+    // Best-effort cache refresh; never block maintenance writes.
+  }
+});
+
 module.exports = mongoose.model('MaintenanceEvent', MaintenanceEventSchema);

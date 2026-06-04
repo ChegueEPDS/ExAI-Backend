@@ -5,6 +5,10 @@ const Inspection = require('../models/inspection');
 const MaintenanceEvent = require('../models/maintenanceEvent');
 const Tenant = require('../models/tenant');
 const { buildMaintenanceSchemaIncidents, buildComplianceSchemaIncidents } = require('./schemaMaintenanceService');
+const {
+  loadMaterializedIncidents,
+  mapMaterializedIncident
+} = require('./dashboardIncidentService');
 
 function toObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
@@ -522,13 +526,38 @@ async function computeDashboardAnalytics({ tenantId, siteId = null, zoneId = nul
   const equipmentIds = equipments.map((e) => e._id).filter(Boolean);
   const equipmentsById = new Map(equipments.map((e) => [String(e._id), e]));
 
-  const [slaTargets, complianceIncidents, complianceSchemaIncidents, maintenanceIncidents, maintenanceSchemaIncidents] = await Promise.all([
+  const [slaTargets, materialized] = await Promise.all([
     loadSlaTargets(tenantObjectId),
-    buildComplianceIncidents({ tenantId: tenantObjectId, equipmentIds }),
-    buildComplianceSchemaIncidents({ tenantId: tenantObjectId, equipmentIds }),
-    buildMaintenanceIncidents({ tenantId: tenantObjectId, equipmentIds }),
-    buildMaintenanceSchemaIncidents({ tenantId: tenantObjectId, equipmentIds })
+    loadMaterializedIncidents({ tenantId: tenantObjectId, equipmentIds })
   ]);
+
+  let complianceIncidents;
+  let complianceSchemaIncidents;
+  let maintenanceIncidents;
+  let maintenanceSchemaIncidents;
+
+  if (materialized.complete) {
+    const materializedIncidents = materialized.incidents || [];
+    complianceIncidents = materializedIncidents
+      .filter((doc) => doc.kind === 'compliance')
+      .map(mapMaterializedIncident);
+    complianceSchemaIncidents = materializedIncidents
+      .filter((doc) => doc.kind === 'compliance-schema')
+      .map(mapMaterializedIncident);
+    maintenanceIncidents = materializedIncidents
+      .filter((doc) => doc.kind === 'maintenance')
+      .map(mapMaterializedIncident);
+    maintenanceSchemaIncidents = materializedIncidents
+      .filter((doc) => doc.kind === 'maintenance-schema')
+      .map(mapMaterializedIncident);
+  } else {
+    [complianceIncidents, complianceSchemaIncidents, maintenanceIncidents, maintenanceSchemaIncidents] = await Promise.all([
+      buildComplianceIncidents({ tenantId: tenantObjectId, equipmentIds }),
+      buildComplianceSchemaIncidents({ tenantId: tenantObjectId, equipmentIds }),
+      buildMaintenanceIncidents({ tenantId: tenantObjectId, equipmentIds }),
+      buildMaintenanceSchemaIncidents({ tenantId: tenantObjectId, equipmentIds })
+    ]);
+  }
 
   // Process MTTR view: closed durations of incidents that started in window
   const mttrMaintenance = formatStats(

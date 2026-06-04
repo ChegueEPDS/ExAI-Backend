@@ -4,9 +4,9 @@ const Tenant = require('../models/tenant');
 
 async function sweepExpiredSubscriptions() {
   const now = new Date();
-  // Olyan előfizetések, amelyek már lejártak (period_end < now) és nem aktívak
+  // Olyan előfizetések, amelyek már lejártak és nem aktívak.
   const candidates = await Subscription.find({
-    currentPeriodEnd: { $ne: null, $lt: now },
+    expiresAt: { $ne: null, $lt: now },
     status: { $nin: ['active', 'trialing'] }
   }).select('tenantId').lean();
 

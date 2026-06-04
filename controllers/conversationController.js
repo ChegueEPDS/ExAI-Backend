@@ -5,6 +5,7 @@ const logger = require('../config/logger');
 const Conversation = require('../models/conversation');
 const User = require('../models/user');
 const Tenant = require('../models/tenant');
+const { attachAssistantRatingCategory } = require('../services/conversationStatsService');
 
 const { handleSendMessageStream } = require('../services/chatStreamService');
 
@@ -75,6 +76,7 @@ exports.rateMessage = async (req, res) => {
         ...conversation.messages[messageIndex]._doc,
         rating: rating
       };
+      attachAssistantRatingCategory(conversation.messages, messageIndex);
       await conversation.save();
       return res.status(200).json({ message: 'Értékelés mentve.' });
     } else {

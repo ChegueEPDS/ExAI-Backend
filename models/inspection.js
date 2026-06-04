@@ -144,4 +144,46 @@ const InspectionSchema = new Schema(
   }
 );
 
+InspectionSchema.index({
+  tenantId: 1,
+  equipmentId: 1,
+  finalizedAt: 1,
+  createdAt: 1,
+  inspectionDate: 1,
+  _id: 1
+});
+InspectionSchema.index({
+  tenantId: 1,
+  equipmentId: 1,
+  schemaId: 1,
+  finalizedAt: 1,
+  createdAt: 1,
+  inspectionDate: 1,
+  _id: 1
+});
+InspectionSchema.index({
+  tenantId: 1,
+  equipmentId: 1,
+  reviewStatus: 1,
+  schemaId: 1
+});
+InspectionSchema.index({
+  tenantId: 1,
+  equipmentId: 1,
+  inspectionDate: -1,
+  createdAt: -1
+});
+
+InspectionSchema.post('save', function scheduleDashboardIncidentRefresh(doc) {
+  try {
+    if (!doc?.tenantId || !doc?.equipmentId) return;
+    require('../services/dashboardIncidentService').scheduleRecomputeEquipmentIncidents({
+      tenantId: doc.tenantId,
+      equipmentId: doc.equipmentId
+    });
+  } catch {
+    // Best-effort cache refresh; never block inspection writes.
+  }
+});
+
 module.exports = mongoose.model('Inspection', InspectionSchema);

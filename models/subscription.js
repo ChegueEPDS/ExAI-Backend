@@ -24,6 +24,7 @@ const SubscriptionSchema = new mongoose.Schema({
 
 // Hasznos indexek
 SubscriptionSchema.index({ tenantId: 1 });
+SubscriptionSchema.index({ tenantId: 1, updatedAt: -1 });
 SubscriptionSchema.index({ expiresAt: 1 });
 
 module.exports = mongoose.model('Subscription', SubscriptionSchema);

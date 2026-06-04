@@ -4,6 +4,10 @@ const Inspection = require('../models/inspection');
 const Unit = require('../models/unit');
 const MaintenanceEvent = require('../models/maintenanceEvent');
 const { buildMaintenanceSchemaIncidents, buildComplianceSchemaIncidents } = require('./schemaMaintenanceService');
+const {
+  loadMaterializedIncidents,
+  mapMaterializedIncident
+} = require('./dashboardIncidentService');
 
 function toObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
@@ -386,26 +390,70 @@ async function computeHealthMetrics({
   const fromMs = from ? toMillis(from) : null;
   const toMs = to ? toMillis(to) : null;
   const normalizedMode = normalizeMode(mode);
-  const [compliance, complianceSchemas, maintenance, maintenanceSchemas] = await Promise.all([
-    computeComplianceMetrics({ tenantId, equipmentIds, fromMs, toMs, mode: normalizedMode }),
-    computeComplianceSchemaMetrics({ tenantId, equipmentIds, fromMs, toMs, mode: normalizedMode }),
-    computeMaintenanceMetrics({
-      tenantId,
-      equipmentIds,
-      fromMs,
-      toMs,
-      mode: normalizedMode,
-      severities: severity
-    }),
-    computeMaintenanceSchemaMetrics({
-      tenantId,
-      equipmentIds,
-      fromMs,
-      toMs,
-      mode: normalizedMode,
-      severities: severity
-    })
-  ]);
+  const materialized = await loadMaterializedIncidents({ tenantId, equipmentIds });
+  let compliance;
+  let complianceSchemas;
+  let maintenance;
+  let maintenanceSchemas;
+
+  if (materialized.complete) {
+    const materializedIncidents = materialized.incidents || [];
+    const severitiesNorm = normalizeSeverities(severity);
+    const fromDocs = (kind) => materializedIncidents
+      .filter((doc) => doc.kind === kind)
+      .map(mapMaterializedIncident)
+      .filter((inc) => applyWindow(inc, { fromMs, toMs, mode: normalizedMode }))
+      .filter((inc) => {
+        if (!severitiesNorm || !kind.includes('maintenance')) return true;
+        return inc.severity && severitiesNorm.includes(String(inc.severity).toUpperCase());
+      });
+
+    compliance = metricStatsFromIncidents(fromDocs('compliance'));
+    maintenance = metricStatsFromIncidents(fromDocs('maintenance'));
+    const maintenanceSchemaIncidents = fromDocs('maintenance-schema');
+    maintenanceSchemas = metricStatsFromIncidents(maintenanceSchemaIncidents);
+    const complianceSchemaIncidents = fromDocs('compliance-schema');
+    complianceSchemas = metricStatsFromIncidents(complianceSchemaIncidents);
+
+    for (const [target, incidents, fallbackName] of [
+      [maintenanceSchemas, maintenanceSchemaIncidents, 'Maintenance schema'],
+      [complianceSchemas, complianceSchemaIncidents, 'Compliance schema']
+    ]) {
+      const bySchemaMap = new Map();
+      for (const inc of incidents) {
+        const schemaId = inc.schemaId ? String(inc.schemaId) : '';
+        if (!schemaId) continue;
+        if (!bySchemaMap.has(schemaId)) {
+          bySchemaMap.set(schemaId, { schemaId, name: inc.schemaName || fallbackName, incidents: [] });
+        }
+        bySchemaMap.get(schemaId).incidents.push(inc);
+      }
+      target.bySchema = Array.from(bySchemaMap.values())
+        .map((item) => ({ schemaId: item.schemaId, name: item.name, ...metricStatsFromIncidents(item.incidents) }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+    }
+  } else {
+    [compliance, complianceSchemas, maintenance, maintenanceSchemas] = await Promise.all([
+      computeComplianceMetrics({ tenantId, equipmentIds, fromMs, toMs, mode: normalizedMode }),
+      computeComplianceSchemaMetrics({ tenantId, equipmentIds, fromMs, toMs, mode: normalizedMode }),
+      computeMaintenanceMetrics({
+        tenantId,
+        equipmentIds,
+        fromMs,
+        toMs,
+        mode: normalizedMode,
+        severities: severity
+      }),
+      computeMaintenanceSchemaMetrics({
+        tenantId,
+        equipmentIds,
+        fromMs,
+        toMs,
+        mode: normalizedMode,
+        severities: severity
+      })
+    ]);
+  }
 
   const complianceDurations = Array.isArray(compliance.__durationsMs) ? compliance.__durationsMs : [];
   const complianceSchemaDurations = Array.isArray(complianceSchemas.__durationsMs) ? complianceSchemas.__durationsMs : [];

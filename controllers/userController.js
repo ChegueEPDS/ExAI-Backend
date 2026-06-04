@@ -6,6 +6,8 @@ const DownloadQuota = require('../models/downloadQuota');
 const Subscription = require('../models/subscription');
 const SubscriptionModel = Subscription; // alias for clarity if needed elsewhere
 const Tenant = require('../models/tenant');
+const Certificate = require('../models/certificate');
+const DraftCertificate = require('../models/draftCertificate');
 const path = require('path');
 
 const mailService = require('../services/mailService');
@@ -196,53 +198,6 @@ exports.listUsers = async (req, res) => {
         }
       },
       { $unwind: { path: '$subscription', preserveNullAndEmptyArrays: true } },
-      // Add: public certificate contribution count per user
-      {
-        $lookup: {
-          from: 'certificates',
-          let: { uid: '$_id' },
-          pipeline: [
-            {
-              $match: {
-                $expr: {
-                  $and: [
-                    { $eq: ['$createdBy', '$$uid'] },
-                    { $eq: ['$visibility', 'public'] }
-                  ]
-                }
-              }
-            },
-            { $count: 'count' }
-          ],
-          as: 'publicContributionAgg'
-        }
-      },
-      { $addFields: { publicContributionCount: { $ifNull: [ { $arrayElemAt: ['$publicContributionAgg.count', 0] }, 0 ] } } },
-      { $unset: 'publicContributionAgg' },
-      // Add: pending drafts count per user (statuses: draft, ready, error), robust id matching
-      {
-        $lookup: {
-          from: 'draftcertificates',
-          let: { uid: '$_id', tId: '$tenantId' },
-          pipeline: [
-            {
-              $match: {
-                $expr: {
-                  $and: [
-                    { $eq: ['$createdBy', '$$uid'] },
-                    { $eq: ['$tenantId', '$$tId'] },
-                    { $in: ['$status', ['draft', 'ready', 'error']] }
-                  ]
-                }
-              }
-            },
-            { $count: 'count' }
-          ],
-          as: 'pendingAgg'
-        }
-      },
-      { $addFields: { pendingCount: { $ifNull: [ { $arrayElemAt: ['$pendingAgg.count', 0] }, 0 ] } } },
-      { $unset: 'pendingAgg' },
       {
         $project: {
           _id: 0,
@@ -261,9 +216,7 @@ exports.listUsers = async (req, res) => {
           subscriptionTier: '$subscription.tier',
           subscriptionStatus: '$subscription.status',
           subscriptionExpiresAt: '$subscription.expiresAt',
-          professions: 1,
-          publicContributionCount: 1,
-          pendingCount: 1
+          professions: 1
         }
       }
     );
@@ -297,6 +250,34 @@ exports.listUsers = async (req, res) => {
       stats: 'publicContributionCount'
     };
     const sortField = sortFieldMap[sortByRaw] || 'firstName';
+
+    if (sortField === 'publicContributionCount') {
+      pipeline.push(
+        {
+          $lookup: {
+            from: 'certificates',
+            let: { uid: '$id' },
+            pipeline: [
+              {
+                $match: {
+                  $expr: {
+                    $and: [
+                      { $eq: ['$createdBy', '$$uid'] },
+                      { $eq: ['$visibility', 'public'] }
+                    ]
+                  }
+                }
+              },
+              { $count: 'count' }
+            ],
+            as: 'publicContributionAgg'
+          }
+        },
+        { $addFields: { publicContributionCount: { $ifNull: [{ $arrayElemAt: ['$publicContributionAgg.count', 0] }, 0] } } },
+        { $unset: 'publicContributionAgg' }
+      );
+    }
+
     const sortSpec = { [sortField]: sortDir };
     if (sortField !== 'firstName') sortSpec.firstName = 1;
     if (sortField !== 'lastName') sortSpec.lastName = 1;
@@ -322,8 +303,37 @@ exports.listUsers = async (req, res) => {
       ]).then(countArr => (countArr[0]?.count || 0))
     ]);
 
+    const userIds = rows.map((row) => row.id).filter(Boolean);
+    const tenantIds = rows.map((row) => row.tenantId).filter(Boolean);
+    const [contributionRows, pendingRows] = userIds.length
+      ? await Promise.all([
+          Certificate.aggregate([
+            { $match: { createdBy: { $in: userIds }, visibility: 'public' } },
+            { $group: { _id: '$createdBy', count: { $sum: 1 } } }
+          ]),
+          DraftCertificate.aggregate([
+            {
+              $match: {
+                createdBy: { $in: userIds },
+                tenantId: { $in: tenantIds },
+                status: { $in: ['draft', 'ready', 'error'] }
+              }
+            },
+            { $group: { _id: '$createdBy', count: { $sum: 1 } } }
+          ])
+        ])
+      : [[], []];
+
+    const contributionByUser = new Map((contributionRows || []).map((row) => [String(row._id), Number(row.count || 0)]));
+    const pendingByUser = new Map((pendingRows || []).map((row) => [String(row._id), Number(row.count || 0)]));
+    const enrichedRows = rows.map((row) => ({
+      ...row,
+      publicContributionCount: contributionByUser.get(String(row.id)) || 0,
+      pendingCount: pendingByUser.get(String(row.id)) || 0
+    }));
+
     return res.json({
-      items: rows,
+      items: enrichedRows,
       total,
       page,
       pageSize

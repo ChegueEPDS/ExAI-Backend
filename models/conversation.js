@@ -7,6 +7,8 @@ const MessageSchema = new mongoose.Schema({
   images: [{ type: String }],
   rating: { type: Number, min: 1, max: 5 },
   category: { type: String },
+  // Denormalized for statistics: category of the user message this assistant answer belongs to.
+  assistantRatingCategory: { type: String, index: true },
   feedback: {
     comment: { type: String, default: null },
     references: { type: String, default: null },
@@ -103,5 +105,7 @@ const ConversationSchema = new mongoose.Schema({
 ConversationSchema.index({ userId: 1, 'job.status': 1, updatedAt: -1 });
 ConversationSchema.index({ createdAt: -1 });
 ConversationSchema.index({ tenantId: 1, updatedAt: -1 });
+ConversationSchema.index({ tenantId: 1, 'messages.category': 1 });
+ConversationSchema.index({ tenantId: 1, 'messages.assistantRatingCategory': 1 });
 
 module.exports = mongoose.model('Conversation', ConversationSchema);
