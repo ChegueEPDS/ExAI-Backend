@@ -536,27 +536,34 @@ async function computeDashboardAnalytics({ tenantId, siteId = null, zoneId = nul
   let maintenanceIncidents;
   let maintenanceSchemaIncidents;
 
-  if (materialized.complete) {
-    const materializedIncidents = materialized.incidents || [];
-    complianceIncidents = materializedIncidents
-      .filter((doc) => doc.kind === 'compliance')
-      .map(mapMaterializedIncident);
-    complianceSchemaIncidents = materializedIncidents
-      .filter((doc) => doc.kind === 'compliance-schema')
-      .map(mapMaterializedIncident);
-    maintenanceIncidents = materializedIncidents
-      .filter((doc) => doc.kind === 'maintenance')
-      .map(mapMaterializedIncident);
-    maintenanceSchemaIncidents = materializedIncidents
-      .filter((doc) => doc.kind === 'maintenance-schema')
-      .map(mapMaterializedIncident);
-  } else {
-    [complianceIncidents, complianceSchemaIncidents, maintenanceIncidents, maintenanceSchemaIncidents] = await Promise.all([
-      buildComplianceIncidents({ tenantId: tenantObjectId, equipmentIds }),
-      buildComplianceSchemaIncidents({ tenantId: tenantObjectId, equipmentIds }),
-      buildMaintenanceIncidents({ tenantId: tenantObjectId, equipmentIds }),
-      buildMaintenanceSchemaIncidents({ tenantId: tenantObjectId, equipmentIds })
+  const materializedIncidents = materialized.incidents || [];
+  complianceIncidents = materializedIncidents
+    .filter((doc) => doc.kind === 'compliance')
+    .map(mapMaterializedIncident);
+  complianceSchemaIncidents = materializedIncidents
+    .filter((doc) => doc.kind === 'compliance-schema')
+    .map(mapMaterializedIncident);
+  maintenanceIncidents = materializedIncidents
+    .filter((doc) => doc.kind === 'maintenance')
+    .map(mapMaterializedIncident);
+  maintenanceSchemaIncidents = materializedIncidents
+    .filter((doc) => doc.kind === 'maintenance-schema')
+    .map(mapMaterializedIncident);
+
+  const missingEquipmentIds = materialized.complete
+    ? []
+    : (materialized.missingEquipmentIds?.length ? materialized.missingEquipmentIds : equipmentIds);
+  if (missingEquipmentIds.length) {
+    const [rawCompliance, rawComplianceSchemas, rawMaintenance, rawMaintenanceSchemas] = await Promise.all([
+      buildComplianceIncidents({ tenantId: tenantObjectId, equipmentIds: missingEquipmentIds }),
+      buildComplianceSchemaIncidents({ tenantId: tenantObjectId, equipmentIds: missingEquipmentIds }),
+      buildMaintenanceIncidents({ tenantId: tenantObjectId, equipmentIds: missingEquipmentIds }),
+      buildMaintenanceSchemaIncidents({ tenantId: tenantObjectId, equipmentIds: missingEquipmentIds })
     ]);
+    complianceIncidents = complianceIncidents.concat(rawCompliance);
+    complianceSchemaIncidents = complianceSchemaIncidents.concat(rawComplianceSchemas);
+    maintenanceIncidents = maintenanceIncidents.concat(rawMaintenance);
+    maintenanceSchemaIncidents = maintenanceSchemaIncidents.concat(rawMaintenanceSchemas);
   }
 
   // Process MTTR view: closed durations of incidents that started in window

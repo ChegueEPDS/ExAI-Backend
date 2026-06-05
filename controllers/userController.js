@@ -290,18 +290,23 @@ exports.listUsers = async (req, res) => {
     const pageSize = allowedPageSizes.includes(pageSizeRaw) ? pageSizeRaw : 25;
     const skip = (page - 1) * pageSize;
 
-    const [rows, total] = await Promise.all([
-      User.aggregate([
-        ...pipeline,
-        sortStage,
-        { $skip: skip },
-        { $limit: pageSize }
-      ]),
-      User.aggregate([
-        ...pipeline,
-        { $count: 'count' }
-      ]).then(countArr => (countArr[0]?.count || 0))
+    const [facetResult] = await User.aggregate([
+      ...pipeline,
+      {
+        $facet: {
+          rows: [
+            sortStage,
+            { $skip: skip },
+            { $limit: pageSize }
+          ],
+          total: [
+            { $count: 'count' }
+          ]
+        }
+      }
     ]);
+    const rows = facetResult?.rows || [];
+    const total = facetResult?.total?.[0]?.count || 0;
 
     const userIds = rows.map((row) => row.id).filter(Boolean);
     const tenantIds = rows.map((row) => row.tenantId).filter(Boolean);

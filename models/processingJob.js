@@ -20,6 +20,7 @@ const ProcessingJobSchema = new mongoose.Schema(
     processed: { type: Number, default: 0 },
     startedAt: { type: Date, default: null },
     finishedAt: { type: Date, default: null },
+    errorMessage: { type: String, default: '' },
     equipmentIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Equipment', default: [] }],
     // Optional per-equipment metadata for async processing (e.g. mobile failure note).
     // Keys are equipmentId strings.
@@ -35,5 +36,6 @@ const ProcessingJobSchema = new mongoose.Schema(
 );
 
 ProcessingJobSchema.index({ type: 1, status: 1, createdAt: 1 });
+ProcessingJobSchema.index({ type: 1, status: 1, startedAt: 1 });
 
 module.exports = mongoose.model('ProcessingJob', ProcessingJobSchema);

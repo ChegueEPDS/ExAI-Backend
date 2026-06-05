@@ -9,6 +9,10 @@ router.post('/certificates/upload', authMiddleware(), certificateController.uplo
 
 // ATEX preview (server-side OCR + AI; no save, no blob upload)
 router.post('/certificates/preview-atex', authMiddleware(), certificateController.previewAtex);
+router.post('/certificates/preview-atex/jobs', authMiddleware(), certificateController.createPreviewAtexJob);
+router.post('/certificates/preview-atex/jobs/:jobId/start', authMiddleware(), certificateController.startPreviewAtexJob);
+router.get('/certificates/preview-atex/jobs/:jobId', authMiddleware(), certificateController.getPreviewAtexJob);
+router.delete('/certificates/preview-atex/jobs/:jobId', authMiddleware(), certificateController.deletePreviewAtexJob);
 
 // Listázás
 router.get('/certificates/samples', certificateController.getCertificatesSamples);

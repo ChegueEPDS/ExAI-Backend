@@ -18,6 +18,7 @@ const heicConvert = require('heic-convert');
 const unzipper = require('unzipper');
 const {
   buildCertificateCacheForTenant,
+  buildCertificateCacheForCertNos,
   resolveCertificateFromCache
 } = require('../helpers/certificateMatchHelper');
 const { notifyAndStore } = require('../lib/notifications/notifier');
@@ -169,6 +170,53 @@ const SEARCHABLE_EQUIPMENT_FIELDS = [
   'Compliance',
   'Other Info'
 ];
+
+const EQUIPMENT_LIST_SELECT = [
+  'EqID',
+  'TagNo',
+  'Manufacturer',
+  'Model/Type',
+  'Serial Number',
+  'Equipment Type',
+  'IP rating',
+  'Max Ambient Temp',
+  'Other Info',
+  'Qualitycheck',
+  'CreatedBy',
+  'ModifiedBy',
+  'Site',
+  'Zone',
+  'Unit',
+  'X condition',
+  'Pictures.blobUrl',
+  'Pictures.tag',
+  'documents.blobUrl',
+  'documents.type',
+  'documents.tag',
+  'customFields',
+  'schemaAssignments',
+  'orderIndex',
+  'lastInspectionDate',
+  'lastInspectionValidUntil',
+  'lastInspectionStatus',
+  'lastInspectionId',
+  'operationalStatus',
+  'pendingReview',
+  'updatedAt',
+  'createdAt'
+].join(' ');
+
+const EQUIPMENT_LIST_SORT_FIELDS = new Set([
+  'orderIndex',
+  'createdAt',
+  'updatedAt',
+  'EqID',
+  'TagNo',
+  'Manufacturer',
+  'Serial Number',
+  'lastInspectionValidUntil',
+  'lastInspectionDate'
+]);
 
 const EXCEL_SERIAL_DATE_OFFSET = 25569;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -777,7 +825,7 @@ function equipmentImportInspectionColumns() {
     { header: 'Inspection Date', group: 'INSPECTION DATA', width: 18, comment: 'Optional. Enter a date, preferably YYYY-MM-DD. If Status is Passed, an inspection can be created from this date.' },
     { header: 'Type', group: 'INSPECTION DATA', width: 18, comment: 'Optional inspection type. Allowed values: Detailed, Visual, Initial Detailed, Initial Detailed (Index), Close.' },
     { header: 'Status', group: 'INSPECTION DATA', width: 14, comment: 'Allowed values: Passed, Failed, NA. Passed with Inspection Date creates an inspection.' },
-    { header: 'Remarks', group: 'INSPECTION DATA', width: 28, comment: 'Free text remarks imported into equipment notes.' }
+    { header: 'Remarks', group: 'INSPECTION DATA', width: 28, comment: 'Free text remarks imported into the inspection-level ITR remarks.' }
   ];
 }
 
@@ -1951,6 +1999,7 @@ exports.importEquipmentXLSX = async (req, res) => {
           inspectionStatus,
           inspectionType: inspectionType || null,
           schemaAssignments: [],
+          inspectionRemarks: remarks || '',
           rbCertificateNo: certificateNo || declarationNo || '',
           rbCompliance: inspectionStatus || 'NA'
         });
@@ -1974,6 +2023,7 @@ exports.importEquipmentXLSX = async (req, res) => {
       if (qualitycheck != null) entry.base.Qualitycheck = qualitycheck;
       if (certificateNo && !entry.rbCertificateNo) entry.rbCertificateNo = certificateNo;
       if (remarks) entry.base['Other Info'] = remarks;
+      if (remarks) entry.inspectionRemarks = remarks;
       if (Object.keys(customFieldsRaw).length) {
         entry.base.customFields = {
           ...(entry.base.customFields || {}),
@@ -2148,7 +2198,8 @@ exports.importEquipmentXLSX = async (req, res) => {
               entry.inspectionDate,
               userId,
               tenantId,
-              entry.inspectionType || 'Detailed'
+              entry.inspectionType || 'Detailed',
+              entry.inspectionRemarks || ''
             );
             stats.inspections += 1;
           } catch (inspectionError) {
@@ -2815,7 +2866,7 @@ exports.cleanupTempUploadsNow = async (_req, res) => {
   }
 };
 
-async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspectorId, tenantId, inspectionType = 'Detailed') {
+async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspectorId, tenantId, inspectionType = 'Detailed', remarks = '') {
   const date = new Date(inspectionDate);
   if (Number.isNaN(date.getTime())) {
     throw new Error('Invalid inspection date provided.');
@@ -2897,6 +2948,7 @@ async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspe
     inspectorId,
     results,
     attachments: [],
+    remarks: String(remarks || '').trim(),
     summary,
     status
   });
@@ -4702,6 +4754,12 @@ exports.listEquipment = async (req, res) => {
       filter["TagNo"] = req.query.TagNo;
     }
 
+    if (req.query.Qualitycheck !== undefined) {
+      const raw = String(req.query.Qualitycheck).trim().toLowerCase();
+      if (['true', '1', 'yes'].includes(raw)) filter.Qualitycheck = true;
+      else if (['false', '0', 'no'].includes(raw)) filter.Qualitycheck = false;
+    }
+
     if (searchTerm) {
       const regex = new RegExp(escapeRegex(searchTerm), 'i');
       const searchConditions = SEARCHABLE_EQUIPMENT_FIELDS.map(field => ({ [field]: regex }));
@@ -4722,34 +4780,36 @@ exports.listEquipment = async (req, res) => {
       filter.isProcessed = { $ne: false };
     }
 
-    const sortField = typeof req.query.sortBy === 'string' && req.query.sortBy.trim()
-      ? req.query.sortBy
+    const requestedSortField = typeof req.query.sortBy === 'string' && req.query.sortBy.trim()
+      ? req.query.sortBy.trim()
       : 'orderIndex';
+    const sortField = EQUIPMENT_LIST_SORT_FIELDS.has(requestedSortField) ? requestedSortField : 'orderIndex';
     const sortDir = req.query.sortDir === 'desc' ? -1 : 1;
     const sortOptions = { [sortField]: sortDir, _id: 1 };
 
     const rawPageSize = parseInt(req.query.pageSize || req.query.limit, 10);
-    const usePagination = Number.isFinite(rawPageSize) && rawPageSize > 0;
-    const pageSize = usePagination ? Math.max(rawPageSize, 1) : null;
+    const usePagination = true;
+    const pageSize = Number.isFinite(rawPageSize) && rawPageSize > 0
+      ? Math.min(Math.max(rawPageSize, 1), 200)
+      : 100;
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const skipParam = parseInt(req.query.skip, 10);
-    const skip = usePagination
-      ? (Number.isFinite(skipParam) && skipParam >= 0 ? skipParam : (page - 1) * pageSize)
-      : null;
+    const skip = Number.isFinite(skipParam) && skipParam >= 0 ? skipParam : (page - 1) * pageSize;
 
-    let query = Equipment.find(filter).sort(sortOptions);
-    if (usePagination && pageSize != null) {
-      query = query.skip(skip || 0).limit(pageSize);
-    }
+    const query = Equipment.find(filter)
+      .select(EQUIPMENT_LIST_SELECT)
+      .sort(sortOptions)
+      .skip(skip || 0)
+      .limit(pageSize);
 
     const [equipments, totalCount] = await Promise.all([
       query.lean(),
-      usePagination ? Equipment.countDocuments(filter) : Promise.resolve(null)
+      Equipment.countDocuments(filter)
     ]);
 
     let certMap = new Map();
     try {
-      certMap = await buildCertificateCacheForTenant(tenantId);
+      certMap = await buildCertificateCacheForCertNos(tenantId, equipments.map(eq => certificateNo(eq)).filter(Boolean));
     } catch (e) {
       console.warn('⚠️ Certificate cache build failed for listEquipment:', e?.message || e);
       certMap = new Map();
@@ -4803,16 +4863,12 @@ exports.listEquipment = async (req, res) => {
       };
     });
 
-    if (usePagination && pageSize != null) {
-      return res.json({
-        items: withPaths,
-        total: typeof totalCount === 'number' ? totalCount : withPaths.length,
-        page,
-        pageSize
-      });
-    }
-
-    return res.json(withPaths);
+    return res.json({
+      items: withPaths,
+      total: typeof totalCount === 'number' ? totalCount : withPaths.length,
+      page,
+      pageSize
+    });
   } catch (error) {
     console.error('Hiba történt az eszközök listázásakor:', error);
     return res.status(500).json({ error: 'Nem sikerült lekérni az eszközöket.' });

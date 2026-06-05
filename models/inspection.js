@@ -100,6 +100,9 @@ const InspectionSchema = new Schema(
       default: [],
     },
 
+    // Free-text inspection-level remarks shown at the end of the ITR checklist.
+    remarks: { type: String, default: '' },
+
     // Összefoglaló (reporthoz, gyors szűréshez)
     summary: {
       failedCount: { type: Number, default: 0 },
@@ -171,7 +174,8 @@ InspectionSchema.index({
   tenantId: 1,
   equipmentId: 1,
   inspectionDate: -1,
-  createdAt: -1
+  createdAt: -1,
+  _id: -1
 });
 
 InspectionSchema.post('save', function scheduleDashboardIncidentRefresh(doc) {
@@ -183,6 +187,11 @@ InspectionSchema.post('save', function scheduleDashboardIncidentRefresh(doc) {
     });
   } catch {
     // Best-effort cache refresh; never block inspection writes.
+  }
+  try {
+    require('../services/rootCauseStatsService').syncInspectionRootCauseStats(doc).catch(() => {});
+  } catch {
+    // Best-effort stats mirror; never block inspection writes.
   }
 });
 

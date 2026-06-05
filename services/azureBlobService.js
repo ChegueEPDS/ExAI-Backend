@@ -171,6 +171,45 @@ async function getReadSasUrl(blobName, opts = {}) {
   return `${blobClient.url}?${sasParams.toString()}`;
 }
 
+async function getWriteSasUrl(blobName, opts = {}) {
+  const {
+    ttlSeconds = 900,
+    ip,
+    contentType,
+    httpsOnly = true
+  } = opts;
+
+  const blobPath = toBlobPath(blobName);
+  if (!blobPath) throw new Error('getWriteSasUrl: missing blob name/path');
+
+  const { accountName, accountKey } = parseConnStr(process.env.AZURE_STORAGE_CONNECTION_STRING);
+  if (!accountName || !accountKey) {
+    throw new Error('AZURE_STORAGE_CONNECTION_STRING must contain AccountName and AccountKey to generate SAS.');
+  }
+
+  const sharedKey = new StorageSharedKeyCredential(accountName, accountKey);
+  const blobClient = containerClient.getBlobClient(blobPath);
+  const startsOn = new Date(Date.now() - 60 * 1000);
+  const expiresOn = new Date(startsOn.getTime() + Math.max(60, ttlSeconds) * 1000);
+  const permissions = BlobSASPermissions.parse('cw');
+
+  const sasParams = generateBlobSASQueryParameters(
+    {
+      containerName: containerClient.containerName,
+      blobName: blobPath,
+      permissions,
+      startsOn,
+      expiresOn,
+      protocol: httpsOnly ? SASProtocol.Https : SASProtocol.HttpsAndHttp,
+      ipRange: ip ? new SASIPRange(ip, ip) : undefined,
+      contentType: contentType || undefined
+    },
+    sharedKey
+  );
+
+  return `${blobClient.url}?${sasParams.toString()}`;
+}
+
 /**
  * Delete all blobs under a given container-relative prefix (e.g. "jobs/<id>/").
  * Returns a summary with the number of deleted blobs.
@@ -300,6 +339,7 @@ module.exports = {
   },
 
   getReadSasUrl,
+  getWriteSasUrl,
   deletePrefix,
   getBlobUrl,
   toBlobPath,

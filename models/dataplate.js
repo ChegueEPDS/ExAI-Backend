@@ -106,6 +106,16 @@ const EquipmentSchema = new mongoose.Schema({
 
 // Lookup helper for mobile sync retries (not unique to avoid migration issues if old duplicates exist).
 EquipmentSchema.index({ tenantId: 1, 'mobileSync.tempId': 1 });
+EquipmentSchema.index({ tenantId: 1, isProcessed: 1, orderIndex: 1, _id: 1 });
+EquipmentSchema.index({ tenantId: 1, Site: 1, isProcessed: 1, orderIndex: 1, _id: 1 });
+EquipmentSchema.index({ tenantId: 1, Zone: 1, isProcessed: 1, orderIndex: 1, _id: 1 });
+EquipmentSchema.index({ tenantId: 1, Unit: 1, isProcessed: 1, orderIndex: 1, _id: 1 });
+EquipmentSchema.index({ tenantId: 1, updatedAt: 1, _id: 1 });
+EquipmentSchema.index({ tenantId: 1, EqID: 1 });
+EquipmentSchema.index({ tenantId: 1, Manufacturer: 1, 'Serial Number': 1, Qualitycheck: 1 });
+EquipmentSchema.index({ tenantId: 1, isProcessed: 1, lastInspectionStatus: 1, lastInspectionValidUntil: 1, _id: 1 });
+EquipmentSchema.index({ tenantId: 1, Site: 1, isProcessed: 1, lastInspectionStatus: 1, lastInspectionValidUntil: 1, _id: 1 });
+EquipmentSchema.index({ tenantId: 1, 'schemaAssignments.values.nextInspectionDate': 1, _id: 1 });
 
 // 🔹 Pre-save middleware: kezeli a tenantId és Company mezőket mentéskor
 EquipmentSchema.pre('save', async function (next) {

@@ -1,5 +1,6 @@
 const Conversation = require('../models/conversation');
 const mongoose = require('mongoose');
+const { getTenantStatistics } = require('../services/conversationStatsService');
 
 exports.getStatistics = async (req, res) => {
   try {
@@ -14,6 +15,17 @@ exports.getStatistics = async (req, res) => {
     const tenantMatchId = mongoose.Types.ObjectId.isValid(String(tenantId))
       ? new mongoose.Types.ObjectId(String(tenantId))
       : tenantId;
+
+    const denormalized = await getTenantStatistics(tenantMatchId);
+    const conversationCount = await Conversation.countDocuments({ tenantId: tenantMatchId });
+    if (conversationCount > 0 && denormalized.sourceConversationStats >= conversationCount) {
+      return res.json({
+        tenantId,
+        categoryCount: denormalized.categoryCount,
+        globalAverageRating: denormalized.globalAverageRating,
+        categoryAverages: denormalized.categoryAverages
+      });
+    }
 
     const [categoryRows, ratingRows, categoryRatingRows] = await Promise.all([
       Conversation.aggregate([

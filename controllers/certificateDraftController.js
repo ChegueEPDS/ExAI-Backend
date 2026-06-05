@@ -31,6 +31,32 @@ async function ensureLinkForTenant(tenantId, certId, userId, session) {
   );
 }
 
+function safeBlobSegment(value, fallback = 'file') {
+  return String(value || fallback)
+    .trim()
+    .replace(/[^\w.\-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 180) || fallback;
+}
+
+function makeUniqueBatchFileNames(items) {
+  const seen = new Map();
+  return items.map((item) => {
+    const original = item.fileName;
+    const count = seen.get(original) || 0;
+    seen.set(original, count + 1);
+    if (count === 0) return item;
+
+    const dot = original.lastIndexOf('.');
+    const base = dot > 0 ? original.slice(0, dot) : original;
+    const ext = dot > 0 ? original.slice(dot) : '';
+    return {
+      ...item,
+      fileName: `${base}-${count + 1}${ext}`
+    };
+  });
+}
+
 // Notifications infra (shared)
 
 /* ===== Single-concurrency processing queue (max 1 concurrent) ===== */
@@ -401,6 +427,146 @@ exports.bulkUpload = [
     }
   }
 ];
+
+exports.initBulkUploadDirect = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const ownerUserId = req.scope?.userId || req.userId || null;
+    if (!tenantId || !ownerUserId) {
+      return res.status(403).json({ error: 'Missing tenantId or user from auth' });
+    }
+
+    const files = Array.isArray(req.body?.files) ? req.body.files : [];
+    if (!files.length) return res.status(400).json({ error: 'No files provided.' });
+    if (files.length > 20) return res.status(400).json({ error: 'Maximum 20 files per upload.' });
+    const normalizedFiles = makeUniqueBatchFileNames(files.map((item, i) => ({
+      fileName: safeBlobSegment(item?.fileName || `certificate-${i + 1}.pdf`, `certificate-${i + 1}.pdf`),
+      contentType: String(item?.contentType || 'application/pdf')
+    })));
+    if (normalizedFiles.some(item => item.contentType !== 'application/pdf')) {
+      return res.status(400).json({ error: 'Only PDF files are supported.' });
+    }
+
+    const requestIdRaw = (req.body && req.body.requestId) || '';
+    let requestId = null;
+    if (requestIdRaw) {
+      if (!mongoose.Types.ObjectId.isValid(String(requestIdRaw))) {
+        return res.status(400).json({ error: 'Invalid requestId format.' });
+      }
+      if (files.length !== 1) {
+        return res.status(400).json({ error: 'Exactly one file must be uploaded when responding to a request.' });
+      }
+      requestId = new mongoose.Types.ObjectId(String(requestIdRaw));
+    }
+
+    const uploadId = `${Date.now()}-${uuidv4().slice(0, 6)}`;
+    const createdAt = new Date();
+    await UploadBatch.create({
+      uploadId,
+      tenantId,
+      createdBy: ownerUserId,
+      createdAt,
+      notified: false,
+      total: files.length,
+      saved: 0,
+      discarded: 0
+    });
+
+    const responseFiles = [];
+    for (let i = 0; i < normalizedFiles.length; i++) {
+      const { fileName: originalName, contentType } = normalizedFiles[i];
+      const blobFolder = `certificates/uploads/${uploadId}`;
+      const blobPdfPath = `${blobFolder}/${i + 1}-${originalName}`;
+      const draft = await DraftCertificate.create({
+        tenantId,
+        uploadId,
+        fileName: originalName,
+        originalPdfPath: null,
+        status: 'draft',
+        createdBy: ownerUserId,
+        blobPdfPath,
+        ...(requestId ? { requestId } : {})
+      });
+
+      if (requestId && draft?._id) {
+        try {
+          await CertificateRequest.updateOne(
+            { _id: requestId, status: 'open' },
+            { $set: { status: 'pending', pendingAt: new Date(), pendingBy: ownerUserId, pendingDraftId: draft._id } }
+          );
+        } catch (e) {
+          try { console.warn('initBulkUploadDirect: failed to mark request pending:', e?.message || e); } catch {}
+        }
+      }
+
+      const uploadUrl = await azureBlobService.getWriteSasUrl(blobPdfPath, {
+        ttlSeconds: 900,
+        contentType
+      });
+      responseFiles.push({
+        id: String(draft._id),
+        fileName: originalName,
+        blobPdfPath,
+        uploadUrl,
+        upload: {
+          method: 'PUT',
+          headers: {
+            'x-ms-blob-type': 'BlockBlob',
+            'Content-Type': contentType
+          }
+        }
+      });
+    }
+
+    return res.status(201).json({
+      uploadId,
+      files: responseFiles
+    });
+  } catch (err) {
+    console.error('❌ Direct bulk upload init error:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to initialize direct upload' });
+  }
+};
+
+exports.completeBulkUploadDirect = async (req, res) => {
+  const { uploadId } = req.params;
+  try {
+    const tenantId = req.scope?.tenantId;
+    const roleRaw = (req.scope?.role || req.scope?.userRole || req.role || '').toString();
+    const isSuperAdmin = /superadmin/i.test(roleRaw);
+    const filter = isSuperAdmin ? { uploadId } : { uploadId, tenantId };
+    const hasAny = await DraftCertificate.exists(filter);
+    if (!hasAny) return res.status(404).json({ error: 'No drafts found for this uploadId' });
+
+    const willQueue = activeProcesses >= PROCESS_CONCURRENCY;
+    const position = willQueue ? processQueue.length + 1 : 0;
+    const p = enqueueProcess(uploadId, { statuses: ['draft', 'error'] });
+
+    if (p && p.alreadyQueuedOrRunning) {
+      return res.status(202).json({
+        message: 'Already queued or running',
+        uploadId,
+        state: inFlight.has(uploadId) ? 'processing' : 'queued',
+        concurrency: { active: activeProcesses, limit: PROCESS_CONCURRENCY, queueLength: processQueue.length }
+      });
+    }
+
+    if (p && typeof p.then === 'function') {
+      p.then(() => {}).catch((err) => console.error('Direct upload processing failed:', err.message));
+    }
+
+    return res.status(202).json({
+      message: willQueue ? `Queued at position ${position}` : 'Processing started',
+      uploadId,
+      state: willQueue ? 'queued' : 'processing',
+      queuePosition: position || undefined,
+      concurrency: { active: activeProcesses, limit: PROCESS_CONCURRENCY, queueLength: processQueue.length }
+    });
+  } catch (err) {
+    console.error('❌ Direct bulk upload complete error:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to complete direct upload' });
+  }
+};
 
 // Internal helper for actual processing logic (not Express handler)
 async function _processDraftsInternal(uploadId, options = {}) {

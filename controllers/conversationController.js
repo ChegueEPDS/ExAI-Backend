@@ -5,7 +5,7 @@ const logger = require('../config/logger');
 const Conversation = require('../models/conversation');
 const User = require('../models/user');
 const Tenant = require('../models/tenant');
-const { attachAssistantRatingCategory } = require('../services/conversationStatsService');
+const { attachAssistantRatingCategory, deleteConversationStats } = require('../services/conversationStatsService');
 
 const { handleSendMessageStream } = require('../services/chatStreamService');
 
@@ -331,6 +331,7 @@ exports.deleteConversation = async (req, res) => {
     })();
 
     // Finally, remove conversation from DB
+    await safeDelete(() => deleteConversationStats(conversation));
     await Conversation.deleteOne({ threadId, userId, tenantId });
 
     return res.json({ ok: true, threadId });

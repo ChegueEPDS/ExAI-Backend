@@ -5,6 +5,7 @@ const archiver = require('archiver');
 const path = require('path');
 const { PassThrough } = require('stream');
 const { v4: uuidv4 } = require('uuid');
+const mongoose = require('mongoose');
 const Inspection = require('../models/inspection');
 const Dataplate = require('../models/dataplate');
 const Site = require('../models/site');
@@ -20,7 +21,7 @@ const mailService = require('../services/mailService');
 const mailTemplates = require('../services/mailTemplates');
 const { notifyAndStore } = require('../lib/notifications/notifier');
 const {
-  buildCertificateCacheForTenant,
+  buildCertificateCacheForCertNos,
   resolveCertificateFromCache
 } = require('../helpers/certificateMatchHelper');
 const { certificateNo, complianceStatus } = require('../services/rbSchemaValueService');
@@ -131,6 +132,40 @@ const PROJECT_REPORT_DIRS = {
 };
 const REPORT_PROGRESS_STEP_COUNT = 10;
 
+const REPORT_EQUIPMENT_SELECT = [
+  'EqID',
+  'TagNo',
+  'Manufacturer',
+  'Model/Type',
+  'Serial Number',
+  'Equipment Type',
+  'IP rating',
+  'Max Ambient Temp',
+  'Other Info',
+  'Site',
+  'Zone',
+  'Unit',
+  'orderIndex',
+  'Pictures',
+  'documents',
+  'X condition',
+  'schemaAssignments',
+  'lastInspectionId',
+  'lastInspectionDate',
+  'lastInspectionValidUntil',
+  'lastInspectionStatus',
+  'CertificateNo',
+  'certificateNo',
+  'Declaration of conformity',
+  'CertNo',
+  'certNo',
+  'certificateNumber',
+  'Ex Marking',
+  'customFields'
+].join(' ');
+
+const REPORT_INSPECTOR_SELECT = 'firstName lastName name position positionInfo signatureBlobUrl signatureBlobPath email';
+
 function normalizeInspectionSeverity(value) {
   if (value === null || value === undefined) return null;
   const normalized = String(value).trim().toUpperCase();
@@ -203,6 +238,7 @@ function buildExportJobContext(job = {}) {
 function createProgressCallback(job) {
   const label = `[report-job ${job?.jobId || 'unknown'}]`;
   let lastNotified = -1;
+  let lastPersistedAt = 0;
   return ({ processed = 0, total = 0 } = {}) => {
     if (!(typeof processed === 'number' && typeof total === 'number' && total > 0)) {
       console.info(`${label} progress update`);
@@ -216,11 +252,36 @@ function createProgressCallback(job) {
     if (!shouldNotify) return;
     lastNotified = processed;
     console.info(`${label} progress ${processed}/${total}`);
+    const now = Date.now();
+    if (job?.jobId && (processed === 0 || processed === total || now - lastPersistedAt >= 5000)) {
+      lastPersistedAt = now;
+      ReportExportJob.updateOne(
+        { jobId: job.jobId },
+        {
+          $set: {
+            progress: { processed, total, updatedAt: new Date() },
+            lastHeartbeatAt: new Date()
+          }
+        }
+      ).catch(err => {
+        console.warn('⚠️ Failed to persist export job progress', err?.message || err);
+      });
+    }
     if (job?.userId) {
       notifyExportJobStatus(job, { status: 'running', processed, total }).catch(err => {
         console.warn('⚠️ Failed to push running status notification', err?.message || err);
       });
     }
+  };
+}
+
+function errorDetails(err) {
+  if (!err) return { message: 'Unknown error' };
+  return {
+    message: err?.message || String(err),
+    name: err?.name || undefined,
+    code: err?.code || undefined,
+    stack: err?.stack || undefined
   };
 }
 
@@ -341,6 +402,137 @@ async function addZoneScopeToEquipmentFilter({ tenantId, zoneId, equipmentFilter
   equipmentFilter.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
 }
 
+function toObjectIdOrValue(value) {
+  if (!value) return value;
+  if (value instanceof mongoose.Types.ObjectId) return value;
+  const str = value.toString ? value.toString() : String(value);
+  return mongoose.isValidObjectId(str) ? new mongoose.Types.ObjectId(str) : value;
+}
+
+function objectIdString(value) {
+  return value && value.toString ? value.toString() : String(value || '');
+}
+
+async function attachInspectorsToInspections(inspections = []) {
+  const inspectorIds = [
+    ...new Set(
+      inspections
+        .map(insp => insp?.inspectorId)
+        .filter(Boolean)
+        .map(objectIdString)
+        .filter(id => mongoose.isValidObjectId(id))
+    )
+  ];
+  if (!inspectorIds.length) return inspections;
+
+  const users = await User.find({ _id: { $in: inspectorIds.map(id => new mongoose.Types.ObjectId(id)) } })
+    .select(REPORT_INSPECTOR_SELECT)
+    .lean();
+  const userById = new Map(users.map(user => [objectIdString(user._id), user]));
+
+  inspections.forEach((insp) => {
+    const key = objectIdString(insp?.inspectorId);
+    if (userById.has(key)) {
+      insp.inspectorId = userById.get(key);
+    }
+  });
+  return inspections;
+}
+
+async function loadLatestInspectionMapForEquipments(equipments = [], tenantId) {
+  const inspectionByEquipment = new Map();
+  const inspectionById = new Map();
+  if (!Array.isArray(equipments) || !equipments.length) {
+    return { inspectionByEquipment, inspectionById };
+  }
+
+  const tenantValue = toObjectIdOrValue(tenantId);
+  const equipmentIds = equipments
+    .map(eq => eq?._id)
+    .filter(Boolean);
+
+  const lastInspectionIds = [
+    ...new Set(
+      equipments
+        .map(eq => eq?.lastInspectionId)
+        .filter(Boolean)
+        .map(objectIdString)
+        .filter(id => mongoose.isValidObjectId(id))
+    )
+  ];
+
+  if (lastInspectionIds.length) {
+    const docs = await Inspection.find({
+      _id: { $in: lastInspectionIds.map(id => new mongoose.Types.ObjectId(id)) },
+      tenantId
+    }).lean();
+    await attachInspectorsToInspections(docs);
+    docs.forEach((insp) => {
+      if (!insp?._id) return;
+      inspectionById.set(objectIdString(insp._id), insp);
+    });
+
+    equipments.forEach((eq) => {
+      const id = objectIdString(eq?.lastInspectionId);
+      const insp = id ? inspectionById.get(id) : null;
+      if (insp) inspectionByEquipment.set(objectIdString(eq._id), insp);
+    });
+  }
+
+  const missingEquipmentIds = equipmentIds.filter(
+    id => !inspectionByEquipment.has(objectIdString(id))
+  );
+  if (missingEquipmentIds.length) {
+    const latest = await Inspection.aggregate([
+      {
+        $match: {
+          tenantId: tenantValue,
+          equipmentId: { $in: missingEquipmentIds.map(toObjectIdOrValue) }
+        }
+      },
+      { $sort: { equipmentId: 1, inspectionDate: -1, createdAt: -1, _id: -1 } },
+      { $group: { _id: '$equipmentId', doc: { $first: '$$ROOT' } } },
+      { $replaceRoot: { newRoot: '$doc' } }
+    ]).allowDiskUse(true);
+    await attachInspectorsToInspections(latest);
+    latest.forEach((insp) => {
+      if (!insp?.equipmentId) return;
+      inspectionByEquipment.set(objectIdString(insp.equipmentId), insp);
+      if (insp._id) inspectionById.set(objectIdString(insp._id), insp);
+    });
+  }
+
+  return { inspectionByEquipment, inspectionById };
+}
+
+async function buildReportCertificateCache(tenantId, equipments = []) {
+  const certNos = [
+    ...new Set(
+      (equipments || [])
+        .map(eq => certificateNo(eq))
+        .filter(Boolean)
+        .map(value => String(value).trim())
+        .filter(Boolean)
+    )
+  ];
+  if (!certNos.length) return new Map();
+  try {
+    const merged = new Map();
+    const chunkSize = 200;
+    for (let i = 0; i < certNos.length; i += chunkSize) {
+      const chunk = certNos.slice(i, i + chunkSize);
+      const map = await buildCertificateCacheForCertNos(tenantId, chunk);
+      map.forEach((value, key) => {
+        if (!merged.has(key)) merged.set(key, value);
+      });
+    }
+    return merged;
+  } catch (err) {
+    console.warn('⚠️ Certificate cache build failed for report:', err?.message || err);
+    return new Map();
+  }
+}
+
 async function resolveSchemeFromEquipment(equipment, certificateCache) {
   let scheme = '';
   const equipmentCertNo = certificateNo(equipment);
@@ -351,7 +543,28 @@ async function resolveSchemeFromEquipment(equipment, certificateCache) {
 
   const cacheKey = equipmentCertNo.toUpperCase();
   if (certificateCache && certificateCache.has(cacheKey)) {
-    return certificateCache.get(cacheKey);
+    const cached = certificateCache.get(cacheKey);
+    if (cached && typeof cached === 'object') {
+      return cached.scheme || '';
+    }
+    return cached || '';
+  }
+
+  const cachedDoc = resolveCertificateFromCache(certificateCache, equipmentCertNo);
+  if (cachedDoc) {
+    scheme = cachedDoc.scheme || '';
+    if (!scheme) {
+      const upperNo = equipmentCertNo.toUpperCase();
+      const hasATEX = upperNo.includes('ATEX');
+      const hasIECEX = upperNo.includes('IECEX');
+      if (hasATEX && hasIECEX) scheme = 'ATEX / IECEx';
+      else if (hasATEX) scheme = 'ATEX';
+      else if (hasIECEX) scheme = 'IECEx';
+    }
+    if (certificateCache) {
+      certificateCache.set(cacheKey, scheme);
+    }
+    return scheme;
   }
 
   let cert = await Certificate.findOne({ certNo: equipmentCertNo })
@@ -542,7 +755,7 @@ function buildEquipmentIdentifier(equipment, context = {}) {
     equipment.ZoneDescription ||
     null;
 
-  const certificateNo =
+  const equipmentCertificateNo =
     context.certificateNo ||
     equipment.certificateNo ||
     equipment.CertificateNo ||
@@ -550,7 +763,7 @@ function buildEquipmentIdentifier(equipment, context = {}) {
     equipment['Declaration of conformity'] ||
     null;
 
-  const parts = [orderIndex, siteClient || zoneDescription, certificateNo]
+  const parts = [orderIndex, siteClient || zoneDescription, equipmentCertificateNo]
     .map(part => (typeof part === 'string' ? part.trim() : part))
     .filter(part => !!part && part.toString().length > 0);
 
@@ -1686,12 +1899,13 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
     }
   });
 
-  if (isIndexTenant) {
+  if (isIndexTenant || inspection?.remarks) {
     const remarksRow = ws.addRow([]);
     const remarksR = remarksRow.number;
     ws.mergeCells(`B${remarksR}:N${remarksR}`);
     ws.getCell(`A${remarksR}`).value = 'Remarks';
     ws.getCell(`A${remarksR}`).font = { bold: true };
+    ws.getCell(`B${remarksR}`).value = inspection?.remarks || '';
     remarksRow.height = 40;
 
     ['A','B','C','D','E','F','G','H','I','J','K','L','M','N'].forEach(col => {
@@ -2369,12 +2583,14 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
 }
 
 async function generateProjectReportArchive({ tenantId, siteId, tenantName, requestHost }, targetStream, progressCb = null) {
-  const site = await Site.findOne({ _id: siteId }).lean();
+  const site = await Site.findOne({ _id: siteId, tenantId }).lean();
   if (!site) {
     throw new Error('Project not found.');
   }
 
-  const equipments = await Dataplate.find({ tenantId, Site: siteId }).lean();
+  const equipments = await Dataplate.find({ tenantId, Site: siteId })
+    .select(REPORT_EQUIPMENT_SELECT)
+    .lean();
   if (!equipments.length) {
     throw new Error('No equipment found for this project.');
   }
@@ -2387,63 +2603,9 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName, requ
   const zoneMap = new Map();
   zones.forEach(zone => zoneMap.set(zone._id.toString(), zone));
 
-  const lastInspectionIds = [
-    ...new Set(
-      equipments
-        .map(e => (e.lastInspectionId ? e.lastInspectionId.toString() : null))
-        .filter(Boolean)
-    )
-  ];
+  const { inspectionByEquipment, inspectionById } = await loadLatestInspectionMapForEquipments(equipments, tenantId);
 
-  let inspections = [];
-  if (lastInspectionIds.length) {
-    inspections = await Inspection.find({
-      _id: { $in: lastInspectionIds },
-      tenantId
-    })
-      .populate(
-        'inspectorId',
-        'firstName lastName name position positionInfo signatureBlobUrl signatureBlobPath'
-      )
-      .lean();
-  }
-  const inspectionById = new Map(inspections.map(i => [i._id.toString(), i]));
-  const inspectionByEquipment = new Map();
-  equipments.forEach(eq => {
-    if (eq.lastInspectionId) {
-      const insp = inspectionById.get(eq.lastInspectionId.toString());
-      if (insp) {
-        inspectionByEquipment.set(eq._id?.toString(), insp);
-      }
-    }
-  });
-
-  const missingEquipments = equipments.filter(
-    eq => !inspectionByEquipment.has(eq._id?.toString())
-  );
-  for (const eq of missingEquipments) {
-    const insp = await Inspection.findOne({ equipmentId: eq._id, tenantId })
-      .sort({ inspectionDate: -1, createdAt: -1 })
-      .populate(
-        'inspectorId',
-        'firstName lastName name position positionInfo signatureBlobUrl signatureBlobPath'
-      )
-      .lean();
-    if (insp) {
-      inspectionByEquipment.set(eq._id.toString(), insp);
-      if (insp._id) {
-        inspectionById.set(insp._id.toString(), insp);
-      }
-    }
-  }
-
-  let certMap = new Map();
-  try {
-    certMap = await buildCertificateCacheForTenant(tenantId);
-  } catch (err) {
-    console.warn('⚠️ Certificate cache build failed for project report:', err?.message || err);
-    certMap = new Map();
-  }
+  const certMap = await buildReportCertificateCache(tenantId, equipments);
 
   const exWorkbook = buildProjectExRegisterWorkbook(equipments, {
     zoneMap,
@@ -2458,7 +2620,7 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName, requ
   const projectExFileName = `Project_ExRegister_${safeSiteName}_${timestamp}.xlsx`;
   const projectExBuffer = await exWorkbook.xlsx.writeBuffer();
 
-  const schemeCache = new Map();
+  const schemeCache = certMap;
   const projectFailures = [];
   const uniqueCertificateKeys = new Set();
 
@@ -2637,11 +2799,11 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName, requ
     progressCb({ processed: totalEquipments, total: totalEquipments });
   }
 
-  return { zipName, byteCount: getByteCount() };
+  return { zipName, byteCount: getByteCount(), totalEquipments };
 }
 
 async function generateLatestInspectionArchive(
-  { tenantId, siteId, zoneId, includeImages, tenantName, requestHost },
+  { tenantId, siteId, zoneId, includeImages, tenantName, requestHost, jobId = null },
   targetStream,
   progressCb = null
 ) {
@@ -2655,7 +2817,9 @@ async function generateLatestInspectionArchive(
   }
   if (siteId) equipmentFilter.Site = siteId;
 
-  const equipments = await Dataplate.find(equipmentFilter).lean();
+  const equipments = await Dataplate.find(equipmentFilter)
+    .select(REPORT_EQUIPMENT_SELECT)
+    .lean();
   if (!equipments || equipments.length === 0) {
     throw new Error('No equipment found for the provided scope.');
   }
@@ -2669,7 +2833,8 @@ async function generateLatestInspectionArchive(
 
   const siteCache = new Map();
   const zoneCache = new Map();
-  const certificateCache = new Map();
+  const certificateCache = await buildReportCertificateCache(tenantId, equipments);
+  const { inspectionByEquipment } = await loadLatestInspectionMapForEquipments(equipments, tenantId);
 
   const { archive, finalized, getByteCount } = setupArchiveStream(targetStream);
   let fileCount = 0;
@@ -2687,82 +2852,81 @@ async function generateLatestInspectionArchive(
   }
 
   let processedEquipments = 0;
+  const exportErrors = [];
   for (const equipment of equipments) {
-    let inspection = null;
+    const equipmentId = objectIdString(equipment?._id);
+    const equipmentLabel = equipment?.EqID || equipment?.TagNo || equipmentId || 'unknown-equipment';
+    try {
+      const inspection = inspectionByEquipment.get(equipmentId);
 
-    if (equipment.lastInspectionId) {
-      inspection = await Inspection.findOne({ _id: equipment.lastInspectionId, tenantId })
-        .populate(
-          'inspectorId',
-          'firstName lastName name position positionInfo signatureBlobUrl signatureBlobPath email'
-        )
-        .lean();
+      if (!inspection) {
+        continue;
+      }
+
+      const context = await resolveInspectionContext(inspection, {
+        equipment,
+        siteCache,
+        zoneCache,
+        certificateCache
+      });
+
+      if (context.error) {
+        exportErrors.push({ equipmentId, equipmentLabel, error: context.error });
+        continue;
+      }
+
+      const identifier =
+        buildEquipmentIdentifier(context.equipment, {
+          site: context.site,
+          zone: context.zone,
+          certificateNo:
+            context.equipment?.certificateNo ||
+            context.equipment?.CertificateNo ||
+            certificateNo(context.equipment) ||
+            context.equipment?.['Declaration of conformity']
+        }) ||
+        context.equipment?.EqID ||
+        inspection.eqId;
+      const attachmentLookup = includeImages
+        ? buildInspectionAttachmentLookup(
+            inspection,
+            context.equipment?.EqID || inspection.eqId,
+            identifier,
+            {
+              siteName: context.site?.Name || context.site?.SiteName || null,
+              zoneName: context.zone?.Name || context.zone?.ZoneName || null,
+              eqId: context.equipment?.EqID || inspection.eqId || null
+            }
+          )
+        : null;
+
+      const { workbook, fileName } = await buildInspectionWorkbook(
+        inspection,
+        context.equipment,
+        context.site,
+        context.zone,
+        context.scheme,
+        attachmentLookup,
+        { tenantName: tenantName || '' }
+      );
+      const buffer = await workbook.xlsx.writeBuffer();
+      archive.append(buffer, { name: fileName });
+      fileCount++;
+
+      if (includeImages && attachmentLookup?.all?.length) {
+        await appendImagesToArchive(archive, attachmentLookup.all);
+      }
+    } catch (err) {
+      const details = errorDetails(err);
+      exportErrors.push({ equipmentId, equipmentLabel, error: details.message });
+      console.warn(`[report-job ${jobId || 'latest_inspections'}] skipped equipment during ITR export`, {
+        equipmentId,
+        equipmentLabel,
+        error: details.message,
+        stack: details.stack
+      });
     }
 
-    if (!inspection) {
-      inspection = await Inspection.findOne({ equipmentId: equipment._id, tenantId })
-        .sort({ inspectionDate: -1, createdAt: -1 })
-        .populate(
-          'inspectorId',
-          'firstName lastName name position positionInfo signatureBlobUrl signatureBlobPath email'
-        )
-        .lean();
-    }
-
-    if (!inspection) {
-      continue;
-    }
-
-    const context = await resolveInspectionContext(inspection, {
-      equipment,
-      siteCache,
-      zoneCache,
-      certificateCache
-    });
-
-    if (context.error) continue;
-
-    const identifier =
-      buildEquipmentIdentifier(context.equipment, {
-        site: context.site,
-        zone: context.zone,
-        certificateNo:
-          context.equipment?.certificateNo ||
-          context.equipment?.CertificateNo ||
-          certificateNo(context.equipment) ||
-          context.equipment?.['Declaration of conformity']
-      }) ||
-      context.equipment?.EqID ||
-      inspection.eqId;
-    const attachmentLookup = includeImages
-      ? buildInspectionAttachmentLookup(
-          inspection,
-          context.equipment?.EqID || inspection.eqId,
-          identifier,
-          {
-            siteName: context.site?.Name || context.site?.SiteName || null,
-            zoneName: context.zone?.Name || context.zone?.ZoneName || null,
-            eqId: context.equipment?.EqID || inspection.eqId || null
-          }
-        )
-      : null;
-
-    const { workbook, fileName } = await buildInspectionWorkbook(
-      inspection,
-      context.equipment,
-      context.site,
-      context.zone,
-      context.scheme,
-      attachmentLookup,
-      { tenantName: tenantName || '' }
-    );
-    const buffer = await workbook.xlsx.writeBuffer();
-    archive.append(buffer, { name: fileName });
-    fileCount++;
-
-    if (includeImages && attachmentLookup?.all?.length) {
-      await appendImagesToArchive(archive, attachmentLookup.all);
-    }
     processedEquipments++;
     if (typeof progressCb === 'function') {
       progressCb({ processed: processedEquipments, total: totalEquipments });
@@ -2770,7 +2934,18 @@ async function generateLatestInspectionArchive(
   }
 
   if (!fileCount) {
-    throw new Error('No inspections were found for the selected zone/project.');
+    const firstError = exportErrors[0]?.error;
+    throw new Error(firstError
+      ? `No inspections could be exported. First error: ${firstError}`
+      : 'No inspections were found for the selected zone/project.');
+  }
+
+  if (exportErrors.length) {
+    archive.append(JSON.stringify({
+      message: 'Some equipment could not be exported.',
+      skippedCount: exportErrors.length,
+      skipped: exportErrors
+    }, null, 2), { name: 'export-errors.json' });
   }
 
   await archive.finalize();
@@ -2780,25 +2955,155 @@ async function generateLatestInspectionArchive(
     progressCb({ processed: totalEquipments, total: totalEquipments });
   }
 
-  return { zipName, byteCount: getByteCount() };
+  return { zipName, byteCount: getByteCount(), totalEquipments };
 }
 
 function buildReportBlobPath(tenantId, jobId) {
   return `${REPORT_BLOB_PREFIX}/${String(tenantId)}/${jobId}.zip`;
 }
 
-function scheduleReportJob(job) {
-  setImmediate(() => {
-    runReportExportJob(job.jobId).catch(err => {
-      console.error('Report export job runner error', err);
-    });
-  });
+const reportJobQueue = [];
+const queuedReportJobIds = new Set();
+let activeReportJobs = 0;
+let reportWorkerTimer = null;
+let reportWorkerRunning = false;
+
+function getReportJobConcurrency() {
+  const n = Number(process.env.REPORT_EXPORT_MAX_CONCURRENCY || 2);
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 5) : 2;
 }
 
+function getReportJobPollMs() {
+  const n = Number(process.env.REPORT_EXPORT_WORKER_POLL_MS || 10000);
+  return Number.isFinite(n) && n >= 1000 ? Math.min(Math.floor(n), 60000) : 10000;
+}
+
+function getReportJobStaleMinutes() {
+  const n = Number(process.env.REPORT_EXPORT_STALE_MINUTES || 120);
+  return Number.isFinite(n) && n >= 15 ? Math.floor(n) : 120;
+}
+
+function getReportJobMaxAttempts() {
+  const n = Number(process.env.REPORT_EXPORT_MAX_ATTEMPTS || 2);
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 5) : 2;
+}
+
+function drainReportJobQueue() {
+  const maxConcurrency = getReportJobConcurrency();
+  while (activeReportJobs < maxConcurrency && reportJobQueue.length) {
+    const jobId = reportJobQueue.shift();
+    queuedReportJobIds.delete(jobId);
+    activeReportJobs += 1;
+    setImmediate(() => {
+      runReportExportJob(jobId)
+        .catch(err => {
+          console.error('Report export job runner error', err);
+        })
+        .finally(() => {
+          activeReportJobs -= 1;
+          drainReportJobQueue();
+        });
+    });
+  }
+}
+
+function scheduleReportJob(job) {
+  if (!job?.jobId) return;
+  if (queuedReportJobIds.has(job.jobId)) return;
+  queuedReportJobIds.add(job.jobId);
+  reportJobQueue.push(job.jobId);
+  drainReportJobQueue();
+}
+
+async function recoverStaleReportJobs() {
+  const now = new Date();
+  const staleBefore = new Date(now.getTime() - getReportJobStaleMinutes() * 60 * 1000);
+  const maxAttempts = getReportJobMaxAttempts();
+  const staleJobs = await ReportExportJob.find({
+    status: 'running',
+    $or: [
+      { lastHeartbeatAt: { $lte: staleBefore } },
+      { lastHeartbeatAt: null, startedAt: { $lte: staleBefore } }
+    ]
+  }).select('jobId attempts').limit(50).lean();
+
+  for (const job of staleJobs || []) {
+    const attempts = Number(job.attempts || 0);
+    if (attempts < maxAttempts) {
+      await ReportExportJob.updateOne(
+        { _id: job._id, status: 'running' },
+        {
+          $set: {
+            status: 'queued',
+            errorMessage: `Retrying stale export job after ${getReportJobStaleMinutes()} minutes without heartbeat.`,
+            finishedAt: null
+          }
+        }
+      );
+      scheduleReportJob(job);
+    } else {
+      await ReportExportJob.updateOne(
+        { _id: job._id, status: 'running' },
+        {
+          $set: {
+            status: 'failed',
+            finishedAt: now,
+            errorMessage: `Export job exceeded ${maxAttempts} attempts or ${getReportJobStaleMinutes()} minutes without heartbeat.`
+          }
+        }
+      );
+    }
+  }
+}
+
+async function enqueueQueuedReportJobs(limit = 25) {
+  const jobs = await ReportExportJob.find({ status: 'queued' })
+    .sort({ createdAt: 1 })
+    .select('jobId')
+    .limit(limit)
+    .lean();
+  for (const job of jobs || []) scheduleReportJob(job);
+}
+
+async function pollReportExportJobs() {
+  if (reportWorkerRunning) return;
+  reportWorkerRunning = true;
+  try {
+    await recoverStaleReportJobs();
+    await enqueueQueuedReportJobs();
+  } catch (err) {
+    console.warn('⚠️ Report export worker poll failed', err?.message || err);
+  } finally {
+    reportWorkerRunning = false;
+  }
+}
+
+function startReportExportWorker() {
+  if (reportWorkerTimer) return;
+  const firstRunTimer = setTimeout(() => pollReportExportJobs().catch(() => {}), 1500);
+  if (typeof firstRunTimer.unref === 'function') firstRunTimer.unref();
+  reportWorkerTimer = setInterval(() => {
+    pollReportExportJobs().catch(() => {});
+  }, getReportJobPollMs());
+  if (typeof reportWorkerTimer.unref === 'function') reportWorkerTimer.unref();
+}
+
+exports.startReportExportWorker = startReportExportWorker;
+
 async function runReportExportJob(jobId) {
+  const now = new Date();
   const job = await ReportExportJob.findOneAndUpdate(
     { jobId, status: 'queued' },
-    { $set: { status: 'running', startedAt: new Date() } },
+    {
+      $set: {
+        status: 'running',
+        startedAt: now,
+        finishedAt: null,
+        errorMessage: '',
+        lastHeartbeatAt: now
+      },
+      $inc: { attempts: 1 }
+    },
     { new: true }
   );
 
@@ -2834,7 +3139,8 @@ async function runReportExportJob(jobId) {
           zoneId: job.params?.zoneId,
           includeImages: job.params?.includeImages !== false,
           tenantName,
-          requestHost
+          requestHost,
+          jobId: job.jobId
         },
         uploadStream,
         progressCallback
@@ -2848,8 +3154,12 @@ async function runReportExportJob(jobId) {
 
     job.status = 'succeeded';
     job.finishedAt = new Date();
+    job.lastHeartbeatAt = new Date();
     job.blobPath = blobPath;
     job.blobSize = result?.byteCount || null;
+    if (result?.totalEquipments) {
+      job.progress = { processed: result.totalEquipments, total: result.totalEquipments, updatedAt: new Date() };
+    }
     job.meta = { ...(job.meta || {}), downloadName: result?.zipName };
     await job.save();
     try {
@@ -2866,13 +3176,14 @@ async function runReportExportJob(jobId) {
     job.status = 'failed';
     job.errorMessage = err?.message || 'Report export job failed';
     job.finishedAt = new Date();
+    job.lastHeartbeatAt = new Date();
     await job.save();
     if (job.userId) {
       notifyExportJobStatus(job, { status: 'failed' }).catch(notifyErr => {
         console.warn('⚠️ Failed to notify job failure', notifyErr?.message || notifyErr);
       });
     }
-    console.error('Report export job failed', { jobId, error: err?.message || err });
+    console.error(`[report-job ${jobId}] Report export job failed`, errorDetails(err));
   }
 }
 
@@ -2908,6 +3219,9 @@ async function serializeReportJob(job, { includeDownloadUrl = false, downloadUrl
     createdAt: job.createdAt,
     startedAt: job.startedAt,
     finishedAt: job.finishedAt,
+    attempts: Number(job.attempts || 0),
+    progress: job.progress || { processed: 0, total: 0, updatedAt: null },
+    lastHeartbeatAt: job.lastHeartbeatAt || null,
     errorMessage: job.errorMessage || null
   };
 
@@ -3111,35 +3425,25 @@ exports.exportPunchlistXLSX = async (req, res) => {
     await addZoneScopeToEquipmentFilter({ tenantId, zoneId, equipmentFilter, includeDescendants: false });
     }
 
-    const equipments = await Dataplate.find(equipmentFilter).lean();
+    const equipments = await Dataplate.find(equipmentFilter)
+      .select(REPORT_EQUIPMENT_SELECT)
+      .lean();
     if (!equipments || equipments.length === 0) {
       return res.status(404).json({ message: 'Nem található eszköz a megadott szűrővel.' });
     }
 
     const siteCache = new Map();
     const zoneCache = new Map();
-    const certificateCache = new Map();
+    const certificateCache = await buildReportCertificateCache(tenantId, equipments);
     const failures = [];
     const punchlistImages = [];
+    const { inspectionByEquipment } = await loadLatestInspectionMapForEquipments(equipments, tenantId);
 
     let headerSite = siteId ? await getSiteCached(siteId, siteCache) : null;
     let headerZone = zoneId ? await getZoneCached(zoneId, zoneCache) : null;
 
     for (const equipment of equipments) {
-      let inspection = null;
-
-      if (equipment.lastInspectionId) {
-        inspection = await Inspection.findOne({ _id: equipment.lastInspectionId, tenantId })
-          .populate('inspectorId', 'firstName lastName email')
-          .lean();
-      }
-
-      if (!inspection) {
-        inspection = await Inspection.findOne({ equipmentId: equipment._id, tenantId })
-          .sort({ inspectionDate: -1, createdAt: -1 })
-          .populate('inspectorId', 'firstName lastName email')
-          .lean();
-      }
+      const inspection = inspectionByEquipment.get(objectIdString(equipment._id));
 
       if (!inspection) {
         continue;
@@ -3198,7 +3502,7 @@ exports.exportPunchlistXLSX = async (req, res) => {
           r.question ||
           '';
 
-        const imageNames = attachmentLookup.getFileNamesForResult(r);
+        const imageNames = attachmentLookup ? attachmentLookup.getFileNamesForResult(r) : [];
 
         failures.push({
           eqId: context.equipment?.EqID || equipment.EqID || inspection.eqId,

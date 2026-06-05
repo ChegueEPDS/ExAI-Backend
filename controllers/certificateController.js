@@ -1,6 +1,7 @@
 // controllers/certificateController.js
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const Certificate = require('../models/certificate');
 const CompanyCertificateLink = require('../models/companyCertificateLink');
 const User = require('../models/user'); // 🔹 Importáljuk a User modellt
@@ -16,6 +17,7 @@ const {
   resolveCertificateFromCache
 } = require('../helpers/certificateMatchHelper');
 const contributionRewardService = require('../services/contributionRewardService');
+const CertificatePreviewJob = require('../models/certificatePreviewJob');
 
 const upload = multer({ dest: 'uploads/' });
 
@@ -174,6 +176,112 @@ function sendDuplicateError(res, err) {
     details
   });
   return true;
+}
+
+function safeBlobSegment(value, fallback = 'file') {
+  return String(value || fallback)
+    .trim()
+    .replace(/[^\w.\-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 180) || fallback;
+}
+
+function normalizePreviewExtracted(aiData = {}) {
+  const certStr = (aiData?.certNo || aiData?.certificateNumber || '').toString().trim().toUpperCase();
+  return {
+    certNo: aiData?.certNo || aiData?.certificateNumber || '',
+    status: aiData?.status || '',
+    issueDate: aiData?.issueDate || '',
+    applicant: aiData?.applicant || '',
+    manufacturer: aiData?.manufacturer || '',
+    equipment: aiData?.equipment || aiData?.product || '',
+    product: aiData?.product || aiData?.equipment || '',
+    exmarking: aiData?.exmarking || aiData?.exMarking || '',
+    protection: aiData?.protection || '',
+    specCondition: aiData?.specCondition || aiData?.specialConditions || '',
+    description: aiData?.description || '',
+    docType: aiData?.docType || '',
+    xcondition: certStr ? (certStr.endsWith('X') || /\bX\b/.test(certStr)) : false,
+    ucondition: certStr ? (certStr.endsWith('U') || /\bU\b/.test(certStr)) : false
+  };
+}
+
+async function runCertificatePreviewFromSource({ source, tenantId, fileName, updateJob }) {
+  console.info(JSON.stringify({
+    level: 'info',
+    message: '[certificate preview] OCR start',
+    tenantId: String(tenantId || ''),
+    fileName
+  }));
+
+  const ocrStart = Date.now();
+  const { recognizedText } = await uploadPdfWithFormRecognizerInternal(source);
+  console.info(JSON.stringify({
+    level: 'info',
+    message: '[certificate preview] OCR done',
+    elapsedMs: Date.now() - ocrStart,
+    textLength: recognizedText?.length || 0
+  }));
+
+  if (typeof updateJob === 'function') {
+    await updateJob({ recognizedText: recognizedText || '' });
+  }
+
+  console.info(JSON.stringify({ level: 'info', message: '[certificate preview] OpenAI extraction start' }));
+  const aiData = await extractCertFieldsFromOCR(recognizedText || '', { tenantId: tenantId ? String(tenantId) : null });
+  const extracted = normalizePreviewExtracted(aiData);
+  console.info(JSON.stringify({ level: 'info', message: '[certificate preview] extraction done', extracted }));
+
+  return { recognizedText: recognizedText || '', extracted };
+}
+
+async function processCertificatePreviewJob(jobId) {
+  const job = await CertificatePreviewJob.findById(jobId);
+  if (!job) return;
+  if (!['created', 'queued', 'error'].includes(job.status)) return;
+
+  await CertificatePreviewJob.updateOne(
+    { _id: job._id },
+    { $set: { status: 'processing', startedAt: new Date(), error: '' } }
+  );
+
+  try {
+    const sasUrl = await azureBlobService.getReadSasUrl(job.blobPath, {
+      ttlSeconds: 900,
+      contentType: job.contentType || 'application/pdf'
+    });
+    const result = await runCertificatePreviewFromSource({
+      source: { sourceUrl: sasUrl },
+      tenantId: job.tenantId,
+      fileName: job.fileName,
+      updateJob: async (patch) => {
+        await CertificatePreviewJob.updateOne({ _id: job._id }, { $set: patch });
+      }
+    });
+
+    await CertificatePreviewJob.updateOne(
+      { _id: job._id },
+      {
+        $set: {
+          status: 'done',
+          recognizedText: result.recognizedText,
+          extracted: result.extracted,
+          finishedAt: new Date()
+        }
+      }
+    );
+  } catch (err) {
+    await CertificatePreviewJob.updateOne(
+      { _id: job._id },
+      {
+        $set: {
+          status: 'error',
+          error: err?.message || 'Preview processing failed',
+          finishedAt: new Date()
+        }
+      }
+    );
+  }
 }
 
 // Fájl feltöltési endpoint
@@ -1016,6 +1124,137 @@ exports.updateToPublic = async (req, res) => {
   });
 };
 
+exports.createPreviewAtexJob = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const userId = req.scope?.userId || req.userId || req.user?._id;
+    if (!tenantId || !userId) {
+      return res.status(403).json({ error: 'Missing tenantId or user from auth' });
+    }
+
+    const fileName = safeBlobSegment(req.body?.fileName, 'preview.pdf');
+    const contentType = String(req.body?.contentType || 'application/pdf');
+    if (contentType !== 'application/pdf') {
+      return res.status(400).json({ error: 'Preview only supports application/pdf' });
+    }
+
+    const size = Number(req.body?.size || 0);
+    const scheme = String(req.body?.scheme || 'ATEX').trim() || 'ATEX';
+    const jobId = crypto.randomUUID();
+    const blobPath = `certificates/preview-jobs/${tenantId}/${jobId}/${fileName}`;
+    const uploadUrl = await azureBlobService.getWriteSasUrl(blobPath, {
+      ttlSeconds: 900,
+      contentType
+    });
+
+    const job = await CertificatePreviewJob.create({
+      _id: new mongoose.Types.ObjectId(),
+      tenantId,
+      createdBy: userId,
+      status: 'created',
+      scheme,
+      fileName,
+      contentType,
+      size,
+      blobPath
+    });
+
+    return res.status(201).json({
+      jobId: String(job._id),
+      uploadId: jobId,
+      uploadUrl,
+      upload: {
+        method: 'PUT',
+        headers: {
+          'x-ms-blob-type': 'BlockBlob',
+          'Content-Type': contentType
+        }
+      }
+    });
+  } catch (err) {
+    console.error('[preview-job] init failed:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to initialize preview job' });
+  }
+};
+
+exports.startPreviewAtexJob = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const userId = req.scope?.userId || req.userId || req.user?._id;
+    const { jobId } = req.params;
+    const job = await CertificatePreviewJob.findOne({ _id: jobId, tenantId, createdBy: userId });
+    if (!job) return res.status(404).json({ error: 'Preview job not found' });
+    if (job.status === 'processing' || job.status === 'done') {
+      return res.status(202).json({ jobId, status: job.status });
+    }
+
+    await CertificatePreviewJob.updateOne(
+      { _id: job._id },
+      { $set: { status: 'queued', error: '' } }
+    );
+    processCertificatePreviewJob(job._id).catch((err) => {
+      console.error('[preview-job] async processing failed:', err?.message || err);
+    });
+
+    return res.status(202).json({ jobId, status: 'queued' });
+  } catch (err) {
+    console.error('[preview-job] start failed:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to start preview job' });
+  }
+};
+
+exports.getPreviewAtexJob = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const userId = req.scope?.userId || req.userId || req.user?._id;
+    const job = await CertificatePreviewJob.findOne({
+      _id: req.params.jobId,
+      tenantId,
+      createdBy: userId
+    }).lean();
+    if (!job) return res.status(404).json({ error: 'Preview job not found' });
+
+    return res.json({
+      jobId: String(job._id),
+      status: job.status,
+      error: job.error || '',
+      recognizedText: job.status === 'done' ? (job.recognizedText || '') : '',
+      extracted: job.status === 'done' ? (job.extracted || null) : null,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt
+    });
+  } catch (err) {
+    console.error('[preview-job] get failed:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to load preview job' });
+  }
+};
+
+exports.deletePreviewAtexJob = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const userId = req.scope?.userId || req.userId || req.user?._id;
+    const job = await CertificatePreviewJob.findOne({
+      _id: req.params.jobId,
+      tenantId,
+      createdBy: userId
+    });
+    if (!job) return res.status(404).json({ error: 'Preview job not found' });
+
+    const prefix = `certificates/preview-jobs/${tenantId}/`;
+    try {
+      if (job.blobPath) await azureBlobService.deleteFile(job.blobPath);
+      else await azureBlobService.deletePrefix(prefix);
+    } catch (e) {
+      console.warn('[preview-job] blob cleanup failed:', e?.message || e);
+    }
+    await CertificatePreviewJob.deleteOne({ _id: job._id });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[preview-job] delete failed:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to delete preview job' });
+  }
+};
+
 // ATEX előnézet OCR+AI feldolgozással (nem ment DB-be, csak visszaadja az eredményt)
 exports.previewAtex = async (req, res) => {
   upload.single('file')(req, res, async (err) => {
@@ -1037,55 +1276,12 @@ exports.previewAtex = async (req, res) => {
 
     try {
       const pdfPath = path.resolve(req.file.path);
-      const originalPdfName = req.file.originalname;
-
-      // --- Real OCR + AI extract (same stack as bulk) ---
       const pdfBuffer = fs.readFileSync(pdfPath);
-
-      // 1) Azure OCR
-      console.info(JSON.stringify({
-        level: 'info',
-        message: '🚀 [ATEX preview] Sending PDF to Azure OCR...',
-        name: originalPdfName,
-        bytes: pdfBuffer?.length || 0
-      }));
-      const ocrStart = Date.now();
-      const { recognizedText } = await uploadPdfWithFormRecognizerInternal(pdfBuffer);
-      console.info(JSON.stringify({
-        level: 'info',
-        message: '✅ [ATEX preview] Azure OCR done.',
-        elapsedMs: Date.now() - ocrStart,
-        textLength: recognizedText?.length || 0
-      }));
-
-      // 2) OpenAI field extraction (ATEX profile inside the helper)
-      console.info(JSON.stringify({ level: 'info', message: '🧠 [ATEX preview] Extracting fields with OpenAI...' }));
-      const tenantId = req.scope?.tenantId || (user?.tenantId ? String(user.tenantId) : null);
-      const aiData = await extractCertFieldsFromOCR(recognizedText || '', { tenantId });
-      console.info(JSON.stringify({ level: 'info', message: '✅ [ATEX preview] Field extraction done.', extracted: aiData }));
-
-      // 3) Normalize keys for the frontend (expects lower-case keys like in IECEx path)
-      const certStr = (aiData?.certNo || aiData?.certificateNumber || '').toString().trim().toUpperCase();
-      const extracted = {
-        certNo: aiData?.certNo || aiData?.certificateNumber || '',
-        status: aiData?.status || '',
-        issueDate: aiData?.issueDate || '',
-        applicant: aiData?.applicant || '',
-        manufacturer: aiData?.manufacturer || '',
-        // Fill equipment from product if equipment is empty
-        equipment: aiData?.equipment || aiData?.product || '',
-        // Also expose product explicitly for clients that prefer it
-        product: aiData?.product || aiData?.equipment || '',
-        exmarking: aiData?.exmarking || aiData?.exMarking || '',
-        protection: aiData?.protection || '',
-        specCondition: aiData?.specCondition || aiData?.specialConditions || '',
-        description: aiData?.description || '',
-        docType: aiData?.docType || '',
-        xcondition: certStr ? (certStr.endsWith('X') || /\bX\b/.test(certStr)) : false,
-        ucondition: certStr ? (certStr.endsWith('U') || /\bU\b/.test(certStr)) : false
-      };
-
-      // Cleanup temp
+      const { recognizedText, extracted } = await runCertificatePreviewFromSource({
+        source: pdfBuffer,
+        tenantId: req.scope?.tenantId || null,
+        fileName: req.file.originalname
+      });
       try { if (fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath); } catch {}
 
       return res.json({

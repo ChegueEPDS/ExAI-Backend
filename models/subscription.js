@@ -26,5 +26,6 @@ const SubscriptionSchema = new mongoose.Schema({
 SubscriptionSchema.index({ tenantId: 1 });
 SubscriptionSchema.index({ tenantId: 1, updatedAt: -1 });
 SubscriptionSchema.index({ expiresAt: 1 });
+SubscriptionSchema.index({ status: 1, expiresAt: 1 });
 
 module.exports = mongoose.model('Subscription', SubscriptionSchema);

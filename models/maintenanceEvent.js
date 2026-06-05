@@ -52,6 +52,11 @@ MaintenanceEventSchema.post('save', function scheduleDashboardIncidentRefresh(do
   } catch {
     // Best-effort cache refresh; never block maintenance writes.
   }
+  try {
+    require('../services/rootCauseStatsService').syncMaintenanceRootCauseStats(doc).catch(() => {});
+  } catch {
+    // Best-effort stats mirror; never block maintenance writes.
+  }
 });
 
 module.exports = mongoose.model('MaintenanceEvent', MaintenanceEventSchema);

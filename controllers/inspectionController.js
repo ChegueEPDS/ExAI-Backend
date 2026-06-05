@@ -250,7 +250,8 @@ exports.createInspection = async (req, res) => {
       inspectionType,
       schemaId,
       results = [],
-      attachments = []
+      attachments = [],
+      remarks = ''
     } = req.body || {};
 
     if (!inspectionDate || (!validUntil && !schemaId)) {
@@ -361,6 +362,7 @@ exports.createInspection = async (req, res) => {
       inspectorId,
       results: normalizedResults,
       attachments: normalizedAttachments,
+      remarks: String(remarks || '').trim(),
       summary,
       status,
       failureSeverity,
@@ -450,6 +452,7 @@ exports.updateInspection = async (req, res) => {
       inspectionType,
       results = [],
       attachments = [],
+      remarks = '',
       finalize = false
     } = req.body || {};
 
@@ -528,6 +531,7 @@ exports.updateInspection = async (req, res) => {
     inspection.inspectionType = inspectionType || inspection.inspectionType;
     inspection.results = normalizedResults;
     inspection.attachments = normalizedAttachments;
+    inspection.remarks = String(remarks || '').trim();
     inspection.summary = summary;
     inspection.status = status;
     inspection.failureSeverity = failureSeverity;

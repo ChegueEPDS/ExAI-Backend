@@ -3,6 +3,7 @@ const Equipment = require('../models/dataplate');
 const MaintenanceEvent = require('../models/maintenanceEvent');
 const Inspection = require('../models/inspection');
 const Unit = require('../models/unit');
+const { getRootCauseTop } = require('../services/rootCauseStatsService');
 
 function toObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
@@ -101,24 +102,38 @@ exports.getMaintenanceRootCauses = async (req, res) => {
       match.severity = { $in: severities };
     }
 
-    const rows = await MaintenanceEvent.aggregate([
-      { $match: match },
-      {
-        $project: {
-          noteNorm: noteNormalizeExpr('$note')
-        }
-      },
-      {
-        $group: {
-          _id: '$noteNorm',
-          count: { $sum: 1 }
-        }
-      },
-      { $sort: { count: -1, _id: 1 } },
-      { $limit: limit }
-    ]);
-
-    const top = (rows || []).map((r) => ({ label: String(r._id || 'Unspecified'), count: Number(r.count || 0) }));
+    const materialized = await getRootCauseTop({
+      tenantId: tenantObjectId,
+      kind: 'maintenance',
+      equipmentIds,
+      from,
+      to,
+      severities,
+      limit
+    });
+    let top = materialized.top;
+    const sourceCount = materialized.hasMaterializedRows
+      ? await MaintenanceEvent.countDocuments(match)
+      : 0;
+    if (!materialized.hasMaterializedRows || materialized.materializedDocCount < sourceCount) {
+      const rows = await MaintenanceEvent.aggregate([
+        { $match: match },
+        {
+          $project: {
+            noteNorm: noteNormalizeExpr('$note')
+          }
+        },
+        {
+          $group: {
+            _id: '$noteNorm',
+            count: { $sum: 1 }
+          }
+        },
+        { $sort: { count: -1, _id: 1 } },
+        { $limit: limit }
+      ]);
+      top = (rows || []).map((r) => ({ label: String(r._id || 'Unspecified'), count: Number(r.count || 0) }));
+    }
     const total = top.reduce((s, x) => s + x.count, 0);
 
     return res.json({
@@ -167,26 +182,39 @@ exports.getComplianceRootCauses = async (req, res) => {
     }
 
     // Root-cause notes are per failed question result (results[].note).
-    const rows = await Inspection.aggregate([
-      { $match: match },
-      { $unwind: '$results' },
-      { $match: { 'results.status': 'Failed' } },
-      {
-        $project: {
-          noteNorm: noteNormalizeExpr('$results.note')
-        }
-      },
-      {
-        $group: {
-          _id: '$noteNorm',
-          count: { $sum: 1 }
-        }
-      },
-      { $sort: { count: -1, _id: 1 } },
-      { $limit: limit }
-    ]);
-
-    const top = (rows || []).map((r) => ({ label: String(r._id || 'Unspecified'), count: Number(r.count || 0) }));
+    const materialized = await getRootCauseTop({
+      tenantId: tenantObjectId,
+      kind: 'compliance',
+      equipmentIds,
+      from,
+      to,
+      limit
+    });
+    let top = materialized.top;
+    const sourceCount = materialized.hasMaterializedRows
+      ? await Inspection.countDocuments(match)
+      : 0;
+    if (!materialized.hasMaterializedRows || materialized.materializedDocCount < sourceCount) {
+      const rows = await Inspection.aggregate([
+        { $match: match },
+        { $unwind: '$results' },
+        { $match: { 'results.status': 'Failed' } },
+        {
+          $project: {
+            noteNorm: noteNormalizeExpr('$results.note')
+          }
+        },
+        {
+          $group: {
+            _id: '$noteNorm',
+            count: { $sum: 1 }
+          }
+        },
+        { $sort: { count: -1, _id: 1 } },
+        { $limit: limit }
+      ]);
+      top = (rows || []).map((r) => ({ label: String(r._id || 'Unspecified'), count: Number(r.count || 0) }));
+    }
     const total = top.reduce((s, x) => s + x.count, 0);
 
     return res.json({

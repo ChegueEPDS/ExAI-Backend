@@ -45,6 +45,7 @@ const mobileSyncRoutes = require('./routes/mobileSyncRoutes');
 const datasetRoutes = require('./routes/datasetRoutes');
 const standardRoutes = require('./routes/standardRoutes');
 const mobileSyncWorker = require('./services/mobileSyncWorker');
+const reportExportController = require('./controllers/exportInspectionReport');
 const statusSummaryRoutes = require('./routes/statusSummaryRoutes');
 const rootCauseRoutes = require('./routes/rootCauseRoutes');
 const maintenanceSeverityRoutes = require('./routes/maintenanceSeverityRoutes');
@@ -59,6 +60,7 @@ const trainingRoutes = require('./routes/trainingRoutes');
 const publicRotRoutes = require('./routes/publicRotRoutes');
 const customFieldRoutes = require('./routes/customFieldRoutes');
 const schemaRoutes = require('./routes/schemaRoutes');
+const navigationRoutes = require('./routes/navigationRoutes');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -326,6 +328,7 @@ app.options('/api/upload-and-ask/stream', cors({ origin: true, credentials: true
 app.use('/api', authRoutes);
 app.use('/api', conversationRoutes);
 app.use('/api', statisticsRoutes);
+app.use('/api', navigationRoutes);
 app.use('/api', userRoutes);
 app.use('/api', feedbackRoutes);
 app.use('/api', ocrRoutes);
@@ -376,6 +379,7 @@ const backgroundJobsDisabled =
 
 if (!backgroundJobsDisabled) {
   reportExportCleanup.start();
+  reportExportController.startReportExportWorker?.();
 }
 
 

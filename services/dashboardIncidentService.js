@@ -9,6 +9,13 @@ const {
 } = require('./schemaMaintenanceService');
 
 const pendingRecomputes = new Map();
+const queuedRecomputes = new Map();
+let queueTimer = null;
+let activeRecomputes = 0;
+
+const RECOMPUTE_DELAY_MS = 2000;
+const RECOMPUTE_BATCH_SIZE = 50;
+const RECOMPUTE_MAX_CONCURRENCY = 2;
 
 function toObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
@@ -221,16 +228,81 @@ async function recomputeEquipmentIncidents({ tenantId, equipmentIds }) {
   return { deleted, inserted };
 }
 
-function scheduleRecomputeEquipmentIncidents({ tenantId, equipmentId, delayMs = 2000 }) {
-  if (!tenantId || !equipmentId) return;
-  const key = `${tenantId}:${equipmentId}`;
-  if (pendingRecomputes.has(key)) clearTimeout(pendingRecomputes.get(key));
+function scheduleQueueDrain(delayMs = RECOMPUTE_DELAY_MS) {
+  if (queueTimer) return;
+  queueTimer = setTimeout(() => {
+    queueTimer = null;
+    drainRecomputeQueue().catch(() => {});
+  }, delayMs);
+  if (typeof queueTimer.unref === 'function') queueTimer.unref();
+}
+
+function enqueueRecompute({ tenantId, equipmentIds }) {
+  const tenantKey = String(tenantId || '');
+  if (!tenantKey) return;
+  const ids = (equipmentIds || []).filter(Boolean).map(String);
+  if (!ids.length) return;
+  if (!queuedRecomputes.has(tenantKey)) queuedRecomputes.set(tenantKey, new Set());
+  const bucket = queuedRecomputes.get(tenantKey);
+  ids.forEach((id) => bucket.add(id));
+  scheduleQueueDrain();
+}
+
+function takeNextQueuedBatch() {
+  for (const [tenantKey, ids] of queuedRecomputes.entries()) {
+    if (!ids.size) {
+      queuedRecomputes.delete(tenantKey);
+      continue;
+    }
+    const batch = [];
+    for (const id of ids) {
+      batch.push(id);
+      ids.delete(id);
+      if (batch.length >= RECOMPUTE_BATCH_SIZE) break;
+    }
+    if (!ids.size) queuedRecomputes.delete(tenantKey);
+    return { tenantId: tenantKey, equipmentIds: batch };
+  }
+  return null;
+}
+
+async function drainRecomputeQueue() {
+  while (activeRecomputes < RECOMPUTE_MAX_CONCURRENCY) {
+    const next = takeNextQueuedBatch();
+    if (!next) return;
+    activeRecomputes += 1;
+    recomputeEquipmentIncidents(next)
+      .catch(() => {})
+      .finally(() => {
+        activeRecomputes -= 1;
+        if (queuedRecomputes.size) scheduleQueueDrain(250);
+      });
+  }
+}
+
+function scheduleRecomputeEquipmentIncidents({ tenantId, equipmentId, equipmentIds, delayMs = RECOMPUTE_DELAY_MS }) {
+  if (!tenantId) return;
+  const ids = equipmentIds || (equipmentId ? [equipmentId] : []);
+  if (!ids.length) return;
+  const tenantKey = String(tenantId);
+  for (const id of ids) {
+    const key = `${tenantKey}:${id}`;
+    if (pendingRecomputes.has(key)) clearTimeout(pendingRecomputes.get(key));
+    const timer = setTimeout(() => {
+      pendingRecomputes.delete(key);
+      enqueueRecompute({ tenantId, equipmentIds: [id] });
+    }, delayMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    pendingRecomputes.set(key, timer);
+  }
+}
+
+function scheduleBackfillMissingIncidents({ tenantId, equipmentIds, delayMs = RECOMPUTE_DELAY_MS }) {
+  if (!tenantId || !equipmentIds?.length) return;
   const timer = setTimeout(() => {
-    pendingRecomputes.delete(key);
-    recomputeEquipmentIncidents({ tenantId, equipmentIds: [equipmentId] }).catch(() => {});
+    enqueueRecompute({ tenantId, equipmentIds });
   }, delayMs);
   if (typeof timer.unref === 'function') timer.unref();
-  pendingRecomputes.set(key, timer);
 }
 
 async function loadMaterializedIncidents({ tenantId, equipmentIds }) {
@@ -242,8 +314,17 @@ async function loadMaterializedIncidents({ tenantId, equipmentIds }) {
     DashboardIncident.find({ tenantId: tenantObjectId, equipmentId: { $in: ids } }).lean()
   ]);
   const covered = new Set((states || []).map((state) => String(state.equipmentId)));
-  const complete = ids.every((id) => covered.has(String(id)));
-  return { complete, incidents };
+  const missingEquipmentIds = ids.filter((id) => !covered.has(String(id)));
+  const complete = missingEquipmentIds.length === 0;
+  if (missingEquipmentIds.length) {
+    scheduleBackfillMissingIncidents({ tenantId: tenantObjectId, equipmentIds: missingEquipmentIds });
+  }
+  return {
+    complete,
+    incidents,
+    coveredEquipmentIds: Array.from(covered),
+    missingEquipmentIds
+  };
 }
 
 function mapMaterializedIncident(doc) {
@@ -264,5 +345,6 @@ module.exports = {
   loadMaterializedIncidents,
   mapMaterializedIncident,
   recomputeEquipmentIncidents,
-  scheduleRecomputeEquipmentIncidents
+  scheduleRecomputeEquipmentIncidents,
+  scheduleBackfillMissingIncidents
 };

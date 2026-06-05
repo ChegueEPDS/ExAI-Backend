@@ -5,6 +5,8 @@ const Unit = require('../models/unit');
 const MaintenanceEvent = require('../models/maintenanceEvent');
 const { buildMaintenanceSchemaIncidents, buildComplianceSchemaIncidents } = require('./schemaMaintenanceService');
 const {
+  buildComplianceIncidents,
+  buildMaintenanceIncidents,
   loadMaterializedIncidents,
   mapMaterializedIncident
 } = require('./dashboardIncidentService');
@@ -396,63 +398,71 @@ async function computeHealthMetrics({
   let maintenance;
   let maintenanceSchemas;
 
-  if (materialized.complete) {
-    const materializedIncidents = materialized.incidents || [];
-    const severitiesNorm = normalizeSeverities(severity);
-    const fromDocs = (kind) => materializedIncidents
-      .filter((doc) => doc.kind === kind)
-      .map(mapMaterializedIncident)
-      .filter((inc) => applyWindow(inc, { fromMs, toMs, mode: normalizedMode }))
-      .filter((inc) => {
-        if (!severitiesNorm || !kind.includes('maintenance')) return true;
-        return inc.severity && severitiesNorm.includes(String(inc.severity).toUpperCase());
-      });
+  const severitiesNorm = normalizeSeverities(severity);
+  const fromDocs = (kind, docs) => (docs || [])
+    .filter((doc) => doc.kind === kind)
+    .map(mapMaterializedIncident)
+    .filter((inc) => applyWindow(inc, { fromMs, toMs, mode: normalizedMode }))
+    .filter((inc) => {
+      if (!severitiesNorm || !kind.includes('maintenance')) return true;
+      return inc.severity && severitiesNorm.includes(String(inc.severity).toUpperCase());
+    });
 
-    compliance = metricStatsFromIncidents(fromDocs('compliance'));
-    maintenance = metricStatsFromIncidents(fromDocs('maintenance'));
-    const maintenanceSchemaIncidents = fromDocs('maintenance-schema');
-    maintenanceSchemas = metricStatsFromIncidents(maintenanceSchemaIncidents);
-    const complianceSchemaIncidents = fromDocs('compliance-schema');
-    complianceSchemas = metricStatsFromIncidents(complianceSchemaIncidents);
+  const materializedIncidents = materialized.incidents || [];
+  let complianceIncidents = fromDocs('compliance', materializedIncidents);
+  let maintenanceIncidents = fromDocs('maintenance', materializedIncidents);
+  let maintenanceSchemaIncidents = fromDocs('maintenance-schema', materializedIncidents);
+  let complianceSchemaIncidents = fromDocs('compliance-schema', materializedIncidents);
 
-    for (const [target, incidents, fallbackName] of [
-      [maintenanceSchemas, maintenanceSchemaIncidents, 'Maintenance schema'],
-      [complianceSchemas, complianceSchemaIncidents, 'Compliance schema']
-    ]) {
-      const bySchemaMap = new Map();
-      for (const inc of incidents) {
-        const schemaId = inc.schemaId ? String(inc.schemaId) : '';
-        if (!schemaId) continue;
-        if (!bySchemaMap.has(schemaId)) {
-          bySchemaMap.set(schemaId, { schemaId, name: inc.schemaName || fallbackName, incidents: [] });
-        }
-        bySchemaMap.get(schemaId).incidents.push(inc);
-      }
-      target.bySchema = Array.from(bySchemaMap.values())
-        .map((item) => ({ schemaId: item.schemaId, name: item.name, ...metricStatsFromIncidents(item.incidents) }))
-        .sort((a, b) => a.name.localeCompare(b.name));
-    }
-  } else {
-    [compliance, complianceSchemas, maintenance, maintenanceSchemas] = await Promise.all([
-      computeComplianceMetrics({ tenantId, equipmentIds, fromMs, toMs, mode: normalizedMode }),
-      computeComplianceSchemaMetrics({ tenantId, equipmentIds, fromMs, toMs, mode: normalizedMode }),
-      computeMaintenanceMetrics({
-        tenantId,
-        equipmentIds,
-        fromMs,
-        toMs,
-        mode: normalizedMode,
-        severities: severity
-      }),
-      computeMaintenanceSchemaMetrics({
-        tenantId,
-        equipmentIds,
-        fromMs,
-        toMs,
-        mode: normalizedMode,
-        severities: severity
-      })
+  const missingEquipmentIds = materialized.complete
+    ? []
+    : (materialized.missingEquipmentIds?.length ? materialized.missingEquipmentIds : equipmentIds);
+  if (missingEquipmentIds.length) {
+    const [rawCompliance, rawComplianceSchemas, rawMaintenance, rawMaintenanceSchemas] = await Promise.all([
+      buildComplianceIncidents({ tenantId, equipmentIds: missingEquipmentIds }),
+      buildComplianceSchemaIncidents({ tenantId, equipmentIds: missingEquipmentIds }),
+      buildMaintenanceIncidents({ tenantId, equipmentIds: missingEquipmentIds }),
+      buildMaintenanceSchemaIncidents({ tenantId, equipmentIds: missingEquipmentIds })
     ]);
+    complianceIncidents = complianceIncidents.concat(
+      rawCompliance.filter((inc) => applyWindow(inc, { fromMs, toMs, mode: normalizedMode }))
+    );
+    complianceSchemaIncidents = complianceSchemaIncidents.concat(
+      rawComplianceSchemas.filter((inc) => applyWindow(inc, { fromMs, toMs, mode: normalizedMode }))
+    );
+    maintenanceIncidents = maintenanceIncidents.concat(
+      rawMaintenance
+        .filter((inc) => applyWindow(inc, { fromMs, toMs, mode: normalizedMode }))
+        .filter((inc) => !severitiesNorm || (inc.severity && severitiesNorm.includes(String(inc.severity).toUpperCase())))
+    );
+    maintenanceSchemaIncidents = maintenanceSchemaIncidents.concat(
+      rawMaintenanceSchemas
+        .filter((inc) => applyWindow(inc, { fromMs, toMs, mode: normalizedMode }))
+        .filter((inc) => !severitiesNorm || (inc.severity && severitiesNorm.includes(String(inc.severity).toUpperCase())))
+    );
+  }
+
+  compliance = metricStatsFromIncidents(complianceIncidents);
+  maintenance = metricStatsFromIncidents(maintenanceIncidents);
+  maintenanceSchemas = metricStatsFromIncidents(maintenanceSchemaIncidents);
+  complianceSchemas = metricStatsFromIncidents(complianceSchemaIncidents);
+
+  for (const [target, incidents, fallbackName] of [
+    [maintenanceSchemas, maintenanceSchemaIncidents, 'Maintenance schema'],
+    [complianceSchemas, complianceSchemaIncidents, 'Compliance schema']
+  ]) {
+    const bySchemaMap = new Map();
+    for (const inc of incidents) {
+      const schemaId = inc.schemaId ? String(inc.schemaId) : '';
+      if (!schemaId) continue;
+      if (!bySchemaMap.has(schemaId)) {
+        bySchemaMap.set(schemaId, { schemaId, name: inc.schemaName || fallbackName, incidents: [] });
+      }
+      bySchemaMap.get(schemaId).incidents.push(inc);
+    }
+    target.bySchema = Array.from(bySchemaMap.values())
+      .map((item) => ({ schemaId: item.schemaId, name: item.name, ...metricStatsFromIncidents(item.incidents) }))
+      .sort((a, b) => a.name.localeCompare(b.name));
   }
 
   const complianceDurations = Array.isArray(compliance.__durationsMs) ? compliance.__durationsMs : [];

@@ -5,6 +5,8 @@ const certificateDraftController = require('../controllers/certificateDraftContr
 const notificationsController = require('../controllers/notificationsController');
 const authMiddleware = require('../middlewares/authMiddleware')
 
+router.post('/certificates/bulk-upload/direct/init', authMiddleware(), certificateDraftController.initBulkUploadDirect);
+router.post('/certificates/bulk-upload/direct/:uploadId/complete', authMiddleware(), certificateDraftController.completeBulkUploadDirect);
 router.post('/certificates/bulk-upload', authMiddleware(), certificateDraftController.bulkUpload);
 router.post('/certificates/drafts/process/:uploadId', authMiddleware(), certificateDraftController.processDrafts);
 router.post('/certificates/drafts/reprocess-not-ready/:uploadId', authMiddleware(['SuperAdmin']), certificateDraftController.reprocessNotReadyDrafts);

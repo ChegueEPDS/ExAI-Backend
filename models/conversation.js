@@ -108,4 +108,20 @@ ConversationSchema.index({ tenantId: 1, updatedAt: -1 });
 ConversationSchema.index({ tenantId: 1, 'messages.category': 1 });
 ConversationSchema.index({ tenantId: 1, 'messages.assistantRatingCategory': 1 });
 
+ConversationSchema.post('save', function syncConversationStats(doc) {
+  try {
+    require('../services/conversationStatsService').syncConversationStats(doc).catch(() => {});
+  } catch {
+    // Best-effort stats mirror; never block chat writes.
+  }
+});
+
+ConversationSchema.post('deleteOne', { document: true, query: false }, function deleteConversationStats(doc) {
+  try {
+    require('../services/conversationStatsService').deleteConversationStats(doc).catch(() => {});
+  } catch {
+    // Best-effort cleanup.
+  }
+});
+
 module.exports = mongoose.model('Conversation', ConversationSchema);

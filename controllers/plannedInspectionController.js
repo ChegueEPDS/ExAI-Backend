@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const Equipment = require('../models/dataplate');
 const Unit = require('../models/unit');
+const Site = require('../models/site');
 const {
   loadComplianceSchemas,
   loadMaintenanceSchemas,
@@ -65,12 +66,17 @@ exports.getPlannedInspections = async (req, res) => {
       query.$and.push({ $or: [{ Unit: { $in: ids } }, { Zone: { $in: ids } }] });
     }
 
-    const rows = await Equipment.find(query)
+    const dueRows = await Equipment.find({
+      ...query,
+      lastInspectionStatus: 'Passed',
+      lastInspectionValidUntil: { $ne: null }
+    })
       .select('_id EqID TagNo lastInspectionValidUntil Site Unit Zone schemaAssignments')
       .populate({ path: 'Site', select: 'Name', options: { lean: true } })
       .populate({ path: 'Unit', select: 'Name', options: { lean: true } })
       .populate({ path: 'Zone', select: 'Name', options: { lean: true } })
       .sort({ lastInspectionValidUntil: 1, _id: 1 })
+      .limit(Math.max(limit * 4, 50))
       .lean();
 
     const now = Date.now();
@@ -89,7 +95,7 @@ exports.getPlannedInspections = async (req, res) => {
     }));
     const items = [];
 
-    for (const r of rows || []) {
+    for (const r of dueRows || []) {
       const dueAt = r.lastInspectionValidUntil ? new Date(r.lastInspectionValidUntil) : null;
       const dueMs = dueAt ? dueAt.getTime() : null;
       if (dueMs != null) {
@@ -103,28 +109,85 @@ exports.getPlannedInspections = async (req, res) => {
           zoneName: r.Unit?.Name || r.Zone?.Name || null
         });
       }
+    }
 
-      for (const assignment of r.schemaAssignments || []) {
-        const group = typedSchemaGroups.find((candidate) => isSchemaAssignment(assignment, candidate.sets));
-        if (!group) continue;
-        const next = assignment.values?.nextInspectionDate ? new Date(assignment.values.nextInspectionDate) : null;
-        const nextMs = next && Number.isFinite(next.getTime()) ? next.getTime() : null;
-        if (nextMs == null) continue;
-        const schema = assignment.schemaId
-          ? group.byId.get(String(assignment.schemaId))
-          : group.byKey.get(String(assignment.schemaKey || ''));
-        items.push({
-          equipmentId: String(r._id),
-          eqId: r.EqID || null,
-          tagNo: r.TagNo || null,
-          dueAt: next,
-          pastDue: now > nextMs,
-          siteName: r.Site?.Name || null,
-          zoneName: r.Unit?.Name || r.Zone?.Name || null,
-          schemaId: assignment.schemaId ? String(assignment.schemaId) : null,
-          schemaName: schema?.name || assignment.schemaKey || group.fallbackName,
-          schemaType: group.type
-        });
+    const tenantObjectId = isValidObjectId(tenantId) ? new mongoose.Types.ObjectId(String(tenantId)) : tenantId;
+    const schemaMatch = {
+      tenantId: tenantObjectId,
+      isProcessed: true,
+      schemaAssignments: { $exists: true, $ne: [] }
+    };
+    const schemaAnd = [];
+    if (scope === 'site') {
+      schemaMatch.Site = new mongoose.Types.ObjectId(String(siteId));
+    }
+    if (scope === 'zone') {
+      schemaMatch.Site = new mongoose.Types.ObjectId(String(siteId));
+      const unitIds = await Unit.find({
+        tenantId,
+        $or: [{ _id: zoneId }, { ancestors: zoneId }]
+      }).select('_id').lean();
+      const ids = unitIds.map(u => u._id);
+      schemaAnd.push({ $or: [{ Unit: { $in: ids } }, { Zone: { $in: ids } }] });
+    }
+    if (schemaAnd.length) schemaMatch.$and = schemaAnd;
+    const schemaPipeline = [
+      { $match: schemaMatch },
+      { $unwind: '$schemaAssignments' },
+      { $match: { 'schemaAssignments.values.nextInspectionDate': { $ne: null } } },
+      {
+        $project: {
+          _id: 1,
+          EqID: 1,
+          TagNo: 1,
+          Site: 1,
+          Unit: 1,
+          Zone: 1,
+          assignment: '$schemaAssignments',
+          dueAt: '$schemaAssignments.values.nextInspectionDate'
+        }
+      },
+      { $sort: { dueAt: 1, _id: 1 } },
+      { $limit: Math.max(limit * 20, 200) }
+    ];
+    const schemaRows = await Equipment.aggregate(schemaPipeline);
+    const schemaSiteIds = [...new Set((schemaRows || []).map((r) => r.Site).filter(Boolean).map(String))];
+    const schemaUnitIds = [...new Set((schemaRows || []).flatMap((r) => [r.Unit, r.Zone]).filter(Boolean).map(String))];
+    const [schemaSites, schemaUnits] = await Promise.all([
+      schemaSiteIds.length
+        ? Site.find({ _id: { $in: schemaSiteIds } }).select('Name').lean()
+        : [],
+      schemaUnitIds.length
+        ? Unit.find({ _id: { $in: schemaUnitIds } }).select('Name').lean()
+        : []
+    ]);
+    const siteNameById = new Map((schemaSites || []).map((s) => [String(s._id), s.Name || null]));
+    const unitNameById = new Map((schemaUnits || []).map((u) => [String(u._id), u.Name || null]));
+
+    for (const r of schemaRows || []) {
+      const assignment = r.assignment || {};
+      const group = typedSchemaGroups.find((candidate) => isSchemaAssignment(assignment, candidate.sets));
+      if (!group) continue;
+      const next = r.dueAt ? new Date(r.dueAt) : null;
+      const nextMs = next && Number.isFinite(next.getTime()) ? next.getTime() : null;
+      if (nextMs == null) continue;
+      const schema = assignment.schemaId
+        ? group.byId.get(String(assignment.schemaId))
+        : group.byKey.get(String(assignment.schemaKey || ''));
+      items.push({
+        equipmentId: String(r._id),
+        eqId: r.EqID || null,
+        tagNo: r.TagNo || null,
+        dueAt: next,
+        pastDue: now > nextMs,
+        siteName: r.Site ? siteNameById.get(String(r.Site)) || null : null,
+        zoneName: r.Unit ? unitNameById.get(String(r.Unit)) || null : (r.Zone ? unitNameById.get(String(r.Zone)) || null : null),
+        schemaId: assignment.schemaId ? String(assignment.schemaId) : null,
+        schemaName: schema?.name || assignment.schemaKey || group.fallbackName,
+        schemaType: group.type
+      });
+      if (items.length >= Math.max(limit * 6, 60)) {
+        break;
       }
     }
 

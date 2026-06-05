@@ -16,6 +16,13 @@ const ReportExportJobSchema = new mongoose.Schema(
     blobSize: { type: Number },
     errorMessage: { type: String },
     meta: mongoose.Schema.Types.Mixed,
+    progress: {
+      processed: { type: Number, default: 0 },
+      total: { type: Number, default: 0 },
+      updatedAt: { type: Date, default: null }
+    },
+    attempts: { type: Number, default: 0 },
+    lastHeartbeatAt: { type: Date, default: null },
     startedAt: { type: Date },
     finishedAt: { type: Date }
   },
@@ -24,5 +31,8 @@ const ReportExportJobSchema = new mongoose.Schema(
 
 ReportExportJobSchema.index({ tenantId: 1, createdAt: -1 });
 ReportExportJobSchema.index({ userId: 1, createdAt: -1 });
+ReportExportJobSchema.index({ status: 1, finishedAt: 1 });
+ReportExportJobSchema.index({ status: 1, createdAt: 1 });
+ReportExportJobSchema.index({ status: 1, lastHeartbeatAt: 1 });
 
 module.exports = mongoose.model('ReportExportJob', ReportExportJobSchema);

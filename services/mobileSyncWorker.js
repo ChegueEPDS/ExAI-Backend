@@ -522,9 +522,43 @@ async function processOneJob(job) {
 async function tick() {
   if (isRunning) return;
   isRunning = true;
+  let job = null;
   try {
     const now = new Date();
-    const job = await ProcessingJob.findOneAndUpdate(
+    const staleMinutes = Math.max(Number(process.env.MOBILE_SYNC_STALE_MINUTES || 120), 15);
+    const staleBefore = new Date(now.getTime() - staleMinutes * 60 * 1000);
+    const staleJobs = await ProcessingJob.find({
+      type: 'mobileSync',
+      status: 'processing',
+      startedAt: { $lte: staleBefore }
+    }).select('_id tenantId equipmentIds').lean();
+    for (const staleJob of staleJobs || []) {
+      await ProcessingJob.updateOne(
+        { _id: staleJob._id, status: 'processing' },
+        {
+          $set: {
+            status: 'error',
+            finishedAt: now,
+            errorMessage: `Mobile sync job exceeded ${staleMinutes} minutes without finishing.`
+          }
+        }
+      );
+      await Equipment.updateMany(
+        {
+          _id: { $in: staleJob.equipmentIds || [] },
+          tenantId: staleJob.tenantId,
+          'mobileSync.jobId': String(staleJob._id)
+        },
+        {
+          $set: {
+            'mobileSync.status': 'error',
+            'mobileSync.finishedAt': now,
+            isProcessed: true
+          }
+        }
+      );
+    }
+    job = await ProcessingJob.findOneAndUpdate(
       { type: 'mobileSync', status: 'queued' },
       { $set: { status: 'processing', startedAt: now } },
       { sort: { createdAt: 1 }, new: true }
@@ -589,8 +623,22 @@ async function tick() {
       // ignore notification failures
     }
   } catch (err) {
-    // If we ever fail mid-update, we keep the current job in 'processing' and it can be handled manually.
-    // This worker is best-effort and should not crash the server.
+    if (job?._id) {
+      try {
+        await ProcessingJob.updateOne(
+          { _id: job._id },
+          {
+            $set: {
+              status: 'error',
+              finishedAt: new Date(),
+              errorMessage: err?.message || String(err)
+            }
+          }
+        );
+      } catch {
+        // Best-effort failure marking; worker must not crash the server.
+      }
+    }
   } finally {
     isRunning = false;
   }

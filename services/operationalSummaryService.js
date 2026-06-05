@@ -296,7 +296,100 @@ async function computeMaintenanceSeveritySummary({ tenantId, siteId = null, zone
   return { totalAffected, counts };
 }
 
+async function resolveSummaryEquipments({ tenantId, siteId = null, zoneId = null, select = '_id operationalStatus lastInspectionStatus schemaAssignments' }) {
+  const tenantObjectId = toObjectId(tenantId) || tenantId;
+  const siteObjectId = siteId ? toObjectId(siteId) : null;
+  const zoneObjectId = zoneId ? toObjectId(zoneId) : null;
+  if (!tenantObjectId) throw new Error('Missing tenantId');
+  if (siteId && !siteObjectId) throw new Error('Invalid siteId');
+  if (zoneId && !zoneObjectId) throw new Error('Invalid zoneId');
+
+  const eqFilter = { tenantId: tenantObjectId };
+  if (siteObjectId) eqFilter.Site = siteObjectId;
+  if (zoneObjectId) {
+    const unitIds = await Unit.find({
+      tenantId: tenantObjectId,
+      $or: [{ _id: zoneObjectId }, { ancestors: zoneObjectId }]
+    }).select('_id').lean();
+    const ids = unitIds.map(u => u._id);
+    eqFilter.$or = [{ Unit: { $in: ids } }, { Zone: { $in: ids } }];
+  }
+
+  const equipments = await Equipment.find(eqFilter).select(select).lean();
+  const equipmentIds = (equipments || []).map((e) => e._id).filter(Boolean);
+  return { tenantObjectId, equipments, equipmentIds };
+}
+
+function summarizeOperationalFromEquipments(equipments, pendingSet) {
+  const total = equipments.length;
+  let failed = 0;
+  for (const eq of equipments || []) {
+    const id = eq?._id ? String(eq._id) : '';
+    if (!id || pendingSet.has(id)) continue;
+    if ((eq.operationalStatus || 'operating') === 'failed') failed += 1;
+  }
+  const pending = pendingSet.size;
+  return { total, counts: { operating: Math.max(total - failed - pending, 0), failed, pending } };
+}
+
+function summarizeComplianceFromEquipments(equipments) {
+  const counts = { passed: 0, failed: 0, na: 0 };
+  for (const eq of equipments || []) {
+    const status = String(eq?.lastInspectionStatus || 'NA');
+    if (status === 'Passed') counts.passed += 1;
+    else if (status === 'Failed') counts.failed += 1;
+    else counts.na += 1;
+  }
+  return { total: counts.passed + counts.failed + counts.na, counts };
+}
+
+function summarizeOverallFromEquipments(equipments, pendingSet) {
+  const total = equipments.length;
+  let passedOperating = 0;
+  let failed = 0;
+  let naPending = 0;
+
+  for (const eq of equipments || []) {
+    const id = eq?._id ? String(eq._id) : '';
+    if (!id) continue;
+    if (pendingSet.has(id)) {
+      naPending += 1;
+      continue;
+    }
+    const op = eq.operationalStatus || 'operating';
+    const compliance = eq.lastInspectionStatus || 'NA';
+    if (op === 'failed' || compliance === 'Failed') failed += 1;
+    else if (compliance === 'NA') naPending += 1;
+    else passedOperating += 1;
+  }
+
+  const accounted = passedOperating + failed + naPending;
+  if (accounted !== total) naPending += Math.max(total - accounted, 0);
+  return { total, counts: { passedOperating, failed, naPending } };
+}
+
+async function computeStatusStackedSummary({ tenantId, siteId = null, zoneId = null }) {
+  const { tenantObjectId, equipments, equipmentIds } = await resolveSummaryEquipments({ tenantId, siteId, zoneId });
+  const pendingSet = equipmentIds.length
+    ? await computePendingRepairSet({ tenantObjectId, equipmentIds })
+    : new Set();
+
+  const [maintenanceSchemas, complianceSchemas] = await Promise.all([
+    computeMaintenanceSchemaStatusSummary({ tenantId: tenantObjectId, equipments }),
+    computeComplianceSchemaStatusSummary({ tenantId: tenantObjectId, equipments })
+  ]);
+
+  return {
+    maintenance: summarizeOperationalFromEquipments(equipments, pendingSet),
+    maintenanceSchemas,
+    compliance: summarizeComplianceFromEquipments(equipments),
+    complianceSchemas,
+    overall: summarizeOverallFromEquipments(equipments, pendingSet)
+  };
+}
+
 module.exports = {
+  computeStatusStackedSummary,
   computeOperationalSummary,
   computeOverallStatusSummary,
   computeMaintenanceSeveritySummary,
