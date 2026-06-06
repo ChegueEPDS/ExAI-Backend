@@ -134,6 +134,7 @@ async function buildSpecialConditionResult(equipmentDoc, tenantId) {
 
   return {
     questionId: undefined,
+    reference: 'SC1',
     table: 'SC',
     group: 'SC',
     number: 1,
@@ -153,6 +154,17 @@ function summarizeAutoInspectionResults(results) {
     else summary.passedCount += 1;
   });
   return { summary, status: summary.failedCount > 0 ? 'Failed' : 'Passed' };
+}
+
+function deriveQuestionReference(input = {}) {
+  const explicit = String(input.reference || '').trim();
+  if (explicit) return explicit;
+  const table = String(input.table || input.Table || '').trim();
+  const number = input.number ?? input.Number;
+  if (table === 'SC' || input.equipmentType === 'Special Condition') return `SC${number || 1}`;
+  if (table && (number || number === 0)) return `${table}-${number}`;
+  if (number || number === 0) return `${number}`;
+  return '';
 }
 
 function truncate(s, max = 200) {
@@ -247,11 +259,12 @@ async function ensureAutoInspectionFromMobileSync({
   if (questionDocs.length) {
     results = questionDocs.map((q) => {
       const eqType = (q.equipmentType || '').toLowerCase();
-      const isAlwaysPassed = basePassedTypes.has(eqType);
+      const isAlwaysPassed = basePassedTypes.has(eqType) || eqType.startsWith('installation');
       const isRelevantByDevice = relevantTypes.has(eqType);
       const shouldBePassed = isAlwaysPassed || isRelevantByDevice;
       return {
         questionId: q._id ? new mongoose.Types.ObjectId(q._id) : undefined,
+        reference: deriveQuestionReference(q),
         table: q.table || q.Table || '',
         group: q.group || q.Group || '',
         number: q.number ?? q.Number ?? null,
@@ -279,6 +292,7 @@ async function ensureAutoInspectionFromMobileSync({
         table: 'AUTO',
         group: 'AUTO',
         number: 1,
+        reference: 'AUTO-1',
         equipmentType: equipmentDoc['Equipment Type'] || '',
         protectionTypes: [],
         questionText: {
@@ -291,6 +305,7 @@ async function ensureAutoInspectionFromMobileSync({
 
   const specialResult = await buildSpecialConditionResult(equipmentDoc, tenantId);
   if (specialResult) results.push(specialResult);
+  results = results.map((r) => ({ ...r, reference: deriveQuestionReference(r) }));
 
   if (compliance === 'Failed') {
     const failureNoteRaw = String(failureNoteFromJob || '').trim();
@@ -395,20 +410,27 @@ async function processOneJob(job) {
   const metaByEquipmentId = job?.metaByEquipmentId && typeof job.metaByEquipmentId === 'object' ? job.metaByEquipmentId : {};
   const tenant = tenantId ? await Tenant.findById(tenantId).select('name').lean() : null;
   const tenantKey = String(tenant?.name || '').toLowerCase();
+  const concurrency = Math.max(1, Math.min(Number(process.env.MOBILE_SYNC_CONCURRENCY || 1), 4));
+  let nextIndex = 0;
+  let processedCount = 0;
 
-  for (let i = 0; i < equipmentIds.length; i += 1) {
-    const equipmentId = equipmentIds[i];
+  async function markProcessed() {
+    processedCount += 1;
+    await ProcessingJob.updateOne({ _id: job._id }, { $set: { processed: processedCount } });
+  }
+
+  async function processEquipment(equipmentId) {
     try {
       const equipmentDoc = await Equipment.findOne({ _id: equipmentId, tenantId });
       if (!equipmentDoc) {
         await ProcessingJob.updateOne(
           { _id: job._id },
           {
-            $push: { errorItems: { equipmentId, message: 'Equipment not found for tenant.' } },
-            $set: { processed: i + 1 }
+            $push: { errorItems: { equipmentId, message: 'Equipment not found for tenant.' } }
           }
         );
-        continue;
+        await markProcessed();
+        return;
       }
 
       equipmentDoc.mobileSync = {
@@ -506,17 +528,28 @@ async function processOneJob(job) {
         // ignore
       }
 
-      await ProcessingJob.updateOne({ _id: job._id }, { $set: { processed: i + 1 } });
+      await markProcessed();
     } catch (err) {
       await ProcessingJob.updateOne(
         { _id: job._id },
         {
-          $push: { errorItems: { equipmentId, message: err?.message || String(err) } },
-          $set: { processed: i + 1 }
+          $push: { errorItems: { equipmentId, message: err?.message || String(err) } }
         }
       );
+      await markProcessed();
     }
   }
+
+  async function worker() {
+    while (nextIndex < equipmentIds.length) {
+      const current = nextIndex;
+      nextIndex += 1;
+      await processEquipment(equipmentIds[current]);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, equipmentIds.length || 1) }, () => worker());
+  await Promise.all(workers);
 }
 
 async function tick() {

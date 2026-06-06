@@ -87,7 +87,10 @@ const HEADER_ALIASES = {
   'temp range': 'Temp. Range',
   'temp. range': 'Temp. Range',
   'temperature range': 'Temp. Range',
+  'max ambient temp': 'Temp. Range',
+  'max ta': 'Temp. Range',
   'epl': 'EPL',
+  'equipment protection level': 'EPL',
   'equipment group': 'Equipment Group',
   'group': 'Equipment Group',
   'equipment category': 'Equipment Category',
@@ -95,8 +98,12 @@ const HEADER_ALIASES = {
   'environment': 'Environment',
   'subgroup': 'SubGroup',
   'sub group': 'SubGroup',
+  'gas / dust group': 'SubGroup',
+  'gas/dust group': 'SubGroup',
+  'gas dust group': 'SubGroup',
   'temperature class': 'Temperature Class',
   'protection concept': 'Protection Concept',
+  'type of protection': 'Protection Concept',
   'certificate no': 'Certificate No',
   'certificate number': 'Certificate No',
   'declaration of conformity': 'Declaration of conformity',
@@ -107,6 +114,7 @@ const HEADER_ALIASES = {
   'inspection date': 'Inspection Date',
   'inspection status': 'Status',
   'status': 'Status',
+  'compliance': 'Status',
   'remarks': 'Remarks',
   'notes': 'Remarks',
   'note': 'Remarks',
@@ -171,7 +179,7 @@ const SEARCHABLE_EQUIPMENT_FIELDS = [
   'Other Info'
 ];
 
-const EQUIPMENT_LIST_SELECT = [
+const EQUIPMENT_LIST_SELECT_FIELDS = [
   'EqID',
   'TagNo',
   'Manufacturer',
@@ -204,7 +212,12 @@ const EQUIPMENT_LIST_SELECT = [
   'pendingReview',
   'updatedAt',
   'createdAt'
-].join(' ');
+];
+
+const EQUIPMENT_LIST_SELECT = EQUIPMENT_LIST_SELECT_FIELDS.reduce((projection, field) => {
+  projection[field] = 1;
+  return projection;
+}, {});
 
 const EQUIPMENT_LIST_SORT_FIELDS = new Set([
   'orderIndex',
@@ -234,6 +247,48 @@ function toObjectId(value) {
   } catch {
     return null;
   }
+}
+
+function maxTimeMsFromEnv(name, fallbackMs) {
+  const n = Number(process.env[name] ?? fallbackMs);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(Math.max(n, 1000), 60_000);
+}
+
+function castListCursorValue(sortField, value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (sortField === 'createdAt' || sortField === 'updatedAt' || sortField === 'lastInspectionValidUntil' || sortField === 'lastInspectionDate') {
+    const d = new Date(String(value));
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  if (sortField === 'orderIndex') {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+  return String(value);
+}
+
+function buildEquipmentKeysetMatch({ sortField, sortDir, afterValue, afterId }) {
+  const value = castListCursorValue(sortField, afterValue);
+  const id = toObjectId(afterId);
+  if (value === null || !id) return null;
+  const op = sortDir === -1 ? '$lt' : '$gt';
+  return {
+    $or: [
+      { [sortField]: { [op]: value } },
+      { [sortField]: value, _id: { $gt: id } }
+    ]
+  };
+}
+
+function buildEquipmentNextCursor(items, sortField) {
+  if (!Array.isArray(items) || !items.length) return null;
+  const last = items[items.length - 1];
+  const value = last?.[sortField];
+  return {
+    afterValue: value instanceof Date ? value.toISOString() : value,
+    afterId: last?._id ? String(last._id) : null
+  };
 }
 
 // Létrehozás (POST /exreg)
@@ -1294,6 +1349,7 @@ async function buildSpecialConditionResult(equipmentDoc, tenantId) {
 
   return {
     questionId: undefined,
+    reference: 'SC1',
     table: 'SC',
     group: 'SC',
     number: 1,
@@ -1321,6 +1377,17 @@ function summarizeAutoInspectionResults(results) {
     summary,
     status: summary.failedCount > 0 ? 'Failed' : 'Passed'
   };
+}
+
+function deriveInspectionQuestionReference(input = {}) {
+  const explicit = String(input.reference || '').trim();
+  if (explicit) return explicit;
+  const table = String(input.table || input.Table || '').trim();
+  const number = input.number ?? input.Number;
+  if (table === 'SC' || input.equipmentType === 'Special Condition') return `SC${number || 1}`;
+  if (table && (number || number === 0)) return `${table}-${number}`;
+  if (number || number === 0) return `${number}`;
+  return '';
 }
 
 // 📥 Létrehozás (POST /exreg)
@@ -2891,11 +2958,12 @@ async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspe
   if (questionDocs.length) {
     results = questionDocs.map((q) => {
       const eqType = (q.equipmentType || '').toLowerCase();
-      const isAlwaysPassed = basePassedTypes.has(eqType);
+      const isAlwaysPassed = basePassedTypes.has(eqType) || eqType.startsWith('installation');
       const isRelevantByDevice = relevantTypes.has(eqType);
 
       return {
         questionId: q._id ? new mongoose.Types.ObjectId(q._id) : undefined,
+        reference: deriveInspectionQuestionReference(q),
         table: q.table || q.Table || '',
         group: q.group || q.Group || '',
         number: q.number ?? q.Number ?? null,
@@ -2920,6 +2988,7 @@ async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspe
       table: 'AUTO',
       group: 'AUTO',
       number: 1,
+      reference: 'AUTO-1',
       equipmentType: equipmentDoc['Equipment Type'] || equipmentDoc.EquipmentType || '',
       protectionTypes: [],
       questionText: {
@@ -2933,6 +3002,7 @@ async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspe
   if (specialResult) {
     results.push(specialResult);
   }
+  results = results.map((r) => ({ ...r, reference: deriveInspectionQuestionReference(r) }));
 
   const { summary, status } = summarizeAutoInspectionResults(results);
 
@@ -3548,8 +3618,8 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
       if (EqID) filter.EqID = EqID;
     }
 
-    if (searchTerm) {
-      const regex = new RegExp(escapeRegex(searchTerm), 'i');
+    if (searchTerm && searchTerm.length >= 2) {
+      const regex = new RegExp(`^${escapeRegex(searchTerm)}`, 'i');
       const searchConditions = SEARCHABLE_EQUIPMENT_FIELDS.map(field => ({ [field]: regex }));
       andConditions.push({ $or: searchConditions });
     }
@@ -4795,17 +4865,33 @@ exports.listEquipment = async (req, res) => {
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const skipParam = parseInt(req.query.skip, 10);
     const skip = Number.isFinite(skipParam) && skipParam >= 0 ? skipParam : (page - 1) * pageSize;
+    const keyset = buildEquipmentKeysetMatch({
+      sortField,
+      sortDir,
+      afterValue: req.query.afterValue,
+      afterId: req.query.afterId
+    });
+    if (keyset) {
+      if (filter.$and) filter.$and.push(keyset);
+      else filter.$and = [keyset];
+    }
+
+    const includeTotal = String(req.query.includeTotal ?? 'true').toLowerCase() !== 'false';
+    const effectiveLimit = includeTotal ? pageSize : pageSize + 1;
 
     const query = Equipment.find(filter)
       .select(EQUIPMENT_LIST_SELECT)
       .sort(sortOptions)
-      .skip(skip || 0)
-      .limit(pageSize);
+      .skip(keyset ? 0 : (skip || 0))
+      .limit(effectiveLimit)
+      .maxTimeMS(maxTimeMsFromEnv('EQUIPMENT_QUERY_MAX_TIME_MS', 10_000));
 
-    const [equipments, totalCount] = await Promise.all([
+    const [rawEquipments, totalCount] = await Promise.all([
       query.lean(),
-      Equipment.countDocuments(filter)
+      includeTotal ? Equipment.countDocuments(filter) : Promise.resolve(null)
     ]);
+    const hasNext = !includeTotal && rawEquipments.length > pageSize;
+    const equipments = includeTotal ? rawEquipments : rawEquipments.slice(0, pageSize);
 
     let certMap = new Map();
     try {
@@ -4856,6 +4942,12 @@ exports.listEquipment = async (req, res) => {
       return {
         ...eq,
         operationalStatus,
+        'Ex Marking': equipmentMarkings(eq),
+        'Certificate No': certificateNo(eq) || '',
+        Compliance: complianceStatus(eq) || 'NA',
+        'IP rating': eq['IP rating'] || '',
+        IP: eq['IP rating'] || '',
+        ipRating: eq['IP rating'] || '',
         BlobPreviewUrl: firstBlobUrl,
         'X condition': xCondition,
         _linkedCertificate: linkedCertificate,
@@ -4865,7 +4957,9 @@ exports.listEquipment = async (req, res) => {
 
     return res.json({
       items: withPaths,
-      total: typeof totalCount === 'number' ? totalCount : withPaths.length,
+      total: typeof totalCount === 'number' ? totalCount : skip + withPaths.length + (hasNext ? 1 : 0),
+      hasNext,
+      nextCursor: buildEquipmentNextCursor(equipments, sortField),
       page,
       pageSize
     });

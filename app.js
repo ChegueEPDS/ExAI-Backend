@@ -9,6 +9,7 @@ const cleanupService = require('./services/cleanupService');
 const subscriptionSweeper = require('./services/subscriptionSweeper');
 const reportExportCleanup = require('./services/reportExportCleanup');
 const systemSettingsStore = require('./services/systemSettingsStore');
+const { withLock } = require('./services/distributedLockService');
 const path = require('path');
 const fs = require('fs');
 
@@ -424,10 +425,22 @@ if (fs.existsSync(frontendDist)) {
 
 if (!backgroundJobsDisabled) {
   // Periodikus tisztítás
-  setInterval(cleanupService.removeEmptyConversations, 3 * 60 * 60 * 1000); // 3 órás intervallum
-  setInterval(() => cleanupService.cleanupUploadTempFiles(), 3 * 60 * 60 * 1000);
-  setInterval(cleanupService.cleanupEquipmentDocsImportErrorReports, 24 * 60 * 60 * 1000); // napi egyszer
-  setInterval(subscriptionSweeper.sweepExpiredSubscriptions, 60 * 60 * 1000);
+  setInterval(
+    () => withLock('cleanup:empty-conversations', 30 * 60 * 1000, cleanupService.removeEmptyConversations),
+    3 * 60 * 60 * 1000
+  ); // 3 órás intervallum
+  setInterval(
+    () => withLock('cleanup:upload-temp-files', 30 * 60 * 1000, () => cleanupService.cleanupUploadTempFiles()),
+    3 * 60 * 60 * 1000
+  );
+  setInterval(
+    () => withLock('cleanup:equipment-doc-import-errors', 2 * 60 * 60 * 1000, cleanupService.cleanupEquipmentDocsImportErrorReports),
+    24 * 60 * 60 * 1000
+  ); // napi egyszer
+  setInterval(
+    () => withLock('subscriptions:sweep-expired', 20 * 60 * 1000, subscriptionSweeper.sweepExpiredSubscriptions),
+    60 * 60 * 1000
+  );
   // Mobile sync background processing (best-effort in-process worker)
   mobileSyncWorker.start({ intervalMs: 5000 });
 }

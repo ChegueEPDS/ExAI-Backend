@@ -13,6 +13,7 @@ const Zone = require('../models/zone');
 const Unit = require('../models/unit');
 const Certificate = require('../models/certificate');
 const User = require('../models/user');
+const Tenant = require('../models/tenant');
 const ReportExportJob = require('../models/reportExportJob');
 const azureBlob = require('../services/azureBlobService');
 const sharp = require('sharp');
@@ -78,6 +79,25 @@ const REPORT_JOB_TYPES = {
 const REPORT_BLOB_PREFIX = 'report-exports';
 function displayInspectionTypeForReport(type) {
   return String(type || '') === 'Initial Detailed (Index)' ? 'Initial Detailed' : (type || '');
+}
+
+function displayInspectionTypeForHeader(inspection) {
+  if (!inspection) return '';
+  if (inspection.schemaNameSnapshot && String(inspection.inspectionType || '') === 'Criteria') {
+    return String(inspection.schemaNameSnapshot || '').trim();
+  }
+  return String(displayInspectionTypeForReport(inspection.inspectionType) || '').trim();
+}
+
+async function getTenantReportLogoUrl(tenantId) {
+  if (!tenantId) return '';
+  try {
+    const tenant = await Tenant.findById(tenantId).select('logoBlobUrl logoBlobPath').lean();
+    return tenant?.logoBlobUrl || (tenant?.logoBlobPath ? azureBlob.getBlobUrl(tenant.logoBlobPath) : '') || '';
+  } catch (err) {
+    console.warn('⚠️ Failed to load tenant report logo:', err?.message || err);
+    return '';
+  }
 }
 
 function listDisplay(value) {
@@ -347,6 +367,22 @@ function fetchImageBuffer(url) {
       res.on('end', () => resolve(Buffer.concat(chunks)));
     }).on('error', reject);
   });
+}
+
+async function logoFitSize(buffer, maxWidth = 117.5, maxHeight = 53.5) {
+  try {
+    const meta = await sharp(buffer).metadata();
+    const width = Number(meta.width || 0);
+    const height = Number(meta.height || 0);
+    if (!width || !height) return { width: maxWidth, height: maxHeight };
+    const scale = Math.min(maxWidth / width, maxHeight / height, 1);
+    return {
+      width: Math.max(1, width * scale),
+      height: Math.max(1, height * scale)
+    };
+  } catch {
+    return { width: maxWidth, height: maxHeight };
+  }
 }
 
 async function findEquipmentForInspection(inspection) {
@@ -773,15 +809,16 @@ function buildEquipmentIdentifier(equipment, context = {}) {
 
 function deriveQuestionReference(result) {
   if (!result) return '';
+  const explicit = String(result.reference || '').trim();
+  if (explicit) return explicit;
   const tableVal = (result.table || result.Table || '').toString();
-  const groupVal = (result.group || result.Group || '').toString();
   const numRaw = result.number ?? result.Number;
   if (tableVal === 'SC' || result.equipmentType === 'Special Condition') {
     const num = typeof numRaw === 'number' ? numRaw : 1;
     return `SC${num}`;
   }
-  if (tableVal && groupVal && (numRaw || numRaw === 0)) {
-    return `${tableVal}-${groupVal}-${numRaw}`;
+  if (tableVal && (numRaw || numRaw === 0)) {
+    return `${tableVal}-${numRaw}`;
   }
   if (numRaw || numRaw === 0) {
     return `${numRaw}`;
@@ -1258,6 +1295,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   const inspectorSignatureUrl =
     inspectorDoc?.signatureBlobUrl ||
     (inspectorDoc?.signatureBlobPath ? azureBlob.getBlobUrl(inspectorDoc.signatureBlobPath) : null);
+  const tenantLogoUrl = options.tenantLogoUrl || await getTenantReportLogoUrl(options.tenantId || inspection.tenantId);
 
   const tenantName = (options.tenantName || '').toLowerCase();
   const isIndexTenant = tenantName === 'index' || tenantName === 'ind-ex';
@@ -1278,107 +1316,88 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   ws.pageSetup.fitToWidth = 1;   // Szélesség: 1 lap
   ws.pageSetup.fitToHeight = 0;  // Magasság: Automatikus
 
-  // ========= 1. sor – logo (Index) + cím + dátum =========
-  if (isIndexTenant) {
-    // Logo bal oldalt A1:B2
-    try {
-      const logoBuffer = await fetchImageBuffer(INDEX_LOGO_URL);
-      const imageId = workbook.addImage({
-        buffer: logoBuffer,
-        extension: 'png'
-      });
-      // Rögzített méretű logó, hogy az arányai ne torzuljanak
-      ws.addImage(imageId, {
-        tl: { col: 0, row: 0 },      // A1
-        ext: { width: 117.5, height: 53.5 } // px
-      });
-      ws.mergeCells('A1:B2');
-    } catch (e) {
-      // ha nem sikerül, csak simán üresen hagyjuk a logó helyét
-      ws.mergeCells('A1:B2');
-    }
-
-    // Szürke háttér a logo mögötti teljes blokkra (A1:B2)
-    ['A','B'].forEach(col => {
-      [1,2].forEach(rn => {
-        const cell = ws.getCell(`${col}${rn}`);
-        cell.fill = HEADER_FILL;
-      });
+  // ========= 1. sor – tenant logo + cím + electrical marker + dátum =========
+  try {
+    const logoBuffer = await fetchImageBuffer(tenantLogoUrl || INDEX_LOGO_URL);
+    const imageId = workbook.addImage({
+      buffer: logoBuffer,
+      extension: 'png'
     });
-
-    ws.mergeCells('C1:I2');
-    const titleCell = ws.getCell('C1');
-    titleCell.value = 'Inspection Test Report';
-    titleCell.font = { bold: true, size: 16 };
-    titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
-    // háttér azonos a dátum cellával
-    titleCell.fill = HEADER_FILL;
-
-    ws.mergeCells('J1:K1');
-    ws.getCell('J1').value = 'Electrical';
-    ws.getCell('J1').font = { bold: true, size: 11 };
-    ws.getCell('J1').alignment = { horizontal: 'center', vertical: 'middle' };
-    ws.getCell('J1').fill = HEADER_FILL;
-    ws.getCell('L1').value = hasElectricalProtection ? 'x' : '';
-    ws.getCell('L1').font = { size: 11 };
-    ws.getCell('L1').alignment = { horizontal: 'center', vertical: 'middle' };
-    ws.getCell('L1').fill = HEADER_FILL;
-
-    ws.mergeCells('J2:K2');
-    ws.getCell('J2').value = 'Non-Electrical';
-    ws.getCell('J2').font = { bold: true, size: 11 };
-    ws.getCell('J2').alignment = { horizontal: 'center', vertical: 'middle' };
-    ws.getCell('J2').fill = HEADER_FILL;
-    ws.getCell('L2').value = hasNonElectricalProtection ? 'x' : '';
-    ws.getCell('L2').font = { size: 11 };
-    ws.getCell('L2').alignment = { horizontal: 'center', vertical: 'middle' };
-    ws.getCell('L2').fill = HEADER_FILL;
-
-    ws.mergeCells('M1:M2');
-    ws.getCell('M1').value = 'Date:';
-    ws.getCell('M1').font = { bold: true, size: 11 };
-    ws.getCell('M1').alignment = { horizontal: 'center', vertical: 'middle' };
-    ws.getCell('M1').fill = HEADER_FILL;
-
-    ws.mergeCells('N1:N2');
-    ws.getCell('N1').value = inspectionDate;
-    ws.getCell('N1').font = { size: 11 };
-    ws.getCell('N1').numFmt = 'yyyy-mm-dd';
-    ws.getCell('N1').alignment = { horizontal: 'center', vertical: 'middle' };
-    ws.getCell('N1').fill = HEADER_FILL;
-
-    ['J','K','L','M','N'].forEach(col => {
-      [1,2].forEach(rn => {
-        const cell = ws.getCell(`${col}${rn}`);
-        cell.border = BORDER_THIN;
-      });
+    const logoSize = await logoFitSize(logoBuffer);
+    // A méret a régi logóboxon belül marad, de az eredeti képarányt megtartja.
+    ws.addImage(imageId, {
+      tl: { col: 0, row: 0 },      // A1
+      ext: logoSize
     });
-  } else {
-    ws.mergeCells('A1:K2');
-    const titleCell = ws.getCell('A1');
-    titleCell.value = 'Inspection Test Report';
-    titleCell.font = { bold: true, size: 16 };
-    titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
-    // háttér azonos a dátum cellával
-    titleCell.fill = HEADER_FILL;
+    ws.mergeCells('A1:B2');
+  } catch (e) {
+    // ha nem sikerül, csak simán üresen hagyjuk a logó helyét
+    ws.mergeCells('A1:B2');
   }
 
-  if (!isIndexTenant) {
-    ws.mergeCells('L1:L2');
-    ws.getCell('L1').value = 'Inspection Date:';
-    ws.getCell('L1').font = { bold: true, size: 16 };
-    ws.getCell('L1').alignment = { horizontal: 'right', vertical: 'middle' };
-    ws.getCell('L1').fill= HEADER_FILL;
+  ['A','B'].forEach(col => {
+    [1,2].forEach(rn => {
+      const cell = ws.getCell(`${col}${rn}`);
+      cell.fill = HEADER_FILL;
+    });
+  });
 
-    ws.mergeCells('M1:N2');
-    ws.getCell('M1').value = inspectionDate;
-    ws.getCell('M1').font = { size: 16 };
-    ws.getCell('M1').numFmt = 'yyyy-mm-dd';
-    ws.getCell('M1').alignment = { horizontal: 'center', vertical: 'middle' };
-    ws.getCell('M1').fill= HEADER_FILL;
-  }
+  ws.mergeCells('C1:I2');
+  const titleCell = ws.getCell('C1');
+  const typeLabel = displayInspectionTypeForHeader(inspection);
+  titleCell.value = typeLabel
+    ? {
+        richText: [
+          { text: 'Inspection Test Report', font: { bold: true, size: 16 } },
+          { text: `\nType: ${typeLabel}`, font: { bold: false, size: 11 } }
+        ]
+      }
+    : 'Inspection Test Report';
+  if (!typeLabel) titleCell.font = { bold: true, size: 16 };
+  titleCell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+  titleCell.fill = HEADER_FILL;
 
-  // Címsorok magassága – kb. 75%-kal nagyobb a defaultnál
+  ws.mergeCells('J1:K1');
+  ws.getCell('J1').value = 'Electrical';
+  ws.getCell('J1').font = { bold: true, size: 11 };
+  ws.getCell('J1').alignment = { horizontal: 'center', vertical: 'middle' };
+  ws.getCell('J1').fill = HEADER_FILL;
+  ws.getCell('L1').value = hasElectricalProtection ? 'x' : '';
+  ws.getCell('L1').font = { bold: true, size: 11 };
+  ws.getCell('L1').alignment = { horizontal: 'center', vertical: 'middle' };
+  ws.getCell('L1').fill = HEADER_FILL;
+
+  ws.mergeCells('J2:K2');
+  ws.getCell('J2').value = 'Non-Electrical';
+  ws.getCell('J2').font = { bold: true, size: 11 };
+  ws.getCell('J2').alignment = { horizontal: 'center', vertical: 'middle' };
+  ws.getCell('J2').fill = HEADER_FILL;
+  ws.getCell('L2').value = hasNonElectricalProtection ? 'x' : '';
+  ws.getCell('L2').font = { bold: true, size: 11 };
+  ws.getCell('L2').alignment = { horizontal: 'center', vertical: 'middle' };
+  ws.getCell('L2').fill = HEADER_FILL;
+
+  ws.mergeCells('M1:M2');
+  ws.getCell('M1').value = 'Date:';
+  ws.getCell('M1').font = { bold: true, size: 11 };
+  ws.getCell('M1').alignment = { horizontal: 'center', vertical: 'middle' };
+  ws.getCell('M1').fill = HEADER_FILL;
+
+  ws.mergeCells('N1:N2');
+  ws.getCell('N1').value = inspectionDate;
+  ws.getCell('N1').font = { size: 11 };
+  ws.getCell('N1').numFmt = 'yyyy-mm-dd';
+  ws.getCell('N1').alignment = { horizontal: 'center', vertical: 'middle' };
+  ws.getCell('N1').fill = HEADER_FILL;
+
+  ['A','B','C','D','E','F','G','H','I','J','K','L','M','N'].forEach(col => {
+    [1,2].forEach(rn => {
+      const cell = ws.getCell(`${col}${rn}`);
+      cell.border = BORDER_THIN;
+    });
+  });
+
+  // Címsorok magassága – két soros cím + fix méretű logó
   const headerRowHeight = 15;
   ws.getRow(1).height = headerRowHeight;
   ws.getRow(2).height = headerRowHeight;
@@ -1796,7 +1815,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       cell.border = BORDER_THIN;
     });
 
-    // Header sor (Ref / Check / Passed / Failed / NA / Comment)
+    // Header sor (Ref / Check / Pass / Fail / NA / Comment)
     const headerRow = ws.addRow([
       'Ref',
       'Check',
@@ -1804,15 +1823,16 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       '',
       '',
       '',
-      'Passed',
-      'Failed',
+      '',
+      'Pass',
+      'Fail',
       'NA',
       'Comment'
     ]);
     const hr = headerRow.number;
 
-    ws.mergeCells(`B${hr}:F${hr}`); // Check
-    ws.mergeCells(`J${hr}:N${hr}`); // Comment
+    ws.mergeCells(`B${hr}:G${hr}`); // Check
+    ws.mergeCells(`K${hr}:N${hr}`); // Comment
 
     ['A','B','C','D','E','F','G','H','I','J','K','L','M','N'].forEach(col => {
       const cell = ws.getCell(`${col}${hr}`);
@@ -1846,6 +1866,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
         '',
         '',
         '',
+        '',
         passedMark,
         failedMark,
         naMark,
@@ -1855,8 +1876,8 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       const rn = row.number;
 
       // Merge check & comment cell blocks
-      ws.mergeCells(`B${rn}:F${rn}`);
-      ws.mergeCells(`J${rn}:N${rn}`);
+      ws.mergeCells(`B${rn}:G${rn}`);
+      ws.mergeCells(`K${rn}:N${rn}`);
 
       // Border + igazítás a sorra
       ['A','B','C','D','E','F','G','H','I','J','K','L','M','N'].forEach(col => {
@@ -1870,14 +1891,14 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       });
 
       // A kérdés (Check) és a Comment cella legyen balra igazítva a merge után
-      const checkCell = ws.getCell(`B${rn}`);   // B–F merge anchor
+      const checkCell = ws.getCell(`B${rn}`);   // B–G merge anchor
       checkCell.alignment = {
         horizontal: 'left',
         vertical: 'middle',
         wrapText: true
       };
 
-      const commentCell = ws.getCell(`J${rn}`); // J–N merge anchor
+      const commentCell = ws.getCell(`K${rn}`); // K–N merge anchor
       commentCell.alignment = {
         horizontal: 'left',
         vertical: 'middle',

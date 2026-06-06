@@ -15,6 +15,7 @@ const sharp = require('sharp');
 const heicConvert = require('heic-convert');
 const { recordTombstone } = require('../services/syncTombstoneService');
 const { sanitizeCustomFields } = require('../services/customFieldService');
+const { getOrSet, ttlMsFromEnv } = require('../services/shortTtlCache');
 
 // LEGACY: const axios = require('axios');
 
@@ -311,10 +312,12 @@ exports.getSiteOperationalSummary = async (req, res) => {
       return res.status(400).json({ message: 'Invalid site id.' });
     }
 
-    const summary = await computeOperationalSummary({
-      tenantId,
-      siteId
-    });
+    const summary = await getOrSet(
+      'operational-summary',
+      JSON.stringify({ tenantId: String(tenantId), siteId: String(siteId) }),
+      ttlMsFromEnv('OPERATIONAL_SUMMARY_CACHE_TTL_MS', 15 * 1000),
+      () => computeOperationalSummary({ tenantId, siteId })
+    );
 
     return res.json({ siteId, ...summary });
   } catch (error) {
@@ -333,7 +336,12 @@ exports.getSiteOverallStatusSummary = async (req, res) => {
       return res.status(400).json({ message: 'Invalid site id.' });
     }
 
-    const summary = await computeOverallStatusSummary({ tenantId, siteId });
+    const summary = await getOrSet(
+      'overall-status-summary',
+      JSON.stringify({ tenantId: String(tenantId), siteId: String(siteId) }),
+      ttlMsFromEnv('STATUS_SUMMARY_CACHE_TTL_MS', 15 * 1000),
+      () => computeOverallStatusSummary({ tenantId, siteId })
+    );
     return res.json({ siteId, ...summary });
   } catch (error) {
     console.error('❌ getSiteOverallStatusSummary error:', error);
@@ -351,10 +359,12 @@ exports.getSiteMaintenanceSeveritySummary = async (req, res) => {
       return res.status(400).json({ message: 'Invalid site id.' });
     }
 
-    const summary = await computeMaintenanceSeveritySummary({
-      tenantId,
-      siteId
-    });
+    const summary = await getOrSet(
+      'maintenance-severity-summary',
+      JSON.stringify({ tenantId: String(tenantId), siteId: String(siteId) }),
+      ttlMsFromEnv('MAINTENANCE_SEVERITY_CACHE_TTL_MS', 15 * 1000),
+      () => computeMaintenanceSeveritySummary({ tenantId, siteId })
+    );
 
     return res.json({ siteId, ...summary });
   } catch (error) {

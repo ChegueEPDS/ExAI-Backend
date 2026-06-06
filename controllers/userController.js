@@ -9,6 +9,7 @@ const Tenant = require('../models/tenant');
 const Certificate = require('../models/certificate');
 const DraftCertificate = require('../models/draftCertificate');
 const path = require('path');
+const sharp = require('sharp');
 
 const mailService = require('../services/mailService');
 const { tenantInviteEmailHtml, registrationEmailHtml } = require('../services/mailTemplates');
@@ -68,11 +69,18 @@ exports.getUserProfile = async (req, res) => {
       query = { _id: req.params.userId, tenantId };
     }
 
-    const user = await User.findOne(query).select('-password');
+    const user = await User.findOne(query).select('-password').lean();
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
-    res.json(user);
+    const tenant = user.tenantId
+      ? await Tenant.findById(user.tenantId).select('logoBlobPath logoBlobUrl').lean()
+      : null;
+    res.json({
+      ...user,
+      tenantLogoBlobPath: tenant?.logoBlobPath || '',
+      tenantLogoBlobUrl: tenant?.logoBlobUrl || ''
+    });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -493,13 +501,30 @@ exports.updateUserProfile = async (req, res) => {
     }
 
     const tenantDoc = targetUser.tenantId
-      ? await Tenant.findById(targetUser.tenantId).select('professionRbacEnabled').lean()
+      ? await Tenant.findById(targetUser.tenantId).select('professionRbacEnabled logoBlobPath logoBlobUrl').lean()
       : null;
     const professionRbacEnabled = Boolean(tenantDoc?.professionRbacEnabled);
+    const files = req.files && typeof req.files === 'object' ? req.files : {};
+    const signatureFile = req.file || (Array.isArray(files.signature) ? files.signature[0] : null);
+    const tenantLogoFile = Array.isArray(files.tenantLogo) ? files.tenantLogo[0] : null;
+    const removeSignature = String(req.body?.removeSignature || '').toLowerCase() === 'true';
+    const removeTenantLogo = String(req.body?.removeTenantLogo || '').toLowerCase() === 'true';
 
     // Aláírás kép feltöltése (opcionális)
     const signatureUpdate = {};
-    const file = req.file;
+    if (removeSignature) {
+      if (targetUser.signatureBlobPath && typeof azureBlob.deleteFile === 'function') {
+        try { await azureBlob.deleteFile(targetUser.signatureBlobPath); } catch (e) {
+          console.warn('⚠️ Failed to delete signature blob:', e?.message || e);
+        }
+      }
+      signatureUpdate.$unset = {
+        ...(signatureUpdate.$unset || {}),
+        signatureBlobPath: '',
+        signatureBlobUrl: ''
+      };
+    }
+    const file = signatureFile;
     if (file && file.buffer && req.params.userId) {
       const userId = String(req.params.userId);
       const extFromName = path.extname(file.originalname || '').toLowerCase();
@@ -510,11 +535,57 @@ exports.updateUserProfile = async (req, res) => {
 
       try {
         await azureBlob.uploadBuffer(blobPath, file.buffer, contentType);
+        delete signatureUpdate.$unset;
         signatureUpdate.signatureBlobPath = blobPath;
         signatureUpdate.signatureBlobUrl = azureBlob.getBlobUrl(blobPath);
       } catch (e) {
         console.error('❌ Failed to upload signature image:', e?.message || e);
         return res.status(500).json({ error: 'Failed to upload signature image' });
+      }
+    }
+
+    let tenantLogoUpdate = null;
+    if (removeTenantLogo) {
+      if (!isAdminLike) {
+        return res.status(403).json({ error: 'Only tenant admins can update the tenant logo' });
+      }
+      const tenantForLogo = targetUser.tenantId;
+      if (!tenantForLogo) return res.status(400).json({ error: 'Missing tenant for logo removal' });
+      if (tenantDoc?.logoBlobPath && typeof azureBlob.deleteFile === 'function') {
+        try { await azureBlob.deleteFile(tenantDoc.logoBlobPath); } catch (e) {
+          console.warn('⚠️ Failed to delete tenant logo blob:', e?.message || e);
+        }
+      }
+      tenantLogoUpdate = { logoBlobPath: '', logoBlobUrl: '' };
+      await Tenant.findByIdAndUpdate(tenantForLogo, { $unset: { logoBlobPath: '', logoBlobUrl: '' } });
+    }
+    if (tenantLogoFile && tenantLogoFile.buffer) {
+      if (!isAdminLike) {
+        return res.status(403).json({ error: 'Only tenant admins can update the tenant logo' });
+      }
+      const tenantForLogo = targetUser.tenantId;
+      if (!tenantForLogo) return res.status(400).json({ error: 'Missing tenant for logo upload' });
+      if (!String(tenantLogoFile.mimetype || '').startsWith('image/')) {
+        return res.status(400).json({ error: 'Only image files are allowed for tenant logo' });
+      }
+
+      const blobPath = `tenants/${tenantForLogo}/report-logo.png`;
+      const contentType = 'image/png';
+
+      try {
+        const pngBuffer = await sharp(tenantLogoFile.buffer)
+          .resize({ width: 320, height: 160, fit: 'inside', withoutEnlargement: true })
+          .png()
+          .toBuffer();
+        await azureBlob.uploadBuffer(blobPath, pngBuffer, contentType);
+        tenantLogoUpdate = {
+          logoBlobPath: blobPath,
+          logoBlobUrl: azureBlob.getBlobUrl(blobPath)
+        };
+        await Tenant.findByIdAndUpdate(tenantForLogo, tenantLogoUpdate);
+      } catch (e) {
+        console.error('❌ Failed to upload tenant logo:', e?.message || e);
+        return res.status(500).json({ error: 'Failed to upload tenant logo' });
       }
     }
 
@@ -526,7 +597,7 @@ exports.updateUserProfile = async (req, res) => {
       ...(billingAddress !== undefined ? { billingAddress } : {}),
       ...(position !== undefined ? { position } : {}),
       ...(positionInfo !== undefined ? { positionInfo } : {}),
-      ...signatureUpdate
+      ...(signatureUpdate.$unset ? {} : signatureUpdate)
     };
 
     // Admin-only fields (never for normal users)
@@ -575,8 +646,16 @@ exports.updateUserProfile = async (req, res) => {
       }
     }
 
-    const user = await User.findByIdAndUpdate(targetUserId, updateFields, { new: true }).select('-password');
-    return res.json(user);
+    const userUpdate = signatureUpdate.$unset
+      ? { $set: updateFields, $unset: signatureUpdate.$unset }
+      : updateFields;
+    const user = await User.findByIdAndUpdate(targetUserId, userUpdate, { new: true }).select('-password').lean();
+    const tenantLogo = tenantLogoUpdate || tenantDoc || {};
+    return res.json({
+      ...user,
+      tenantLogoBlobPath: tenantLogo.logoBlobPath || '',
+      tenantLogoBlobUrl: tenantLogo.logoBlobUrl || ''
+    });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }

@@ -228,13 +228,17 @@ async function runTableQuery({ tenantId, projectId, datasetVersion, allowedFilen
 
   const sheetWanted = query?.sheet ? String(query.sheet).trim() : '';
 
-  const rowDocs = await DatasetRowChunk.find({ tenantId, projectId, datasetVersion, datasetFileId: fileDoc._id })
-    .select('filename sheet rowIndex text')
-    .limit(maxExecRows)
-    .lean();
-
   const rows = [];
-  for (const d of rowDocs || []) {
+  const rowFilter = { tenantId, projectId, datasetVersion, datasetFileId: fileDoc._id };
+  if (sheetWanted) rowFilter.sheet = sheetWanted;
+  const cursor = DatasetRowChunk.find(rowFilter)
+    .select('filename sheet rowIndex text')
+    .sort({ sheet: 1, rowIndex: 1, _id: 1 })
+    .limit(maxExecRows)
+    .lean()
+    .cursor();
+
+  for await (const d of cursor) {
     const sheet = String(d?.sheet || '').trim();
     if (sheetWanted && sheetWanted.toLowerCase() !== sheet.toLowerCase()) continue;
     const obj = parseRowChunkText(d?.text);

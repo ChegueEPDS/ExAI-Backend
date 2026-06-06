@@ -17,6 +17,7 @@ const { sanitizeCustomFields } = require('../services/customFieldService');
 const { ensureRbSchema } = require('../services/schemaSeedService');
 const { ensureRbAssignment } = require('../services/rbSchemaValueService');
 const { normalizeRbValues } = require('../services/schemaRules/rbRules');
+const { getOrSet, ttlMsFromEnv } = require('../services/shortTtlCache');
 
 // Helper: convert string tenantId to ObjectId safely
 const toObjectId = (id) => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null);
@@ -293,10 +294,12 @@ exports.getZoneOperationalSummary = async (req, res) => {
       return res.status(400).json({ message: 'Invalid zone id.' });
     }
 
-    const summary = await computeOperationalSummary({
-      tenantId: tenantIdStr,
-      zoneId
-    });
+    const summary = await getOrSet(
+      'operational-summary',
+      JSON.stringify({ tenantId: String(tenantIdStr), zoneId: String(zoneId) }),
+      ttlMsFromEnv('OPERATIONAL_SUMMARY_CACHE_TTL_MS', 15 * 1000),
+      () => computeOperationalSummary({ tenantId: tenantIdStr, zoneId })
+    );
 
     return res.json({ zoneId, ...summary });
   } catch (error) {
@@ -319,10 +322,12 @@ exports.getZoneMaintenanceSeveritySummary = async (req, res) => {
       return res.status(400).json({ message: 'Invalid zone id.' });
     }
 
-    const summary = await computeMaintenanceSeveritySummary({
-      tenantId: tenantIdStr,
-      zoneId
-    });
+    const summary = await getOrSet(
+      'maintenance-severity-summary',
+      JSON.stringify({ tenantId: String(tenantIdStr), zoneId: String(zoneId) }),
+      ttlMsFromEnv('MAINTENANCE_SEVERITY_CACHE_TTL_MS', 15 * 1000),
+      () => computeMaintenanceSeveritySummary({ tenantId: tenantIdStr, zoneId })
+    );
 
     return res.json({ zoneId, ...summary });
   } catch (error) {

@@ -3,6 +3,7 @@ const Equipment = require('../models/dataplate');
 const Unit = require('../models/unit');
 const MaintenanceEvent = require('../models/maintenanceEvent');
 const { computeDashboardAnalytics } = require('../services/dashboardAnalyticsService');
+const { getOrSet, ttlMsFromEnv } = require('../services/shortTtlCache');
 const {
   assignmentStatus,
   isSchemaAssignment,
@@ -18,6 +19,13 @@ function parseDateOrNull(input) {
   return d;
 }
 
+function bucketDateForCache(date, bucketMs = 5 * 60 * 1000) {
+  if (!date) return null;
+  const t = date.getTime();
+  if (!Number.isFinite(t)) return null;
+  return new Date(Math.floor(t / bucketMs) * bucketMs).toISOString();
+}
+
 exports.getDashboardAnalytics = async (req, res) => {
   try {
     const tenantId = req.scope?.tenantId;
@@ -29,7 +37,20 @@ exports.getDashboardAnalytics = async (req, res) => {
     const from = parseDateOrNull(req.query.from);
     const to = parseDateOrNull(req.query.to);
 
-    const data = await computeDashboardAnalytics({ tenantId, siteId, zoneId, from, to });
+    const cacheKey = JSON.stringify({
+      tenantId: String(tenantId),
+      scope,
+      siteId,
+      zoneId,
+      from: bucketDateForCache(from),
+      to: bucketDateForCache(to)
+    });
+    const data = await getOrSet(
+      'dashboard-analytics',
+      cacheKey,
+      ttlMsFromEnv('DASHBOARD_ANALYTICS_CACHE_TTL_MS', 15_000),
+      () => computeDashboardAnalytics({ tenantId, siteId, zoneId, from, to })
+    );
     return res.json(data);
   } catch (error) {
     console.error('❌ getDashboardAnalytics error:', error);

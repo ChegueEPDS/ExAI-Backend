@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const {
   computeStatusStackedSummary
 } = require('../services/operationalSummaryService');
+const { getOrSet, ttlMsFromEnv } = require('../services/shortTtlCache');
 
 function toObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
@@ -20,7 +21,17 @@ exports.getTenantStatusStackedSummary = async (req, res) => {
     if (siteId && !siteObjectId) return res.status(400).json({ message: 'Invalid siteId.' });
     if (zoneId && !zoneObjectId) return res.status(400).json({ message: 'Invalid zoneId.' });
 
-    const summary = await computeStatusStackedSummary({ tenantId, siteId: siteObjectId, zoneId: zoneObjectId });
+    const cacheKey = JSON.stringify({
+      tenantId: String(tenantId),
+      siteId: siteObjectId ? String(siteObjectId) : null,
+      zoneId: zoneObjectId ? String(zoneObjectId) : null
+    });
+    const summary = await getOrSet(
+      'status-stacked-summary',
+      cacheKey,
+      ttlMsFromEnv('STATUS_SUMMARY_CACHE_TTL_MS', 15_000),
+      () => computeStatusStackedSummary({ tenantId, siteId: siteObjectId, zoneId: zoneObjectId })
+    );
     return res.json(summary);
   } catch (error) {
     console.error('❌ getTenantStatusStackedSummary error:', error);

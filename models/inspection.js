@@ -10,8 +10,9 @@ const InspectionResultSchema = new Schema(
     questionOrigin: { type: String, enum: ['legacy', 'system', 'tenant', null], default: null },
 
     // Azonosítók (snapshot, hogy később is érthető maradjon)
+    reference: { type: String, required: false }, // pl. "T2-1" vagy "SC1"; group nélkül
     table: { type: String, required: false },   // pl. "T1"
-    group: { type: String, required: false },   // pl. "G2"
+    group: { type: String, required: false },   // UI csoportosításhoz, nem része a reference-nek
     number: { type: Number, required: false },  // pl. 3
     equipmentType: { type: String, required: false },
     protectionTypes: [{ type: String }],

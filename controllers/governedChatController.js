@@ -1221,25 +1221,27 @@ exports.chatGovernedStream = async (req, res) => {
         filename: { $in: allowedFilenames },
       };
 
-      const tableMatches = allowedFilenames.length ? await pinecone.queryVectors({
-        namespace,
-        vector: qEmbedding,
-        topK: candTables,
-        filter: { ...baseFilter, kind: 'table_row' },
-      }) : [];
-      const docMatches = allowedFilenames.length ? await pinecone.queryVectors({
-        namespace,
-        vector: qEmbedding,
-        topK: candDocs,
-        filter: { ...baseFilter, kind: 'doc_chunk' },
-      }) : [];
       const candImg = Number(systemSettings.getNumber('GOVERNED_RAG_IMG_CANDIDATES') || 20);
-      const imgMatches = allowedFilenames.length ? await pinecone.queryVectors({
-        namespace,
-        vector: qEmbedding,
-        topK: candImg,
-        filter: { ...baseFilter, kind: 'image_chunk' },
-      }) : [];
+      const retrievalTimeoutMs = Math.max(
+        1000,
+        Math.min(Number(systemSettings.getNumber('GOVERNED_RAG_QUERY_TIMEOUT_MS') || 12_000), 60_000)
+      );
+      const withRetrievalTimeout = async (promise, label, fallback = []) => {
+        let timer = null;
+        try {
+          return await Promise.race([
+            promise,
+            new Promise((resolve) => {
+              timer = setTimeout(() => {
+                try { logger.warn('governed.retrieval.timeout', { requestId: req.requestId, label, timeoutMs: retrievalTimeoutMs }); } catch { }
+                resolve(fallback);
+              }, retrievalTimeoutMs);
+            })
+          ]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
 
       // Standard library is stored under a separate "projectId" key for namespace isolation
       const stdNamespace = pinecone.resolveNamespace({ tenantId, projectId: 'standard-library' });
@@ -1250,30 +1252,70 @@ exports.chatGovernedStream = async (req, res) => {
       // Standard retrieval:
       // - If a primary standard is pinned (Standard Explorer), prioritize that standard first.
       // - If results are weak, expand to full tenant library without forcing the user to pick sets.
-      let stdMatches = [];
-      if (selectedStandardRefs.length) {
-        const primaryFilter = { ...stdFilter, standardRef: { $in: selectedStandardRefs } };
-        stdMatches = await pinecone.queryVectors({ namespace: stdNamespace, vector: qEmbedding, topK: candStd, filter: primaryFilter });
+      const queryStandardMatches = async () => {
+        let matches = [];
+        if (selectedStandardRefs.length) {
+          const primaryFilter = { ...stdFilter, standardRef: { $in: selectedStandardRefs } };
+          matches = await withRetrievalTimeout(
+            pinecone.queryVectors({ namespace: stdNamespace, vector: qEmbedding, topK: candStd, filter: primaryFilter }),
+            'standard-primary'
+          );
 
-        // Fallback expansion (still keep primary hits first).
-        const minMatches = Math.max(
-          4,
-          Math.min(Number(systemSettings.getNumber('STANDARD_EXPLORER_FALLBACK_MIN_MATCHES') || 10), candStd)
-        );
-        if (standardExplorerEnabled && (stdMatches || []).length < minMatches) {
-          const extra = await pinecone.queryVectors({ namespace: stdNamespace, vector: qEmbedding, topK: candStd, filter: stdFilter });
-          const seen = new Set((stdMatches || []).map(m => String(m?.id || '')));
-          for (const m of (extra || [])) {
-            const id = String(m?.id || '');
-            if (!id || seen.has(id)) continue;
-            stdMatches.push(m);
-            seen.add(id);
-            if (stdMatches.length >= candStd) break;
+          // Fallback expansion (still keep primary hits first).
+          const minMatches = Math.max(
+            4,
+            Math.min(Number(systemSettings.getNumber('STANDARD_EXPLORER_FALLBACK_MIN_MATCHES') || 10), candStd)
+          );
+          if (standardExplorerEnabled && (matches || []).length < minMatches) {
+            const extra = await withRetrievalTimeout(
+              pinecone.queryVectors({ namespace: stdNamespace, vector: qEmbedding, topK: candStd, filter: stdFilter }),
+              'standard-fallback'
+            );
+            const seen = new Set((matches || []).map(m => String(m?.id || '')));
+            for (const m of (extra || [])) {
+              const id = String(m?.id || '');
+              if (!id || seen.has(id)) continue;
+              matches.push(m);
+              seen.add(id);
+              if (matches.length >= candStd) break;
+            }
           }
+          return matches;
         }
-      } else {
-        stdMatches = await pinecone.queryVectors({ namespace: stdNamespace, vector: qEmbedding, topK: candStd, filter: stdFilter });
-      }
+        return withRetrievalTimeout(
+          pinecone.queryVectors({ namespace: stdNamespace, vector: qEmbedding, topK: candStd, filter: stdFilter }),
+          'standard'
+        );
+      };
+
+      const [tableMatches, docMatches, imgMatches, stdMatchesInitial] = await Promise.all([
+        allowedFilenames.length
+          ? withRetrievalTimeout(pinecone.queryVectors({
+              namespace,
+              vector: qEmbedding,
+              topK: candTables,
+              filter: { ...baseFilter, kind: 'table_row' },
+            }), 'table')
+          : Promise.resolve([]),
+        allowedFilenames.length
+          ? withRetrievalTimeout(pinecone.queryVectors({
+              namespace,
+              vector: qEmbedding,
+              topK: candDocs,
+              filter: { ...baseFilter, kind: 'doc_chunk' },
+            }), 'doc')
+          : Promise.resolve([]),
+        allowedFilenames.length
+          ? withRetrievalTimeout(pinecone.queryVectors({
+              namespace,
+              vector: qEmbedding,
+              topK: candImg,
+              filter: { ...baseFilter, kind: 'image_chunk' },
+            }), 'image')
+          : Promise.resolve([]),
+        queryStandardMatches()
+      ]);
+      let stdMatches = stdMatchesInitial || [];
 
       // If the user asks for Ex marking / temperature class, add a second targeted retrieval pass.
       // This helps reliably pull in IEC 60079-14 Table 14 and the dust surface-temperature selection rules.
@@ -1287,7 +1329,10 @@ exports.chatGovernedStream = async (req, res) => {
           ].join('. ');
           const q2Embedding = await createEmbeddingVector(openai, q2, embeddingModel);
           if (Array.isArray(q2Embedding) && q2Embedding.length) {
-            const extra = await pinecone.queryVectors({ namespace: stdNamespace, vector: q2Embedding, topK: candStd, filter: stdFilter });
+            const extra = await withRetrievalTimeout(
+              pinecone.queryVectors({ namespace: stdNamespace, vector: q2Embedding, topK: candStd, filter: stdFilter }),
+              'standard-temperature'
+            );
             const seen = new Set((stdMatches || []).map(m => String(m?.id || '')));
             for (const m of (extra || [])) {
               const id = String(m?.id || '');

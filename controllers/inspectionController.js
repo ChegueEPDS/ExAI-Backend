@@ -81,6 +81,23 @@ function computeFailureSeverity(results = []) {
   return best && ['P1', 'P2', 'P3', 'P4'].includes(best) ? best : null;
 }
 
+function deriveQuestionReference(input = {}) {
+  const explicit = String(input.reference || '').trim();
+  if (explicit) return explicit;
+  const table = String(input.table || input.Table || '').trim();
+  const number = input.number ?? input.Number;
+  if (table === 'SC' || input.equipmentType === 'Special Condition') {
+    return `SC${number || 1}`;
+  }
+  if (table && (number || number === 0)) {
+    return `${table}-${number}`;
+  }
+  if (number || number === 0) {
+    return `${number}`;
+  }
+  return '';
+}
+
 function extractProtectionTokens(equipmentDoc) {
   const protection = protectionText(equipmentDoc) || '';
   if (!protection) return [];
@@ -141,6 +158,7 @@ async function buildSpecialConditionResultFromEquipment(equipmentDoc, tenantId) 
 
   return {
     questionId: undefined,
+    reference: 'SC1',
     table: 'SC',
     group: 'SC',
     number: 1,
@@ -174,11 +192,12 @@ async function generateInspectionResultsForEquipment({ equipmentDoc, tenantId, i
     })
     .map((q) => {
       const eqType = (q.equipmentType || '').toLowerCase();
-      const shouldBePassed = basePassedTypes.has(eqType) || relevantTypes.has(eqType);
+      const shouldBePassed = basePassedTypes.has(eqType) || eqType.startsWith('installation') || relevantTypes.has(eqType);
       return {
         questionId: undefined,
         schemaQuestionKey: q.key || undefined,
         questionOrigin: 'system',
+        reference: deriveQuestionReference(q),
         table: q.table || q.Table || '',
         group: q.group || q.Group || '',
         number: q.number ?? q.Number ?? null,
@@ -294,6 +313,7 @@ exports.createInspection = async (req, res) => {
       questionId: r.questionId ? new mongoose.Types.ObjectId(r.questionId) : undefined,
       schemaQuestionKey: r.schemaQuestionKey || r.questionKey || r.key || undefined,
       questionOrigin: ['system', 'tenant', 'legacy'].includes(r.questionOrigin) ? r.questionOrigin : null,
+      reference: deriveQuestionReference(r),
       table: r.table || r.Table || undefined,
       group: r.group || r.Group || undefined,
       number: r.number ?? r.Number,
@@ -495,6 +515,7 @@ exports.updateInspection = async (req, res) => {
       questionId: r.questionId ? new mongoose.Types.ObjectId(r.questionId) : undefined,
       schemaQuestionKey: r.schemaQuestionKey || r.questionKey || r.key || undefined,
       questionOrigin: ['system', 'tenant', 'legacy'].includes(r.questionOrigin) ? r.questionOrigin : null,
+      reference: deriveQuestionReference(r),
       table: r.table || r.Table || undefined,
       group: r.group || r.Group || undefined,
       number: r.number ?? r.Number,
@@ -719,12 +740,52 @@ exports.listInspections = async (req, res) => {
       }
     }
 
-    const inspections = await Inspection.find(filter)
+    const rawPage = parseInt(req.query.page || '1', 10);
+    const rawPageSize = parseInt(req.query.pageSize || req.query.limit || '50', 10);
+    const page = Math.max(Number.isFinite(rawPage) ? rawPage : 1, 1);
+    const pageSize = Math.min(Math.max(Number.isFinite(rawPageSize) ? rawPageSize : 50, 1), 200);
+    const skip = (page - 1) * pageSize;
+    const wantsPaged =
+      req.query.page !== undefined ||
+      req.query.pageSize !== undefined ||
+      req.query.limit !== undefined ||
+      String(req.query.paged || '').toLowerCase() === 'true';
+
+    const listSelect = [
+      'equipmentId',
+      'eqId',
+      'tenantId',
+      'siteId',
+      'zoneId',
+      'inspectionDate',
+      'validUntil',
+      'inspectionType',
+      'inspectorId',
+      'summary',
+      'status',
+      'failureSeverity',
+      'reviewStatus',
+      'source',
+      'createdAt',
+      'updatedAt'
+    ].join(' ');
+
+    const query = Inspection.find(filter)
+      .select(listSelect)
       .populate('inspectorId', 'firstName lastName email')
       .sort({ inspectionDate: -1, createdAt: -1 })
+      .skip(skip)
+      .limit(pageSize)
+      .maxTimeMS(Math.max(1000, Math.min(Number(process.env.INSPECTION_QUERY_MAX_TIME_MS || 10_000), 60_000)))
       .lean();
 
-    return res.json(inspections);
+    const [inspections, total] = await Promise.all([
+      query,
+      Inspection.countDocuments(filter)
+    ]);
+
+    if (!wantsPaged) return res.json(inspections);
+    return res.json({ items: inspections, total, page, pageSize });
   } catch (error) {
     console.error('❌ Hiba az inspectionök listázása közben:', error);
     return res.status(500).json({ message: 'Belső szerverhiba az inspectionök listázásakor.' });

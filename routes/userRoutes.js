@@ -17,10 +17,10 @@ const authMiddleware = require('../middlewares/authMiddleware');
 
 const router = express.Router();
 
-// Signature upload handled in-memory; max ~2 MB
+// Signature / tenant logo upload handled in-memory; max ~2 MB per image
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 2 * 1024 * 1024, files: 1 }
+  limits: { fileSize: 2 * 1024 * 1024, files: 2 }
 });
 
 // List users (Admin: same tenant, SuperAdmin: all)
@@ -29,8 +29,16 @@ router.get('/users', authMiddleware(['Admin', 'SuperAdmin']), listUsers);
 // Fetch user profile
 router.get('/user/:userId', authMiddleware(), getUserProfile);
 
-// Update user profile (basic fields + optional signature image)
-router.put('/user/:userId', authMiddleware(), upload.single('signature'), updateUserProfile);
+// Update user profile (basic fields + optional signature image / admin tenant logo)
+router.put(
+  '/user/:userId',
+  authMiddleware(),
+  upload.fields([
+    { name: 'signature', maxCount: 1 },
+    { name: 'tenantLogo', maxCount: 1 }
+  ]),
+  updateUserProfile
+);
 
 // Update user professions (RBAC) - Admin/SuperAdmin
 router.put('/users/:userId/professions', authMiddleware(['Admin', 'SuperAdmin']), updateUserProfessions);

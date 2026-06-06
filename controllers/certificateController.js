@@ -130,6 +130,56 @@ const SORT_HINTS = Object.freeze({
   createdAt:    { visibility: 1, createdAt: -1, _id: 1 }  // index built descending on createdAt
 });
 
+function parsePositiveInt(value, fallback, max) {
+  const n = parseInt(value, 10);
+  const safe = Number.isFinite(n) && n > 0 ? n : fallback;
+  return Math.min(Math.max(safe, 1), max);
+}
+
+function parsePageParams(query = {}, { defaultPageSize = 25, maxPageSize = 200 } = {}) {
+  const page = Math.max(parseInt(query.page || '1', 10) || 1, 1);
+  const pageSize = parsePositiveInt(query.pageSize || query.limit, defaultPageSize, maxPageSize);
+  return { page, pageSize, skip: (page - 1) * pageSize };
+}
+
+function maxTimeMsFromEnv(name, fallbackMs) {
+  const n = Number(process.env[name] ?? fallbackMs);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(Math.max(n, 1000), 60_000);
+}
+
+function castCursorValue(sortKey, value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (sortKey === 'createdAt' || sortKey === 'issueDate') {
+    const d = new Date(String(value));
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  return String(value);
+}
+
+function buildKeysetMatch({ sortKey, dir, afterValue, afterId }) {
+  const value = castCursorValue(sortKey, afterValue);
+  const id = tryObjectId(afterId);
+  if (value === null || !id) return null;
+  const op = dir === -1 ? '$lt' : '$gt';
+  return {
+    $or: [
+      { [sortKey]: { [op]: value } },
+      { [sortKey]: value, _id: { $gt: id } }
+    ]
+  };
+}
+
+function encodeNextCursor(items, sortKey) {
+  if (!Array.isArray(items) || !items.length) return null;
+  const last = items[items.length - 1];
+  const value = last?.[sortKey];
+  return {
+    afterValue: value instanceof Date ? value.toISOString() : value,
+    afterId: last?._id ? String(last._id) : null
+  };
+}
+
 // Safely handle incoming id parameters (skip CastError)
 function tryObjectId(id) {
   try {
@@ -482,9 +532,17 @@ exports.getCertificates = async (req, res) => {
     }
 
     console.log(`🔍 Saját (tenant=${tenantId}) + adoptált PUBLIC lekérés`);
+    const { page, pageSize, skip } = parsePageParams(req.query, { defaultPageSize: 500, maxPageSize: 1000 });
+    const wantsPaged = req.query.page || req.query.pageSize || req.query.limit || String(req.query.paged || '').toLowerCase() === 'true';
+    const project = 'certNo scheme status issueDate applicant protection equipment manufacturer exmarking fileName fileUrl docxUrl xcondition specCondition description visibility docType createdAt';
 
     // Saját tenant összes tanúsítványa (független a visibility-től)
-    const own = await Certificate.find({ tenantId }).lean();
+    const ownQuery = Certificate.find({ tenantId })
+      .select(project)
+      .sort({ createdAt: -1, _id: 1 })
+      .skip(skip)
+      .limit(pageSize)
+      .lean();
 
     // Adoptáltak: csak PUBLIC cert-ek adoptálhatók/láthatók
     const links = await CompanyCertificateLink.find({ tenantId }).select('certId').lean();
@@ -492,11 +550,23 @@ exports.getCertificates = async (req, res) => {
 
     let adoptedPublic = [];
     if (adoptedIds.length) {
-      adoptedPublic = await Certificate.find({ _id: { $in: adoptedIds }, visibility: 'public' }).lean();
+      adoptedPublic = await Certificate.find({ _id: { $in: adoptedIds }, visibility: 'public' })
+        .select(project)
+        .sort({ createdAt: -1, _id: 1 })
+        .limit(pageSize)
+        .lean();
       adoptedPublic = adoptedPublic.map(c => ({ ...c, adoptedByMe: true }));
     }
 
-    res.json([...own, ...adoptedPublic]);
+    const own = await ownQuery;
+    const items = [...own, ...adoptedPublic].slice(0, pageSize);
+    if (!wantsPaged) return res.json(items);
+
+    const [ownTotal, adoptedTotal] = await Promise.all([
+      Certificate.countDocuments({ tenantId }),
+      adoptedIds.length ? Certificate.countDocuments({ _id: { $in: adoptedIds }, visibility: 'public' }) : 0
+    ]);
+    return res.json({ items, total: ownTotal + adoptedTotal, page, pageSize });
   } catch (error) {
     console.error('❌ Hiba a lekérdezés során:', error);
     res.status(500).send('❌ Hiba a lekérdezés során');
@@ -511,8 +581,13 @@ exports.getPublicCertificates = async (req, res) => {
 
     const tenantObjectId = new mongoose.Types.ObjectId(tenantId);
 
+    const { page, pageSize, skip } = parsePageParams(req.query, { defaultPageSize: 500, maxPageSize: 1000 });
+    const wantsPaged = req.query.page || req.query.pageSize || req.query.limit || String(req.query.paged || '').toLowerCase() === 'true';
     const certificates = await Certificate.aggregate([
       { $match: { visibility: 'public' } },
+      { $sort: { certNo: 1, _id: 1 } },
+      { $skip: skip },
+      { $limit: pageSize },
       {
         $lookup: {
           from: 'companycertificatelinks',
@@ -536,7 +611,9 @@ exports.getPublicCertificates = async (req, res) => {
       { $addFields: { adoptedByMe: { $gt: [{ $size: '$myLink' }, 0] } } },
       { $project: { myLink: 0 } }
     ]);
-    res.json(certificates);
+    if (!wantsPaged) return res.json(certificates);
+    const total = await Certificate.countDocuments({ visibility: 'public' });
+    return res.json({ items: certificates, total, page, pageSize });
   } catch (error) {
     console.error('❌ Hiba a public lekérdezés során:', error);
     res.status(500).send('❌ Hiba a public lekérdezés során');
@@ -569,6 +646,13 @@ exports.getPublicCertificatesPaged = async (req, res) => {
     if (certRegex) match.certNo = certRegex;
     if (f.manufacturer) match.manufacturer = { $regex: '^' + escapeRegex(f.manufacturer), $options: 'i' };
     if (f.equipment)    match.equipment    = { $regex: '^' + escapeRegex(f.equipment), $options: 'i' };
+    const keyset = buildKeysetMatch({
+      sortKey: key,
+      dir,
+      afterValue: req.query.afterValue,
+      afterId: req.query.afterId
+    });
+    if (keyset) match.$and = [...(match.$and || []), keyset];
 
     const project = buildProjectFromFields(req.query.fields);
 
@@ -589,7 +673,7 @@ exports.getPublicCertificatesPaged = async (req, res) => {
       {
         $facet: {
           items: [
-            { $skip: (page - 1) * pageSize },
+            ...(keyset ? [] : [{ $skip: (page - 1) * pageSize }]),
             { $limit: pageSize },
             // adoptedByMe computed without $lookup
             ...(tenantObjectId
@@ -611,11 +695,13 @@ exports.getPublicCertificatesPaged = async (req, res) => {
       aggCursor = aggCursor.hint(hintSpec);
     }
 
+    aggCursor = aggCursor.option({ maxTimeMS: maxTimeMsFromEnv('CERTIFICATE_QUERY_MAX_TIME_MS', 10_000) });
+
     const [agg] = await aggCursor.exec();
     const items = agg?.items || [];
-    const total = agg?.total?.[0]?.count || 0;
+    const total = keyset ? null : (agg?.total?.[0]?.count || 0);
 
-    return res.json({ items, total, page, pageSize });
+    return res.json({ items, total, page, pageSize, nextCursor: encodeNextCursor(items, key), hasNext: items.length === pageSize });
   } catch (e) {
     console.error('getPublicCertificatesPaged error:', e);
     return res.status(500).json({ error: 'Failed to load paged public certificates' });
@@ -644,44 +730,74 @@ exports.getMyCertificatesPaged = async (req, res) => {
       equipment:    (req.query.equipment || '').trim(),
     };
 
-    const ownIds = await Certificate.find({ tenantId: tenantObjectId }).select('_id').lean();
     const links  = await CompanyCertificateLink.find({ tenantId: tenantObjectId }).select('certId').lean();
     const adoptedIds = links.map(l => l.certId);
-
-    const allIds = [...ownIds.map(x => x._id), ...adoptedIds];
-    if (allIds.length === 0) {
-      return res.json({ items: [], total: 0, page, pageSize });
-    }
-
-    const match = { _id: { $in: allIds } };
+    const ownMatch = { tenantId: tenantObjectId };
+    const adoptedMatch = { visibility: 'public' };
     const certRegex = buildLooseCertNoRegex(f.certNo);
-    if (certRegex) match.certNo = certRegex;
-    if (f.manufacturer) match.manufacturer = { $regex: '^' + escapeRegex(f.manufacturer), $options: 'i' };
-    if (f.equipment)    match.equipment    = { $regex: '^' + escapeRegex(f.equipment), $options: 'i' };
+    if (certRegex) {
+      ownMatch.certNo = certRegex;
+      adoptedMatch.certNo = certRegex;
+    }
+    if (f.manufacturer) {
+      ownMatch.manufacturer = { $regex: '^' + escapeRegex(f.manufacturer), $options: 'i' };
+      adoptedMatch.manufacturer = { $regex: '^' + escapeRegex(f.manufacturer), $options: 'i' };
+    }
+    if (f.equipment) {
+      ownMatch.equipment = { $regex: '^' + escapeRegex(f.equipment), $options: 'i' };
+      adoptedMatch.equipment = { $regex: '^' + escapeRegex(f.equipment), $options: 'i' };
+    }
 
     const project = buildProjectFromFields(req.query.fields);
 
+    const keyset = buildKeysetMatch({
+      sortKey: key,
+      dir,
+      afterValue: req.query.afterValue,
+      afterId: req.query.afterId
+    });
+
     const pipeline = [
-      { $match: match },
+      { $match: ownMatch },
       { $addFields: { adoptedByMe: { $and: [ { $eq: ['$visibility', 'public'] }, { $in: ['$_id', adoptedIds] } ] } } },
+      { $project: project },
+      {
+        $unionWith: {
+          coll: 'certificates',
+          pipeline: [
+            { $match: { _id: { $in: adoptedIds }, ...adoptedMatch } },
+            { $addFields: { adoptedByMe: true } },
+            { $project: project }
+          ]
+        }
+      },
+      {
+        $group: {
+          _id: '$_id',
+          doc: { $first: '$$ROOT' },
+          adoptedFlag: { $max: { $cond: ['$adoptedByMe', 1, 0] } }
+        }
+      },
+      { $set: { 'doc.adoptedByMe': { $toBool: '$adoptedFlag' } } },
+      { $replaceRoot: { newRoot: '$doc' } },
+      ...(keyset ? [{ $match: keyset }] : []),
       { $sort: sort },
       {
         $facet: {
           items: [
-            { $skip: (page - 1) * pageSize },
-            { $limit: pageSize },
-            { $project: project }
+            ...(keyset ? [] : [{ $skip: (page - 1) * pageSize }]),
+            { $limit: pageSize }
           ],
-          total: [{ $count: 'count' }]
+          ...(keyset ? {} : { total: [{ $count: 'count' }] })
         }
       }
     ];
 
-    const [agg] = await Certificate.aggregate(pipeline);
+    const [agg] = await Certificate.aggregate(pipeline).option({ maxTimeMS: maxTimeMsFromEnv('CERTIFICATE_QUERY_MAX_TIME_MS', 10_000) });
     const items = agg?.items || [];
-    const total = agg?.total?.[0]?.count || 0;
+    const total = keyset ? null : (agg?.total?.[0]?.count || 0);
 
-    return res.json({ items, total, page, pageSize });
+    return res.json({ items, total, page, pageSize, nextCursor: encodeNextCursor(items, key), hasNext: items.length === pageSize });
   } catch (e) {
     console.error('getMyCertificatesPaged error:', e);
     return res.status(500).json({ error: 'Failed to load paged certificates' });
@@ -729,12 +845,25 @@ exports.countMyPublicCertificates = async (req, res) => {
 // Tanúsítvány minták – csak PUBLIC, csak minimális mezők (auth NEM szükséges)
 exports.getCertificatesSamples = async (req, res) => {
   try {
-    // Csak a publikus tanúsítványok és csak a szükséges mezők
-    const samples = await Certificate.find({ visibility: 'public' })
-      .select({ certNo: 1, manufacturer: 1, equipment: 1, _id: 0 })
-      .lean();
+    const { page, pageSize, skip } = parsePageParams(req.query, { defaultPageSize: 25, maxPageSize: 100 });
+    const certRegex = buildLooseCertNoRegex(req.query.certNo || '');
+    const match = { visibility: 'public' };
+    if (certRegex) match.certNo = certRegex;
+    if (req.query.manufacturer) match.manufacturer = { $regex: '^' + escapeRegex(String(req.query.manufacturer).trim()), $options: 'i' };
+    if (req.query.equipment) match.equipment = { $regex: '^' + escapeRegex(String(req.query.equipment).trim()), $options: 'i' };
 
-    return res.json(samples);
+    // Csak a publikus tanúsítványok és csak a szükséges mezők
+    const [samples, total] = await Promise.all([
+      Certificate.find(match)
+      .select({ certNo: 1, manufacturer: 1, equipment: 1, _id: 0 })
+        .sort({ certNo: 1, _id: 1 })
+        .skip(skip)
+        .limit(pageSize)
+        .lean(),
+      Certificate.countDocuments(match)
+    ]);
+
+    return res.json({ items: samples, total, page, pageSize });
   } catch (error) {
     console.error('❌ Hiba a getCertificatesSamples lekérdezés során:', error);
     return res.status(500).send('❌ Hiba a getCertificatesSamples lekérdezés során');

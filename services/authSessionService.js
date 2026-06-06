@@ -10,6 +10,20 @@ const { computePermissions, getEffectiveProfessions } = require('../helpers/rbac
 const ACCESS_COOKIE = 'access_token';
 const REFRESH_COOKIE = 'refresh_token';
 const CSRF_COOKIE = 'csrf_token';
+const authContextCache = new Map();
+
+function authContextCacheTtlMs() {
+  const raw = Number(process.env.AUTH_CONTEXT_CACHE_TTL_MS ?? 5000);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.min(raw, 60_000);
+}
+
+function pruneAuthContextCache(now = Date.now()) {
+  if (authContextCache.size < 1000) return;
+  for (const [key, value] of authContextCache.entries()) {
+    if (!value || value.expiresAt <= now) authContextCache.delete(key);
+  }
+}
 
 function mustJwtSecret() {
   const secret = process.env.JWT_SECRET;
@@ -357,11 +371,22 @@ async function authenticateAccessToken(token) {
   if (decoded.type !== 'access' && decoded.typ !== 'access') throw new Error('Wrong token type');
   if (!decoded.sid) throw new Error('Missing session');
 
+  const ttlMs = authContextCacheTtlMs();
+  const now = Date.now();
+  const cacheKey = ttlMs ? `${decoded.sid}:${decoded.sub || decoded.userId || ''}` : '';
+  const cached = cacheKey ? authContextCache.get(cacheKey) : null;
+  if (cached && cached.expiresAt > now) {
+    if (!cached.session?.absoluteExpiresAt || new Date(cached.session.absoluteExpiresAt).getTime() > now) {
+      return { decoded, session: cached.session, user: cached.user };
+    }
+    authContextCache.delete(cacheKey);
+  }
+
   const session = await Session.findOne({
     _id: decoded.sid,
     revokedAt: null,
     expiresAt: { $gt: new Date() },
-  });
+  }).lean();
   if (!session) throw new Error('Session revoked or expired');
   if (session.absoluteExpiresAt && new Date(session.absoluteExpiresAt).getTime() <= Date.now()) {
     await Session.findByIdAndUpdate(session._id, { revokedAt: new Date() });
@@ -371,11 +396,22 @@ async function authenticateAccessToken(token) {
   const user = await User.findById(session.userId).lean();
   if (!user || !user.tenantId) throw new Error('Invalid session user');
   const userContext = await buildUserContext(user, session);
+  if (cacheKey && ttlMs) {
+    pruneAuthContextCache(now);
+    authContextCache.set(cacheKey, {
+      expiresAt: now + ttlMs,
+      session,
+      user: userContext,
+    });
+  }
   return { decoded, session, user: userContext };
 }
 
 async function revokeSession(sessionId) {
   if (!sessionId) return;
+  for (const key of authContextCache.keys()) {
+    if (key.startsWith(`${sessionId}:`)) authContextCache.delete(key);
+  }
   await Session.findByIdAndUpdate(sessionId, { revokedAt: new Date() });
 }
 

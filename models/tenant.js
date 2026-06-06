@@ -85,7 +85,11 @@ const TenantSchema = new mongoose.Schema(
       trim: true,
       default: '',
       match: /^$|^asst_[A-Za-z0-9]+$/,
-    }
+    },
+
+    // Optional report logo used in generated ITR headers.
+    logoBlobPath: { type: String, default: '' },
+    logoBlobUrl: { type: String, default: '' }
   },
   { timestamps: true }
 );
