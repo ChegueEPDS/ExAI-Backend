@@ -153,7 +153,7 @@ const PROJECT_REPORT_DIRS = {
 };
 const REPORT_PROGRESS_STEP_COUNT = 10;
 
-const REPORT_EQUIPMENT_SELECT = [
+const REPORT_EQUIPMENT_FIELDS = [
   'EqID',
   'TagNo',
   'Manufacturer',
@@ -183,7 +183,10 @@ const REPORT_EQUIPMENT_SELECT = [
   'certificateNumber',
   'Ex Marking',
   'customFields'
-].join(' ');
+];
+const REPORT_EQUIPMENT_SELECT = Object.fromEntries(
+  REPORT_EQUIPMENT_FIELDS.map(field => [field, 1])
+);
 
 const REPORT_INSPECTOR_SELECT = 'firstName lastName name position positionInfo signatureBlobUrl signatureBlobPath email';
 
@@ -648,7 +651,7 @@ async function resolveInspectionContext(inspection, options = {}) {
   }
 
   const site = await getSiteCached(equipment.Site, siteCache);
-  const zone = await getZoneCached(equipment.Zone, zoneCache);
+  const zone = await getZoneCached(equipment.Unit || equipment.Zone, zoneCache);
   const scheme = await resolveSchemeFromEquipment(equipment, certificateCache);
 
   return { equipment, site, zone, scheme };
