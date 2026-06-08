@@ -16,6 +16,7 @@ const {
   assignmentCycle,
   markAssignmentInspectionCompleted
 } = require('../services/schemaCycleService');
+const { scheduleDashboardStatsDirty } = require('../services/dashboardSummaryService');
 
 const upload = multer({ dest: 'uploads/' });
 
@@ -947,6 +948,7 @@ exports.deleteInspection = async (req, res) => {
 
     // 2) Inspection dokumentum törlése
     await Inspection.deleteOne({ _id: inspection._id });
+    scheduleDashboardStatsDirty({ tenantId, reason: 'inspection_deleted' });
 
     // 3) Equipment dokumentum frissítése (dokumentum-lista + lastInspection mezők)
     try {

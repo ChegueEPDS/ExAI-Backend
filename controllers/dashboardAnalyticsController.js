@@ -3,7 +3,7 @@ const Equipment = require('../models/dataplate');
 const Unit = require('../models/unit');
 const MaintenanceEvent = require('../models/maintenanceEvent');
 const { computeDashboardAnalytics } = require('../services/dashboardAnalyticsService');
-const { getOrSet, ttlMsFromEnv } = require('../services/shortTtlCache');
+const { getMaterializedSummary } = require('../services/dashboardSummaryService');
 const {
   assignmentStatus,
   isSchemaAssignment,
@@ -37,20 +37,19 @@ exports.getDashboardAnalytics = async (req, res) => {
     const from = parseDateOrNull(req.query.from);
     const to = parseDateOrNull(req.query.to);
 
-    const cacheKey = JSON.stringify({
-      tenantId: String(tenantId),
+    const params = {
       scope,
-      siteId,
-      zoneId,
       from: bucketDateForCache(from),
       to: bucketDateForCache(to)
+    };
+    const data = await getMaterializedSummary({
+      kind: 'dashboard-analytics',
+      tenantId,
+      siteId,
+      zoneId,
+      params,
+      loader: () => computeDashboardAnalytics({ tenantId, siteId, zoneId, from, to })
     });
-    const data = await getOrSet(
-      'dashboard-analytics',
-      cacheKey,
-      ttlMsFromEnv('DASHBOARD_ANALYTICS_CACHE_TTL_MS', 15_000),
-      () => computeDashboardAnalytics({ tenantId, siteId, zoneId, from, to })
-    );
     return res.json(data);
   } catch (error) {
     console.error('❌ getDashboardAnalytics error:', error);

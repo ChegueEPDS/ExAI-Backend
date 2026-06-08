@@ -53,6 +53,16 @@ MaintenanceEventSchema.post('save', function scheduleDashboardIncidentRefresh(do
     // Best-effort cache refresh; never block maintenance writes.
   }
   try {
+    if (doc?.tenantId) {
+      require('../services/dashboardSummaryService').scheduleDashboardStatsDirty({
+        tenantId: doc.tenantId,
+        reason: 'maintenance_event_saved'
+      });
+    }
+  } catch {
+    // Best-effort materialized summary invalidation; never block maintenance writes.
+  }
+  try {
     require('../services/rootCauseStatsService').syncMaintenanceRootCauseStats(doc).catch(() => {});
   } catch {
     // Best-effort stats mirror; never block maintenance writes.

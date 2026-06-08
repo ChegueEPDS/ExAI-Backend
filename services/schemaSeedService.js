@@ -14,7 +14,8 @@ const RB_DATA_FIELDS = [
   { key: 'epl', label: 'EPL', fieldType: 'multiselect', options: ['Ga', 'Gb', 'Gc', 'Da', 'Db', 'Dc'], order: 9 },
   { key: 'ambientTempMin', label: 'Ambient Temp. min', fieldType: 'number', order: 10 },
   { key: 'ambientTempMax', label: 'Ambient Temp. max', fieldType: 'number', order: 11 },
-  { key: 'clientRequirements', label: 'Client Requirements', fieldType: 'textarea', order: 12 }
+  { key: 'ipRating', label: 'IP Rating', fieldType: 'text', order: 12 },
+  { key: 'clientRequirements', label: 'Client Requirements', fieldType: 'textarea', order: 13 }
 ];
 
 async function loadLegacyRbQuestions() {

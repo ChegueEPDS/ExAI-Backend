@@ -39,6 +39,7 @@ function normalizeRbValues(rawValues = {}) {
   const environment = String(values.environment || '').trim();
   const scheme = String(values.scheme || 'ATEX').trim() || 'ATEX';
   const compliance = String(values.compliance || 'NA').trim() || 'NA';
+  const ipRating = values.ipRating ?? values.IPRating ?? values['IP Rating'] ?? values['IP rating'] ?? '';
   const normalized = {
     scheme,
     certificateNo: String(values.certificateNo || '').trim(),
@@ -51,6 +52,7 @@ function normalizeRbValues(rawValues = {}) {
     epl: [],
     ambientTempMin: values.ambientTempMin ?? null,
     ambientTempMax: values.ambientTempMax ?? null,
+    ipRating: String(ipRating || '').trim(),
     clientRequirements: values.clientRequirements || []
   };
 
@@ -69,6 +71,7 @@ function normalizeRbValues(rawValues = {}) {
     normalized.epl = [];
     normalized.ambientTempMin = null;
     normalized.ambientTempMax = null;
+    normalized.ipRating = '';
     return normalized;
   }
 

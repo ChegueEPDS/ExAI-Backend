@@ -190,6 +190,16 @@ InspectionSchema.post('save', function scheduleDashboardIncidentRefresh(doc) {
     // Best-effort cache refresh; never block inspection writes.
   }
   try {
+    if (doc?.tenantId) {
+      require('../services/dashboardSummaryService').scheduleDashboardStatsDirty({
+        tenantId: doc.tenantId,
+        reason: 'inspection_saved'
+      });
+    }
+  } catch {
+    // Best-effort materialized summary invalidation; never block inspection writes.
+  }
+  try {
     require('../services/rootCauseStatsService').syncInspectionRootCauseStats(doc).catch(() => {});
   } catch {
     // Best-effort stats mirror; never block inspection writes.

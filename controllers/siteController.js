@@ -15,7 +15,7 @@ const sharp = require('sharp');
 const heicConvert = require('heic-convert');
 const { recordTombstone } = require('../services/syncTombstoneService');
 const { sanitizeCustomFields } = require('../services/customFieldService');
-const { getOrSet, ttlMsFromEnv } = require('../services/shortTtlCache');
+const { getMaterializedSummary, scheduleDashboardStatsDirty } = require('../services/dashboardSummaryService');
 
 // LEGACY: const axios = require('axios');
 
@@ -157,6 +157,7 @@ exports.createSite = async (req, res) => {
     }
     */
 
+    scheduleDashboardStatsDirty({ tenantId: tenantObjectId, reason: 'site_created' });
     return res.status(201).json(newSite);
   } catch (error) {
     console.error('❌ createSite error:', error);
@@ -228,6 +229,11 @@ exports.getSiteSummary = async (req, res) => {
       return res.status(400).json({ message: 'Invalid site or tenant ID.' });
     }
 
+    const summary = await getMaterializedSummary({
+      kind: 'site-summary',
+      tenantId: tenantObjectId,
+      siteId: siteObjectId,
+      loader: async () => {
     const [zoneCount, zoneStats] = await Promise.all([
       Zone.countDocuments({ Site: siteObjectId, tenantId: tenantObjectId }),
       Equipment.aggregate([
@@ -286,13 +292,17 @@ exports.getSiteSummary = async (req, res) => {
       0
     );
 
-    return res.json({
+        return {
       siteId: siteObjectId.toString(),
       zoneCount,
       deviceCount,
       statusCounts,
       zoneStats: zoneStatsFormatted
+        };
+      }
     });
+
+    return res.json(summary);
   } catch (error) {
     console.error('❌ getSiteSummary error:', error);
     return res.status(500).json({
@@ -312,12 +322,12 @@ exports.getSiteOperationalSummary = async (req, res) => {
       return res.status(400).json({ message: 'Invalid site id.' });
     }
 
-    const summary = await getOrSet(
-      'operational-summary',
-      JSON.stringify({ tenantId: String(tenantId), siteId: String(siteId) }),
-      ttlMsFromEnv('OPERATIONAL_SUMMARY_CACHE_TTL_MS', 15 * 1000),
-      () => computeOperationalSummary({ tenantId, siteId })
-    );
+    const summary = await getMaterializedSummary({
+      kind: 'operational-summary',
+      tenantId,
+      siteId,
+      loader: () => computeOperationalSummary({ tenantId, siteId })
+    });
 
     return res.json({ siteId, ...summary });
   } catch (error) {
@@ -336,12 +346,12 @@ exports.getSiteOverallStatusSummary = async (req, res) => {
       return res.status(400).json({ message: 'Invalid site id.' });
     }
 
-    const summary = await getOrSet(
-      'overall-status-summary',
-      JSON.stringify({ tenantId: String(tenantId), siteId: String(siteId) }),
-      ttlMsFromEnv('STATUS_SUMMARY_CACHE_TTL_MS', 15 * 1000),
-      () => computeOverallStatusSummary({ tenantId, siteId })
-    );
+    const summary = await getMaterializedSummary({
+      kind: 'overall-status-summary',
+      tenantId,
+      siteId,
+      loader: () => computeOverallStatusSummary({ tenantId, siteId })
+    });
     return res.json({ siteId, ...summary });
   } catch (error) {
     console.error('❌ getSiteOverallStatusSummary error:', error);
@@ -359,12 +369,12 @@ exports.getSiteMaintenanceSeveritySummary = async (req, res) => {
       return res.status(400).json({ message: 'Invalid site id.' });
     }
 
-    const summary = await getOrSet(
-      'maintenance-severity-summary',
-      JSON.stringify({ tenantId: String(tenantId), siteId: String(siteId) }),
-      ttlMsFromEnv('MAINTENANCE_SEVERITY_CACHE_TTL_MS', 15 * 1000),
-      () => computeMaintenanceSeveritySummary({ tenantId, siteId })
-    );
+    const summary = await getMaterializedSummary({
+      kind: 'maintenance-severity-summary',
+      tenantId,
+      siteId,
+      loader: () => computeMaintenanceSeveritySummary({ tenantId, siteId })
+    });
 
     return res.json({ siteId, ...summary });
   } catch (error) {
@@ -423,6 +433,7 @@ exports.updateSite = async (req, res) => {
     */
 
     await site.save();
+    scheduleDashboardStatsDirty({ tenantId: site.tenantId || req.scope?.tenantId, reason: 'site_updated' });
     res.status(200).json(site);
   } catch (error) {
     console.error("❌ Site módosítás hiba:", error);
@@ -467,6 +478,7 @@ exports.deleteSite = async (req, res) => {
     }
 
     await site.deleteOne();
+    scheduleDashboardStatsDirty({ tenantId: tenantObjectId, reason: 'site_deleted' });
 
     // LEGACY (Graph/SharePoint) — removed:
     /*

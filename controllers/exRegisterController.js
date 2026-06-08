@@ -43,6 +43,7 @@ const { ensureRbSchema } = require('../services/schemaSeedService');
 const SchemaDefinition = require('../models/schemaDefinition');
 const { applySchemaCycleDefaults } = require('../services/schemaCycleService');
 const { validateSchemaValues } = require('../services/schemaValidationService');
+const { scheduleDashboardStatsDirty } = require('../services/dashboardSummaryService');
 
 const { BlobServiceClient } = require('@azure/storage-blob');
 const path = require('path');
@@ -1208,6 +1209,7 @@ function zoneRbDisplays(zone) {
     subGroup: listDisplay(rb.SubGroup),
     temp: tempParts.join(' / '),
     ambient: ambientParts.join(' / '),
+    ipRating: rb.IPRating || '',
     epl: listDisplay(rb.EPL),
     clientReq: Array.isArray(rb.clientReq) ? rb.clientReq : []
   };
@@ -5246,6 +5248,7 @@ async function deleteEquipmentInternal(equipment, tenantId, tenantName) {
       : null;
 
   await Equipment.deleteOne({ _id: equipment._id });
+  scheduleDashboardStatsDirty({ tenantId, reason: 'equipment_deleted' });
 
   // 🧹 Sorszámok újraszámozása az adott zónán/projekten belül
   if (deletedOrderIndex != null) {

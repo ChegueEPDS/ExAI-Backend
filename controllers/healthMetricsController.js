@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const { computeHealthMetrics } = require('../services/healthMetricsService');
+const { getMaterializedSummary } = require('../services/dashboardSummaryService');
 
 function normalizeQueryValue(v) {
   if (v == null || v === '') return null;
@@ -21,13 +22,22 @@ exports.getSiteHealthMetrics = async (req, res) => {
       return res.status(400).json({ message: 'Invalid site id.' });
     }
 
-    const metrics = await computeHealthMetrics({
-      tenantId,
-      siteId,
+    const params = {
       from: normalizeQueryValue(req.query.from),
       to: normalizeQueryValue(req.query.to),
       mode: normalizeQueryValue(req.query.mode),
       severity: parseSeverityQuery(req.query.severity)
+    };
+    const metrics = await getMaterializedSummary({
+      kind: 'health-metrics',
+      tenantId,
+      siteId,
+      params,
+      loader: () => computeHealthMetrics({
+        tenantId,
+        siteId,
+        ...params
+      })
     });
     return res.json(metrics);
   } catch (error) {
@@ -45,13 +55,22 @@ exports.getZoneHealthMetrics = async (req, res) => {
       return res.status(400).json({ message: 'Invalid zone id.' });
     }
 
-    const metrics = await computeHealthMetrics({
-      tenantId,
-      zoneId,
+    const params = {
       from: normalizeQueryValue(req.query.from),
       to: normalizeQueryValue(req.query.to),
       mode: normalizeQueryValue(req.query.mode),
       severity: parseSeverityQuery(req.query.severity)
+    };
+    const metrics = await getMaterializedSummary({
+      kind: 'health-metrics',
+      tenantId,
+      zoneId,
+      params,
+      loader: () => computeHealthMetrics({
+        tenantId,
+        zoneId,
+        ...params
+      })
     });
     return res.json(metrics);
   } catch (error) {
@@ -65,12 +84,20 @@ exports.getTenantHealthMetrics = async (req, res) => {
     const tenantId = req.scope?.tenantId;
     if (!tenantId) return res.status(401).json({ message: 'Missing tenantId from auth.' });
 
-    const metrics = await computeHealthMetrics({
-      tenantId,
+    const params = {
       from: normalizeQueryValue(req.query.from),
       to: normalizeQueryValue(req.query.to),
       mode: normalizeQueryValue(req.query.mode),
       severity: parseSeverityQuery(req.query.severity)
+    };
+    const metrics = await getMaterializedSummary({
+      kind: 'health-metrics',
+      tenantId,
+      params,
+      loader: () => computeHealthMetrics({
+        tenantId,
+        ...params
+      })
     });
     return res.json(metrics);
   } catch (error) {

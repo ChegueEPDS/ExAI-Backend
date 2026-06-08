@@ -21,6 +21,7 @@ function listValue(value) {
 
 function zoneView(entity) {
   const values = getRbValues(entity);
+  const ipRating = values.ipRating ?? values.IPRating ?? values['IP Rating'] ?? values['IP rating'] ?? '';
   return {
     Scheme: values.scheme || '',
     Environment: values.environment || '',
@@ -34,6 +35,7 @@ function zoneView(entity) {
     EPL: listValue(values.epl),
     AmbientTempMin: values.ambientTempMin ?? null,
     AmbientTempMax: values.ambientTempMax ?? null,
+    IPRating: ipRating || '',
     clientReq: values.clientReq || values.clientRequirements || []
   };
 }

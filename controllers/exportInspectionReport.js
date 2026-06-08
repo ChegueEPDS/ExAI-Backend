@@ -25,7 +25,7 @@ const {
   buildCertificateCacheForCertNos,
   resolveCertificateFromCache
 } = require('../helpers/certificateMatchHelper');
-const { certificateNo, complianceStatus } = require('../services/rbSchemaValueService');
+const { certificateNo, complianceStatus, getRbValues } = require('../services/rbSchemaValueService');
 const systemSettings = require('../services/systemSettingsStore');
 const {
   equipmentMarkings,
@@ -119,6 +119,7 @@ function zoneRbDisplays(zone) {
     subGroup: listDisplay(rb.SubGroup),
     temp: tempParts.join(' / '),
     ambient: ambientParts.join(' - '),
+    ipRating: rb.IPRating || '',
     epl: listDisplay(rb.EPL),
     clientReq: Array.isArray(rb.clientReq) ? rb.clientReq : []
   };
@@ -1260,6 +1261,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   // -------- Excel workbook + sheet --------
   const workbook = new ExcelJS.Workbook();
   const ws = workbook.addWorksheet('Inspection Report');
+  const topRowHeight = 23;
 
   const setHeaderCell = (range, text) => {
     ws.mergeCells(range);
@@ -1277,6 +1279,16 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
     cell.value = value || '';
     cell.alignment = { horizontal: 'center', vertical: 'middle' };
     return cell;
+  };
+
+  const topDataRowHeight = (values = []) => {
+    const maxTextLength = values.reduce((max, value) => {
+      if (value instanceof Date) return max;
+      const len = String(value ?? '').length;
+      return Math.max(max, len);
+    }, 1);
+    const lineCount = Math.max(1, Math.ceil(maxTextLength / 23));
+    return Math.max(topRowHeight, lineCount * 15);
   };
 
   // Oszlopszélességek – kb. a tervhez igazítva
@@ -1299,7 +1311,6 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
 
   const tenantName = (options.tenantName || '').toLowerCase();
   const isIndexTenant = tenantName === 'index' || tenantName === 'ind-ex';
-  const schemeIsIECEx = typeof scheme === 'string' && scheme.toLowerCase().includes('iecex');
   const exMarking = primaryEquipmentMarking(equipment);
   const protectionTokens = String(exMarking['Type of Protection'] || '')
     .toLowerCase()
@@ -1407,18 +1418,22 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   emptyRow3.height = 7;
 
   let currentRow = 4;
-  const topRowHeight = 23;
   const spacerHeight = 5;
 
   // Client / Project / Zone
   const clientRow = currentRow;
+  const clientRowValues = [
+    isIndexTenant ? (zone?.SkidID || '') : (site?.Client || ''),
+    isIndexTenant ? (zone?.SkidDescription || zone?.Name || '') : (site?.Name || ''),
+    isIndexTenant ? (site?.Name || '') : (zone?.Name || zone?.ZoneName || '')
+  ];
   setHeaderCell(`A${clientRow}:B${clientRow}`, isIndexTenant ? 'Skid ID' : 'Client name');
-  setValueCell(`C${clientRow}:E${clientRow}`, isIndexTenant ? (zone?.SkidID || '') : (site?.Client || ''));
+  setValueCell(`C${clientRow}:E${clientRow}`, clientRowValues[0]);
   setHeaderCell(`F${clientRow}:G${clientRow}`, isIndexTenant ? 'Skid Description' :'Project');
-  setValueCell(`H${clientRow}:J${clientRow}`, isIndexTenant ? (zone?.SkidDescription || zone?.Name || '') : (site?.Name || ''));
+  setValueCell(`H${clientRow}:J${clientRow}`, clientRowValues[1]);
   setHeaderCell(`K${clientRow}:L${clientRow}`, isIndexTenant ? 'Project' : 'Zone');
-  setValueCell(`M${clientRow}:N${clientRow}`, isIndexTenant ? (site?.Name || '') : (zone?.Name || zone?.ZoneName || ''));
-  ws.getRow(clientRow).height = topRowHeight;
+  setValueCell(`M${clientRow}:N${clientRow}`, clientRowValues[2]);
+  ws.getRow(clientRow).height = topDataRowHeight(clientRowValues);
   currentRow += 1;
 
   const tagIdValue = equipment?.TagNo || equipment?.['TagNo'] || equipment?.['Tag No'] || equipment?.tagId || '';
@@ -1427,48 +1442,70 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
 
   if (hasTagId) {
     tagRowIndex = currentRow;
+    const tagRowValues = [
+      tagIdValue,
+      equipment.EqID || '',
+      equipment['Equipment Type'] || equipment.EquipmentType || ''
+    ];
     setHeaderCell(`A${tagRowIndex}:B${tagRowIndex}`, isIndexTenant ? 'Voith ID Tag' : 'Tag ID');
-    setValueCell(`C${tagRowIndex}:E${tagRowIndex}`, tagIdValue);
+    setValueCell(`C${tagRowIndex}:E${tagRowIndex}`, tagRowValues[0]);
 
     setHeaderCell(`F${tagRowIndex}:G${tagRowIndex}`, isIndexTenant ? 'Project ID Tag' : 'Equipment ID');
-    setValueCell(`H${tagRowIndex}:J${tagRowIndex}`, equipment.EqID || '');
+    setValueCell(`H${tagRowIndex}:J${tagRowIndex}`, tagRowValues[1]);
 
     setHeaderCell(`K${tagRowIndex}:L${tagRowIndex}`, 'Equipment Description');
-    setValueCell(`M${tagRowIndex}:N${tagRowIndex}`, equipment['Equipment Type'] || equipment.EquipmentType || '');
-    ws.getRow(tagRowIndex).height = topRowHeight;
+    setValueCell(`M${tagRowIndex}:N${tagRowIndex}`, tagRowValues[2]);
+    ws.getRow(tagRowIndex).height = topDataRowHeight(tagRowValues);
     currentRow += 1;
   }
 
   const equipmentRow = currentRow;
+  let equipmentRowValues;
   if (hasTagId) {
+    equipmentRowValues = [
+      equipment.Manufacturer || '',
+      equipment['Model/Type'] || '',
+      equipment['Serial Number'] || equipment.SerialNumber || ''
+    ];
     setHeaderCell(`A${equipmentRow}:B${equipmentRow}`, 'Manufacturer');
-    setValueCell(`C${equipmentRow}:E${equipmentRow}`, equipment.Manufacturer || '');
+    setValueCell(`C${equipmentRow}:E${equipmentRow}`, equipmentRowValues[0]);
     setHeaderCell(`F${equipmentRow}:G${equipmentRow}`, 'Model');
-    setValueCell(`H${equipmentRow}:J${equipmentRow}`, equipment['Model/Type'] || '');
+    setValueCell(`H${equipmentRow}:J${equipmentRow}`, equipmentRowValues[1]);
     setHeaderCell(`K${equipmentRow}:L${equipmentRow}`, 'Serial No');
-    setValueCell(`M${equipmentRow}:N${equipmentRow}`, equipment['Serial Number'] || equipment.SerialNumber || '');
+    setValueCell(`M${equipmentRow}:N${equipmentRow}`, equipmentRowValues[2]);
   } else {
+    equipmentRowValues = [
+      equipment.EqID || '',
+      equipment.Manufacturer || '',
+      equipment['Model/Type'] || ''
+    ];
     setHeaderCell(`A${equipmentRow}:B${equipmentRow}`, 'Equipment ID');
-    setValueCell(`C${equipmentRow}:E${equipmentRow}`, equipment.EqID || '');
+    setValueCell(`C${equipmentRow}:E${equipmentRow}`, equipmentRowValues[0]);
     setHeaderCell(`F${equipmentRow}:G${equipmentRow}`, 'Manufacturer');
-    setValueCell(`H${equipmentRow}:J${equipmentRow}`, equipment.Manufacturer || '');
+    setValueCell(`H${equipmentRow}:J${equipmentRow}`, equipmentRowValues[1]);
     setHeaderCell(`K${equipmentRow}:L${equipmentRow}`, 'Model');
-    setValueCell(`M${equipmentRow}:N${equipmentRow}`, equipment['Model/Type'] || '');
+    setValueCell(`M${equipmentRow}:N${equipmentRow}`, equipmentRowValues[2]);
   }
-  ws.getRow(equipmentRow).height = topRowHeight;
+  ws.getRow(equipmentRow).height = topDataRowHeight(equipmentRowValues);
   currentRow += 1;
 
   // ========= Certificate / Ex scheme =========
   const certificateRow = currentRow;
-  setHeaderCell(`A${certificateRow}:B${certificateRow}`, 'Certificate no');
-  setValueCell(`C${certificateRow}:E${certificateRow}`, certificateNo(equipment) || '');
-  setHeaderCell(`F${certificateRow}:G${certificateRow}`, 'Ex scheme');
-  setValueCell(`H${certificateRow}:J${certificateRow}`, scheme || '');
-  setHeaderCell(`K${certificateRow}:L${certificateRow}`, 'Status');
   const statusValue = inspection.status || '';
+  const equipmentRbScheme = String(getRbValues(equipment)?.scheme || '').trim();
+  const certificateRowValues = [
+    certificateNo(equipment) || '',
+    equipmentRbScheme || scheme || '',
+    statusValue
+  ];
+  setHeaderCell(`A${certificateRow}:B${certificateRow}`, 'Certificate no');
+  setValueCell(`C${certificateRow}:E${certificateRow}`, certificateRowValues[0]);
+  setHeaderCell(`F${certificateRow}:G${certificateRow}`, 'Ex scheme');
+  setValueCell(`H${certificateRow}:J${certificateRow}`, certificateRowValues[1]);
+  setHeaderCell(`K${certificateRow}:L${certificateRow}`, 'Status');
   const isPassed = statusValue === 'Passed';
   const isFailed = statusValue === 'Failed';
-  setValueCell(`M${certificateRow}:N${certificateRow}`, statusValue);
+  setValueCell(`M${certificateRow}:N${certificateRow}`, certificateRowValues[2]);
   const statusCell = ws.getCell(`M${certificateRow}`);
   statusCell.value = statusValue;
   statusCell.font = {
@@ -1479,7 +1516,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
         ? { argb: 'FFFF0000' } // red
         : undefined
   };
-  ws.getRow(certificateRow).height = topRowHeight;
+  ws.getRow(certificateRow).height = topDataRowHeight(certificateRowValues);
   currentRow += 1;
 
   // üres sor
@@ -1495,6 +1532,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   const zoneSubGroup = zoneDisplays.subGroup;
   const zoneTempDisplay = zoneDisplays.temp;
   const ambientDisplay = zoneDisplays.ambient;
+  const zoneIpRating = zoneDisplays.ipRating;
   const zoneEpl = zoneDisplays.epl;
 
   const areaLabelFill = {
@@ -1538,7 +1576,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   ws.getCell(`K${areaRow}`).value = 'IP Rating';
   ws.getCell(`K${areaRow}`).font = { bold: true };
   ws.getCell(`K${areaRow}`).fill = HEADER_FILL;
-  ws.getCell(`L${areaRow}`).value = '';
+  ws.getCell(`L${areaRow}`).value = zoneIpRating || '';
 
   ws.getCell(`M${areaRow}`).value = 'EPL';
   ws.getCell(`M${areaRow}`).font = { bold: true };
@@ -1605,10 +1643,8 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   const spacerAfterBlock = ws.getRow(spacerAfterBlockIndex);
   spacerAfterBlock.height = spacerHeight;
 
-  // enforce heights again (some cells wrap)
-  const enforceHeights = [clientRow, equipmentRow, certificateRow, areaRow, equipmentInfoRow];
-  if (hasTagId && tagRowIndex) enforceHeights.splice(1, 0, tagRowIndex);
-  enforceHeights.forEach(rn => {
+  // enforce Area / Equipment comparison heights again (some cells wrap)
+  [areaRow, equipmentInfoRow].forEach(rn => {
     const row = ws.getRow(rn);
     row.height = topRowHeight;
   });
@@ -1800,6 +1836,8 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
     fgColor: { argb: 'FFD9D9D9' }
   };
 
+  const checklistApproxCharsPerLine = isIndexTenant ? 95 : 65;
+
   sortedGroupNames.forEach((groupName, groupIndex) => {
     // Csoportcím sor – teljes szélesség merge
     const groupRow = ws.addRow([groupName]);
@@ -1815,24 +1853,38 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       cell.border = BORDER_THIN;
     });
 
-    // Header sor (Ref / Check / Pass / Fail / NA / Comment)
-    const headerRow = ws.addRow([
-      'Ref',
-      'Check',
-      '',
-      '',
-      '',
-      '',
-      '',
-      'Pass',
-      'Fail',
-      'NA',
-      'Comment'
-    ]);
-    const hr = headerRow.number;
+    const checklistLayout = isIndexTenant
+      ? {
+          checkStartCol: 'B',
+          checkEndCol: 'H',
+          passCol: 'I',
+          failCol: 'J',
+          naCol: 'K',
+          commentStartCol: 'L',
+          commentEndCol: 'N'
+        }
+      : {
+          checkStartCol: 'B',
+          checkEndCol: 'G',
+          passCol: 'H',
+          failCol: 'I',
+          naCol: 'J',
+          commentStartCol: 'K',
+          commentEndCol: 'N'
+        };
 
-    ws.mergeCells(`B${hr}:G${hr}`); // Check
-    ws.mergeCells(`K${hr}:N${hr}`); // Comment
+    // Header sor (Ref / Check / Pass / Fail / NA / Comment)
+    const headerRow = ws.addRow([]);
+    const hr = headerRow.number;
+    ws.getCell(`A${hr}`).value = 'Ref';
+    ws.getCell(`B${hr}`).value = 'Check';
+    ws.getCell(`${checklistLayout.passCol}${hr}`).value = 'Pass';
+    ws.getCell(`${checklistLayout.failCol}${hr}`).value = 'Fail';
+    ws.getCell(`${checklistLayout.naCol}${hr}`).value = 'NA';
+    ws.getCell(`${checklistLayout.commentStartCol}${hr}`).value = 'Comment';
+
+    ws.mergeCells(`${checklistLayout.checkStartCol}${hr}:${checklistLayout.checkEndCol}${hr}`); // Check
+    ws.mergeCells(`${checklistLayout.commentStartCol}${hr}:${checklistLayout.commentEndCol}${hr}`); // Comment
 
     ['A','B','C','D','E','F','G','H','I','J','K','L','M','N'].forEach(col => {
       const cell = ws.getCell(`${col}${hr}`);
@@ -1859,25 +1911,19 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       const imageNames = attachmentLookup ? attachmentLookup.getFileNamesForResult(r) : [];
       const commentCellInfo = buildCommentCellValueWithSeverity(r.note, r.severity, imageNames);
 
-      const row = ws.addRow([
-        ref,
-        questionText,
-        '',
-        '',
-        '',
-        '',
-        '',
-        passedMark,
-        failedMark,
-        naMark,
-        commentCellInfo.value
-      ]);
+      const row = ws.addRow([]);
 
       const rn = row.number;
+      ws.getCell(`A${rn}`).value = ref;
+      ws.getCell(`B${rn}`).value = questionText;
+      ws.getCell(`${checklistLayout.passCol}${rn}`).value = passedMark;
+      ws.getCell(`${checklistLayout.failCol}${rn}`).value = failedMark;
+      ws.getCell(`${checklistLayout.naCol}${rn}`).value = naMark;
+      ws.getCell(`${checklistLayout.commentStartCol}${rn}`).value = commentCellInfo.value;
 
       // Merge check & comment cell blocks
-      ws.mergeCells(`B${rn}:G${rn}`);
-      ws.mergeCells(`K${rn}:N${rn}`);
+      ws.mergeCells(`${checklistLayout.checkStartCol}${rn}:${checklistLayout.checkEndCol}${rn}`);
+      ws.mergeCells(`${checklistLayout.commentStartCol}${rn}:${checklistLayout.commentEndCol}${rn}`);
 
       // Border + igazítás a sorra
       ['A','B','C','D','E','F','G','H','I','J','K','L','M','N'].forEach(col => {
@@ -1891,14 +1937,14 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       });
 
       // A kérdés (Check) és a Comment cella legyen balra igazítva a merge után
-      const checkCell = ws.getCell(`B${rn}`);   // B–G merge anchor
+      const checkCell = ws.getCell(`B${rn}`);
       checkCell.alignment = {
         horizontal: 'left',
         vertical: 'middle',
         wrapText: true
       };
 
-      const commentCell = ws.getCell(`K${rn}`); // K–N merge anchor
+      const commentCell = ws.getCell(`${checklistLayout.commentStartCol}${rn}`);
       commentCell.alignment = {
         horizontal: 'left',
         vertical: 'middle',
@@ -1907,9 +1953,8 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
 
       // Sor magasság becslése a kérdés hossza alapján,
       // hogy a teljes szöveg látható legyen több sorban is.
-      const approxCharsPerLine = 65; // kb. ennyi karakter fér el egy sorban
       const textLength = (questionText?.length || 0) + (commentCellInfo.text?.length || 0) || 1;
-      const lineCount = Math.max(1, Math.ceil(textLength / approxCharsPerLine));
+      const lineCount = Math.max(1, Math.ceil(textLength / checklistApproxCharsPerLine));
       ws.getRow(rn).height = lineCount * 15; // 15 pont / sor, szükség esetén növelhető
     });
 
@@ -1927,7 +1972,9 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
     ws.getCell(`A${remarksR}`).value = 'Remarks';
     ws.getCell(`A${remarksR}`).font = { bold: true };
     ws.getCell(`B${remarksR}`).value = inspection?.remarks || '';
-    remarksRow.height = 40;
+    const remarksTextLength = (inspection?.remarks?.length || 0) || 1;
+    const remarksLineCount = Math.max(1, Math.ceil(remarksTextLength / checklistApproxCharsPerLine));
+    remarksRow.height = remarksLineCount * 15;
 
     ['A','B','C','D','E','F','G','H','I','J','K','L','M','N'].forEach(col => {
       const cell = ws.getCell(`${col}${remarksR}`);
@@ -1970,8 +2017,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
 
   setFooterField(nameR, 'Name:', inspectorName || '');
   setFooterField(positionR, 'Position:', inspectorPosition || '');
-  // IECEx CoPC# csak IECEx sémánál értelmezett – egyébként üresen hagyjuk a mezőt
-  setFooterField(copcR, 'IECEx CoPC#:', schemeIsIECEx ? (inspectorPositionInfo || '') : '');
+  setFooterField(copcR, 'IECEx CoPC#:', inspectorPositionInfo || '');
 
   // jobb oldali blokk: Signature (H–N oszlop, 3 sor magas)
   ws.mergeCells(`H${nameR}:N${copcR}`);
@@ -2457,6 +2503,7 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
     const zoneSubGroup = zoneDisplays.subGroup;
     const zoneTempDisplay = zoneDisplays.temp;
     const ambientDisplay = zoneDisplays.ambient;
+    const zoneIpRating = zoneDisplays.ipRating;
     const zoneEpl = zoneDisplays.epl;
 
     const areaLabelFill = {
@@ -2496,7 +2543,7 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
     ws.getCell(`K${ar}`).value = 'IP Rating';
     ws.getCell(`K${ar}`).font = { bold: true };
     ws.getCell(`K${ar}`).fill = HEADER_FILL;
-    ws.getCell(`L${ar}`).value = '';
+    ws.getCell(`L${ar}`).value = zoneIpRating || '';
 
     ws.getCell(`M${ar}`).value = 'EPL';
     ws.getCell(`M${ar}`).font = { bold: true };

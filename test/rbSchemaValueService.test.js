@@ -21,6 +21,7 @@ test('zoneView reads RB values from schemaAssignments', () => {
         zone: [1],
         subGroup: ['IIB'],
         tempClass: 'T4',
+        ipRating: 'IP66',
         epl: ['Gb']
       }
     }]
@@ -32,6 +33,7 @@ test('zoneView reads RB values from schemaAssignments', () => {
   assert.deepEqual(rb.SubGroup, ['IIB']);
   assert.equal(rb.TempClass, 'T4');
   assert.equal(Object.prototype.hasOwnProperty.call(rb, 'IpRating'), false);
+  assert.equal(rb.IPRating, 'IP66');
   assert.deepEqual(rb.EPL, ['Gb']);
 });
 

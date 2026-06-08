@@ -17,7 +17,7 @@ const { sanitizeCustomFields } = require('../services/customFieldService');
 const { ensureRbSchema } = require('../services/schemaSeedService');
 const { ensureRbAssignment } = require('../services/rbSchemaValueService');
 const { normalizeRbValues } = require('../services/schemaRules/rbRules');
-const { getOrSet, ttlMsFromEnv } = require('../services/shortTtlCache');
+const { getMaterializedSummary, scheduleDashboardStatsDirty } = require('../services/dashboardSummaryService');
 
 // Helper: convert string tenantId to ObjectId safely
 const toObjectId = (id) => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null);
@@ -215,6 +215,7 @@ exports.createZone = async (req, res) => {
       console.warn('⚠️ Could not create .keep blob for zone folder:', e?.message);
     }
 
+    scheduleDashboardStatsDirty({ tenantId: tenantObjectId, reason: 'zone_created' });
     return res.status(201).json({ message: 'Zone created successfully', zone: unit });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -294,12 +295,12 @@ exports.getZoneOperationalSummary = async (req, res) => {
       return res.status(400).json({ message: 'Invalid zone id.' });
     }
 
-    const summary = await getOrSet(
-      'operational-summary',
-      JSON.stringify({ tenantId: String(tenantIdStr), zoneId: String(zoneId) }),
-      ttlMsFromEnv('OPERATIONAL_SUMMARY_CACHE_TTL_MS', 15 * 1000),
-      () => computeOperationalSummary({ tenantId: tenantIdStr, zoneId })
-    );
+    const summary = await getMaterializedSummary({
+      kind: 'operational-summary',
+      tenantId: tenantIdStr,
+      zoneId,
+      loader: () => computeOperationalSummary({ tenantId: tenantIdStr, zoneId })
+    });
 
     return res.json({ zoneId, ...summary });
   } catch (error) {
@@ -322,12 +323,12 @@ exports.getZoneMaintenanceSeveritySummary = async (req, res) => {
       return res.status(400).json({ message: 'Invalid zone id.' });
     }
 
-    const summary = await getOrSet(
-      'maintenance-severity-summary',
-      JSON.stringify({ tenantId: String(tenantIdStr), zoneId: String(zoneId) }),
-      ttlMsFromEnv('MAINTENANCE_SEVERITY_CACHE_TTL_MS', 15 * 1000),
-      () => computeMaintenanceSeveritySummary({ tenantId: tenantIdStr, zoneId })
-    );
+    const summary = await getMaterializedSummary({
+      kind: 'maintenance-severity-summary',
+      tenantId: tenantIdStr,
+      zoneId,
+      loader: () => computeMaintenanceSeveritySummary({ tenantId: tenantIdStr, zoneId })
+    });
 
     return res.json({ zoneId, ...summary });
   } catch (error) {
@@ -364,6 +365,7 @@ exports.updateZone = async (req, res) => {
 
     zone.ModifiedBy = req.userId;
     await zone.save();
+    scheduleDashboardStatsDirty({ tenantId: tenantObjectId, reason: 'zone_updated' });
     return res.status(200).json({ message: 'Zone updated successfully', zone });
   } catch (error) {
     return res.status(400).json({ error: error.message });
@@ -445,6 +447,7 @@ exports.moveZone = async (req, res) => {
       await Unit.bulkWrite(bulkOps);
     }
 
+    scheduleDashboardStatsDirty({ tenantId: tenantObjectId, reason: 'zone_moved' });
     return res.status(200).json({ message: 'Unit moved successfully' });
   } catch (error) {
     return res.status(500).json({ message: 'Failed to move unit', error: error.message || String(error) });
@@ -490,6 +493,7 @@ exports.deleteZone = async (req, res) => {
     }
 
     await Unit.deleteMany({ _id: { $in: unitIds }, tenantId: tenantObjectId });
+    scheduleDashboardStatsDirty({ tenantId: tenantObjectId, reason: 'zone_deleted' });
     return res.status(200).json({ message: 'Zone and related equipment deleted successfully' });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -556,6 +560,7 @@ exports.importZonesFromXlsx = async (req, res) => {
       const eplRaw = row['EPL'] ?? '';
       const ambMinRaw = row['AmbientTempMin'] ?? row['Ambient Min'] ?? '';
       const ambMaxRaw = row['AmbientTempMax'] ?? row['Ambient Max'] ?? '';
+      const ipRatingRaw = String(row['IP Rating'] || row['IP rating'] || row['IPRating'] || '').trim();
 
       const envMap = {
         'gas': 'Gas',
@@ -642,7 +647,8 @@ exports.importZonesFromXlsx = async (req, res) => {
           maxTemp: MaxTemp,
           epl: EPL,
           ambientTempMin: AmbientTempMin,
-          ambientTempMax: AmbientTempMax
+          ambientTempMax: AmbientTempMax,
+          ipRating: ipRatingRaw
         };
         const payload = {
           Name: name,

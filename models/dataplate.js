@@ -117,6 +117,53 @@ EquipmentSchema.index({ tenantId: 1, isProcessed: 1, lastInspectionStatus: 1, la
 EquipmentSchema.index({ tenantId: 1, Site: 1, isProcessed: 1, lastInspectionStatus: 1, lastInspectionValidUntil: 1, _id: 1 });
 EquipmentSchema.index({ tenantId: 1, 'schemaAssignments.values.nextInspectionDate': 1, _id: 1 });
 
+const DASHBOARD_SUMMARY_RELEVANT_PATHS = [
+    'tenantId',
+    'Site',
+    'Zone',
+    'Unit',
+    'isProcessed',
+    'pendingReview',
+    'lastInspectionDate',
+    'lastInspectionValidUntil',
+    'lastInspectionStatus',
+    'lastInspectionId',
+    'operationalStatus',
+    'schemaAssignments'
+];
+
+function isDashboardSummaryRelevantUpdate(update) {
+    if (!update || typeof update !== 'object') return false;
+    const changed = new Set();
+    const collect = (obj) => {
+        if (!obj || typeof obj !== 'object') return;
+        Object.keys(obj).forEach((key) => changed.add(key));
+    };
+    collect(update.$set);
+    collect(update.$unset);
+    collect(update.$inc);
+    collect(update.$push);
+    collect(update.$pull);
+    Object.keys(update).forEach((key) => {
+        if (!key.startsWith('$')) changed.add(key);
+    });
+    return Array.from(changed).some((key) =>
+        DASHBOARD_SUMMARY_RELEVANT_PATHS.some((path) => key === path || key.startsWith(`${path}.`))
+    );
+}
+
+function scheduleDashboardSummaryDirtyForEquipment(doc, reason) {
+    try {
+        if (!doc?.tenantId) return;
+        require('../services/dashboardSummaryService').scheduleDashboardStatsDirty({
+            tenantId: doc.tenantId,
+            reason
+        });
+    } catch {
+        // Best-effort materialized summary invalidation; never block equipment writes.
+    }
+}
+
 // 🔹 Pre-save middleware: kezeli a tenantId és Company mezőket mentéskor
 EquipmentSchema.pre('save', async function (next) {
     if (!this.CreatedBy) {
@@ -124,6 +171,11 @@ EquipmentSchema.pre('save', async function (next) {
     }
 
     try {
+        this.$locals = this.$locals || {};
+        this.$locals.dashboardSummaryRelevantChange =
+            this.isNew ||
+            DASHBOARD_SUMMARY_RELEVANT_PATHS.some((path) => this.isModified(path));
+
         if (!this.Unit && this.Zone) {
             this.Unit = this.Zone;
         }
@@ -144,10 +196,18 @@ EquipmentSchema.pre('save', async function (next) {
     }
 });
 
+EquipmentSchema.post('save', function scheduleDashboardSummaryInvalidation(doc) {
+    if (!doc?.$locals?.dashboardSummaryRelevantChange) return;
+    scheduleDashboardSummaryDirtyForEquipment(doc, doc.isNew ? 'equipment_created' : 'equipment_saved');
+});
+
 // 🔹 Pre-update middleware: módosításkor beállítja a ModifiedBy mezőt
 EquipmentSchema.pre('findOneAndUpdate', async function (next) {
     const update = this.getUpdate();
     if (!update) return next();
+
+    this.options = this.options || {};
+    this.options.dashboardSummaryRelevantChange = isDashboardSummaryRelevantUpdate(update);
 
     if (update.$set && update.$set.Zone && !update.$set.Unit) {
         update.$set.Unit = update.$set.Zone;
@@ -170,6 +230,11 @@ EquipmentSchema.pre('findOneAndUpdate', async function (next) {
     update.$set.updatedAt = new Date(); // Frissítjük az időbélyeget is
 
     next();
+});
+
+EquipmentSchema.post('findOneAndUpdate', function scheduleDashboardSummaryInvalidation(doc) {
+    if (!this.options?.dashboardSummaryRelevantChange) return;
+    scheduleDashboardSummaryDirtyForEquipment(doc, 'equipment_updated');
 });
 
 module.exports = mongoose.model('Equipment', EquipmentSchema);
