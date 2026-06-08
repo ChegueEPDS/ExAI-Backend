@@ -74,7 +74,7 @@ async function getCurrentVersion(tenantId) {
   if (existing) return Number(existing.version || 0);
   const doc = await DashboardStatsVersion.findOneAndUpdate(
     { _id: versionId },
-    { $setOnInsert: { _id: versionId, tenantId: tenantObjectId, version: 0, updatedAt: new Date(), reason: 'init' } },
+    { $setOnInsert: { _id: versionId, tenantId: tenantObjectId, version: 0, reason: 'init' } },
     { upsert: true, new: true, setDefaultsOnInsert: true }
   ).lean();
   return Number(doc?.version || 0);
@@ -123,7 +123,7 @@ async function saveFreshSummary(key, sourceVersion, summary) {
         dirtyReason: '',
         errorMessage: ''
       },
-      $setOnInsert: { _id: key.summaryId, createdAt: now }
+      $setOnInsert: { _id: key.summaryId }
     },
     { upsert: true }
   );
@@ -146,7 +146,7 @@ async function rebuildSummary(job) {
         status: 'rebuilding',
         rebuildStartedAt: now
       },
-      $setOnInsert: { _id: key.summaryId, sourceVersion: 0, summary: {}, createdAt: now }
+      $setOnInsert: { _id: key.summaryId, sourceVersion: 0, summary: {} }
     },
     { upsert: true }
   );
@@ -243,7 +243,7 @@ async function markDashboardStatsDirty({ tenantId, reason = 'data_changed' }) {
     { _id: `tenant:${String(tenantObjectId)}` },
     {
       $inc: { version: 1 },
-      $set: { updatedAt: now, reason: String(reason || 'data_changed') },
+      $set: { reason: String(reason || 'data_changed') },
       $setOnInsert: { _id: `tenant:${String(tenantObjectId)}`, tenantId: tenantObjectId }
     },
     { upsert: true }

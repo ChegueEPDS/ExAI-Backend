@@ -2104,7 +2104,10 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
     equipment.EqID ||
     inspection.eqId ||
     'unknown';
-  const fileName = `${sanitizeFileNameSegment(identifier)}_Inspection_${Date.now()}.xlsx`;
+  const sanitizedIdentifier = sanitizeFileNameSegment(identifier);
+  const fileName = isIndexTenant
+    ? `Ex ITR - Line ${sanitizedIdentifier}_Inspection_${Date.now()}.xlsx`
+    : `${sanitizedIdentifier}_Inspection_${Date.now()}.xlsx`;
   return { workbook, fileName };
 }
 
