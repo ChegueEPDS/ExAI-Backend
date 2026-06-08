@@ -15,6 +15,7 @@ const TrainingCandidateSchema = new mongoose.Schema(
     rowNo: { type: Number, default: null },
 
     trainingLocation: { type: String, default: '', trim: true },
+    recordOfTrainingNo: { type: String, trim: true },
     givenNames: { type: String, default: '', trim: true },
     lastName: { type: String, default: '', trim: true },
     employer: { type: String, default: '', trim: true },
@@ -52,6 +53,7 @@ const TrainingCandidateSchema = new mongoose.Schema(
 );
 
 TrainingCandidateSchema.index({ trainingId: 1, createdAt: -1 });
+TrainingCandidateSchema.index({ recordOfTrainingNo: 1 }, { unique: true, sparse: true });
 TrainingCandidateSchema.index({ 'finalPdf.verifyToken': 1 }, { unique: true, sparse: true });
 
 TrainingCandidateSchema.set('toJSON', {

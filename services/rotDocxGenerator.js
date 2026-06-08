@@ -336,8 +336,9 @@ async function generateRotDocxBuffer({ templateBuffer, training, candidate, unit
     if (combined) xml = replaceNextTableCellAfterAnchor(xml, 'Standard(s):', combined);
   }
 
-  if (training.recordOfTrainingNo) {
-    xml = replaceNextTableCellAfterAnchor(xml, 'No.:', training.recordOfTrainingNo);
+  const recordOfTrainingNo = candidate.recordOfTrainingNo || training.recordOfTrainingNo;
+  if (recordOfTrainingNo) {
+    xml = replaceNextTableCellAfterAnchor(xml, 'No.:', recordOfTrainingNo);
   }
 
   // 8) Unit rows: only include rows selected in the XLSX for this candidate.

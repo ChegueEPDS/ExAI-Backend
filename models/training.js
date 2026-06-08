@@ -9,7 +9,8 @@ const TrainingSchema = new mongoose.Schema(
     dateOfIssue: { type: String, required: true, trim: true }, // 'YYYY-MM-DD'
     validityFrom: { type: String, required: true, trim: true }, // 'YYYY-MM-DD'
     validityTo: { type: String, required: true, trim: true }, // 'YYYY-MM-DD'
-    recordOfTrainingNo: { type: String, required: true, trim: true },
+    // Legacy training-level ROT number. New ROT numbers live on TrainingCandidate.
+    recordOfTrainingNo: { type: String, default: '', trim: true },
     trainingLanguage: { type: String, default: 'English', trim: true },
 
     status: { type: String, enum: ['open', 'closed'], default: 'open', index: true },

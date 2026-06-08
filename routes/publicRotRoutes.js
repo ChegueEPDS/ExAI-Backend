@@ -38,7 +38,8 @@ router.get('/rot/candidates', async (req, res) => {
         $project: {
           _id: 1,
           trainingId: 1,
-          recordOfTrainingNo: '$t.recordOfTrainingNo',
+          rowNo: 1,
+          recordOfTrainingNo: { $ifNull: ['$recordOfTrainingNo', '$t.recordOfTrainingNo'] },
           validityFrom: '$t.validityFrom',
           validityTo: '$t.validityTo',
           candidateGivenNames: '$givenNames',
@@ -97,7 +98,8 @@ router.get('/rot/candidates/:token', async (req, res) => {
         $project: {
           _id: 1,
           trainingId: 1,
-          recordOfTrainingNo: '$t.recordOfTrainingNo',
+          rowNo: 1,
+          recordOfTrainingNo: { $ifNull: ['$recordOfTrainingNo', '$t.recordOfTrainingNo'] },
           validityFrom: '$t.validityFrom',
           validityTo: '$t.validityTo',
           candidateGivenNames: '$givenNames',

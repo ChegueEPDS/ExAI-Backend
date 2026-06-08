@@ -23,6 +23,8 @@ const upload = multer({
   limits: { fileSize: 30 * 1024 * 1024 } // 30MB
 });
 
+const ROT_COUNTER_KEY = 'global';
+
 function envInt(name, fallback) {
   const raw = process.env[name];
   if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
@@ -57,7 +59,7 @@ function getSignatureWatermarkOptions({ training, candidate }) {
   const enabled = String(process.env.SIGN_WM_ENABLED || '').trim().toLowerCase() === 'true';
   if (!enabled) return { enabled: false };
 
-  const recordNo = String(training?.recordOfTrainingNo || '').trim();
+  const recordNo = String(candidate?.recordOfTrainingNo || training?.recordOfTrainingNo || '').trim();
   const fullName = `${String(candidate?.lastName || '').trim()} ${String(candidate?.givenNames || '').trim()}`.trim();
   const pieces = [recordNo, fullName, 'Valid only with QR verification'].filter(Boolean);
 
@@ -114,54 +116,67 @@ function formatRecordOfTrainingNo(year, seq) {
   return `IECEx RT IDX${yy}.${pad4(seq)}`;
 }
 
-async function computeExistingMaxSeq({ tenantId, year }) {
+function parseRecordSeq(recordOfTrainingNo, year) {
   const yy = String(year).slice(-2);
   const re = new RegExp(`^IECEx RT IDX${yy}\\.(\\d{4})$`);
-  const q = { recordOfTrainingNo: re };
-  if (mongoose.Types.ObjectId.isValid(tenantId)) q.createdByTenantId = tenantId;
-  const last = await Training.findOne(q).sort({ recordOfTrainingNo: -1 }).select({ recordOfTrainingNo: 1 }).lean();
-  if (!last?.recordOfTrainingNo) return 0;
-  const mm = String(last.recordOfTrainingNo).match(re);
+  const mm = String(recordOfTrainingNo || '').match(re);
   if (!mm) return 0;
   const n = Number(mm[1]);
   return Number.isFinite(n) ? n : 0;
 }
 
-async function allocateRecordOfTrainingNo({ tenantKey, tenantId, year }) {
-  const existingMax = await computeExistingMaxSeq({ tenantId, year });
-  // 1) Ensure counter exists and catches up to any existing trainings (manual overrides, legacy data).
+async function computeExistingMaxSeq({ year }) {
+  const yy = String(year).slice(-2);
+  const re = new RegExp(`^IECEx RT IDX${yy}\\.(\\d{4})$`);
+  const [lastCandidate, lastLegacyTraining] = await Promise.all([
+    TrainingCandidate.findOne({ recordOfTrainingNo: re }).sort({ recordOfTrainingNo: -1 }).select({ recordOfTrainingNo: 1 }).lean(),
+    Training.findOne({ recordOfTrainingNo: re }).sort({ recordOfTrainingNo: -1 }).select({ recordOfTrainingNo: 1 }).lean()
+  ]);
+  return Math.max(
+    parseRecordSeq(lastCandidate?.recordOfTrainingNo, year),
+    parseRecordSeq(lastLegacyTraining?.recordOfTrainingNo, year)
+  );
+}
+
+async function allocateRecordOfTrainingNos({ year, count }) {
+  const n = Math.max(0, Math.floor(Number(count || 0)));
+  if (!n) return [];
+
+  const existingMax = await computeExistingMaxSeq({ year });
+  // 1) Ensure counter exists and catches up to existing candidate-level and legacy training-level data.
   await TrainingRecordCounter.findOneAndUpdate(
-    { tenantKey, year },
+    { tenantKey: ROT_COUNTER_KEY, year },
     { $setOnInsert: { lastSeq: existingMax } },
     { upsert: true, new: false }
   );
   if (existingMax > 0) {
     await TrainingRecordCounter.findOneAndUpdate(
-      { tenantKey, year },
+      { tenantKey: ROT_COUNTER_KEY, year },
       { $max: { lastSeq: existingMax } },
       { new: false }
     );
   }
-  // 2) Atomically increment to reserve the next value.
+  // 2) Atomically increment to reserve the next batch of candidate values.
   const doc = await TrainingRecordCounter.findOneAndUpdate(
-    { tenantKey, year },
-    { $inc: { lastSeq: 1 } },
+    { tenantKey: ROT_COUNTER_KEY, year },
+    { $inc: { lastSeq: n } },
     { new: true }
   ).lean();
-  const seq = doc?.lastSeq || existingMax + 1;
-  return formatRecordOfTrainingNo(year, seq);
+  const lastSeq = Number(doc?.lastSeq || existingMax + n);
+  const firstSeq = lastSeq - n + 1;
+  return Array.from({ length: n }, (_v, i) => formatRecordOfTrainingNo(year, firstSeq + i));
 }
 
-async function peekNextRecordOfTrainingNo({ tenantKey, tenantId, year }) {
+async function peekNextRecordOfTrainingNo({ year }) {
   const [counter, existingMax] = await Promise.all([
-    TrainingRecordCounter.findOne({ tenantKey, year }).select({ lastSeq: 1 }).lean(),
-    computeExistingMaxSeq({ tenantId, year })
+    TrainingRecordCounter.findOne({ tenantKey: ROT_COUNTER_KEY, year }).select({ lastSeq: 1 }).lean(),
+    computeExistingMaxSeq({ year })
   ]);
   const lastSeq = Math.max(Number(counter?.lastSeq || 0), Number(existingMax || 0));
   if (counter && lastSeq > Number(counter?.lastSeq || 0)) {
     // Keep counter in sync even if records were created manually or existed before counters.
     await TrainingRecordCounter.findOneAndUpdate(
-      { tenantKey, year },
+      { tenantKey: ROT_COUNTER_KEY, year },
       { $max: { lastSeq } },
       { upsert: true, new: false }
     );
@@ -295,9 +310,7 @@ exports.getNextRecordOfTrainingNo = async (req, res) => {
   try {
     const dateOfIssue = String(req.query?.dateOfIssue || '').trim();
     const year = yearFromYmdOrNow(dateOfIssue);
-    const tenantId = req.scope?.tenantId || null;
-    const tenantKey = String(tenantId || req.scope?.tenantName || 'global');
-    const next = await peekNextRecordOfTrainingNo({ tenantKey, tenantId, year });
+    const next = await peekNextRecordOfTrainingNo({ year });
     return res.json({ ok: true, year, next });
   } catch (e) {
     return res.status(400).json({ ok: false, error: e?.message || 'Failed to compute next record number' });
@@ -312,55 +325,19 @@ exports.createTraining = [
       const dateOfIssue = asYmd(req.body?.dateOfIssue);
       const validityFrom = asYmd(req.body?.validityFrom);
       const validityTo = asYmd(req.body?.validityTo);
-      let recordOfTrainingNo = String(req.body?.recordOfTrainingNo || '').trim();
       const trainingLanguage = String(req.body?.trainingLanguage || 'English').trim() || 'English';
       if (!name) return res.status(400).json({ ok: false, error: 'Missing name' });
 
       const xlsx = req.file;
       if (!xlsx) return res.status(400).json({ ok: false, error: 'Missing XLSX file' });
 
-      const tenantId = req.scope?.tenantId || null;
-      const tenantKey = String(tenantId || req.scope?.tenantName || 'global');
       const year = yearFromYmdOrNow(dateOfIssue);
-
-      if (!recordOfTrainingNo) {
-        recordOfTrainingNo = await allocateRecordOfTrainingNo({ tenantKey, tenantId, year });
-      } else {
-        // Enforce uniqueness (per tenant); counter-based allocation guarantees this for auto values.
-        const existing = await Training.findOne({
-          createdByTenantId: mongoose.Types.ObjectId.isValid(tenantId) ? tenantId : null,
-          recordOfTrainingNo
-        })
-          .select({ _id: 1 })
-          .lean();
-        if (existing?._id) return res.status(409).json({ ok: false, error: 'Record of Training No. already exists' });
-
-        // If the manual value matches the IDXYY.XXXX scheme for the issue year, keep the counter in sync.
-        const yy = String(year).slice(-2);
-        const re = new RegExp(`^IECEx RT IDX${yy}\\.(\\d{4})$`);
-        const mm = recordOfTrainingNo.match(re);
-        if (mm) {
-          const manualSeq = Number(mm[1]);
-          if (Number.isFinite(manualSeq)) {
-            await TrainingRecordCounter.findOneAndUpdate(
-              { tenantKey, year },
-              { $setOnInsert: { lastSeq: manualSeq } },
-              { upsert: true, new: false }
-            );
-            await TrainingRecordCounter.findOneAndUpdate(
-              { tenantKey, year },
-              { $max: { lastSeq: manualSeq } },
-              { new: false }
-            );
-          }
-        }
-      }
+      const { candidates, warnings } = await parseCandidatesFromXlsxBuffer(xlsx.buffer);
+      const candidateRecordNos = await allocateRecordOfTrainingNos({ year, count: candidates.length });
 
       const folderName = toFolderName(name);
       const xlsxBlobPath = `index/trainings/${folderName}/source/${Date.now()}-${safeSegment(xlsx.originalname || 'candidates', 140)}.xlsx`;
       await azureBlob.uploadBuffer(xlsxBlobPath, xlsx.buffer, xlsx.mimetype || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-
-      const { candidates, warnings } = await parseCandidatesFromXlsxBuffer(xlsx.buffer);
 
       const training = await Training.create({
         name,
@@ -368,7 +345,6 @@ exports.createTraining = [
         dateOfIssue,
         validityFrom,
         validityTo,
-        recordOfTrainingNo,
         trainingLanguage,
         sourceXlsx: {
           originalName: xlsx.originalname || '',
@@ -381,9 +357,10 @@ exports.createTraining = [
 
       if (candidates.length) {
         await TrainingCandidate.insertMany(
-          candidates.map((c) => ({
+          candidates.map((c, idx) => ({
             trainingId: training._id,
             rowNo: c.rowNo,
+            recordOfTrainingNo: candidateRecordNos[idx],
             trainingLocation: c.trainingLocation,
             givenNames: c.givenNames,
             lastName: c.lastName,
@@ -546,7 +523,7 @@ exports.closeTraining = async (req, res) => {
         signatureWatermark: getSignatureWatermarkOptions({ training, candidate: cand })
       });
       const finalPdfBuf = await signPdfBuffer(stampedPdfBuf, {
-        reason: `IECEx ROT final PDF (${training.recordOfTrainingNo || training.name || ''})`,
+        reason: `IECEx ROT final PDF (${cand.recordOfTrainingNo || training.recordOfTrainingNo || training.name || ''})`,
       });
 
       cand.finalPdf = {
@@ -654,7 +631,7 @@ exports.stampFinalPdfsWithQr = async (req, res) => {
         signatureWatermark: getSignatureWatermarkOptions({ training, candidate: cand })
       });
       const finalPdfBuf = await signPdfBuffer(stampedPdfBuf, {
-        reason: `IECEx ROT final PDF (${training.recordOfTrainingNo || training.name || ''})`,
+        reason: `IECEx ROT final PDF (${cand.recordOfTrainingNo || training.recordOfTrainingNo || training.name || ''})`,
       });
       await azureBlob.uploadBuffer(blobPath, finalPdfBuf, 'application/pdf');
 
@@ -747,7 +724,8 @@ exports.listDatabaseCandidates = async (_req, res) => {
       $project: {
         _id: 1,
         trainingId: 1,
-        recordOfTrainingNo: '$t.recordOfTrainingNo',
+        rowNo: 1,
+        recordOfTrainingNo: { $ifNull: ['$recordOfTrainingNo', '$t.recordOfTrainingNo'] },
         trainingName: '$t.name',
         validityFrom: '$t.validityFrom',
         validityTo: '$t.validityTo',
