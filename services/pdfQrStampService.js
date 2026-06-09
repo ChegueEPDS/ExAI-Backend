@@ -126,7 +126,7 @@ async function stampPdfWithQr(pdfBuffer, url, opts = {}) {
       const label = 'Verify';
       const warn =
         String(warningText || '').trim() ||
-        'Amennyiben az adatok eltérnek, az adatokat kompromittálhatták, egyeztessen a szolgáltatóval.';
+        'If the details do not match, the document may have been altered. Please contact the issuer.';
 
       const fontSize = Math.max(6, Math.min(Number(labelFontSize || 8), 16));
       const labelY = Math.max(0, y - 12);

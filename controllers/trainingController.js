@@ -322,6 +322,7 @@ exports.createTraining = [
   async (req, res) => {
     try {
       const name = String(req.body?.name || '').trim();
+      const subject = String(req.body?.subject || '').trim();
       const dateOfIssue = asYmd(req.body?.dateOfIssue);
       const validityFrom = asYmd(req.body?.validityFrom);
       const validityTo = asYmd(req.body?.validityTo);
@@ -341,6 +342,7 @@ exports.createTraining = [
 
       const training = await Training.create({
         name,
+        subject,
         folderName,
         dateOfIssue,
         validityFrom,

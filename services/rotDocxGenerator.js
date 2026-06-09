@@ -106,6 +106,50 @@ function replaceNextTableCellAfterAnchor(xml, anchorLiteral, newText) {
   return xml.slice(0, valueStart) + updated + xml.slice(valueEnd + '</w:tc>'.length);
 }
 
+function paragraphContainsText(paragraphXml, phrase) {
+  const text = (paragraphXml.match(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g) || [])
+    .map((t) => t.replace(/<[^>]+>/g, ''))
+    .join('');
+  return normalizeText(text).toLowerCase().includes(String(phrase || '').toLowerCase());
+}
+
+function buildSubjectLineRuns(subject) {
+  const text = escapeXml(subject);
+  return (
+    '<w:r><w:br/></w:r>' +
+    '<w:r>' +
+      '<w:rPr>' +
+        '<w:b w:val="0"/>' +
+        '<w:bCs w:val="0"/>' +
+        '<w:sz w:val="28"/>' +
+        '<w:szCs w:val="28"/>' +
+      '</w:rPr>' +
+      `<w:t>${text}</w:t>` +
+    '</w:r>'
+  );
+}
+
+function insertSubjectInTitleParagraph(xml, subject) {
+  const value = normalizeText(subject);
+  if (!value) return xml;
+
+  const phrase = 'Record of training';
+  let pos = 0;
+  while (pos < xml.length) {
+    const pStart = xml.indexOf('<w:p', pos);
+    if (pStart === -1) return xml;
+    const pEnd = xml.indexOf('</w:p>', pStart);
+    if (pEnd === -1) return xml;
+    const paragraphEnd = pEnd + '</w:p>'.length;
+    const paragraphXml = xml.slice(pStart, paragraphEnd);
+    if (paragraphContainsText(paragraphXml, phrase)) {
+      return xml.slice(0, pEnd) + buildSubjectLineRuns(value) + xml.slice(pEnd);
+    }
+    pos = paragraphEnd;
+  }
+  return xml;
+}
+
 function updateCheckboxesInSegment(segmentXml, desired) {
   // desired: ['gas','dust','both'] -> which one should be checked (only one)
   const wanted = desired;
@@ -307,6 +351,13 @@ async function generateRotDocxBuffer({ templateBuffer, training, candidate, unit
   const docFile = zip.file(docPath);
   if (!docFile) throw new Error('Template DOCX missing word/document.xml');
   let xml = await docFile.async('string');
+
+  xml = insertSubjectInTitleParagraph(xml, training.subject);
+  const headerFiles = zip.file(/^word\/header\d+\.xml$/);
+  for (const headerFile of headerFiles) {
+    const headerXml = await headerFile.async('string');
+    zip.file(headerFile.name, insertSubjectInTitleParagraph(headerXml, training.subject));
+  }
 
   // 1) Candidate name (after "that:" and before "completed")
   const texts = findWTTexts(xml).map((t) => t || '');

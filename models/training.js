@@ -4,6 +4,7 @@ const mongoose = require('mongoose');
 const TrainingSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true, maxlength: 200 },
+    subject: { type: String, default: '', trim: true, maxlength: 300 },
     folderName: { type: String, required: true, trim: true, maxlength: 240 }, // sanitized for blob path
 
     dateOfIssue: { type: String, required: true, trim: true }, // 'YYYY-MM-DD'
