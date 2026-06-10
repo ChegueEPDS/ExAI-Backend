@@ -3,13 +3,17 @@ const express = require('express');
 const cors = require('cors');
 const connectDB = require('./config/db');
 const logger = require('./config/logger');
+
+if (process.env.WORKER_ONLY === '1' || process.env.WORKER_ONLY === 'true') {
+  logger.error('WORKER_ONLY=true is set, but app.js was started. Use `npm run start:worker` for the worker App Service.');
+  process.exit(1);
+}
+
 const requestIdMiddleware = require('./middlewares/requestIdMiddleware');
 const limiter = require('./middlewares/rateLimiter');
-const cleanupService = require('./services/cleanupService');
-const subscriptionSweeper = require('./services/subscriptionSweeper');
-const reportExportCleanup = require('./services/reportExportCleanup');
 const systemSettingsStore = require('./services/systemSettingsStore');
-const { withLock } = require('./services/distributedLockService');
+const { seedInitialSuperAdminIfEmpty } = require('./services/bootstrapSuperAdmin');
+const { backgroundJobsDisabled, startWorkerRuntime } = require('./services/workerRuntime');
 const path = require('path');
 const fs = require('fs');
 
@@ -45,8 +49,6 @@ const downloadRoutes = require('./routes/downloadRoutes');
 const mobileSyncRoutes = require('./routes/mobileSyncRoutes');
 const datasetRoutes = require('./routes/datasetRoutes');
 const standardRoutes = require('./routes/standardRoutes');
-const mobileSyncWorker = require('./services/mobileSyncWorker');
-const reportExportController = require('./controllers/exportInspectionReport');
 const statusSummaryRoutes = require('./routes/statusSummaryRoutes');
 const rootCauseRoutes = require('./routes/rootCauseRoutes');
 const maintenanceSeverityRoutes = require('./routes/maintenanceSeverityRoutes');
@@ -76,7 +78,10 @@ console.error = (...args) => {
   logger.error(args.join(' '));
 };
 
-connectDB().then(() => console.log('Database connected successfully')).catch((err) => {
+connectDB().then(async () => {
+  console.log('Database connected successfully');
+  await seedInitialSuperAdminIfEmpty();
+}).catch((err) => {
   console.error('Database connection failed:', err);
   process.exit(1); // Exit if DB connection fails
 });
@@ -373,14 +378,8 @@ app.use('/api', schemaRoutes);
 app.use('/api/public', publicRotRoutes);
 app.use('/api', trainingRoutes);
 
-const backgroundJobsDisabled =
-  process.env.DISABLE_BACKGROUND_JOBS === '1' ||
-  process.env.DISABLE_BACKGROUND_JOBS === 'true' ||
-  process.env.NODE_ENV === 'test';
-
-if (!backgroundJobsDisabled) {
-  reportExportCleanup.start();
-  reportExportController.startReportExportWorker?.();
+if (!backgroundJobsDisabled()) {
+  startWorkerRuntime();
 }
 
 
@@ -421,28 +420,6 @@ if (fs.existsSync(frontendDist)) {
   });
 } else {
   console.warn('[SPA] Frontend dist folder not found:', frontendDist);
-}
-
-if (!backgroundJobsDisabled) {
-  // Periodikus tisztítás
-  setInterval(
-    () => withLock('cleanup:empty-conversations', 30 * 60 * 1000, cleanupService.removeEmptyConversations),
-    3 * 60 * 60 * 1000
-  ); // 3 órás intervallum
-  setInterval(
-    () => withLock('cleanup:upload-temp-files', 30 * 60 * 1000, () => cleanupService.cleanupUploadTempFiles()),
-    3 * 60 * 60 * 1000
-  );
-  setInterval(
-    () => withLock('cleanup:equipment-doc-import-errors', 2 * 60 * 60 * 1000, cleanupService.cleanupEquipmentDocsImportErrorReports),
-    24 * 60 * 60 * 1000
-  ); // napi egyszer
-  setInterval(
-    () => withLock('subscriptions:sweep-expired', 20 * 60 * 1000, subscriptionSweeper.sweepExpiredSubscriptions),
-    60 * 60 * 1000
-  );
-  // Mobile sync background processing (best-effort in-process worker)
-  mobileSyncWorker.start({ intervalMs: 5000 });
 }
 
 console.log("Starting application...");

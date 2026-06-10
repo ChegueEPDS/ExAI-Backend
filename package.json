@@ -4,6 +4,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node app.js",
+    "start:worker": "node worker.js",
     "test": "node --test",
     "test:smoke": "node scripts/smoke-e2e.js"
   },

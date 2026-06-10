@@ -3042,6 +3042,14 @@ let activeReportJobs = 0;
 let reportWorkerTimer = null;
 let reportWorkerRunning = false;
 
+function reportBackgroundJobsDisabled() {
+  return (
+    process.env.DISABLE_BACKGROUND_JOBS === '1' ||
+    process.env.DISABLE_BACKGROUND_JOBS === 'true' ||
+    process.env.NODE_ENV === 'test'
+  );
+}
+
 function getReportJobConcurrency() {
   const n = Number(process.env.REPORT_EXPORT_MAX_CONCURRENCY || 2);
   return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 5) : 2;
@@ -3082,6 +3090,7 @@ function drainReportJobQueue() {
 }
 
 function scheduleReportJob(job) {
+  if (reportBackgroundJobsDisabled()) return;
   if (!job?.jobId) return;
   if (queuedReportJobIds.has(job.jobId)) return;
   queuedReportJobIds.add(job.jobId);
@@ -3153,6 +3162,7 @@ async function pollReportExportJobs() {
 }
 
 function startReportExportWorker() {
+  if (reportBackgroundJobsDisabled()) return;
   if (reportWorkerTimer) return;
   const firstRunTimer = setTimeout(() => pollReportExportJobs().catch(() => {}), 1500);
   if (typeof firstRunTimer.unref === 'function') firstRunTimer.unref();
