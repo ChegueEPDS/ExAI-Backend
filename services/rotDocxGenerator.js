@@ -129,11 +129,22 @@ function buildSubjectLineRuns(subject) {
   );
 }
 
+function getParagraphText(paragraphXml) {
+  const runs = paragraphXml.match(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g) || [];
+  return runs
+    .map((t) => t.replace(/<[^>]+>/g, ''))
+    .join('');
+}
+
+function isRecordOfTrainingTitleParagraph(paragraphXml) {
+  const text = normalizeText(getParagraphText(paragraphXml)).toLowerCase();
+  return text === 'record of training';
+}
+
 function insertSubjectInTitleParagraph(xml, subject) {
   const value = normalizeText(subject);
   if (!value) return xml;
 
-  const phrase = 'Record of training';
   let pos = 0;
   while (pos < xml.length) {
     const pStart = xml.indexOf('<w:p', pos);
@@ -142,7 +153,7 @@ function insertSubjectInTitleParagraph(xml, subject) {
     if (pEnd === -1) return xml;
     const paragraphEnd = pEnd + '</w:p>'.length;
     const paragraphXml = xml.slice(pStart, paragraphEnd);
-    if (paragraphContainsText(paragraphXml, phrase)) {
+    if (isRecordOfTrainingTitleParagraph(paragraphXml)) {
       return xml.slice(0, pEnd) + buildSubjectLineRuns(value) + xml.slice(pEnd);
     }
     pos = paragraphEnd;

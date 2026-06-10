@@ -11,7 +11,9 @@ function isTruthyMark(v) {
 }
 
 // Map of supported unit columns in the provided XLSX template.
-// Candidate rows start at 11; header rows are 7-9.
+// Candidate rows start at 11; unit headers are on rows 8-9.
+// In the current XLSX template, units start at L:
+// L=EX 000, M=EX 001, N/O=EX 002 gas/dust, W/X=EX 010 gas/dust, Y=EX 011.
 const COLS = {
   trainingLocation: 3, // C
   givenNames: 4, // D
@@ -23,18 +25,18 @@ const COLS = {
   phone: 10, // J
   // IECEx units (by column number)
   units: {
-    'EX 001': { cols: [12], scope: 'both' }, // L
-    'EX 003': { cols: [15], scope: 'both' }, // O
-    'EX 004': { cols: [16], scope: 'both' }, // P
-    'EX 006': { cols: [18], scope: 'both' }, // R
-    'EX 007': { cols: [19], scope: 'both' }, // S
-    'EX 008': { cols: [20], scope: 'both' }, // T
-    // Optional in XLSX but not in the provided DOCX template:
-    'EX 002': { cols: [13, 14], scope: 'gas_dust' }, // M gas, N dust
-    'EX 010': { cols: [22, 23], scope: 'gas_dust' }, // V gas, W dust
-    'EX 000': { cols: [11], scope: 'both' }, // K
-    'EX 005': { cols: [17], scope: 'both' }, // Q
-    'EX 009': { cols: [21], scope: 'both' }, // U
+    'EX 000': { cols: [12], scope: 'both' }, // L
+    'EX 001': { cols: [13], scope: 'both' }, // M
+    'EX 002': { cols: [14, 15], scope: 'gas_dust' }, // N gas, O dust
+    'EX 003': { cols: [16], scope: 'both' }, // P
+    'EX 004': { cols: [17], scope: 'both' }, // Q
+    'EX 005': { cols: [18], scope: 'both' }, // R
+    'EX 006': { cols: [19], scope: 'both' }, // S
+    'EX 007': { cols: [20], scope: 'both' }, // T
+    'EX 008': { cols: [21], scope: 'both' }, // U
+    'EX 009': { cols: [22], scope: 'both' }, // V
+    'EX 010': { cols: [23, 24], scope: 'gas_dust' }, // W gas, X dust
+    'EX 011': { cols: [25], scope: 'both' }, // Y
   }
 };
 
@@ -52,8 +54,8 @@ async function parseCandidatesFromXlsxBuffer(buffer) {
   const warnings = [];
   const candidates = [];
 
-  // Candidate rows usually start at 11 (based on sample).
-  for (let r = 11; r <= ws.rowCount; r++) {
+  // Candidate rows start at 10 in the current XLSX template.
+  for (let r = 10; r <= ws.rowCount; r++) {
     const givenNames = norm(ws.getRow(r).getCell(COLS.givenNames).value);
     const lastName = norm(ws.getRow(r).getCell(COLS.lastName).value);
     const trainingLocation = norm(ws.getRow(r).getCell(COLS.trainingLocation).value);
@@ -101,7 +103,7 @@ async function parseCandidatesFromXlsxBuffer(buffer) {
     });
   }
 
-  if (!candidates.length) warnings.push('No candidates found in XLSX (expected data starting around row 11).');
+  if (!candidates.length) warnings.push('No candidates found in XLSX (expected data starting around row 10).');
   return { candidates, warnings };
 }
 
