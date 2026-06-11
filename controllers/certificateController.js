@@ -286,14 +286,12 @@ async function runCertificatePreviewFromSource({ source, tenantId, fileName, upd
 }
 
 async function processCertificatePreviewJob(jobId) {
-  const job = await CertificatePreviewJob.findById(jobId);
-  if (!job) return;
-  if (!['created', 'queued', 'error'].includes(job.status)) return;
-
-  await CertificatePreviewJob.updateOne(
-    { _id: job._id },
-    { $set: { status: 'processing', startedAt: new Date(), error: '' } }
+  const job = await CertificatePreviewJob.findOneAndUpdate(
+    { _id: jobId, status: { $in: ['created', 'queued', 'error'] } },
+    { $set: { status: 'processing', startedAt: new Date(), error: '' } },
+    { new: true }
   );
+  if (!job) return;
 
   try {
     const sasUrl = await azureBlobService.getReadSasUrl(job.blobPath, {
@@ -333,6 +331,8 @@ async function processCertificatePreviewJob(jobId) {
     );
   }
 }
+
+exports.processCertificatePreviewJob = processCertificatePreviewJob;
 
 // Fájl feltöltési endpoint
 exports.uploadCertificate = async (req, res) => {
@@ -1321,9 +1321,6 @@ exports.startPreviewAtexJob = async (req, res) => {
       { _id: job._id },
       { $set: { status: 'queued', error: '' } }
     );
-    processCertificatePreviewJob(job._id).catch((err) => {
-      console.error('[preview-job] async processing failed:', err?.message || err);
-    });
 
     return res.status(202).json({ jobId, status: 'queued' });
   } catch (err) {

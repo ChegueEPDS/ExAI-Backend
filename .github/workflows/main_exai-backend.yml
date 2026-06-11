@@ -70,4 +70,12 @@ jobs:
           app-name: 'ExAI-Backend'
           slot-name: 'Production'
           package: .
+
+      - name: 'Deploy Worker to Azure Web App'
+        id: deploy-worker-to-webapp
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: 'Exai-Worker'
+          slot-name: 'Production'
+          package: .
           

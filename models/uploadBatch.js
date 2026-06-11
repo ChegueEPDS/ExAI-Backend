@@ -17,6 +17,18 @@ const UploadBatchSchema = new Schema(
     notified:   { type: Boolean, default: false },
     completedAt:{ type: Date, default: null },
 
+    processingStatus: {
+      type: String,
+      enum: ['created', 'queued', 'processing', 'done', 'error'],
+      default: 'created',
+      index: true
+    },
+    processingStatuses: [{ type: String }],
+    processingRequestedAt: { type: Date, default: null },
+    processingStartedAt: { type: Date, default: null },
+    processingFinishedAt: { type: Date, default: null },
+    processingError: { type: String, default: '' },
+
     createdAt:  { type: Date, default: Date.now }
   },
   { versionKey: false }
@@ -24,5 +36,6 @@ const UploadBatchSchema = new Schema(
 
 // gyors listázáshoz
 UploadBatchSchema.index({ tenantId: 1, createdAt: -1 });
+UploadBatchSchema.index({ processingStatus: 1, processingRequestedAt: 1, createdAt: 1 });
 
 module.exports = mongoose.model('UploadBatch', UploadBatchSchema);

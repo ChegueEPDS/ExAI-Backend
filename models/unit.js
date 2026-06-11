@@ -138,7 +138,15 @@ UnitSchema.pre('findOneAndUpdate', async function (next) {
 
 UnitSchema.index({ tenantId: 1, Site: 1, parentUnitId: 1 });
 UnitSchema.index({ tenantId: 1, Site: 1, ancestors: 1 });
-UnitSchema.index({ tenantId: 1, 'mobileSync.tempId': 1 }, { unique: true, sparse: true });
+UnitSchema.index(
+  { tenantId: 1, 'mobileSync.tempId': 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      'mobileSync.tempId': { $type: 'string' }
+    }
+  }
+);
 UnitSchema.index(
   { tenantId: 1, Site: 1, parentUnitId: 1, nameKey: 1 },
   { unique: true, partialFilterExpression: { nameKey: { $type: 'string' } } }

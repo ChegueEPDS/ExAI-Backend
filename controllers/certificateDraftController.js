@@ -163,6 +163,51 @@ async function retryWithBackoff(fn, opts = {}) {
 }
 // --------------------------------------------------------------------
 
+function normalizeProcessingStatuses(statuses) {
+  const list = Array.isArray(statuses) && statuses.length
+    ? statuses
+    : ['draft'];
+  return Array.from(new Set(
+    list
+      .map((status) => String(status || '').trim())
+      .filter(Boolean)
+  ));
+}
+
+async function queueDraftProcessing(uploadId, options = {}) {
+  const processingStatuses = normalizeProcessingStatuses(options.statuses);
+  const now = new Date();
+  const result = await UploadBatch.updateOne(
+    { uploadId },
+    {
+      $set: {
+        processingStatus: 'queued',
+        processingStatuses,
+        processingRequestedAt: now,
+        processingStartedAt: null,
+        processingFinishedAt: null,
+        processingError: ''
+      }
+    }
+  );
+  if (!result.matchedCount) {
+    throw new Error('Upload batch not found for this uploadId');
+  }
+  return { uploadId, processingStatuses };
+}
+
+async function getDraftQueueConcurrency(filter = {}) {
+  const [active, queued] = await Promise.all([
+    UploadBatch.countDocuments({ ...filter, processingStatus: 'processing' }),
+    UploadBatch.countDocuments({ ...filter, processingStatus: 'queued' })
+  ]);
+  return {
+    active,
+    limit: PROCESS_CONCURRENCY,
+    queueLength: queued
+  };
+}
+
 // ---- blob move with incrementing version suffix (_2, _3, ...) ----
 async function moveBlobWithVersioning(srcPath, baseName, ext) {
   try { if (!srcPath) return null; } catch { }
@@ -538,29 +583,14 @@ exports.completeBulkUploadDirect = async (req, res) => {
     const hasAny = await DraftCertificate.exists(filter);
     if (!hasAny) return res.status(404).json({ error: 'No drafts found for this uploadId' });
 
-    const willQueue = activeProcesses >= PROCESS_CONCURRENCY;
-    const position = willQueue ? processQueue.length + 1 : 0;
-    const p = enqueueProcess(uploadId, { statuses: ['draft', 'error'] });
-
-    if (p && p.alreadyQueuedOrRunning) {
-      return res.status(202).json({
-        message: 'Already queued or running',
-        uploadId,
-        state: inFlight.has(uploadId) ? 'processing' : 'queued',
-        concurrency: { active: activeProcesses, limit: PROCESS_CONCURRENCY, queueLength: processQueue.length }
-      });
-    }
-
-    if (p && typeof p.then === 'function') {
-      p.then(() => {}).catch((err) => console.error('Direct upload processing failed:', err.message));
-    }
+    await queueDraftProcessing(uploadId, { statuses: ['draft', 'error'] });
+    const concurrency = await getDraftQueueConcurrency(isSuperAdmin ? {} : { tenantId });
 
     return res.status(202).json({
-      message: willQueue ? `Queued at position ${position}` : 'Processing started',
+      message: 'Processing queued',
       uploadId,
-      state: willQueue ? 'queued' : 'processing',
-      queuePosition: position || undefined,
-      concurrency: { active: activeProcesses, limit: PROCESS_CONCURRENCY, queueLength: processQueue.length }
+      state: 'queued',
+      concurrency
     });
   } catch (err) {
     console.error('❌ Direct bulk upload complete error:', err?.message || err);
@@ -693,6 +723,8 @@ async function _processDraftsInternal(uploadId, options = {}) {
   }
 }
 
+exports.processDraftUploadBatch = _processDraftsInternal;
+
 exports.processDrafts = async (req, res) => {
   const { uploadId } = req.params;
 
@@ -703,31 +735,14 @@ exports.processDrafts = async (req, res) => {
       return res.status(404).json({ message: 'No drafts found for this uploadId' });
     }
 
-    const willQueue = activeProcesses >= PROCESS_CONCURRENCY;
-    const position = willQueue ? processQueue.length + 1 : 0;
-
-    const p = enqueueProcess(uploadId);
-
-    // already running or queued
-    if (p && p.alreadyQueuedOrRunning) {
-      return res.status(202).json({
-        message: 'Already queued or running',
-        uploadId,
-        state: inFlight.has(uploadId) ? 'processing' : 'queued',
-        concurrency: { active: activeProcesses, limit: PROCESS_CONCURRENCY, queueLength: processQueue.length }
-      });
-    }
-
-    // fire-and-forget; client can poll GET /certificates/drafts/:uploadId
-    if (p && typeof p.then === 'function') {
-      p.then(() => { /* no-op */ }).catch((err) => console.error('Queue item failed:', err.message));
-    }
+    await queueDraftProcessing(uploadId);
+    const concurrency = await getDraftQueueConcurrency(req.scope?.tenantId ? { tenantId: req.scope.tenantId } : {});
 
     return res.status(202).json({
-      message: willQueue ? `Queued at position ${position}` : 'Processing started',
+      message: 'Processing queued',
       uploadId,
-      state: willQueue ? 'queued' : 'processing',
-      concurrency: { active: activeProcesses, limit: PROCESS_CONCURRENCY, queueLength: processQueue.length }
+      state: 'queued',
+      concurrency
     });
   } catch (err) {
     console.error('❌ Queueing error:', err.message);
@@ -753,29 +768,14 @@ exports.reprocessNotReadyDrafts = async (req, res) => {
       return res.status(404).json({ message: 'No draft/error items found for this uploadId' });
     }
 
-    const willQueue = activeProcesses >= PROCESS_CONCURRENCY;
-    const position = willQueue ? processQueue.length + 1 : 0;
-
-    const p = enqueueProcess(uploadId, { statuses: ['draft', 'error'] });
-
-    if (p && p.alreadyQueuedOrRunning) {
-      return res.status(202).json({
-        message: 'Already queued or running',
-        uploadId,
-        state: inFlight.has(uploadId) ? 'processing' : 'queued',
-        concurrency: { active: activeProcesses, limit: PROCESS_CONCURRENCY, queueLength: processQueue.length }
-      });
-    }
-
-    if (p && typeof p.then === 'function') {
-      p.then(() => { /* no-op */ }).catch((err) => console.error('Retry queue item failed:', err.message));
-    }
+    await queueDraftProcessing(uploadId, { statuses: ['draft', 'error'] });
+    const concurrency = await getDraftQueueConcurrency(req.scope?.tenantId ? { tenantId: req.scope.tenantId } : {});
 
     return res.status(202).json({
-      message: willQueue ? `Queued at position ${position}` : 'Reprocessing started',
+      message: 'Reprocessing queued',
       uploadId,
-      state: willQueue ? 'queued' : 'processing',
-      concurrency: { active: activeProcesses, limit: PROCESS_CONCURRENCY, queueLength: processQueue.length }
+      state: 'queued',
+      concurrency
     });
   } catch (err) {
     console.error('❌ Reprocess queueing error:', err.message);
@@ -1524,20 +1524,21 @@ exports.getPendingUploads = async (req, res) => {
 
     const items = await DraftCertificate.aggregate(pipeline);
 
-    // Enrich with live queue state
+    const uploadIds = (items || []).map((it) => it.uploadId).filter(Boolean);
+    const batches = uploadIds.length
+      ? await UploadBatch.find({ uploadId: { $in: uploadIds } })
+          .select('uploadId processingStatus processingRequestedAt processingStartedAt processingFinishedAt processingError')
+          .lean()
+      : [];
+    const batchByUploadId = new Map((batches || []).map((batch) => [String(batch.uploadId), batch]));
+
+    // Enrich with DB-backed worker queue state.
     const enriched = (items || []).map(it => {
       let queueState = null;
       let queuePosition = null;
-
-      if (inFlight.has(it.uploadId)) {
-        queueState = 'processing';
-      } else {
-        const idx = processQueue.findIndex(x => x && x.uploadId === it.uploadId);
-        if (idx !== -1) {
-          queueState = 'queued';
-          queuePosition = idx + 1;
-        }
-      }
+      const batch = batchByUploadId.get(String(it.uploadId));
+      const processingStatus = String(batch?.processingStatus || '');
+      if (processingStatus === 'queued' || processingStatus === 'processing') queueState = processingStatus;
 
       const c = it.counts || {};
       const ready = Number(c.ready || 0);
@@ -1552,14 +1553,21 @@ exports.getPendingUploads = async (req, res) => {
       return {
         ...it,
         queueState,
-        queuePosition
+        queuePosition,
+        processingStatus: processingStatus || null,
+        processingError: batch?.processingError || ''
       };
     });
 
+    const queueFilter = isSuperAdmin ? {} : { tenantId: new mongoose.Types.ObjectId(tenantId) };
+    const [active, queued] = await Promise.all([
+      UploadBatch.countDocuments({ ...queueFilter, processingStatus: 'processing' }),
+      UploadBatch.countDocuments({ ...queueFilter, processingStatus: 'queued' })
+    ]);
     const concurrency = {
-      active: activeProcesses,
+      active,
       limit: PROCESS_CONCURRENCY,
-      queueLength: processQueue.length
+      queueLength: queued
     };
 
     return res.json({ items: enriched, concurrency, scope: isSuperAdmin ? 'all-tenants' : 'tenant' });

@@ -22,11 +22,14 @@ router.delete('/admin/trainings/units/:id', controller.deleteUnit);
 
 // Trainings
 router.get('/admin/trainings', controller.listTrainings);
+router.get('/admin/trainings/counter', controller.getTrainingCounter);
+router.put('/admin/trainings/counter', express.json(), controller.updateTrainingCounter);
 router.get('/admin/trainings/next-record-no', controller.getNextRecordOfTrainingNo);
 router.get('/admin/trainings/closed', controller.listClosedTrainings);
 router.get('/admin/trainings/database/candidates', controller.listDatabaseCandidates);
 router.post('/admin/trainings', ...controller.createTraining);
 router.get('/admin/trainings/:id', controller.getTraining);
+router.delete('/admin/trainings/:id', controller.deleteTraining);
 router.get('/admin/trainings/:id/xlsx', controller.getXlsxDownloadUrl);
 router.post('/admin/trainings/:id/generate', controller.generateRotDocs);
 router.post('/admin/trainings/:id/zip', controller.generateRotZip);
