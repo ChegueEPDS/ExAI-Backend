@@ -15,7 +15,7 @@ const connectDB = async () => {
       maxPoolSize,
       autoIndex,
     });
-    console.log('MongoDB connected');
+    console.log('MongoDB connected OK');
   } catch (err) {
     console.error('MongoDB connection error:', err.message);
     process.exit(1);
