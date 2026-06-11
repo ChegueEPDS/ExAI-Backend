@@ -1,4 +1,5 @@
 require('dotenv').config();
+const util = require('util');
 const express = require('express');
 const cors = require('cors');
 const connectDB = require('./config/db');
@@ -80,6 +81,9 @@ function formatConsoleArg(arg) {
 }
 
 function formatConsoleArgs(args) {
+  if (typeof args[0] === 'string') {
+    return util.formatWithOptions({ depth: 5, colors: false }, ...args);
+  }
   return args.map(formatConsoleArg).join(' ');
 }
 
