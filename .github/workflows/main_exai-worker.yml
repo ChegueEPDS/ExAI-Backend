@@ -23,11 +23,22 @@ jobs:
         with:
           node-version: '22.x'
 
+      - name: Install production dependencies (skip ngrok download)
+        run: npm ci --omit=dev
+        env:
+          NGROK_SKIP_DOWNLOAD: "true"
+
+      - name: Build (if present)
+        run: npm run build --if-present
+
+      - name: Zip artifact for deployment
+        run: zip release.zip ./* -r
+
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
           name: node-app
-          path: .
+          path: release.zip
 
   deploy:
     runs-on: ubuntu-latest
@@ -41,6 +52,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: node-app
+
+      - name: Unzip artifact for deployment
+        run: unzip release.zip
       
       - name: Login to Azure
         uses: azure/login@v2
