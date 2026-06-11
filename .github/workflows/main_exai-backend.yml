@@ -63,6 +63,10 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_96F0BB1F2AD7461885DC02C30A07BBE5 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_BA60CDCFDC714CDCBB986598A7F05135 }}
 
+      - name: List visible Azure Web Apps
+        run: |
+          az webapp list --query "[].{name:name, resourceGroup:resourceGroup, state:state, defaultHostName:defaultHostName}" -o table
+
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
