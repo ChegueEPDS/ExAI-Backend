@@ -68,14 +68,29 @@ const navigationRoutes = require('./routes/navigationRoutes');
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
 const port = process.env.PORT || 3000;
+
+function formatConsoleArg(arg) {
+  if (arg instanceof Error) return arg.stack || arg.message;
+  if (typeof arg === 'string') return arg;
+  try {
+    return JSON.stringify(arg);
+  } catch {
+    return String(arg);
+  }
+}
+
+function formatConsoleArgs(args) {
+  return args.map(formatConsoleArg).join(' ');
+}
+
 console.log = (...args) => {
-  logger.info(args.join(' '));
+  logger.info(formatConsoleArgs(args));
 };
 console.warn = (...args) => {
-  logger.warn(args.join(' '));
+  logger.warn(formatConsoleArgs(args));
 };
 console.error = (...args) => {
-  logger.error(args.join(' '));
+  logger.error(formatConsoleArgs(args));
 };
 
 connectDB().then(async () => {

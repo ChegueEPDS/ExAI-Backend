@@ -25,6 +25,17 @@ const upload = multer({
 
 const ROT_COUNTER_KEY = 'global';
 
+function isSuperAdminReq(req) {
+  const roleRaw = String(req?.role || req?.user?.role || req?.auth?.role || req?.scope?.role || req?.scope?.userRole || '');
+  return /super\s*admin/i.test(roleRaw) || /superadmin/i.test(roleRaw);
+}
+
+function requireSuperAdmin(req, res) {
+  if (isSuperAdminReq(req)) return true;
+  res.status(403).json({ ok: false, error: 'Only SuperAdmin can perform this action' });
+  return false;
+}
+
 function envInt(name, fallback) {
   const raw = process.env[name];
   if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
@@ -105,6 +116,16 @@ function yearFromYmdOrNow(ymd) {
   return Number.isFinite(y) ? y : new Date().getFullYear();
 }
 
+function yearFromInputOrNow(input) {
+  const v = String(input || '').trim();
+  const fullYear = v.match(/^(\d{4})$/);
+  if (fullYear) {
+    const y = Number(fullYear[1]);
+    return Number.isFinite(y) ? y : new Date().getFullYear();
+  }
+  return yearFromYmdOrNow(v);
+}
+
 function pad4(n) {
   const x = Number(n || 0);
   const s = Number.isFinite(x) ? String(Math.max(0, Math.floor(x))) : '0';
@@ -182,6 +203,23 @@ async function peekNextRecordOfTrainingNo({ year }) {
     );
   }
   return formatRecordOfTrainingNo(year, lastSeq + 1);
+}
+
+async function getCounterSnapshot({ year }) {
+  const [counter, existingMax] = await Promise.all([
+    TrainingRecordCounter.findOne({ tenantKey: ROT_COUNTER_KEY, year }).select({ lastSeq: 1 }).lean(),
+    computeExistingMaxSeq({ year })
+  ]);
+  const storedLastSeq = Number(counter?.lastSeq || 0);
+  const effectiveLastSeq = Math.max(storedLastSeq, Number(existingMax || 0));
+  return {
+    year,
+    storedLastSeq,
+    existingMax,
+    lastSeq: effectiveLastSeq,
+    nextSeq: effectiveLastSeq + 1,
+    next: formatRecordOfTrainingNo(year, effectiveLastSeq + 1)
+  };
 }
 
 async function getTemplateSettings() {
@@ -291,6 +329,59 @@ exports.getTraining = async (req, res) => {
   return res.json({ ok: true, training, candidates });
 };
 
+exports.deleteTraining = async (req, res) => {
+  try {
+    if (!requireSuperAdmin(req, res)) return;
+
+    const id = String(req.params.id || '').trim();
+    const training = await Training.findById(id).lean();
+    if (!training) return res.status(404).json({ ok: false, error: 'Training not found' });
+
+    const candidates = await TrainingCandidate.find({ trainingId: id }).lean();
+    const explicitBlobPaths = new Set();
+    for (const p of [
+      training?.sourceXlsx?.blobPath,
+      training?.finalPdf?.blobPath,
+      ...(candidates || []).flatMap((c) => [c?.rotDocx?.blobPath, c?.finalPdf?.blobPath])
+    ]) {
+      const s = String(p || '').trim();
+      if (s) explicitBlobPaths.add(s);
+    }
+
+    let prefixDeleted = 0;
+    if (training.folderName) {
+      const resp = await azureBlob.deletePrefix(`index/trainings/${training.folderName}/`);
+      prefixDeleted = Number(resp?.deleted || 0);
+    }
+
+    let explicitDeleted = 0;
+    for (const blobPath of explicitBlobPaths) {
+      try {
+        const resp = await azureBlob.deleteFile(blobPath);
+        if (resp?.succeeded) explicitDeleted++;
+      } catch (e) {
+        try { console.warn('[trainings.delete] blob delete failed', blobPath, e?.message || e); } catch {}
+      }
+    }
+
+    const candidateDelete = await TrainingCandidate.deleteMany({ trainingId: id });
+    const trainingDelete = await Training.deleteOne({ _id: id });
+
+    return res.json({
+      ok: true,
+      deleted: {
+        training: trainingDelete.deletedCount || 0,
+        candidates: candidateDelete.deletedCount || 0,
+        blobs: prefixDeleted + explicitDeleted,
+        prefixBlobs: prefixDeleted,
+        explicitBlobs: explicitDeleted
+      }
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || 'Failed to delete training' });
+  }
+};
+
 exports.getXlsxDownloadUrl = async (req, res) => {
   const id = String(req.params.id || '').trim();
   const training = await Training.findById(id).lean();
@@ -314,6 +405,50 @@ exports.getNextRecordOfTrainingNo = async (req, res) => {
     return res.json({ ok: true, year, next });
   } catch (e) {
     return res.status(400).json({ ok: false, error: e?.message || 'Failed to compute next record number' });
+  }
+};
+
+exports.getTrainingCounter = async (req, res) => {
+  try {
+    if (!requireSuperAdmin(req, res)) return;
+    const year = yearFromInputOrNow(req.query?.year);
+    const counter = await getCounterSnapshot({ year });
+    return res.json({ ok: true, counter });
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: e?.message || 'Failed to load training counter' });
+  }
+};
+
+exports.updateTrainingCounter = async (req, res) => {
+  try {
+    if (!requireSuperAdmin(req, res)) return;
+    const year = yearFromInputOrNow(req.body?.year);
+    const nextSeq = Number(req.body?.nextSeq);
+    if (!Number.isInteger(nextSeq) || nextSeq < 1 || nextSeq > 9999) {
+      return res.status(400).json({ ok: false, error: 'nextSeq must be an integer between 1 and 9999' });
+    }
+
+    const existingMax = await computeExistingMaxSeq({ year });
+    const minNextSeq = existingMax + 1;
+    if (nextSeq < minNextSeq) {
+      return res.status(400).json({
+        ok: false,
+        error: `Next sequence cannot be lower than ${minNextSeq}; ${formatRecordOfTrainingNo(year, existingMax)} already exists.`,
+        minNextSeq,
+        existingMax
+      });
+    }
+
+    await TrainingRecordCounter.findOneAndUpdate(
+      { tenantKey: ROT_COUNTER_KEY, year },
+      { $set: { lastSeq: nextSeq - 1 } },
+      { upsert: true, new: true }
+    ).lean();
+
+    const counter = await getCounterSnapshot({ year });
+    return res.json({ ok: true, counter });
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: e?.message || 'Failed to update training counter' });
   }
 };
 

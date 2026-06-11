@@ -43,7 +43,7 @@ jobs:
     needs: build
     environment:
       name: 'Production'
-      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+      url: ${{ steps.deploy-api-to-webapp.outputs.webapp-url }}
     permissions:
       id-token: write #This is required for requesting the JWT
 
@@ -63,11 +63,19 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_96F0BB1F2AD7461885DC02C30A07BBE5 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_BA60CDCFDC714CDCBB986598A7F05135 }}
 
-      - name: 'Deploy to Azure Web App'
-        id: deploy-to-webapp
+      - name: 'Deploy API to Azure Web App'
+        id: deploy-api-to-webapp
         uses: azure/webapps-deploy@v3
         with:
           app-name: 'ExAI-Backend'
+          slot-name: 'Production'
+          package: .
+
+      - name: 'Deploy Worker to Azure Web App'
+        id: deploy-worker-to-webapp
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: 'Exai-Worker'
           slot-name: 'Production'
           package: .
           

@@ -1132,6 +1132,43 @@ function appendSchemaExportValues(rowData, entity, schemaColumns) {
   return rowData;
 }
 
+function hasMeaningfulExMarking(marking) {
+  if (!marking || typeof marking !== 'object') return false;
+  return Object.entries(marking).some(([key, value]) =>
+    key !== '_id' && String(value || '').trim()
+  );
+}
+
+async function applyRbSchemaFromLegacyEquipmentFields(payload, userId = null, existingEquipment = null) {
+  if (!payload || typeof payload !== 'object') return;
+
+  const markings = (Array.isArray(payload['Ex Marking']) ? payload['Ex Marking'] : [])
+    .filter(hasMeaningfulExMarking);
+  const certificateNo = String(payload['Certificate No'] || payload.CertificateNo || '').trim();
+  const compliance = String(payload.Compliance || '').trim();
+  const hasCompliance = compliance && compliance !== 'NA';
+
+  if (!markings.length && !certificateNo && !hasCompliance) return;
+
+  if (!Array.isArray(payload.schemaAssignments)) {
+    payload.schemaAssignments = Array.isArray(existingEquipment?.schemaAssignments)
+      ? [...existingEquipment.schemaAssignments]
+      : [];
+  }
+
+  const rbSchema = await ensureRbSchema();
+  ensureRbAssignment(payload, rbSchema, {
+    ...valuesFromEquipmentMarkings(markings),
+    certificateNo,
+    compliance: compliance || 'NA'
+  }, userId);
+
+  delete payload['Ex Marking'];
+  delete payload['Certificate No'];
+  delete payload.CertificateNo;
+  delete payload.Compliance;
+}
+
 function determineEnvironmentFromSubGroup(value) {
   if (!value) return '';
   const entries = String(value)
@@ -1530,6 +1567,8 @@ exports.createEquipment = async (req, res) => {
           values: updateFields.customFields
         });
       }
+
+      await applyRbSchemaFromLegacyEquipmentFields(updateFields, CreatedBy, existingEquipment);
 
       if (existingEquipment) {
         updateFields.ModifiedBy = CreatedBy;
