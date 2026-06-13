@@ -2,8 +2,11 @@ const mongoose = require('mongoose');
 
 const Equipment = require('../models/dataplate');
 const MaintenanceEvent = require('../models/maintenanceEvent');
+const MaintenanceActivity = require('../models/maintenanceActivity');
 const Inspection = require('../models/inspection');
 const EquipmentDataVersion = require('../models/equipmentDataVersion');
+const SchemaDefinition = require('../models/schemaDefinition');
+const { validateSchemaValues } = require('../services/schemaValidationService');
 
 function toObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
@@ -190,6 +193,75 @@ exports.completeRepair = async (req, res) => {
   }
 };
 
+exports.createCustomActivity = async (req, res) => {
+  try {
+    const tenantId = toObjectId(req.scope?.tenantId);
+    const equipmentId = toObjectId(req.params.id);
+    const actorId = toObjectId(req.scope?.userId);
+    const schemaId = toObjectId(req.params.schemaId);
+    if (!tenantId || !equipmentId || !actorId || !schemaId) {
+      return res.status(400).json({ error: 'Invalid tenantId / equipmentId / user / schemaId.' });
+    }
+
+    const equipment = await loadEquipmentOr404({ tenantId, equipmentId }, res);
+    if (!equipment) return;
+
+    const schema = await SchemaDefinition.findOne({
+      _id: schemaId,
+      type: 'maintenance',
+      status: 'published',
+      active: { $ne: false },
+      targetLevels: 'equipment',
+      $or: [
+        { scope: 'system' },
+        { scope: 'tenant', tenantId }
+      ]
+    });
+    if (!schema) {
+      return res.status(404).json({ error: 'Maintenance schema not found.' });
+    }
+
+    const occurredAt = parseOptionalDate(req.body?.occurredAt) || new Date();
+    const status = ['completed', 'partial', 'skipped'].includes(req.body?.status) ? req.body.status : 'completed';
+    const values = validateSchemaValues(schema, req.body?.values || {});
+    const note = typeof req.body?.note === 'string' ? req.body.note.trim() : '';
+    const attachments = Array.isArray(req.body?.attachments)
+      ? req.body.attachments.map((a) => ({
+        blobPath: a?.blobPath || '',
+        blobUrl: a?.blobUrl || '',
+        type: a?.type === 'document' ? 'document' : 'image',
+        contentType: a?.contentType || '',
+        size: a?.size ?? null,
+        note: a?.note || '',
+        createdBy: actorId
+      }))
+      : [];
+
+    const activity = await new MaintenanceActivity({
+      tenantId,
+      equipmentId,
+      schemaId: schema._id,
+      schemaKeySnapshot: schema.systemKey || '',
+      schemaNameSnapshot: schema.name || '',
+      occurredAt,
+      actorId,
+      status,
+      values,
+      note,
+      attachments,
+      source: req.body?.source === 'mobile' ? 'mobile' : 'web'
+    }).save();
+
+    equipment.ModifiedBy = actorId;
+    await equipment.save();
+
+    return res.status(201).json({ activity });
+  } catch (error) {
+    console.error('❌ createCustomActivity error:', error);
+    return res.status(error.status || 500).json({ error: error.message || 'Nem sikerült rögzíteni a maintenance tevékenységet.' });
+  }
+};
+
 exports.getEquipmentHistory = async (req, res) => {
   try {
     const tenantId = toObjectId(req.scope?.tenantId);
@@ -207,8 +279,13 @@ exports.getEquipmentHistory = async (req, res) => {
       return res.status(404).json({ error: 'Eszköz nem található.' });
     }
 
-    const [maintenanceEvents, inspections, versions] = await Promise.all([
+    const [maintenanceEvents, maintenanceActivities, inspections, versions] = await Promise.all([
       MaintenanceEvent.find({ tenantId, equipmentId })
+        .sort({ occurredAt: -1, _id: -1 })
+        .limit(limit)
+        .populate('actorId', 'firstName lastName nickname')
+        .lean(),
+      MaintenanceActivity.find({ tenantId, equipmentId })
         .sort({ occurredAt: -1, _id: -1 })
         .limit(limit)
         .populate('actorId', 'firstName lastName nickname')
@@ -234,6 +311,18 @@ exports.getEquipmentHistory = async (req, res) => {
         maintenance: {
           ...e,
           actor: e.actorId || null
+        }
+      });
+    }
+
+    for (const a of maintenanceActivities || []) {
+      events.push({
+        type: 'maintenanceActivity',
+        occurredAt: a.occurredAt,
+        sortAt: a.occurredAt,
+        maintenanceActivity: {
+          ...a,
+          actor: a.actorId || null
         }
       });
     }

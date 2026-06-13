@@ -192,7 +192,17 @@ function mergeSchemaAssignments(existingAssignments, incomingAssignments) {
       (assignment.schemaKey && item?.schemaKey === assignment.schemaKey) ||
       (assignment.schemaId && String(item?.schemaId) === String(assignment.schemaId))
     );
-    if (idx >= 0) next[idx] = assignment;
+    if (idx >= 0) {
+      const existing = next[idx] || {};
+      next[idx] = {
+        ...existing,
+        ...assignment,
+        values: {
+          ...(existing.values && typeof existing.values === 'object' ? existing.values : {}),
+          ...(assignment.values && typeof assignment.values === 'object' ? assignment.values : {})
+        }
+      };
+    }
     else next.push(assignment);
   });
   return next;

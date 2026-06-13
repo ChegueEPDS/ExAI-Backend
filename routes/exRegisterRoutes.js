@@ -121,6 +121,7 @@ router.get('/exreg/:id/history', authMiddleware(), maintenanceController.getEqui
 router.post('/exreg/:id/maintenance/faults', authMiddleware(), requireTenantFeature('maintenance'), requirePermission(['maintenance:manage', 'maintenance:fault:report']), maintenanceController.reportFault);
 router.post('/exreg/:id/maintenance/repairs/start', authMiddleware(), requireTenantFeature('maintenance'), requirePermission('maintenance:manage'), maintenanceController.startRepair);
 router.post('/exreg/:id/maintenance/repairs/:repairId/complete', authMiddleware(), requireTenantFeature('maintenance'), requirePermission('maintenance:manage'), maintenanceController.completeRepair);
+router.post('/exreg/:id/maintenance/schemas/:schemaId/activities', authMiddleware(), requireTenantFeature('maintenance'), requirePermission('maintenance:manage'), express.json(), maintenanceController.createCustomActivity);
 
 // Módosítás
 router.put('/exreg/:id', authMiddleware(), requirePermission('asset:write'), upload.array('pictures'), exRegisterController.updateEquipment);
