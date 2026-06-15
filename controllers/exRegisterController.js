@@ -70,6 +70,21 @@ async function sanitizeEquipmentSchemaAssignmentsForSave(assignments, tenantId) 
   });
 }
 
+function preserveRbComplianceForEquipmentUpdate(assignments, existingEquipment) {
+  if (!Array.isArray(assignments) || !assignments.length) return assignments;
+  const existingCompliance = complianceStatus(existingEquipment) || 'NA';
+  return assignments.map((assignment) => {
+    if (!assignment || assignment.schemaKey !== 'rb') return assignment;
+    return {
+      ...assignment,
+      values: {
+        ...(assignment.values || {}),
+        compliance: existingCompliance
+      }
+    };
+  });
+}
+
 const HEADER_ALIASES = {
   '#': '#',
   'tag no': 'TagNo',
@@ -5054,7 +5069,13 @@ exports.updateEquipment = async (req, res) => {
     }
     if (Object.prototype.hasOwnProperty.call(updatedFields, 'schemaAssignments')) {
       updatedFields.schemaAssignments = await sanitizeEquipmentSchemaAssignmentsForSave(updatedFields.schemaAssignments, tenantId);
+      updatedFields.schemaAssignments = preserveRbComplianceForEquipmentUpdate(updatedFields.schemaAssignments, equipment);
     }
+    delete updatedFields.Compliance;
+    delete updatedFields.lastInspectionDate;
+    delete updatedFields.lastInspectionValidUntil;
+    delete updatedFields.lastInspectionStatus;
+    delete updatedFields.lastInspectionId;
     updatedFields.ModifiedBy = new mongoose.Types.ObjectId(ModifiedBy);
 
     const updatedEquipment = await Equipment.findByIdAndUpdate(

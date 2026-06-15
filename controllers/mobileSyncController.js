@@ -16,7 +16,7 @@ const { parseSinceDate } = require('../services/syncTombstoneService');
 const { notifyAndStore } = require('../lib/notifications/notifier');
 const { sanitizeCustomFields } = require('../services/customFieldService');
 const { ensureRbSchema } = require('../services/schemaSeedService');
-const { ensureRbAssignment, getRbValues } = require('../services/rbSchemaValueService');
+const { ensureRbAssignment, getRbValues, complianceStatus } = require('../services/rbSchemaValueService');
 
 const toObjectId = (value) => {
   if (!value) return null;
@@ -101,6 +101,20 @@ function forceRbCompliance(assignments, compliance = 'Failed') {
     };
   });
   return { assignments: next, changed };
+}
+
+function preserveRbCompliance(assignments, existingEquipment = null) {
+  const compliance = existingEquipment ? (complianceStatus(existingEquipment) || 'NA') : 'NA';
+  return (Array.isArray(assignments) ? assignments : []).map((assignment) => {
+    if (!assignment || assignment.schemaKey !== 'rb') return assignment;
+    return {
+      ...assignment,
+      values: {
+        ...(assignment.values || {}),
+        compliance
+      }
+    };
+  });
 }
 
 function hasMobileFailureReport({ item, failureNote, failureSeverity, schemaAssignments }) {
@@ -440,7 +454,8 @@ exports.mobileSync = async (req, res) => {
             values: a.values
           }))
       : [];
-    const isMobileFailureReport = hasMobileFailureReport({ item, failureNote, failureSeverity, schemaAssignments });
+    const isNormalEquipmentSync = !item?.mode || item.mode === 'equipment';
+    const isMobileFailureReport = !isNormalEquipmentSync && hasMobileFailureReport({ item, failureNote, failureSeverity, schemaAssignments });
     if (isMobileFailureReport) {
       const forced = forceRbCompliance(schemaAssignments, 'Failed');
       schemaAssignments = forced.assignments;
@@ -465,6 +480,9 @@ exports.mobileSync = async (req, res) => {
       const existing = await Equipment.findOne({ _id: existingEquipmentId, tenantId });
       if (!existing) {
         return res.status(404).json({ message: `Item ${tempId}: equipment not found for tenant.` });
+      }
+      if (isNormalEquipmentSync && schemaAssignments.length) {
+        schemaAssignments = preserveRbCompliance(schemaAssignments, existing);
       }
       if (baseUpdatedAt && existing.updatedAt && existing.updatedAt > baseUpdatedAt) {
         const serverUpdatedAt = existing.updatedAt ? new Date(existing.updatedAt).toISOString() : null;
@@ -725,6 +743,9 @@ exports.mobileSync = async (req, res) => {
         orderIndex: await getNextOrderIndex(tenantId, siteId, zoneId)
       };
       if (customFields) equipmentPayload.customFields = customFields;
+      if (isNormalEquipmentSync && schemaAssignments.length) {
+        schemaAssignments = preserveRbCompliance(schemaAssignments);
+      }
       if (schemaAssignments.length) equipmentPayload.schemaAssignments = schemaAssignments;
       if (equipmentTypeRaw) equipmentPayload['Equipment Type'] = equipmentTypeRaw;
       if (otherInfoPresent || clearBaseFields.has('otherInfo')) equipmentPayload['Other Info'] = String(otherInfo || '').trim();

@@ -178,6 +178,56 @@ function tenantInviteEmailHtml({ firstName, lastName, tenantName, loginUrl, pass
   });
 }
 
+function tenantJoinInviteEmailHtml({
+  firstName,
+  lastName,
+  tenantName,
+  inviterFirstName,
+  inviterLastName,
+  inviterEmail,
+  acceptUrl,
+  rejectUrl,
+  baseUrl
+}) {
+  const effectiveBaseUrl = normalizeBaseUrl(tenantName, baseUrl);
+  const safeAcceptUrl = withBaseOrigin(effectiveBaseUrl, acceptUrl, 'join-invite');
+  const safeRejectUrl = withBaseOrigin(effectiveBaseUrl, rejectUrl, 'join-invite');
+  const inviterName = `${inviterFirstName || ''} ${inviterLastName || ''}`.trim() || inviterEmail || 'An administrator';
+  const recipientName = `${firstName || ''} ${lastName || ''}`.trim() || 'there';
+  return baseTemplate({
+    title: `You have been invited to join ${tenantName}`,
+    tenantName,
+    baseUrl: effectiveBaseUrl,
+    bodyHtml: `
+      <h2 style="color:#131313;">Dear ${escapeHtml(recipientName)},</h2>
+      <p>
+        <strong>${escapeHtml(inviterName)}</strong>
+        ${inviterEmail ? `(${escapeHtml(inviterEmail)})` : ''}
+        has invited you to join the <strong>${escapeHtml(tenantName)}</strong> team.
+      </p>
+      <p>To accept the invitation and join this team, click the button below.</p>
+      <p style="margin:30px 0; text-align:center;">
+        <a href="${safeAcceptUrl}" target="_blank" rel="noopener noreferrer"
+           style="background:#f8d201; color:#131313; text-decoration:none; padding:12px 24px; border-radius:4px; font-size:16px; display:inline-block;">
+          Accept invitation
+        </a>
+      </p>
+      <p>If the button does not work, open this link:<br/>
+        <a href="${safeAcceptUrl}" target="_blank" rel="noopener noreferrer">${safeAcceptUrl}</a>
+      </p>
+      <p style="font-size:13px; color:#555;">
+        Accepting this invitation will move your account from your current free personal workspace to the
+        <strong>${escapeHtml(tenantName)}</strong> team.
+      </p>
+      <p>
+        If you do not want to join, you can ignore this email or
+        <a href="${safeRejectUrl}" target="_blank" rel="noopener noreferrer">reject the invitation</a>.
+      </p>
+      <p>Best regards,<br/>The ${tenantName?.toLowerCase()==='index' ? 'ExAI IndEx' : 'ATEXdb'} Team</p>
+    `,
+  });
+}
+
 function forgotPasswordEmailHtml({ firstName, lastName, loginUrl, tempPassword, tenantName, baseUrl }) {
   const effectiveBaseUrl = normalizeBaseUrl(tenantName, baseUrl);
   const safeLoginUrl = withBaseOrigin(effectiveBaseUrl, loginUrl);
@@ -432,6 +482,7 @@ module.exports = {
   registrationEmailHtml,
   emailVerificationEmailHtml,
   tenantInviteEmailHtml,
+  tenantJoinInviteEmailHtml,
   forgotPasswordEmailHtml,
   uploadCompletedEmail,
   certificateRequestFulfilledEmail,
