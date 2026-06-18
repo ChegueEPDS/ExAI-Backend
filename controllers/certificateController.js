@@ -18,6 +18,7 @@ const {
 } = require('../helpers/certificateMatchHelper');
 const contributionRewardService = require('../services/contributionRewardService');
 const CertificatePreviewJob = require('../models/certificatePreviewJob');
+const { buildLooseCertNoRegex, buildSubstringRegex } = require('../helpers/certificateSearch');
 
 const upload = multer({ dest: 'uploads/' });
 
@@ -192,16 +193,6 @@ function tryObjectId(id) {
 // Small helper to escape user-provided filter strings in regex
 function escapeRegex(s = '') {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function buildLooseCertNoRegex(value = '') {
-  const source = (value || '').toString().trim();
-  if (!source) return null;
-  const pattern = source
-    .split('')
-    .map(ch => escapeRegex(ch))
-    .join('\\s*');
-  return new RegExp('^' + pattern, 'i');
 }
 
 // --- Helper: standardized duplicate (unique index) error response ---
@@ -644,7 +635,7 @@ exports.getPublicCertificatesPaged = async (req, res) => {
     const match = { visibility: 'public' };
     const certRegex = buildLooseCertNoRegex(f.certNo);
     if (certRegex) match.certNo = certRegex;
-    if (f.manufacturer) match.manufacturer = { $regex: '^' + escapeRegex(f.manufacturer), $options: 'i' };
+    if (f.manufacturer) match.manufacturer = buildSubstringRegex(f.manufacturer);
     if (f.equipment)    match.equipment    = { $regex: '^' + escapeRegex(f.equipment), $options: 'i' };
     const keyset = buildKeysetMatch({
       sortKey: key,
@@ -740,8 +731,8 @@ exports.getMyCertificatesPaged = async (req, res) => {
       adoptedMatch.certNo = certRegex;
     }
     if (f.manufacturer) {
-      ownMatch.manufacturer = { $regex: '^' + escapeRegex(f.manufacturer), $options: 'i' };
-      adoptedMatch.manufacturer = { $regex: '^' + escapeRegex(f.manufacturer), $options: 'i' };
+      ownMatch.manufacturer = buildSubstringRegex(f.manufacturer);
+      adoptedMatch.manufacturer = buildSubstringRegex(f.manufacturer);
     }
     if (f.equipment) {
       ownMatch.equipment = { $regex: '^' + escapeRegex(f.equipment), $options: 'i' };
@@ -849,7 +840,7 @@ exports.getCertificatesSamples = async (req, res) => {
     const certRegex = buildLooseCertNoRegex(req.query.certNo || '');
     const match = { visibility: 'public' };
     if (certRegex) match.certNo = certRegex;
-    if (req.query.manufacturer) match.manufacturer = { $regex: '^' + escapeRegex(String(req.query.manufacturer).trim()), $options: 'i' };
+    if (req.query.manufacturer) match.manufacturer = buildSubstringRegex(req.query.manufacturer);
     if (req.query.equipment) match.equipment = { $regex: '^' + escapeRegex(String(req.query.equipment).trim()), $options: 'i' };
 
     // Csak a publikus tanúsítványok és csak a szükséges mezők
