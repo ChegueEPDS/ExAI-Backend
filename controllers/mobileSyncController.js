@@ -17,6 +17,7 @@ const { notifyAndStore } = require('../lib/notifications/notifier');
 const { sanitizeCustomFields } = require('../services/customFieldService');
 const { ensureRbSchema } = require('../services/schemaSeedService');
 const { ensureRbAssignment, getRbValues, complianceStatus } = require('../services/rbSchemaValueService');
+const { shouldOpenMobileEquipmentConflict } = require('../services/mobileSyncConflictService');
 
 const toObjectId = (value) => {
   if (!value) return null;
@@ -159,6 +160,7 @@ function buildClientChanges({
   customFields,
   schemaAssignments,
   clearBaseFields,
+  manualClearFields,
   otherInfoPresent,
   failureNotePresent,
   manualFields,
@@ -175,19 +177,24 @@ function buildClientChanges({
   const fields = {};
   if (manualFields && typeof manualFields === 'object') {
     Object.keys(manualFields).forEach((k) => {
-      fields[k] = manualFields[k];
+      const value = String(manualFields[k] ?? '').trim();
+      if (value || (manualClearFields && manualClearFields.has(k))) {
+        fields[k] = value;
+      }
     });
   }
 
   const exMarking = {};
   if (manualExMarking && typeof manualExMarking === 'object') {
     Object.keys(manualExMarking).forEach((k) => {
-      exMarking[k] = manualExMarking[k];
+      const value = String(manualExMarking[k] ?? '').trim();
+      exMarking[k] = value;
     });
   }
 
   const out = { equipment };
   if (Object.keys(fields).length) out.fields = fields;
+  if (manualClearFields && manualClearFields.size) out.clearFields = Array.from(manualClearFields);
   if (Object.keys(exMarking).length) out.exMarking = exMarking;
   if (customFields && typeof customFields === 'object' && Object.keys(customFields).length) {
     out.customFields = { ...customFields };
@@ -437,6 +444,11 @@ exports.mobileSync = async (req, res) => {
     const manual = item?.manual && typeof item.manual === 'object' ? item.manual : null;
     const manualFields = manual?.fields && typeof manual.fields === 'object' ? manual.fields : null;
     const manualExMarking = manual?.exMarking && typeof manual.exMarking === 'object' ? manual.exMarking : null;
+    const manualClearFields = new Set(
+      Array.isArray(manual?.clearFields)
+        ? manual.clearFields.map((k) => String(k || '').trim()).filter(Boolean)
+        : []
+    );
     const rawCustomFields = item?.customFields && typeof item.customFields === 'object' && !Array.isArray(item.customFields)
       ? item.customFields
       : null;
@@ -463,7 +475,9 @@ exports.mobileSync = async (req, res) => {
 
     const pickManualString = (obj, key) => {
       if (!hasOwn(obj, key)) return { present: false, value: '' };
-      return { present: true, value: String(obj[key] ?? '').trim() };
+      const value = String(obj[key] ?? '').trim();
+      if (!value && !manualClearFields.has(key)) return { present: false, value: '' };
+      return { present: true, value };
     };
 
     const allowedFieldKeys = [
@@ -484,7 +498,13 @@ exports.mobileSync = async (req, res) => {
       if (isNormalEquipmentSync && schemaAssignments.length) {
         schemaAssignments = preserveRbCompliance(schemaAssignments, existing);
       }
-      if (baseUpdatedAt && existing.updatedAt && existing.updatedAt > baseUpdatedAt) {
+      const shouldOpenConflict = await shouldOpenMobileEquipmentConflict({
+        tenantId,
+        equipmentId: existing._id,
+        baseUpdatedAt,
+        serverUpdatedAt: existing.updatedAt
+      });
+      if (shouldOpenConflict) {
         const serverUpdatedAt = existing.updatedAt ? new Date(existing.updatedAt).toISOString() : null;
         let conflictDoc = null;
         let wasOpen = false;
@@ -501,6 +521,7 @@ exports.mobileSync = async (req, res) => {
             customFields,
             schemaAssignments,
             clearBaseFields,
+            manualClearFields,
             otherInfoPresent,
             failureNotePresent,
             manualFields,

@@ -37,6 +37,15 @@ function pickValue(choice, serverVal, clientVal) {
   return serverVal;
 }
 
+function pickFieldValue(choice, serverVal, clientVal, allowEmptyClient = false) {
+  if (choice === 'client') {
+    if (clientVal === undefined) return serverVal;
+    if (!allowEmptyClient && String(clientVal ?? '').trim() === '') return serverVal;
+    return clientVal;
+  }
+  return serverVal;
+}
+
 function applyResolutionToSnapshot(serverSnapshot, clientChanges, resolution) {
   const out = { ...(serverSnapshot || {}) };
   const takeAll = resolution?.takeAll || null;
@@ -48,6 +57,11 @@ function applyResolutionToSnapshot(serverSnapshot, clientChanges, resolution) {
   const fields = clientChanges?.fields || {};
   const ex = clientChanges?.exMarking || {};
   const customFields = clientChanges?.customFields || {};
+  const clearFields = new Set(
+    Array.isArray(clientChanges?.clearFields)
+      ? clientChanges.clearFields.map((k) => String(k || '').trim()).filter(Boolean)
+      : []
+  );
   const clientRbAssignment = Array.isArray(clientChanges?.schemaAssignments)
     ? clientChanges.schemaAssignments.find((a) => a?.schemaKey === 'rb')
     : null;
@@ -58,7 +72,13 @@ function applyResolutionToSnapshot(serverSnapshot, clientChanges, resolution) {
 
   const customChoice = resolution?.customFields || {};
   const choose = (scope, key, serverVal, clientVal) => {
-    if (takeAll === 'client') return pickValue('client', serverVal, clientVal);
+    if (takeAll === 'client') {
+      return scope === 'fields'
+        ? pickFieldValue('client', serverVal, clientVal, clearFields.has(key))
+        : scope === 'ex'
+          ? pickFieldValue('client', serverVal, clientVal, true)
+        : pickValue('client', serverVal, clientVal);
+    }
     if (takeAll === 'server') return serverVal;
     const choice = scope === 'base'
       ? baseChoice?.[key]
@@ -67,6 +87,12 @@ function applyResolutionToSnapshot(serverSnapshot, clientChanges, resolution) {
         : scope === 'custom'
           ? customChoice?.[key]
           : exChoice?.[key];
+    if (scope === 'fields') {
+      return pickFieldValue(choice, serverVal, clientVal, clearFields.has(key));
+    }
+    if (scope === 'ex') {
+      return pickFieldValue(choice, serverVal, clientVal, true);
+    }
     return pickValue(choice, serverVal, clientVal);
   };
 
