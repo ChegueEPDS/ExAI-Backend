@@ -64,6 +64,13 @@ async function processDataplateForEquipment({ equipmentDoc, tenantId, tenantKey,
   }
 
   const buffer = await azureBlob.downloadToBuffer(target.blobPath);
+  const parsed = await extractDataplateFieldsFromImageBuffer({ buffer, tenantId });
+  if (!parsed) return { processed: false, reason: 'llm_extract_failed' };
+
+  return applyDataplateFieldsToEquipment({ equipmentDoc, parsed, userId, source: target.source });
+}
+
+async function extractDataplateFieldsFromImageBuffer({ buffer, tenantId }) {
   const { formattedText, recognizedText } = await ocrImageBufferToDataplatePrompt(buffer);
 
   // Prefer structured extraction (Responses json_schema) for accuracy + deterministic validation.
@@ -85,7 +92,7 @@ async function processDataplateForEquipment({ equipmentDoc, tenantId, tenantKey,
     parsed = null;
   }
 
-  if (!parsed) return { processed: false, reason: 'llm_extract_failed' };
+  if (!parsed) return null;
 
   // Normalize "Type of Protection" to the supported set used by questions/inspections.
   if (Array.isArray(parsed['Ex Marking'])) {
@@ -102,6 +109,10 @@ async function processDataplateForEquipment({ equipmentDoc, tenantId, tenantKey,
     });
   }
 
+  return parsed;
+}
+
+async function applyDataplateFieldsToEquipment({ equipmentDoc, parsed, userId, source }) {
   let changed = false;
   changed = setNestedIfEmpty(equipmentDoc, 'Manufacturer', parsed.Manufacturer) || changed;
   changed = setNestedIfEmpty(equipmentDoc, 'Model/Type', parsed['Model/Type']) || changed;
@@ -166,7 +177,7 @@ async function processDataplateForEquipment({ equipmentDoc, tenantId, tenantKey,
     await equipmentDoc.save();
   }
 
-  return { processed: true, changed, source: target.source };
+  return { processed: true, changed, source };
 }
 
-module.exports = { processDataplateForEquipment };
+module.exports = { processDataplateForEquipment, extractDataplateFieldsFromImageBuffer };

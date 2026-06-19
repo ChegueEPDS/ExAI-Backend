@@ -18,6 +18,7 @@ const { sanitizeCustomFields } = require('../services/customFieldService');
 const { ensureRbSchema } = require('../services/schemaSeedService');
 const { ensureRbAssignment, getRbValues, complianceStatus } = require('../services/rbSchemaValueService');
 const { shouldOpenMobileEquipmentConflict } = require('../services/mobileSyncConflictService');
+const { extractDataplateFieldsFromImageBuffer } = require('../services/dataplateProcessingService');
 
 const toObjectId = (value) => {
   if (!value) return null;
@@ -125,6 +126,134 @@ function hasMobileFailureReport({ item, failureNote, failureSeverity, schemaAssi
     hasFaultDocument(item) ||
     hasFailedRbCompliance(schemaAssignments)
   );
+}
+
+function isBlankValue(value) {
+  if (value == null) return true;
+  if (typeof value === 'string') return value.trim() === '';
+  if (Array.isArray(value)) return value.length === 0;
+  return false;
+}
+
+async function mergeDataplateFieldsIntoClientChanges({
+  clientChanges,
+  parsed,
+  serverEquipment,
+  userId
+}) {
+  if (!parsed || typeof parsed !== 'object') return clientChanges || {};
+
+  const next = {
+    ...(clientChanges || {}),
+    equipment: { ...((clientChanges || {}).equipment || {}) },
+    fields: { ...((clientChanges || {}).fields || {}) },
+    exMarking: { ...((clientChanges || {}).exMarking || {}) },
+    schemaAssignments: Array.isArray((clientChanges || {}).schemaAssignments)
+      ? [...(clientChanges || {}).schemaAssignments]
+      : []
+  };
+
+  const clearFields = new Set(
+    Array.isArray(next.clearFields)
+      ? next.clearFields.map((k) => String(k || '').trim()).filter(Boolean)
+      : []
+  );
+
+  const setFieldFromDataplate = (key, value) => {
+    const clean = String(value || '').trim();
+    if (!clean) return;
+    if (next.fields[key] !== undefined || clearFields.has(key)) return;
+    const current = serverEquipment?.get ? serverEquipment.get(key) : serverEquipment?.[key];
+    if (isBlankValue(current)) next.fields[key] = clean;
+  };
+
+  setFieldFromDataplate('Manufacturer', parsed.Manufacturer);
+  setFieldFromDataplate('Model/Type', parsed['Model/Type']);
+  setFieldFromDataplate('Serial Number', parsed['Serial Number']);
+  setFieldFromDataplate('IP rating', parsed['IP rating']);
+  setFieldFromDataplate('Max Ambient Temp', parsed['Max Ambient Temp']);
+
+  const parsedEquipmentType = String(parsed['Equipment Type'] || '').trim();
+  if (
+    parsedEquipmentType &&
+    next.equipment.equipmentType === undefined &&
+    isBlankValue(serverEquipment?.get ? serverEquipment.get('Equipment Type') : serverEquipment?.['Equipment Type'])
+  ) {
+    next.equipment.equipmentType = parsedEquipmentType;
+  }
+
+  const parsedOtherInfo = String(parsed['Other Info'] || '').trim();
+  if (
+    parsedOtherInfo &&
+    next.equipment.otherInfo === undefined &&
+    isBlankValue(serverEquipment?.get ? serverEquipment.get('Other Info') : serverEquipment?.['Other Info'])
+  ) {
+    next.equipment.otherInfo = parsedOtherInfo;
+  }
+
+  const rbSchema = await ensureRbSchema({ userId });
+  const serverRbValues = getRbValues(serverEquipment);
+  const idx = next.schemaAssignments.findIndex((a) => a?.schemaKey === 'rb');
+  const existingClientAssignment = idx >= 0 ? next.schemaAssignments[idx] : null;
+  const clientValues = {
+    ...((existingClientAssignment && existingClientAssignment.values) || {})
+  };
+
+  let rbTouched = false;
+  const parsedCertificateNo = String(parsed['Certificate No'] || '').trim();
+  if (
+    parsedCertificateNo &&
+    isBlankValue(clientValues.certificateNo) &&
+    isBlankValue(serverRbValues.certificateNo)
+  ) {
+    clientValues.certificateNo = parsedCertificateNo;
+    rbTouched = true;
+  }
+
+  const parsedMarks = Array.isArray(parsed['Ex Marking']) ? parsed['Ex Marking'] : [];
+  const parsedFirst = parsedMarks[0] && typeof parsedMarks[0] === 'object' ? parsedMarks[0] : null;
+  if (parsedFirst) {
+    const serverMarks = Array.isArray(serverRbValues.exMarking) ? serverRbValues.exMarking : [];
+    const serverFirst = serverMarks[0] && typeof serverMarks[0] === 'object' ? serverMarks[0] : {};
+    const clientMarks = Array.isArray(clientValues.exMarking) ? [...clientValues.exMarking] : [];
+    const clientFirst = clientMarks[0] && typeof clientMarks[0] === 'object' ? { ...clientMarks[0] } : {};
+
+    Object.keys(parsedFirst).forEach((key) => {
+      const clean = String(parsedFirst[key] || '').trim();
+      if (!clean) return;
+      if (!isBlankValue(next.exMarking[key])) return;
+      if (!isBlankValue(clientFirst[key])) return;
+      if (!isBlankValue(serverFirst[key])) return;
+      next.exMarking[key] = parsedFirst[key];
+      clientFirst[key] = parsedFirst[key];
+      rbTouched = true;
+    });
+
+    if (Object.keys(clientFirst).length) {
+      clientMarks[0] = clientFirst;
+      clientValues.exMarking = clientMarks;
+    }
+  }
+
+  if (rbTouched) {
+    const nextAssignment = {
+      ...(existingClientAssignment || {}),
+      schemaId: existingClientAssignment?.schemaId || rbSchema?._id,
+      schemaKey: 'rb',
+      attachedAt: existingClientAssignment?.attachedAt || new Date(),
+      attachedBy: existingClientAssignment?.attachedBy || userId,
+      values: clientValues
+    };
+    if (idx >= 0) next.schemaAssignments[idx] = nextAssignment;
+    else next.schemaAssignments.push(nextAssignment);
+  }
+
+  if (!Object.keys(next.equipment).length) delete next.equipment;
+  if (!Object.keys(next.fields).length) delete next.fields;
+  if (!Object.keys(next.exMarking).length) delete next.exMarking;
+  if (!next.schemaAssignments.length) delete next.schemaAssignments;
+
+  return next;
 }
 
 async function applyMobileInspectionFailureState({
@@ -607,6 +736,7 @@ exports.mobileSync = async (req, res) => {
 
             const docsOut = Array.isArray(docToUpdate.clientDocuments) ? [...docToUpdate.clientDocuments] : [];
             let attachedDataplate = docsOut.some((d) => String(d?.tag || '') === 'dataplate');
+            let parsedDataplateFields = null;
 
             for (const file of matchingFiles) {
               const safeOriginalName = cleanFileName(stripFileKeyPrefix(file.originalname));
@@ -651,6 +781,14 @@ exports.mobileSync = async (req, res) => {
                 else attachedDataplate = true;
               }
 
+              if (tag === 'dataplate' && !parsedDataplateFields) {
+                try {
+                  parsedDataplateFields = await extractDataplateFieldsFromImageBuffer({ buffer, tenantId });
+                } catch {
+                  parsedDataplateFields = null;
+                }
+              }
+
               if (alreadyHas) {
                 // Best-effort: update tag if it became known later.
                 try {
@@ -681,6 +819,15 @@ exports.mobileSync = async (req, res) => {
             }
 
             docToUpdate.clientDocuments = docsOut;
+            if (parsedDataplateFields) {
+              docToUpdate.clientChanges = await mergeDataplateFieldsIntoClientChanges({
+                clientChanges: docToUpdate.clientChanges || {},
+                parsed: parsedDataplateFields,
+                serverEquipment: existing,
+                userId
+              });
+              if (docToUpdate.markModified) docToUpdate.markModified('clientChanges');
+            }
             if (docToUpdate.markModified) docToUpdate.markModified('clientDocuments');
             await docToUpdate.save();
           }
@@ -818,6 +965,7 @@ exports.mobileSync = async (req, res) => {
     const eqPrefix = buildEquipmentPrefix(tenantName, tenantIdStr, String(siteId), String(zoneId), eqIdForPrefix);
 
     let attachedDataplate = false;
+    const wasExistingEquipment = !!existingEquipmentId;
     for (const file of matchingFiles) {
       const safeOriginalName = cleanFileName(stripFileKeyPrefix(file.originalname));
       const buf = fs.readFileSync(file.path);
@@ -893,6 +1041,15 @@ exports.mobileSync = async (req, res) => {
     }
 
     await saved.save();
+
+    if (wasExistingEquipment && attachedDataplate) {
+      processingEquipmentIds.push(saved._id);
+      const key = String(saved._id);
+      metaByEquipmentId[key] = {
+        ...(metaByEquipmentId[key] && typeof metaByEquipmentId[key] === 'object' ? metaByEquipmentId[key] : {})
+      };
+      delete metaByEquipmentId[key].skipDataplateProcessing;
+    }
   }
 
   const processIdMap = new Map();
