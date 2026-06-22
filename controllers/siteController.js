@@ -16,6 +16,7 @@ const heicConvert = require('heic-convert');
 const { recordTombstone } = require('../services/syncTombstoneService');
 const { sanitizeCustomFields } = require('../services/customFieldService');
 const { getMaterializedSummary, scheduleDashboardStatsDirty } = require('../services/dashboardSummaryService');
+const tenantAccess = require('../services/tenantAccessService');
 
 // LEGACY: const axios = require('axios');
 
@@ -174,7 +175,8 @@ exports.getAllSites = async (req, res) => {
             return res.status(400).json({ message: "Invalid or missing tenantId in auth" });
         }
 
-        const filter = { tenantId: tenantObjectId };
+        const accessCtx = await tenantAccess.getAccessContext(req);
+        const filter = { tenantId: tenantObjectId, ...(await tenantAccess.buildSiteScopeFilterWithZones(accessCtx)) };
         if (req.query.updatedSince) {
           const raw = String(req.query.updatedSince).trim();
           const asNum = Number(raw);
@@ -205,7 +207,8 @@ exports.getSiteById = async (req, res) => {
         if (!tenantObjectId) {
             return res.status(400).json({ message: "Invalid or missing tenantId in auth" });
         }
-        const site = await Site.findOne({ _id: siteId, tenantId: tenantObjectId })
+        const accessCtx = await tenantAccess.getAccessContext(req);
+        const site = await Site.findOne({ _id: siteId, tenantId: tenantObjectId, ...(await tenantAccess.buildSiteScopeFilterWithZones(accessCtx)) })
           .populate('CreatedBy', 'firstName lastName nickname');
         if (!site) {
             return res.status(404).json({ message: "Site not found" });
@@ -228,6 +231,7 @@ exports.getSiteSummary = async (req, res) => {
     if (!tenantObjectId || !siteObjectId) {
       return res.status(400).json({ message: 'Invalid site or tenant ID.' });
     }
+    await tenantAccess.assertLocationAccess(req, { siteId: siteObjectId });
 
     const summary = await getMaterializedSummary({
       kind: 'site-summary',
@@ -321,6 +325,7 @@ exports.getSiteOperationalSummary = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(siteId)) {
       return res.status(400).json({ message: 'Invalid site id.' });
     }
+    await tenantAccess.assertLocationAccess(req, { siteId });
 
     const summary = await getMaterializedSummary({
       kind: 'operational-summary',
@@ -345,6 +350,7 @@ exports.getSiteOverallStatusSummary = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(siteId)) {
       return res.status(400).json({ message: 'Invalid site id.' });
     }
+    await tenantAccess.assertLocationAccess(req, { siteId });
 
     const summary = await getMaterializedSummary({
       kind: 'overall-status-summary',
@@ -368,6 +374,7 @@ exports.getSiteMaintenanceSeveritySummary = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(siteId)) {
       return res.status(400).json({ message: 'Invalid site id.' });
     }
+    await tenantAccess.assertLocationAccess(req, { siteId });
 
     const summary = await getMaterializedSummary({
       kind: 'maintenance-severity-summary',
@@ -393,6 +400,7 @@ exports.updateSite = async (req, res) => {
     const tenantObjectId = toObjectId(tenantIdStr);
     if (!tenantObjectId) return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
 
+    await tenantAccess.assertLocationAccess(req, { siteId: req.params.id });
     let site = await Site.findOne({ _id: req.params.id, tenantId: tenantObjectId });
     if (!site) {
       return res.status(404).json({ message: "Site not found" });
@@ -450,6 +458,7 @@ exports.deleteSite = async (req, res) => {
     const tenantObjectId = toObjectId(tenantIdStr);
     if (!tenantObjectId) return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
 
+    await tenantAccess.assertLocationAccess(req, { siteId });
     const site = await Site.findOne({ _id: siteId, tenantId: tenantObjectId });
     if (!site) return res.status(404).json({ message: "Site not found" });
 
@@ -506,6 +515,7 @@ exports.uploadFileToSite = async (req, res) => {
     const tenantObjectId = toObjectId(tenantIdStr);
     if (!tenantObjectId) return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
 
+    await tenantAccess.assertLocationAccess(req, { siteId: req.params.id });
     const site = await Site.findOne({ _id: req.params.id, tenantId: tenantObjectId });
     if (!site) return res.status(404).json({ message: "Site not found" });
 
@@ -564,6 +574,7 @@ exports.getFilesOfSite = async (req, res) => {
     const tenantIdStr = req.scope?.tenantId;
     const tenantObjectId = toObjectId(tenantIdStr);
     if (!tenantObjectId) return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
+    await tenantAccess.assertLocationAccess(req, { siteId: req.params.id });
     const site = await Site.findOne({ _id: req.params.id, tenantId: tenantObjectId });
     if (!site) return res.status(404).json({ message: "Site not found" });
 
@@ -580,6 +591,7 @@ exports.deleteFileFromSite = async (req, res) => {
     const tenantIdStr = req.scope?.tenantId;
     const tenantObjectId = toObjectId(tenantIdStr);
     if (!tenantObjectId) return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
+    await tenantAccess.assertLocationAccess(req, { siteId });
 
     const site = await Site.findOne({ _id: siteId, tenantId: tenantObjectId });
     if (!site) return res.status(404).json({ message: "Site not found" });

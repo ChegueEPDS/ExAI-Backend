@@ -6,6 +6,8 @@ const DownloadQuota = require('../models/downloadQuota');
 const Subscription = require('../models/subscription');
 const SubscriptionModel = Subscription; // alias for clarity if needed elsewhere
 const Tenant = require('../models/tenant');
+const TenantAccessGroup = require('../models/tenantAccessGroup');
+const TenantAccessGroupMembership = require('../models/tenantAccessGroupMembership');
 const Certificate = require('../models/certificate');
 const DraftCertificate = require('../models/draftCertificate');
 const path = require('path');
@@ -318,7 +320,7 @@ exports.listUsers = async (req, res) => {
 
     const userIds = rows.map((row) => row.id).filter(Boolean);
     const tenantIds = rows.map((row) => row.tenantId).filter(Boolean);
-    const [contributionRows, pendingRows] = userIds.length
+    const [contributionRows, pendingRows, membershipRows] = userIds.length
       ? await Promise.all([
           Certificate.aggregate([
             { $match: { createdBy: { $in: userIds }, visibility: 'public' } },
@@ -333,14 +335,40 @@ exports.listUsers = async (req, res) => {
               }
             },
             { $group: { _id: '$createdBy', count: { $sum: 1 } } }
-          ])
+          ]),
+          TenantAccessGroupMembership.find({ userId: { $in: userIds } })
+            .where('tenantId')
+            .in(tenantIds)
+            .select('userId groupId')
+            .lean()
         ])
-      : [[], []];
+      : [[], [], []];
+
+    const accessGroupIds = [...new Set((membershipRows || []).map((row) => String(row.groupId)).filter(Boolean))];
+    const accessGroups = accessGroupIds.length
+      ? await TenantAccessGroup.find({ _id: { $in: accessGroupIds }, tenantId: { $in: tenantIds }, active: true })
+          .select('_id name')
+          .lean()
+      : [];
+    const accessGroupById = new Map(accessGroups.map((group) => [
+      String(group._id),
+      { _id: String(group._id), name: group.name }
+    ]));
+    const accessGroupsByUser = new Map();
+    for (const membership of membershipRows || []) {
+      const group = accessGroupById.get(String(membership.groupId));
+      if (!group) continue;
+      const key = String(membership.userId);
+      const list = accessGroupsByUser.get(key) || [];
+      list.push(group);
+      accessGroupsByUser.set(key, list);
+    }
 
     const contributionByUser = new Map((contributionRows || []).map((row) => [String(row._id), Number(row.count || 0)]));
     const pendingByUser = new Map((pendingRows || []).map((row) => [String(row._id), Number(row.count || 0)]));
     const enrichedRows = rows.map((row) => ({
       ...row,
+      accessGroups: accessGroupsByUser.get(String(row.id)) || [],
       publicContributionCount: contributionByUser.get(String(row.id)) || 0,
       pendingCount: pendingByUser.get(String(row.id)) || 0
     }));

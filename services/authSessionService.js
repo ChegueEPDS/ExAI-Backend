@@ -6,6 +6,7 @@ const Tenant = require('../models/tenant');
 const Subscription = require('../models/subscription');
 const Session = require('../models/session');
 const { computePermissions, getEffectiveProfessions } = require('../helpers/rbac');
+const tenantAccessService = require('./tenantAccessService');
 
 const ACCESS_COOKIE = 'access_token';
 const REFRESH_COOKIE = 'refresh_token';
@@ -114,7 +115,7 @@ function randomToken(bytes = 48) {
 
 async function getTenantMeta(tenantId) {
   if (!tenantId) return { name: null, type: null, professionRbacEnabled: false };
-  const t = await Tenant.findById(tenantId).lean().select('name type professionRbacEnabled plan seats seatsManaged');
+  const t = await Tenant.findById(tenantId).lean().select('name type features professionRbacEnabled plan seats seatsManaged');
   return t
     ? {
         name: t.name || null,
@@ -178,13 +179,48 @@ async function buildUserContext(user, session = null) {
   const tenantId = String(user.tenantId || session?.tenantId || '');
   const meta = await getTenantMeta(tenantId);
   const subscription = await getSubscriptionSnapshot(tenantId);
-  const professionRbacEnabled = Boolean(meta.professionRbacEnabled);
+  const tenantFeatures = tenantAccessService.normalizeTenantFeatures(meta.tenant || meta);
+  const professionRbacEnabled = Boolean(tenantFeatures.professionRbac);
   const effectiveProfessions = professionRbacEnabled
     ? getEffectiveProfessions({ role: user.role, professions: user.professions })
     : ['manager'];
-  const permissions = professionRbacEnabled
+  let permissions = professionRbacEnabled
     ? computePermissions({ role: user.role, professions: effectiveProfessions })
     : ['*:*'];
+  let access = null;
+  try {
+    const accessCtx = await tenantAccessService.getAccessContext({
+      id: String(user._id),
+      userId: String(user._id),
+      role: user.role,
+      tenantId,
+      professions: effectiveProfessions,
+      permissions,
+    });
+    permissions = await tenantAccessService.getPermissionStrings({
+      id: String(user._id),
+      userId: String(user._id),
+      role: user.role,
+      tenantId,
+      professions: effectiveProfessions,
+      permissions,
+    });
+    access = {
+      groupRbacEnabled: Boolean(accessCtx.groupRbacEnabled),
+      allSites: Boolean(accessCtx.allSites),
+      siteIds: accessCtx.siteIds || [],
+      zoneIds: accessCtx.zoneIds || [],
+      features: accessCtx.features || tenantFeatures,
+    };
+  } catch {
+    access = {
+      groupRbacEnabled: false,
+      allSites: true,
+      siteIds: [],
+      zoneIds: [],
+      features: tenantFeatures,
+    };
+  }
   const plan =
     (subscription && (subscription.plan || subscription.tier)) ||
     meta.tenant?.plan ||
@@ -202,6 +238,8 @@ async function buildUserContext(user, session = null) {
     lastName: user.lastName || '',
     azureId: user.azureId || null,
     professionRbacEnabled,
+    tenantFeatures,
+    access,
     professions: effectiveProfessions,
     permissions,
     subscription,
@@ -225,6 +263,8 @@ async function signAccessToken(user, session) {
     lastName: ctx.lastName,
     azureId: ctx.azureId,
     professionRbacEnabled: ctx.professionRbacEnabled,
+    tenantFeatures: ctx.tenantFeatures,
+    access: ctx.access,
     professions: ctx.professions,
     permissions: ctx.permissions,
     subscription: ctx.subscription,

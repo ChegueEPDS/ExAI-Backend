@@ -12,6 +12,10 @@ const TenantJoinInviteSchema = new mongoose.Schema(
       type: [{ type: String, enum: ['manager', 'operative', 'ex_inspector', 'technician'] }],
       default: undefined,
     },
+    accessGroupIds: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'TenantAccessGroup' }],
+      default: undefined,
+    },
     tokenHash: { type: String, required: true, unique: true, index: true },
     status: {
       type: String,

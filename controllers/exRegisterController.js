@@ -28,6 +28,7 @@ const EquipmentDataVersion = require('../models/equipmentDataVersion');
 const { createEquipmentDataVersion } = require('../services/equipmentVersioningService');
 const { recordTombstone } = require('../services/syncTombstoneService');
 const { sanitizeCustomFields } = require('../services/customFieldService');
+const tenantAccess = require('../services/tenantAccessService');
 const {
   equipmentMarkings,
   certificateNo,
@@ -1078,6 +1079,7 @@ function equipmentListExportGroupForHeader(header) {
     'Declaration of conformity'
   ].includes(header)) return 'CERTIFICATION';
   if ([
+    'Zone Name',
     'Zone',
     'Gas / Dust Group',
     'Temp Rating',
@@ -1106,6 +1108,68 @@ function buildEquipmentListExportColumns(headers) {
     width: Math.min(Math.max(String(header).length + 4, 14), 42),
     comment: 'Exported equipment data.'
   }));
+}
+
+function isTruthyQueryValue(value) {
+  return ['true', '1', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+async function getZoneScopeIdsForQuery(tenantId, zoneId, includeSubzones = false) {
+  if (!zoneId) return [];
+  if (!mongoose.Types.ObjectId.isValid(String(zoneId))) return [];
+  const zoneObjectId = new mongoose.Types.ObjectId(String(zoneId));
+  if (!includeSubzones) return [zoneObjectId];
+
+  const zones = await Zone.find({
+    tenantId,
+    $or: [
+      { _id: zoneObjectId },
+      { ancestors: zoneObjectId }
+    ]
+  }).select('_id').lean();
+
+  const ids = zones.map((zone) => zone._id).filter(Boolean);
+  return ids.length ? ids : [zoneObjectId];
+}
+
+function equipmentZoneCondition(zoneIds) {
+  const ids = (zoneIds || []).filter(Boolean);
+  if (!ids.length) return { _id: { $exists: false } };
+  return {
+    $or: [
+      { Zone: { $in: ids } },
+      { Unit: { $in: ids } }
+    ]
+  };
+}
+
+function zoneIdForEquipment(equipment) {
+  const zoneId = equipment?.Zone || equipment?.Unit || null;
+  return zoneId ? String(zoneId) : '';
+}
+
+function orderIndexForEquipment(equipment) {
+  return typeof equipment?.orderIndex === 'number' && Number.isFinite(equipment.orderIndex)
+    ? equipment.orderIndex
+    : Number.MAX_SAFE_INTEGER;
+}
+
+function compareEquipmentByZoneThenOrder(zoneMap) {
+  return (a, b) => {
+    const aZoneId = zoneIdForEquipment(a);
+    const bZoneId = zoneIdForEquipment(b);
+    const aZoneName = (zoneMap.get(aZoneId)?.Name || '').toString();
+    const bZoneName = (zoneMap.get(bZoneId)?.Name || '').toString();
+    const byZone = aZoneName.localeCompare(bZoneName, undefined, { numeric: true, sensitivity: 'base' });
+    if (byZone) return byZone;
+    const byZoneId = aZoneId.localeCompare(bZoneId);
+    if (byZoneId) return byZoneId;
+    const byOrder = orderIndexForEquipment(a) - orderIndexForEquipment(b);
+    if (byOrder) return byOrder;
+    const byCreatedAt = new Date(a?.createdAt || 0).getTime() - new Date(b?.createdAt || 0).getTime();
+    if (byCreatedAt) return byCreatedAt;
+    return String(a?._id || '').localeCompare(String(b?._id || ''));
+  };
 }
 
 async function loadEquipmentExportSchemaColumns(tenantId) {
@@ -1505,7 +1569,17 @@ exports.createEquipment = async (req, res) => {
       let existingEquipment = null;
       if (_id) {
         existingEquipment = await Equipment.findOne({ _id, tenantId });
+        if (existingEquipment) {
+          await tenantAccess.assertLocationAccess(req, {
+            siteId: existingEquipment.Site || equipment.Site || null,
+            zoneId: existingEquipment.Unit || existingEquipment.Zone || equipment.Unit || equipment.Zone || null
+          });
+        }
       }
+      await tenantAccess.assertLocationAccess(req, {
+        siteId: equipment.Site || existingEquipment?.Site || null,
+        zoneId: equipment.Unit || equipment.Zone || existingEquipment?.Unit || existingEquipment?.Zone || null
+      });
 
       const siteIdForPrefix = equipment.Site ? String(equipment.Site) : null;
       const unitIdForPrefix = equipment.Unit || equipment.Zone ? String(equipment.Unit || equipment.Zone) : null;
@@ -1647,12 +1721,10 @@ exports.uploadImagesToEquipment = async (req, res) => {
     const equipmentId = req.params.id;
     const files = Array.isArray(req.files) ? req.files : [];
 
-    const equipment = await Equipment.findById(equipmentId);
     const tenantId = req.scope?.tenantId;
     if (!tenantId) return res.status(401).json({ message: 'Missing tenantId' });
-    if (equipment?.tenantId && String(equipment.tenantId) !== String(tenantId)) {
-      return res.status(403).json({ message: 'Forbidden (wrong tenant)' });
-    }
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const equipment = await Equipment.findOne({ _id: equipmentId, tenantId, ...tenantAccess.buildScopeFilter(accessCtx) });
     if (!equipment) return res.status(404).json({ message: "Equipment not found" });
 
     const tenantName = req.scope?.tenantName || '';
@@ -1715,7 +1787,8 @@ exports.uploadDocumentsToEquipment = async (req, res) => {
       return res.status(401).json({ message: 'Missing tenantId' });
     }
 
-    const equipment = await Equipment.findOne({ _id: equipmentId, tenantId });
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const equipment = await Equipment.findOne({ _id: equipmentId, tenantId, ...tenantAccess.buildScopeFilter(accessCtx) });
     if (!equipment) {
       return res.status(404).json({ message: 'Equipment not found' });
     }
@@ -1802,7 +1875,8 @@ exports.getDocumentsOfEquipment = async (req, res) => {
       return res.status(401).json({ message: 'Missing tenantId' });
     }
 
-    const equipment = await Equipment.findOne({ _id: id, tenantId }).lean();
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const equipment = await Equipment.findOne({ _id: id, tenantId, ...tenantAccess.buildScopeFilter(accessCtx) }).lean();
     if (!equipment) {
       return res.status(404).json({ message: 'Equipment not found' });
     }
@@ -1824,7 +1898,8 @@ exports.deleteDocumentFromEquipment = async (req, res) => {
       return res.status(401).json({ message: 'Missing tenantId' });
     }
 
-    const equipment = await Equipment.findOne({ _id: id, tenantId });
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const equipment = await Equipment.findOne({ _id: id, tenantId, ...tenantAccess.buildScopeFilter(accessCtx) });
     if (!equipment) {
       return res.status(404).json({ message: 'Equipment not found' });
     }
@@ -3113,7 +3188,11 @@ exports.exportEquipmentXLSX = async (req, res) => {
     }
 
     const { ids, zoneId, siteId } = req.query || {};
-    const filter = { tenantId };
+    const includeSubzones = isTruthyQueryValue(req.query?.includeSubzones);
+    const includeLocationZone = includeSubzones || isTruthyQueryValue(req.query?.includeZoneName);
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const filter = { tenantId, ...tenantAccess.buildScopeFilter(accessCtx) };
+    const andConditions = [];
 
     // 1) Kijelölt eszközök (ids paraméter)
     if (ids) {
@@ -3138,8 +3217,19 @@ exports.exportEquipmentXLSX = async (req, res) => {
       filter._id = { $in: objectIds };
     } else {
       // 2) Zóna / projekt alapú szűrés
-      if (zoneId) filter.Zone = zoneId;
+      if (zoneId) {
+        const zoneIds = await getZoneScopeIdsForQuery(tenantId, zoneId, includeSubzones);
+        const zoneCondition = equipmentZoneCondition(zoneIds);
+        if (zoneCondition) andConditions.push(zoneCondition);
+      }
       if (siteId) filter.Site = siteId;
+    }
+
+    if (andConditions.length === 1) {
+      if (filter.$and) filter.$and.push(andConditions[0]);
+      else filter.$and = [andConditions[0]];
+    } else if (andConditions.length > 1) {
+      filter.$and = [...(filter.$and || []), ...andConditions];
     }
 
     const equipments = await Equipment.find(filter)
@@ -3167,7 +3257,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
     const zoneIds = [
       ...new Set(
         equipments
-          .map(e => (e.Zone ? e.Zone.toString() : null))
+          .map(e => zoneIdForEquipment(e) || null)
           .filter(Boolean)
       )
     ];
@@ -3175,6 +3265,9 @@ exports.exportEquipmentXLSX = async (req, res) => {
       ? await Zone.find({ _id: { $in: zoneIds } }).lean()
       : [];
     const zoneMap = new Map(zones.map(z => [z._id.toString(), z]));
+    if (includeSubzones) {
+      equipments.sort(compareEquipmentByZoneThenOrder(zoneMap));
+    }
 
     // ---- Inspection cache (utolsó inspection az eszközhöz) ----
     const lastInspectionIds = [
@@ -3214,6 +3307,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
 	      '#',
 	      'TagNo',
 	      'EqID',
+      ...(includeLocationZone ? ['Location/Zone'] : []),
 	      'Description',
 	      'Manufacturer',
 	      'Model',
@@ -3232,7 +3326,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
 	      'Certificate Issue Date',
 	      'Special Condition',
       'Declaration of conformity',
-      'Zone',
+	      'Zone',
       'Gas / Dust Group',
       'Temp Rating',
       'Ambient Temp',
@@ -3281,6 +3375,14 @@ exports.exportEquipmentXLSX = async (req, res) => {
 
 	    const groupRow = worksheet.getRow(1);
 	    const columnNumber = (header) => headers.indexOf(header) + 1;
+    const identificationStartCol = columnNumber('_id');
+    const identificationEndCol = includeLocationZone ? columnNumber('Location/Zone') : columnNumber('EqID');
+    const equipmentStartCol = columnNumber('Description');
+    const equipmentEndCol = columnNumber('Qualitycheck');
+    const exStartCol = columnNumber('EPL');
+    const exEndCol = columnNumber('Protection Concept');
+    const certificationStartCol = columnNumber('Certificate No');
+    const certificationEndCol = columnNumber('Declaration of conformity');
 	    const projectStartCol = includeProjectSkid ? columnNumber('Skid ID') : null;
 	    const projectEndCol = includeProjectSkid ? columnNumber('Project ID') : null;
 	    const zoneStartCol = columnNumber('Zone');
@@ -3295,13 +3397,13 @@ exports.exportEquipmentXLSX = async (req, res) => {
 	    const schemaEndCol = schemaStartCol ? schemaStartCol + schemaExportColumns.length - 1 : 0;
 
     groupRow.getCell(1).value = 'IDENTIFICATION';
-    worksheet.mergeCells(1, 1, 1, 4);
-	    groupRow.getCell(5).value = 'EQUIPMENT DATA';
-	    worksheet.mergeCells(1, 5, 1, 10);
-	    groupRow.getCell(11).value = 'EX DATA';
-	    worksheet.mergeCells(1, 11, 1, 18);
-	    groupRow.getCell(19).value = 'CERTIFICATION';
-	    worksheet.mergeCells(1, 19, 1, 22);
+    worksheet.mergeCells(1, identificationStartCol, 1, identificationEndCol);
+	    groupRow.getCell(equipmentStartCol).value = 'EQUIPMENT DATA';
+	    worksheet.mergeCells(1, equipmentStartCol, 1, equipmentEndCol);
+	    groupRow.getCell(exStartCol).value = 'EX DATA';
+	    worksheet.mergeCells(1, exStartCol, 1, exEndCol);
+	    groupRow.getCell(certificationStartCol).value = 'CERTIFICATION';
+	    worksheet.mergeCells(1, certificationStartCol, 1, certificationEndCol);
 	    if (includeProjectSkid) {
 	      groupRow.getCell(projectStartCol).value = 'PROJECT / SKID';
 	      worksheet.mergeCells(1, projectStartCol, 1, projectEndCol);
@@ -3328,10 +3430,10 @@ exports.exportEquipmentXLSX = async (req, res) => {
 	    }
 
 	    const groupColorRanges = [
-	      { start: 1, end: 4, color: 'FF00AA00' },
-	      { start: 5, end: 10, color: 'FFFF9900' },
-	      { start: 11, end: 18, color: 'FF538DD5' },
-	      { start: 19, end: 22, color: 'FF00AA00' }
+	      { start: identificationStartCol, end: identificationEndCol, color: 'FF00AA00' },
+	      { start: equipmentStartCol, end: equipmentEndCol, color: 'FFFF9900' },
+	      { start: exStartCol, end: exEndCol, color: 'FF538DD5' },
+	      { start: certificationStartCol, end: certificationEndCol, color: 'FF00AA00' }
 	    ];
 	    if (includeProjectSkid) {
 	      groupColorRanges.push({ start: projectStartCol, end: projectEndCol, color: 'FF80DEEA' });
@@ -3371,10 +3473,10 @@ exports.exportEquipmentXLSX = async (req, res) => {
     });
 
 	    const headerColorRanges = [
-	      { start: 1, end: 4, color: 'FFCCFFCC' },
-	      { start: 5, end: 10, color: 'FFFFE0B2' },
-	      { start: 11, end: 18, color: 'FFDCE6F1' },
-	      { start: 19, end: 22, color: 'FFCCFFCC' }
+	      { start: identificationStartCol, end: identificationEndCol, color: 'FFCCFFCC' },
+	      { start: equipmentStartCol, end: equipmentEndCol, color: 'FFFFE0B2' },
+	      { start: exStartCol, end: exEndCol, color: 'FFDCE6F1' },
+	      { start: certificationStartCol, end: certificationEndCol, color: 'FFCCFFCC' }
 	    ];
 	    if (includeProjectSkid) {
 	      headerColorRanges.push({ start: projectStartCol, end: projectEndCol, color: 'FFE0F7FA' });
@@ -3502,6 +3604,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
             : equipmentIndex,
           'TagNo': eq['TagNo'] || '',
           'EqID': eq['EqID'] || '',
+          ...(includeLocationZone ? { 'Location/Zone': zone?.Name || '' } : {}),
           'Description': eq['Equipment Type'] || '',
           'Manufacturer': eq.Manufacturer || '',
           'Model': eq['Model/Type'] || '',
@@ -3615,6 +3718,7 @@ exports.exportEquipmentXLSX = async (req, res) => {
     const fileNameParts = ['exregister'];
     if (siteId) fileNameParts.push(`site_${siteId}`);
     if (zoneId) fileNameParts.push(`zone_${zoneId}`);
+    if (includeSubzones) fileNameParts.push('with_subzones');
     const fileName = `${fileNameParts.join('_')}.xlsx`;
 
     res.setHeader('Content-Type', EXCEL_CONTENT_TYPE);
@@ -3643,8 +3747,11 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
     }
 
     const { ids, zoneId, siteId, scheme, EqID } = req.query || {};
+    const includeSubzones = isTruthyQueryValue(req.query?.includeSubzones);
+    const includeZoneName = includeSubzones || isTruthyQueryValue(req.query?.includeZoneName);
     const searchTerm = typeof req.query?.search === 'string' ? req.query.search.trim() : '';
-    const filter = { tenantId };
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const filter = { tenantId, ...tenantAccess.buildScopeFilter(accessCtx) };
     const andConditions = [];
 
     if (ids) {
@@ -3669,7 +3776,11 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
 
       filter._id = { $in: objectIds };
     } else {
-      if (zoneId) filter.Zone = zoneId;
+      if (zoneId) {
+        const zoneIds = await getZoneScopeIdsForQuery(tenantId, zoneId, includeSubzones);
+        const zoneCondition = equipmentZoneCondition(zoneIds);
+        if (zoneCondition) andConditions.push(zoneCondition);
+      }
       if (siteId) filter.Site = siteId;
       if (EqID) filter.EqID = EqID;
     }
@@ -3681,9 +3792,10 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
     }
 
     if (andConditions.length === 1) {
-      Object.assign(filter, andConditions[0]);
+      if (filter.$and) filter.$and.push(andConditions[0]);
+      else filter.$and = [andConditions[0]];
     } else if (andConditions.length > 1) {
-      filter.$and = andConditions;
+      filter.$and = [...(filter.$and || []), ...andConditions];
     }
 
     const equipments = await Equipment.find(filter)
@@ -3707,6 +3819,22 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
       }))
 	    ];
     const schemaExportColumns = await loadEquipmentExportSchemaColumns(tenantId);
+    const zoneIds = includeZoneName
+      ? [
+          ...new Set(
+            equipments
+              .map(item => (item?.Zone || item?.Unit ? String(item.Zone || item.Unit) : null))
+              .filter(Boolean)
+          )
+        ]
+      : [];
+    const zones = zoneIds.length
+      ? await Zone.find({ _id: { $in: zoneIds }, tenantId }).select('_id Name').lean()
+      : [];
+    const zoneMap = new Map(zones.map((zone) => [String(zone._id), zone]));
+    if (includeSubzones) {
+      equipments.sort(compareEquipmentByZoneThenOrder(zoneMap));
+    }
 
 	    let hideAtexSpecific = false;
     if (typeof scheme === 'string' && scheme.toUpperCase() === 'IECEX') {
@@ -3721,7 +3849,8 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
 
     const headers = [
       '_id',
-      'EqID',
+	      'EqID',
+      ...(includeZoneName ? ['Zone Name'] : []),
       'TagNo',
       'Manufacturer',
       'Model/Type',
@@ -3769,6 +3898,9 @@ exports.exportEquipmentUiXLSX = async (req, res) => {
     const buildRowBase = (item) => ({
       '_id': item?._id ? item._id.toString() : '',
       'EqID': item?.EqID || '',
+      ...(includeZoneName ? {
+        'Zone Name': zoneMap.get(String(item?.Zone || item?.Unit || ''))?.Name || ''
+      } : {}),
       'TagNo': item?.TagNo || '',
       'Manufacturer': item?.Manufacturer || '',
       'Model/Type': item?.['Model/Type'] || '',
@@ -3886,13 +4018,15 @@ exports.exportZoneCertificateSummary = async (req, res) => {
     if (!zoneId) {
       return res.status(400).json({ message: 'zoneId query parameter is required.' });
     }
+    await tenantAccess.assertLocationAccess(req, { zoneId });
 
     const zone = await Zone.findOne({ _id: zoneId, tenantId }).lean();
     if (!zone) {
       return res.status(404).json({ message: 'Zone not found for this tenant.' });
     }
 
-    const equipments = await Equipment.find({ tenantId, Zone: zoneId })
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const equipments = await Equipment.find({ tenantId, Zone: zoneId, ...tenantAccess.buildScopeFilter(accessCtx) })
       .sort({ orderIndex: 1, createdAt: 1, _id: 1 })
       .lean();
 
@@ -4327,13 +4461,15 @@ exports.exportZoneCertificateSummaryCompact = async (req, res) => {
     if (!zoneId) {
       return res.status(400).json({ message: 'zoneId query parameter is required.' });
     }
+    await tenantAccess.assertLocationAccess(req, { zoneId });
 
     const zone = await Zone.findOne({ _id: zoneId, tenantId }).lean();
     if (!zone) {
       return res.status(404).json({ message: 'Zone not found for this tenant.' });
     }
 
-    const equipments = await Equipment.find({ tenantId, Zone: zoneId })
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const equipments = await Equipment.find({ tenantId, Zone: zoneId, ...tenantAccess.buildScopeFilter(accessCtx) })
       .sort({ orderIndex: 1, createdAt: 1, _id: 1 })
       .lean();
 
@@ -4818,7 +4954,8 @@ exports.getEquipmentById = async (req, res) => {
     if (!tenantId) {
       return res.status(401).json({ error: 'Hiányzó tenant azonosító az auth-ból.' });
     }
-    const equipment = await Equipment.findOne({ _id: id, tenantId }).lean();
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const equipment = await Equipment.findOne({ _id: id, tenantId, ...tenantAccess.buildScopeFilter(accessCtx) }).lean();
 
     if (!equipment) {
       return res.status(404).json({ error: 'Eszköz nem található.' });
@@ -4841,9 +4978,11 @@ exports.listEquipment = async (req, res) => {
       return res.status(401).json({ error: 'Nincs bejelentkezett felhasználó vagy hiányzó tenant.' });
     }
 
-    const filter = { tenantId };
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const filter = { tenantId, ...tenantAccess.buildScopeFilter(accessCtx) };
     const searchTerm = typeof req.query.search === 'string' ? req.query.search.trim() : '';
     const andConditions = [];
+    const includeSubzones = isTruthyQueryValue(req.query.includeSubzones);
 
     if (req.query.updatedSince) {
       const raw = String(req.query.updatedSince).trim();
@@ -4855,7 +4994,9 @@ exports.listEquipment = async (req, res) => {
     }
 
     if (req.query.Zone) {
-      filter.Zone = req.query.Zone;
+      const zoneIds = await getZoneScopeIdsForQuery(tenantId, req.query.Zone, includeSubzones);
+      const zoneCondition = equipmentZoneCondition(zoneIds);
+      if (zoneCondition) andConditions.push(zoneCondition);
     } else if (req.query.noZone) {
       andConditions.push({ $or: [{ Zone: null }, { Zone: { $exists: false } }] });
     }
@@ -4893,9 +5034,10 @@ exports.listEquipment = async (req, res) => {
     }
 
     if (andConditions.length === 1) {
-      Object.assign(filter, andConditions[0]);
+      if (filter.$and) filter.$and.push(andConditions[0]);
+      else filter.$and = [andConditions[0]];
     } else if (andConditions.length > 1) {
-      filter.$and = andConditions;
+      filter.$and = [...(filter.$and || []), ...andConditions];
     }
 
     // Hide mobile-created equipment until async processing is finished.
@@ -4957,6 +5099,20 @@ exports.listEquipment = async (req, res) => {
       certMap = new Map();
     }
 
+    const equipmentZoneIds = includeSubzones
+      ? [
+          ...new Set(
+            equipments
+              .map(eq => (eq?.Zone || eq?.Unit ? String(eq.Zone || eq.Unit) : null))
+              .filter(Boolean)
+          )
+        ]
+      : [];
+    const zones = equipmentZoneIds.length
+      ? await Zone.find({ _id: { $in: equipmentZoneIds }, tenantId }).select('_id Name').lean()
+      : [];
+    const zoneMap = new Map(zones.map((zone) => [String(zone._id), zone]));
+
     const withPaths = equipments.map(eq => {
       const operationalStatus = eq.operationalStatus || 'operating';
       const firstBlobUrl =
@@ -4997,6 +5153,7 @@ exports.listEquipment = async (req, res) => {
 
       return {
         ...eq,
+        ZoneName: zoneMap.get(String(eq.Zone || eq.Unit || ''))?.Name || '',
         operationalStatus,
         'Ex Marking': equipmentMarkings(eq),
         'Certificate No': certificateNo(eq) || '',
@@ -5035,7 +5192,8 @@ exports.updateEquipment = async (req, res) => {
       return res.status(401).json({ error: 'Hiányzó jogosultság (tenant).' });
     }
 
-    const equipment = await Equipment.findOne({ _id: id, tenantId });
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const equipment = await Equipment.findOne({ _id: id, tenantId, ...tenantAccess.buildScopeFilter(accessCtx) });
     if (!equipment) {
       return res.status(404).json({ error: 'Eszköz nem található.' });
     }
@@ -5048,6 +5206,10 @@ exports.updateEquipment = async (req, res) => {
     } else {
       updatedFields = { ...req.body };
     }
+    await tenantAccess.assertLocationAccess(req, {
+      siteId: updatedFields.Site || equipment.Site || null,
+      zoneId: updatedFields.Unit || updatedFields.Zone || equipment.Unit || equipment.Zone || null
+    });
 
     const oldEqID = req.body.OriginalEqID || equipment.EqID;
 
@@ -5204,7 +5366,8 @@ exports.listEquipmentDataVersions = async (req, res) => {
     const tenantId = req.scope?.tenantId;
     if (!tenantId) return res.status(401).json({ message: 'Missing tenantId' });
 
-    const equipment = await Equipment.findOne({ _id: id, tenantId }).select('_id').lean();
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const equipment = await Equipment.findOne({ _id: id, tenantId, ...tenantAccess.buildScopeFilter(accessCtx) }).select('_id').lean();
     if (!equipment) return res.status(404).json({ message: 'Equipment not found' });
 
     const versions = await EquipmentDataVersion.find({ tenantId, equipmentId: id })
@@ -5227,7 +5390,8 @@ exports.getEquipmentDataVersion = async (req, res) => {
     const tenantId = req.scope?.tenantId;
     if (!tenantId) return res.status(401).json({ message: 'Missing tenantId' });
 
-    const equipment = await Equipment.findOne({ _id: id, tenantId }).select('_id').lean();
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const equipment = await Equipment.findOne({ _id: id, tenantId, ...tenantAccess.buildScopeFilter(accessCtx) }).select('_id').lean();
     if (!equipment) return res.status(404).json({ message: 'Equipment not found' });
 
     const versionDoc = await EquipmentDataVersion.findOne({
@@ -5328,7 +5492,8 @@ exports.deleteEquipment = async (req, res) => {
       return res.status(401).json({ error: 'Nincs bejelentkezett felhasználó vagy hiányzó tenant.' });
     }
     const tenantName = req.scope?.tenantName || '';
-    const equipment = await Equipment.findOne({ _id: id, tenantId });
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const equipment = await Equipment.findOne({ _id: id, tenantId, ...tenantAccess.buildScopeFilter(accessCtx) });
     if (!equipment) {
       return res.status(404).json({ error: 'Az eszköz nem található vagy nem tartozik a vállalatához.' });
     }
@@ -5381,7 +5546,8 @@ exports.bulkDeleteEquipment = async (req, res) => {
       return res.status(400).json({ error: 'Érvénytelen eszköz azonosítók.' });
     }
 
-    const equipments = await Equipment.find({ _id: { $in: objectIds }, tenantId });
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const equipments = await Equipment.find({ _id: { $in: objectIds }, tenantId, ...tenantAccess.buildScopeFilter(accessCtx) });
     if (!equipments.length) {
       return res.status(404).json({ error: 'Egyik megadott eszköz sem található vagy nem tartozik a vállalatához.' });
     }

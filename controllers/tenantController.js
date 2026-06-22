@@ -1,6 +1,7 @@
 // controllers/tenantController.js
 const Tenant = require('../models/tenant');
 const Stripe = require('stripe');
+const { ensureDefaultTenantAccessGroups } = require('../services/defaultTenantAccessGroups');
 
 let stripe = null;
 try {
@@ -19,12 +20,22 @@ function slugify(name) {
     .substring(0, 64);
 }
 
-function normalizeFeatures(features, tenantType) {
+function normalizeFeatures(features, tenantType, legacy = {}) {
   const hasMaintenance = features && Object.prototype.hasOwnProperty.call(features, 'maintenance');
+  const hasProfessionRbac = features && Object.prototype.hasOwnProperty.call(features, 'professionRbac');
+  const hasGroupRbac = features && Object.prototype.hasOwnProperty.call(features, 'groupRbac');
+  const hasCustomFields = features && Object.prototype.hasOwnProperty.call(features, 'customFields');
+  const hasCustomSchemas = features && Object.prototype.hasOwnProperty.call(features, 'customSchemas');
   return {
     maintenance: String(tenantType || '').toLowerCase() === 'personal'
       ? false
-      : (hasMaintenance ? Boolean(features.maintenance) : false)
+      : (hasMaintenance ? Boolean(features.maintenance) : false),
+    professionRbac: hasProfessionRbac ? Boolean(features.professionRbac) : Boolean(legacy.professionRbacEnabled),
+    groupRbac: String(tenantType || '').toLowerCase() === 'personal'
+      ? false
+      : (hasGroupRbac ? Boolean(features.groupRbac) : false),
+    customFields: hasCustomFields ? Boolean(features.customFields) : false,
+    customSchemas: hasCustomSchemas ? Boolean(features.customSchemas) : false,
   };
 }
 
@@ -32,7 +43,7 @@ function normalizeTenantFeaturesForResponse(tenant) {
   if (!tenant) return tenant;
   return {
     ...tenant,
-    features: normalizeFeatures(tenant.features, tenant.type)
+    features: normalizeFeatures(tenant.features, tenant.type, tenant)
   };
 }
 
@@ -185,7 +196,13 @@ exports.createTenant = async (req, res) => {
       ownerUserId: ownerUserId || undefined,
       seats: { max: seatsMax, used: 0 },
       seatsManaged,
-      features: { maintenance: false }
+      features: {
+        maintenance: false,
+        professionRbac: false,
+        groupRbac: false,
+        customFields: false,
+        customSchemas: false
+      }
     });
 
     return res.status(201).json(t);
@@ -249,6 +266,13 @@ exports.updateTenant = async (req, res) => {
 
     const { name, seatsMax, seatsManaged, plan, professionRbacEnabled, features } = req.body || {};
     const updates = {};
+    const currentFeatures = normalizeFeatures(
+      tenant.features?.toObject ? tenant.features.toObject() : tenant.features || {},
+      tenant.type,
+      tenant
+    );
+    let shouldProvisionDefaultAccessGroups = false;
+    let provisionFeatureSnapshot = null;
 
     // name (slug + ensure unique)
     if (typeof name === 'string' && name.trim()) {
@@ -330,6 +354,7 @@ exports.updateTenant = async (req, res) => {
         return res.status(403).json({ message: 'Only SuperAdmin can change profession RBAC settings.' });
       }
       updates.professionRbacEnabled = Boolean(professionRbacEnabled);
+      updates['features.professionRbac'] = Boolean(professionRbacEnabled);
     }
 
     // Tenant feature flags (SuperAdmin only)
@@ -338,15 +363,42 @@ exports.updateTenant = async (req, res) => {
         return res.status(403).json({ message: 'Only SuperAdmin can change tenant feature settings.' });
       }
       if (features && typeof features === 'object' && !Array.isArray(features)) {
+        const nextFeatures = normalizeFeatures({ ...currentFeatures, ...features }, tenant.type);
         if (features.maintenance !== undefined) {
-          if (tenant.type === 'personal' && Boolean(features.maintenance)) {
+          if (tenant.type === 'personal' && nextFeatures.maintenance) {
             return res.status(400).json({ message: 'Maintenance cannot be enabled for personal tenants.' });
           }
-          updates['features.maintenance'] = Boolean(features.maintenance);
+          updates['features.maintenance'] = nextFeatures.maintenance;
+        }
+        if (features.professionRbac !== undefined) {
+          updates['features.professionRbac'] = nextFeatures.professionRbac;
+          updates.professionRbacEnabled = nextFeatures.professionRbac;
+        }
+        if (features.groupRbac !== undefined) {
+          if (tenant.type === 'personal' && nextFeatures.groupRbac) {
+            return res.status(400).json({ message: 'Group RBAC cannot be enabled for personal tenants.' });
+          }
+          updates['features.groupRbac'] = nextFeatures.groupRbac;
+          shouldProvisionDefaultAccessGroups = !currentFeatures.groupRbac && nextFeatures.groupRbac;
+          provisionFeatureSnapshot = nextFeatures;
+        }
+        if (features.customFields !== undefined) {
+          updates['features.customFields'] = nextFeatures.customFields;
+        }
+        if (features.customSchemas !== undefined) {
+          updates['features.customSchemas'] = nextFeatures.customSchemas;
         }
       } else {
         return res.status(400).json({ message: 'Invalid features payload.' });
       }
+    }
+
+    if (shouldProvisionDefaultAccessGroups) {
+      await ensureDefaultTenantAccessGroups({
+        tenantId: tenant._id,
+        tenantFeatures: provisionFeatureSnapshot,
+        actorUserId: req.userId || req.user?._id || null,
+      });
     }
 
     // Végrehajtás

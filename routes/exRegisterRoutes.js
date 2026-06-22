@@ -3,7 +3,7 @@ const router = express.Router();
 const exRegisterController = require('../controllers/exRegisterController');
 const maintenanceController = require('../controllers/maintenanceController');
 const authMiddleware = require('../middlewares/authMiddleware');
-const { requirePermission } = require('../middlewares/permissionMiddleware');
+const { requireAccess } = require('../middlewares/tenantAccessMiddleware');
 const { requireTenantFeature } = require('../middlewares/tenantFeatureMiddleware');
 const multer = require('multer'); 
 const upload = multer({ dest: 'uploads/' });
@@ -11,17 +11,17 @@ const upload = multer({ dest: 'uploads/' });
 
 
 // Létrehozás
-router.post('/exreg', authMiddleware(), requirePermission('asset:write'), upload.array('pictures'), exRegisterController.createEquipment);
+router.post('/exreg', authMiddleware(), requireAccess('equipment', 'create'), upload.array('pictures'), exRegisterController.createEquipment);
 
-router.post('/exreg/import', authMiddleware(), requirePermission('asset:write'), express.json(), exRegisterController.createEquipment);
+router.post('/exreg/import', authMiddleware(), requireAccess('equipment', 'create'), express.json(), exRegisterController.createEquipment);
 
-router.post('/exreg/:id/upload-images', authMiddleware(), requirePermission('asset:write'), upload.array('pictures'), exRegisterController.uploadImagesToEquipment);
+router.post('/exreg/:id/upload-images', authMiddleware(), requireAccess('equipment', 'update'), upload.array('pictures'), exRegisterController.uploadImagesToEquipment);
 
 // Equipment documents (images + files) upload / list / delete
 router.post(
   '/exreg/:id/upload-documents',
   authMiddleware(),
-  requirePermission('asset:write'),
+  requireAccess('equipment', 'update'),
   upload.array('files'),
   exRegisterController.uploadDocumentsToEquipment
 );
@@ -29,7 +29,7 @@ router.post(
 router.post(
   '/exreg/import-xlsx',
   authMiddleware(),
-  requirePermission('asset:write'),
+  requireAccess('equipment', 'create'),
   upload.single('file'),
   exRegisterController.importEquipmentXLSX
 );
@@ -44,7 +44,7 @@ router.get(
 router.post(
   '/exreg/import-documents-zip',
   authMiddleware(),
-  requirePermission('asset:write'),
+  requireAccess('equipment', 'create'),
   upload.single('file'),
   exRegisterController.importEquipmentDocumentsZip
 );
@@ -53,7 +53,7 @@ router.post(
 router.post(
   '/exreg/import-documents-zip/cleanup-temp',
   authMiddleware(),
-  requirePermission('asset:write'),
+  requireAccess('equipment', 'update'),
   exRegisterController.cleanupTempUploadsNow
 );
 
@@ -68,18 +68,21 @@ router.get(
 router.get(
   '/exreg/export-xlsx',
   authMiddleware(),
+  requireAccess('equipment', 'read'),
   exRegisterController.exportEquipmentXLSX
 );
 
 router.get(
   '/exreg/export-ui-xlsx',
   authMiddleware(),
+  requireAccess('equipment', 'read'),
   exRegisterController.exportEquipmentUiXLSX
 );
 
 router.get(
   '/exreg/certificate-summary',
   authMiddleware(),
+  requireAccess('equipment', 'read'),
   exRegisterController.exportZoneCertificateSummary
 );
 
@@ -87,6 +90,7 @@ router.get(
 router.get(
   '/exreg/certificate-summary-compact',
   authMiddleware(),
+  requireAccess('equipment', 'read'),
   exRegisterController.exportZoneCertificateSummaryCompact
 );
 
@@ -94,42 +98,43 @@ router.get(
 router.get(
   '/exreg/:id/documents',
   authMiddleware(),
+  requireAccess('equipment', 'read'),
   exRegisterController.getDocumentsOfEquipment
 );
 
 router.delete(
   '/exreg/:id/documents/:docId',
   authMiddleware(),
-  requirePermission('asset:write'),
+  requireAccess('equipment', 'update'),
   exRegisterController.deleteDocumentFromEquipment
 );
 
 // Listázás
-router.get('/exreg', authMiddleware(), exRegisterController.listEquipment);
+router.get('/exreg', authMiddleware(), requireAccess('equipment', 'read'), exRegisterController.listEquipment);
 
 // Lekérés ID alapján (GET /exreg/:id)
-router.get('/exreg/:id', authMiddleware(), exRegisterController.getEquipmentById);
+router.get('/exreg/:id', authMiddleware(), requireAccess('equipment', 'read'), exRegisterController.getEquipmentById);
 
 // Equipment data history (SCD2-like versions)
-router.get('/exreg/:id/versions', authMiddleware(), exRegisterController.listEquipmentDataVersions);
-router.get('/exreg/:id/versions/:versionId', authMiddleware(), exRegisterController.getEquipmentDataVersion);
+router.get('/exreg/:id/versions', authMiddleware(), requireAccess('equipment', 'read'), exRegisterController.listEquipmentDataVersions);
+router.get('/exreg/:id/versions/:versionId', authMiddleware(), requireAccess('equipment', 'read'), exRegisterController.getEquipmentDataVersion);
 
 // Unified timeline history: inspections + equipment versions + maintenance actions
-router.get('/exreg/:id/history', authMiddleware(), maintenanceController.getEquipmentHistory);
+router.get('/exreg/:id/history', authMiddleware(), requireAccess('equipment', 'read'), maintenanceController.getEquipmentHistory);
 
 // Maintenance actions
-router.post('/exreg/:id/maintenance/faults', authMiddleware(), requireTenantFeature('maintenance'), requirePermission(['maintenance:manage', 'maintenance:fault:report']), maintenanceController.reportFault);
-router.post('/exreg/:id/maintenance/repairs/start', authMiddleware(), requireTenantFeature('maintenance'), requirePermission('maintenance:manage'), maintenanceController.startRepair);
-router.post('/exreg/:id/maintenance/repairs/:repairId/complete', authMiddleware(), requireTenantFeature('maintenance'), requirePermission('maintenance:manage'), maintenanceController.completeRepair);
-router.post('/exreg/:id/maintenance/schemas/:schemaId/activities', authMiddleware(), requireTenantFeature('maintenance'), requirePermission('maintenance:manage'), express.json(), maintenanceController.createCustomActivity);
+router.post('/exreg/:id/maintenance/faults', authMiddleware(), requireTenantFeature('maintenance'), requireAccess('maintenance', 'create'), maintenanceController.reportFault);
+router.post('/exreg/:id/maintenance/repairs/start', authMiddleware(), requireTenantFeature('maintenance'), requireAccess('maintenance', 'update'), maintenanceController.startRepair);
+router.post('/exreg/:id/maintenance/repairs/:repairId/complete', authMiddleware(), requireTenantFeature('maintenance'), requireAccess('maintenance', 'update'), maintenanceController.completeRepair);
+router.post('/exreg/:id/maintenance/schemas/:schemaId/activities', authMiddleware(), requireTenantFeature('maintenance'), requireAccess('maintenance', 'create'), express.json(), maintenanceController.createCustomActivity);
 
 // Módosítás
-router.put('/exreg/:id', authMiddleware(), requirePermission('asset:write'), upload.array('pictures'), exRegisterController.updateEquipment);
+router.put('/exreg/:id', authMiddleware(), requireAccess('equipment', 'update'), upload.array('pictures'), exRegisterController.updateEquipment);
 
 // Törlés
-router.delete('/exreg/:id', authMiddleware(), requirePermission('asset:write'), exRegisterController.deleteEquipment);
+router.delete('/exreg/:id', authMiddleware(), requireAccess('equipment', 'delete'), exRegisterController.deleteEquipment);
 
 // Tömeges törlés
-router.post('/exreg/bulk-delete', authMiddleware(), requirePermission('asset:write'), express.json(), exRegisterController.bulkDeleteEquipment);
+router.post('/exreg/bulk-delete', authMiddleware(), requireAccess('equipment', 'delete'), express.json(), exRegisterController.bulkDeleteEquipment);
 
 module.exports = router;

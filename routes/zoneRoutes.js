@@ -3,38 +3,38 @@ const router = express.Router();
 const zoneController = require('../controllers/zoneController');
 const healthMetricsController = require('../controllers/healthMetricsController');
 const authMiddleware = require('../middlewares/authMiddleware');
-const { requirePermission } = require('../middlewares/permissionMiddleware');
+const { requireAccess } = require('../middlewares/tenantAccessMiddleware');
 const { requireTenantFeature } = require('../middlewares/tenantFeatureMiddleware');
 const multer = require('multer');
 const upload = multer({ dest: 'uploads/' });
 
 // Új projekt létrehozása
-router.post('/', authMiddleware(), requirePermission('zone:write'), zoneController.createZone);
+router.post('/', authMiddleware(), requireAccess('zone', 'create'), zoneController.createZone);
 
 // Összes projekt lekérdezése
-router.get('/', authMiddleware(), zoneController.getZones);
+router.get('/', authMiddleware(), requireAccess('zone', 'read'), zoneController.getZones);
 
 // Egy konkrét projekt lekérdezése ID alapján
-router.get('/:id', authMiddleware(), zoneController.getZoneById);
+router.get('/:id', authMiddleware(), requireAccess('zone', 'read'), zoneController.getZoneById);
 
 // Operational status summary (maintenance states)
-router.get('/:id/operational-summary', authMiddleware(), zoneController.getZoneOperationalSummary);
-router.get('/:id/maintenance-severity-summary', authMiddleware(), requireTenantFeature('maintenance'), zoneController.getZoneMaintenanceSeveritySummary);
-router.get('/:id/health-metrics', authMiddleware(), healthMetricsController.getZoneHealthMetrics);
+router.get('/:id/operational-summary', authMiddleware(), requireAccess('zone', 'read'), zoneController.getZoneOperationalSummary);
+router.get('/:id/maintenance-severity-summary', authMiddleware(), requireTenantFeature('maintenance'), requireAccess('zone', 'read'), zoneController.getZoneMaintenanceSeveritySummary);
+router.get('/:id/health-metrics', authMiddleware(), requireAccess('zone', 'read'), healthMetricsController.getZoneHealthMetrics);
 
 // Projekt módosítása ID alapján
-router.put('/:id', authMiddleware(), requirePermission('zone:write'), zoneController.updateZone);
+router.put('/:id', authMiddleware(), requireAccess('zone', 'update'), zoneController.updateZone);
 
 // Projekt áthelyezése (parent váltás)
-router.patch('/:id/move', authMiddleware(), requirePermission('zone:write'), zoneController.moveZone);
+router.patch('/:id/move', authMiddleware(), requireAccess('zone', 'update'), zoneController.moveZone);
 
 // Projekt törlése ID alapján
-router.delete('/:id', authMiddleware(), requirePermission('zone:write'), zoneController.deleteZone);
+router.delete('/:id', authMiddleware(), requireAccess('zone', 'delete'), zoneController.deleteZone);
 
 router.post(
     '/:id/upload-file',
     authMiddleware(),
-    requirePermission('zone:write'),
+    requireAccess('zone', 'update'),
     upload.array('files'),
     zoneController.uploadFileToZone
   );
@@ -43,7 +43,7 @@ router.post(
 router.post(
   '/import-xlsx',
   authMiddleware(),
-  requirePermission('zone:write'),
+  requireAccess('zone', 'create'),
   upload.single('file'),
   zoneController.importZonesFromXlsx
 );
@@ -51,13 +51,14 @@ router.post(
   router.get(
     '/:id/files',
     authMiddleware(),
+    requireAccess('zone', 'read'),
     zoneController.getFilesOfZone
   );
 
   router.delete(
     '/:zoneId/files/:fileId',
     authMiddleware(),
-    requirePermission('zone:write'),
+    requireAccess('zone', 'update'),
     zoneController.deleteFileFromZone
   );
 
@@ -65,7 +66,7 @@ router.post(
   router.delete(
     '/:id/equipment-images',
     authMiddleware(),
-    requirePermission('zone:write'),
+    requireAccess('zone', 'delete'),
     zoneController.deleteEquipmentImagesInZone
   );
 

@@ -18,6 +18,7 @@ const { sanitizeCustomFields } = require('../services/customFieldService');
 const { ensureRbSchema } = require('../services/schemaSeedService');
 const { ensureRbAssignment, getRbValues, complianceStatus } = require('../services/rbSchemaValueService');
 const { shouldOpenMobileEquipmentConflict } = require('../services/mobileSyncConflictService');
+const tenantAccess = require('../services/tenantAccessService');
 const { extractDataplateFieldsFromImageBuffer } = require('../services/dataplateProcessingService');
 
 const toObjectId = (value) => {
@@ -539,6 +540,7 @@ exports.mobileSync = async (req, res) => {
     if (!siteId || !zoneId) {
       return res.status(400).json({ message: `Item ${tempId}: missing Site/Zone.` });
     }
+    await tenantAccess.assertLocationAccess(req, { siteId, zoneId });
 
     const hasOwn = (obj, key) => !!obj && typeof obj === 'object' && Object.prototype.hasOwnProperty.call(obj, key);
     const clearBaseFields = new Set(Array.isArray(item?.clearBaseFields) ? item.clearBaseFields.map((k) => String(k || '').trim()).filter(Boolean) : []);

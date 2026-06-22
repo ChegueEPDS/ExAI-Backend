@@ -2,8 +2,11 @@
 const Tenant = require('../models/tenant');
 const User = require('../models/user');
 const TenantJoinInvite = require('../models/tenantJoinInvite');
+const TenantAccessGroup = require('../models/tenantAccessGroup');
+const TenantAccessGroupMembership = require('../models/tenantAccessGroupMembership');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
+const mongoose = require('mongoose');
 const mailService = require('../services/mailService');
 const { tenantInviteEmailHtml, tenantJoinInviteEmailHtml } = require('../services/mailTemplates');
 const { resolvePublicBaseUrl, persistPublicBaseUrlIfMissing } = require('../helpers/publicBaseUrl');
@@ -25,6 +28,28 @@ function generatePassword() {
   return pwd.split('').sort(() => Math.random() - 0.5).join('');
 }
 
+async function syncUserAccessGroups({ tenantId, userId, groupIds, actorId }) {
+  if (!Array.isArray(groupIds)) return null;
+  const validGroupIds = Array.from(new Set(groupIds.filter(Boolean).map(String)))
+    .filter((id) => mongoose.Types.ObjectId.isValid(id));
+  const groups = await TenantAccessGroup.find({
+    _id: { $in: validGroupIds },
+    tenantId,
+    active: { $ne: false },
+  }).select('_id').lean();
+  const validIds = groups.map((g) => String(g._id));
+  await TenantAccessGroupMembership.deleteMany({ tenantId, userId, groupId: { $nin: validIds } });
+  const ops = validIds.map((groupId) => ({
+    updateOne: {
+      filter: { tenantId, groupId, userId },
+      update: { $setOnInsert: { tenantId, groupId, userId, addedBy: actorId || null } },
+      upsert: true,
+    },
+  }));
+  if (ops.length) await TenantAccessGroupMembership.bulkWrite(ops, { ordered: false });
+  return validIds;
+}
+
 function hashInviteToken(token) {
   return crypto.createHash('sha256').update(String(token || '')).digest('hex');
 }
@@ -38,7 +63,7 @@ function inviteExpiryDate() {
   return new Date(Date.now() + days * 24 * 60 * 60 * 1000);
 }
 
-async function createOrRefreshJoinInvite({ req, user, fromTenantId, toTenant, invitedBy, targetRole, professions }) {
+async function createOrRefreshJoinInvite({ req, user, fromTenantId, toTenant, invitedBy, targetRole, professions, accessGroupIds }) {
   const rawToken = generateInviteToken();
   const tokenHash = hashInviteToken(rawToken);
   const expiresAt = inviteExpiryDate();
@@ -66,6 +91,7 @@ async function createOrRefreshJoinInvite({ req, user, fromTenantId, toTenant, in
     invitedByUserId: invitedBy._id,
     targetRole: targetRole === 'Admin' ? 'Admin' : 'User',
     ...(Array.isArray(professions) && professions.length ? { professions } : {}),
+    ...(Array.isArray(accessGroupIds) && accessGroupIds.length ? { accessGroupIds } : {}),
     tokenHash,
     status: 'pending',
     expiresAt,
@@ -134,6 +160,7 @@ exports.createInvite = async (req, res) => {
     lastName: bodyLastName,
     nickname: bodyNickname,
     professions: bodyProfessions,
+    accessGroupIds,
   } = req.body || {};
 
   const tenantId = callerRole === 'SuperAdmin' ? (bodyTenantId || callerTenantId) : callerTenantId;
@@ -264,6 +291,7 @@ exports.createInvite = async (req, res) => {
           invitedBy,
           targetRole,
           professions,
+          accessGroupIds,
         });
       } catch (err) {
         console.warn('[mail] tenant join invite failed:', err?.message || err);
@@ -289,6 +317,13 @@ exports.createInvite = async (req, res) => {
       });
     }
   }
+
+  await syncUserAccessGroups({
+    tenantId,
+    userId: user._id,
+    groupIds: accessGroupIds,
+    actorId: req.user?.id || req.userId || null,
+  });
 
   // --- E-mail (fire-and-forget) ---
   (async () => {
@@ -452,6 +487,12 @@ exports.acceptJoinInvite = async (req, res) => {
       user.professions = invite.professions;
     }
     await user.save();
+    await syncUserAccessGroups({
+      tenantId: invite.toTenantId,
+      userId: user._id,
+      groupIds: invite.accessGroupIds,
+      actorId: invite.invitedByUserId,
+    });
 
     if (fromTenantId) {
       await Tenant.updateOne(

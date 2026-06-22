@@ -18,6 +18,7 @@ const { ensureRbSchema } = require('../services/schemaSeedService');
 const { ensureRbAssignment } = require('../services/rbSchemaValueService');
 const { normalizeRbValues } = require('../services/schemaRules/rbRules');
 const { getMaterializedSummary, scheduleDashboardStatsDirty } = require('../services/dashboardSummaryService');
+const tenantAccess = require('../services/tenantAccessService');
 
 // Helper: convert string tenantId to ObjectId safely
 const toObjectId = (id) => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null);
@@ -118,6 +119,7 @@ exports.createZone = async (req, res) => {
     if (!siteIdFinal) {
       return res.status(400).json({ message: 'Missing Site for unit' });
     }
+    await tenantAccess.assertLocationAccess(req, { siteId: siteIdFinal, zoneId: parentUnitId || null });
 
     const tempId = typeof mobileSync?.tempId === 'string' ? mobileSync.tempId.trim() : '';
     if (tempId) {
@@ -261,6 +263,8 @@ exports.getZones = async (req, res) => {
       }
     }
 
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    query = { ...query, ...tenantAccess.buildScopeFilter(accessCtx, { siteField: 'Site', zoneField: '_id', unitField: '_id' }) };
     const zones = await Unit.find(query).populate('CreatedBy', 'nickname');
     res.status(200).json(zones);
   } catch (error) {
@@ -273,7 +277,12 @@ exports.getZoneById = async (req, res) => {
     const tenantIdStr = req.scope?.tenantId;
     const tenantObjectId = toObjectId(tenantIdStr);
     if (!tenantObjectId) return res.status(400).json({ error: 'Invalid or missing tenantId in auth' });
-    const zone = await Unit.findOne({ _id: req.params.id, tenantId: tenantObjectId }).populate('CreatedBy', 'nickname');
+    const accessCtx = await tenantAccess.getAccessContext(req);
+    const zone = await Unit.findOne({
+      _id: req.params.id,
+      tenantId: tenantObjectId,
+      ...tenantAccess.buildScopeFilter(accessCtx, { siteField: 'Site', zoneField: '_id', unitField: '_id' })
+    }).populate('CreatedBy', 'nickname');
     if (!zone) return res.status(404).json({ error: 'Zone not found' });
     res.status(200).json(zone);
   } catch (error) {
@@ -294,6 +303,7 @@ exports.getZoneOperationalSummary = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(zoneId)) {
       return res.status(400).json({ message: 'Invalid zone id.' });
     }
+    await tenantAccess.assertLocationAccess(req, { zoneId });
 
     const summary = await getMaterializedSummary({
       kind: 'operational-summary',
@@ -322,6 +332,7 @@ exports.getZoneMaintenanceSeveritySummary = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(zoneId)) {
       return res.status(400).json({ message: 'Invalid zone id.' });
     }
+    await tenantAccess.assertLocationAccess(req, { zoneId });
 
     const summary = await getMaterializedSummary({
       kind: 'maintenance-severity-summary',
@@ -348,6 +359,7 @@ exports.updateZone = async (req, res) => {
     const tenantObjectId = toObjectId(tenantIdStr);
     if (!tenantObjectId) return res.status(400).json({ error: 'Invalid or missing tenantId in auth' });
 
+    await tenantAccess.assertLocationAccess(req, { zoneId: req.params.id });
     const zone = await Unit.findOne({ _id: req.params.id, tenantId: tenantObjectId });
     if (!zone) return res.status(404).json({ error: 'Zone not found' });
 
@@ -391,6 +403,8 @@ exports.moveZone = async (req, res) => {
     if (newParentUnitId && String(newParentUnitId) === String(unitId)) {
       return res.status(400).json({ message: 'Unit cannot be its own parent.' });
     }
+    await tenantAccess.assertLocationAccess(req, { zoneId: unitId });
+    if (newParentUnitId) await tenantAccess.assertLocationAccess(req, { zoneId: newParentUnitId });
 
     const unit = await Unit.findOne({ _id: unitId, tenantId: tenantObjectId });
     if (!unit) return res.status(404).json({ message: 'Unit not found.' });
@@ -461,6 +475,7 @@ exports.deleteZone = async (req, res) => {
     const tenantName = req.scope?.tenantName || '';
     const tenantObjectId = toObjectId(tenantIdStr);
     if (!tenantObjectId) return res.status(400).json({ error: 'Invalid or missing tenantId in auth' });
+    await tenantAccess.assertLocationAccess(req, { zoneId });
 
     const zone = await Unit.findOne({ _id: zoneId, tenantId: tenantObjectId });
     if (!zone) return res.status(404).json({ error: 'Zone not found' });
@@ -521,6 +536,7 @@ exports.importZonesFromXlsx = async (req, res) => {
     if (!siteId || !mongoose.Types.ObjectId.isValid(siteId)) {
       return res.status(400).json({ message: 'Valid siteId must be provided in the form data or query.' });
     }
+    await tenantAccess.assertLocationAccess(req, { siteId });
 
     const site = await Site.findOne({ _id: siteId, tenantId: tenantObjectId }).select('Name');
     if (!site) {
@@ -801,6 +817,7 @@ exports.uploadFileToZone = async (req, res) => {
     const tenantName = req.scope?.tenantName || '';
     const tenantObjectId = toObjectId(tenantIdStr);
     if (!tenantObjectId) return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
+    await tenantAccess.assertLocationAccess(req, { zoneId: req.params.id });
 
     const zone = await Unit.findOne({ _id: req.params.id, tenantId: tenantObjectId });
     if (!zone) return res.status(404).json({ message: "Zone not found" });
@@ -858,6 +875,7 @@ exports.getFilesOfZone = async (req, res) => {
     const tenantIdStr = req.scope?.tenantId;
     const tenantObjectId = toObjectId(tenantIdStr);
     if (!tenantObjectId) return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
+    await tenantAccess.assertLocationAccess(req, { zoneId: req.params.id });
     const zone = await Unit.findOne({ _id: req.params.id, tenantId: tenantObjectId });
     if (!zone) return res.status(404).json({ message: "Zone not found" });
     res.status(200).json(zone.documents || []);
@@ -872,6 +890,7 @@ exports.deleteFileFromZone = async (req, res) => {
     const tenantIdStr = req.scope?.tenantId;
     const tenantObjectId = toObjectId(tenantIdStr);
     if (!tenantObjectId) return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
+    await tenantAccess.assertLocationAccess(req, { zoneId });
     const zone = await Unit.findOne({ _id: zoneId, tenantId: tenantObjectId });
     if (!zone) return res.status(404).json({ message: "Zone not found" });
 
@@ -904,6 +923,7 @@ exports.deleteEquipmentImagesInZone = async (req, res) => {
     if (!tenantObjectId) {
       return res.status(400).json({ message: 'Invalid or missing tenantId in auth' });
     }
+    await tenantAccess.assertLocationAccess(req, { zoneId });
 
     const zone = await Unit.findOne({ _id: zoneId, tenantId: tenantObjectId }).select('_id Name');
     if (!zone) {

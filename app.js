@@ -65,6 +65,7 @@ const publicRotRoutes = require('./routes/publicRotRoutes');
 const customFieldRoutes = require('./routes/customFieldRoutes');
 const schemaRoutes = require('./routes/schemaRoutes');
 const navigationRoutes = require('./routes/navigationRoutes');
+const tenantAccessRoutes = require('./routes/tenantAccessRoutes');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -373,6 +374,7 @@ app.use('/api', notificationsRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api', upgradeRoutes);
 app.use('/api', tenantRoutes);
+app.use('/api', tenantAccessRoutes);
 app.use('/api', healthMetricsRoutes);
 app.use('/api', statusSummaryRoutes);
 app.use('/api', rootCauseRoutes);

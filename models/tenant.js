@@ -73,6 +73,22 @@ const TenantSchema = new mongoose.Schema(
       maintenance: {
         type: Boolean,
         default: false
+      },
+      professionRbac: {
+        type: Boolean,
+        default: false
+      },
+      groupRbac: {
+        type: Boolean,
+        default: false
+      },
+      customFields: {
+        type: Boolean,
+        default: false
+      },
+      customSchemas: {
+        type: Boolean,
+        default: false
       }
     },
 
@@ -108,8 +124,12 @@ TenantSchema.pre('validate', function (next) {
   if (this.type === 'personal') {
     this.features = {
       ...(this.features || {}),
-      maintenance: false
+      maintenance: false,
+      groupRbac: false
     };
+  }
+  if (this.professionRbacEnabled && this.features) {
+    this.features.professionRbac = true;
   }
   next();
 });
