@@ -529,6 +529,13 @@ exports.importZonesFromXlsx = async (req, res) => {
 
     const file = req.file;
     const siteId = req.body?.siteId || req.query?.siteId;
+    const parentUnitIdRaw = req.body?.parentUnitId ?? req.query?.parentUnitId ?? null;
+    const parentUnitIdText = parentUnitIdRaw === null || parentUnitIdRaw === undefined
+      ? ''
+      : String(parentUnitIdRaw).trim();
+    const parentUnitId = parentUnitIdText && parentUnitIdText !== 'null' && parentUnitIdText !== 'undefined'
+      ? toObjectId(parentUnitIdText)
+      : null;
 
     if (!file) {
       return res.status(400).json({ message: 'Missing XLSX file (field name: file).' });
@@ -536,12 +543,26 @@ exports.importZonesFromXlsx = async (req, res) => {
     if (!siteId || !mongoose.Types.ObjectId.isValid(siteId)) {
       return res.status(400).json({ message: 'Valid siteId must be provided in the form data or query.' });
     }
-    await tenantAccess.assertLocationAccess(req, { siteId });
+    if (parentUnitIdText && !parentUnitId) {
+      return res.status(400).json({ message: 'Invalid parentUnitId format.' });
+    }
 
     const site = await Site.findOne({ _id: siteId, tenantId: tenantObjectId }).select('Name');
     if (!site) {
       return res.status(404).json({ message: 'Site not found for this tenant.' });
     }
+
+    let parentUnit = null;
+    if (parentUnitId) {
+      parentUnit = await Unit.findOne({ _id: parentUnitId, tenantId: tenantObjectId }).select('_id Site ancestors depth');
+      if (!parentUnit) {
+        return res.status(404).json({ message: 'Parent zone not found for this tenant.' });
+      }
+      if (String(parentUnit.Site) !== String(site._id)) {
+        return res.status(400).json({ message: 'Parent zone must belong to the provided site.' });
+      }
+    }
+    await tenantAccess.assertLocationAccess(req, { siteId: site._id, zoneId: parentUnit?._id || null });
 
     const workbook = xlsx.readFile(file.path);
     const firstSheetName = workbook.SheetNames[0];
@@ -648,10 +669,15 @@ exports.importZonesFromXlsx = async (req, res) => {
       const AmbientTempMax = ambMaxRaw !== '' && ambMaxRaw !== null ? Number(ambMaxRaw) : undefined;
 
       try {
+        const nameKey = typeof Unit.normalizeNameKey === 'function' ? Unit.normalizeNameKey(name) : name;
         const existing = await Unit.findOne({
           tenantId: tenantObjectId,
           Site: site._id,
-          Name: name
+          parentUnitId: parentUnit ? parentUnit._id : null,
+          $or: [
+            { nameKey },
+            { Name: name }
+          ]
         });
 
         const rbValuesInput = {
@@ -669,7 +695,10 @@ exports.importZonesFromXlsx = async (req, res) => {
         const payload = {
           Name: name,
           Description: description || undefined,
-          Site: site._id
+          Site: site._id,
+          parentUnitId: parentUnit ? parentUnit._id : null,
+          ancestors: parentUnit ? [...(parentUnit.ancestors || []), parentUnit._id] : [],
+          depth: parentUnit ? Number(parentUnit.depth || 0) + 1 : 0
         };
 
         // clientReq csak index tenantnál értelmezett

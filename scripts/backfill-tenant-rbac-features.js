@@ -141,6 +141,10 @@ async function upsertGroupWithMembers({ tenantId, name, description, permissions
 }
 
 async function seedDefaultGroupsForTenant({ tenant, features, users, apply }) {
+  if (String(tenant.type || '').toLowerCase() === 'personal') {
+    return [];
+  }
+
   const tenantId = tenant._id;
   const tenantUsers = users.filter((user) => String(user.tenantId || '') === String(tenantId));
   const groups = [
@@ -252,7 +256,12 @@ async function main() {
 
   const changed = [];
   const seededGroups = [];
-  for (const tenant of tenants) {
+  let skippedPersonalDefaultGroups = 0;
+  for (const [index, tenant] of tenants.entries()) {
+    if (apply && (index === 0 || (index + 1) % 25 === 0 || index + 1 === tenants.length)) {
+      console.error(`[rbac-backfill] processing tenant ${index + 1}/${tenants.length}: ${tenant.name}`);
+    }
+
     const nextFeatures = inferFeatures(tenant, usage, { enableGroupRbac });
     if (enableGroupRbac && (seedLegacyGroups || seedDefaultGroups) && String(tenant.type || '').toLowerCase() !== 'personal') {
       nextFeatures.groupRbac = true;
@@ -300,7 +309,11 @@ async function main() {
       }
     }
 
-    if (seedDefaultGroups) {
+    if (seedDefaultGroups && String(tenant.type || '').toLowerCase() === 'personal') {
+      skippedPersonalDefaultGroups += 1;
+    }
+
+    if (seedDefaultGroups && String(tenant.type || '').toLowerCase() !== 'personal') {
       const plannedGroups = await seedDefaultGroupsForTenant({
         tenant,
         features: nextFeatures,
@@ -347,6 +360,7 @@ async function main() {
     seedLegacyGroups,
     enableGroupRbac,
     checked: tenants.length,
+    skippedPersonalDefaultGroups,
     wouldUpdate: changed.length,
     updated: apply ? changed.length : 0,
     changed,
@@ -354,6 +368,7 @@ async function main() {
   }, null, 2));
 
   await mongoose.disconnect();
+  process.exit(0);
 }
 
 main().catch(async (err) => {
