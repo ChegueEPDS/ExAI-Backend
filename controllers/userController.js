@@ -220,6 +220,7 @@ exports.listUsers = async (req, res) => {
           position: 1,
           positionInfo: 1,
           azureId: 1,
+          lastLoginAt: 1,
           tenantId: 1,
           tenantName: '$tenant.name',
           tenantPlan: '$tenant.plan',
@@ -257,6 +258,7 @@ exports.listUsers = async (req, res) => {
       subscriptionStatus: 'subscriptionStatus',
       subscriptionExpiresAt: 'subscriptionExpiresAt',
       azureId: 'azureId',
+      lastLoginAt: 'lastLoginAt',
       stats: 'publicContributionCount'
     };
     const sortField = sortFieldMap[sortByRaw] || 'firstName';

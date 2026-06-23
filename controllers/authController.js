@@ -269,6 +269,30 @@ function sendAuthResult(req, res, result, extra = {}) {
   });
 }
 
+function attachAuthResultToRequest(req, result) {
+  const user = result?.user;
+  if (!user) return;
+  req.user = { ...user, tokenType: 'access' };
+  req.userId = user.id || user.userId;
+  req.role = user.role;
+  req.scope = {
+    userId: user.id || user.userId,
+    tenantId: user.tenantId,
+    tenantName: user.tenantName,
+    tenantType: user.tenantType,
+    professionRbacEnabled: Boolean(user.professionRbacEnabled),
+    plan: user.plan || null,
+    sessionId: result?.session ? String(result.session._id) : user.sessionId,
+  };
+}
+
+async function markInteractiveLogin(user) {
+  if (!user?._id) return;
+  const lastLoginAt = new Date();
+  user.lastLoginAt = lastLoginAt;
+  await User.updateOne({ _id: user._id }, { $set: { lastLoginAt } });
+}
+
 // ----------------------
 // 🔹 Felhasználó regisztráció (email + jelszó)
 //   Body elvárt / opcionális mezők: firstName, lastName, email, password, nickname?, role?, tenantName?
@@ -440,6 +464,8 @@ exports.login = async (req, res) => {
 
     stepLog('sign-token-start');
     const authResult = await createSession({ user, clientType: getClientType(req), req });
+    await markInteractiveLogin(user);
+    attachAuthResultToRequest(req, authResult);
     stepLog('sign-token-done');
     stepLog('success-response');
     return sendAuthResult(req, res, authResult);
@@ -513,6 +539,7 @@ exports.verifyEmail = async (req, res) => {
     }
 
     const authResult = await createSession({ user, clientType: getClientType(req), req });
+    attachAuthResultToRequest(req, authResult);
 
     return sendAuthResult(req, res, authResult, {
       message: 'Email verified successfully',
@@ -641,6 +668,8 @@ exports.microsoftLogin = async (req, res) => {
     }
 
     const authResult = await createSession({ user, clientType: getClientType(req), req });
+    await markInteractiveLogin(user);
+    attachAuthResultToRequest(req, authResult);
     return sendAuthResult(req, res, authResult);
   } catch (error) {
     console.error('❌ Microsoft login error:', error);

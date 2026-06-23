@@ -11,6 +11,7 @@ if (process.env.WORKER_ONLY === '1' || process.env.WORKER_ONLY === 'true') {
 }
 
 const requestIdMiddleware = require('./middlewares/requestIdMiddleware');
+const auditMiddleware = require('./middlewares/auditMiddleware');
 const limiter = require('./middlewares/rateLimiter');
 const systemSettingsStore = require('./services/systemSettingsStore');
 const { seedInitialSuperAdminIfEmpty } = require('./services/bootstrapSuperAdmin');
@@ -66,6 +67,7 @@ const customFieldRoutes = require('./routes/customFieldRoutes');
 const schemaRoutes = require('./routes/schemaRoutes');
 const navigationRoutes = require('./routes/navigationRoutes');
 const tenantAccessRoutes = require('./routes/tenantAccessRoutes');
+const auditRoutes = require('./routes/auditRoutes');
 
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
@@ -270,6 +272,7 @@ app.use('/api', billingWebhook);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(limiter);
+app.use(auditMiddleware);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/results', express.static(path.join(__dirname, 'results')));
 app.get('/health', (req, res) => {
@@ -375,6 +378,7 @@ app.use('/api/billing', billingRoutes);
 app.use('/api', upgradeRoutes);
 app.use('/api', tenantRoutes);
 app.use('/api', tenantAccessRoutes);
+app.use('/api', auditRoutes);
 app.use('/api', healthMetricsRoutes);
 app.use('/api', statusSummaryRoutes);
 app.use('/api', rootCauseRoutes);

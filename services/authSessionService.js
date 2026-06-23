@@ -236,6 +236,7 @@ async function buildUserContext(user, session = null) {
     nickname: user.nickname || null,
     firstName: user.firstName || '',
     lastName: user.lastName || '',
+    email: user.email || '',
     azureId: user.azureId || null,
     professionRbacEnabled,
     tenantFeatures,

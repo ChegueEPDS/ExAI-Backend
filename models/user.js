@@ -59,6 +59,9 @@ const UserSchema = new mongoose.Schema(
     pendingCheckoutCompanyName: { type: String },
     pendingCheckoutPromoCode: { type: String },
     pendingCheckoutCampaign: { type: String },
+
+    // Last successful interactive sign-in. Token refreshes do not update this.
+    lastLoginAt: { type: Date, index: true },
   },
   { timestamps: true }
 );
