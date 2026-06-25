@@ -6,6 +6,8 @@ const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 const AUTH_ACTION_PATHS = new Map([
   ['/api/login', 'auth.login'],
   ['/api/microsoft-login', 'auth.microsoftLogin'],
+  ['/api/renew-token', 'auth.renewToken'],
+  ['/api/auth/refresh', 'auth.renewToken'],
   ['/api/logout', 'auth.logout'],
   ['/api/auth/change-password', 'auth.changePassword'],
 ]);
@@ -87,10 +89,17 @@ function toObjectId(value) {
 
 async function writeAuditLog(req, res, overrides = {}) {
   try {
+    const statusCode = overrides.statusCode || res?.statusCode;
+    if (
+      Number(statusCode) === 401 &&
+      ['/api/renew-token', '/api/auth/refresh'].includes(normalizePath(req))
+    ) {
+      return;
+    }
+
     const user = overrides.user || req.user || null;
     const scope = req.scope || {};
     const { resourceType, resourceId } = getResourceFromRequest(req);
-    const statusCode = overrides.statusCode || res?.statusCode;
 
     await AuditLog.create({
       actorUserId: toObjectId(overrides.actorUserId || user?.id || user?._id || scope.userId),

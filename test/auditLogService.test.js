@@ -1,7 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { inferAction, shouldAuditRequest } = require('../services/auditLogService');
+const AuditLog = require('../models/auditLog');
+const { inferAction, shouldAuditRequest, writeAuditLog } = require('../services/auditLogService');
 
 function req(overrides = {}) {
   return {
@@ -26,6 +27,25 @@ test('should audit auth endpoints but not the audit table itself', () => {
 
 test('infers stable action names from auth paths and resources', () => {
   assert.equal(inferAction(req({ method: 'POST', originalUrl: '/api/login' })), 'auth.login');
+  assert.equal(inferAction(req({ method: 'POST', originalUrl: '/api/renew-token' })), 'auth.renewToken');
   assert.equal(inferAction(req({ method: 'PATCH', originalUrl: '/api/users/123/professions' })), 'users.update');
   assert.equal(inferAction(req({ method: 'DELETE', originalUrl: '/api/user/123' })), 'user.delete');
+});
+
+test('skips noisy failed renew-token audit rows', async () => {
+  const originalCreate = AuditLog.create;
+  let called = false;
+  AuditLog.create = async () => {
+    called = true;
+  };
+
+  try {
+    await writeAuditLog(
+      req({ method: 'POST', originalUrl: '/api/renew-token' }),
+      { statusCode: 401 }
+    );
+    assert.equal(called, false);
+  } finally {
+    AuditLog.create = originalCreate;
+  }
 });
