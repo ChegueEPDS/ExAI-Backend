@@ -35,6 +35,22 @@ function getAuthAction(req) {
   return AUTH_ACTION_PATHS.get(normalizePath(req)) || null;
 }
 
+function getCertificateAction(req) {
+  const path = normalizePath(req);
+  const method = String(req.method || '').toUpperCase();
+  if (method === 'POST' && path === '/api/certificates/upload') {
+    const visibility = String(req.body?.visibility || '').toLowerCase();
+    const isPublicFlag = req.body?.isPublic === true || req.body?.isPublic === 'true';
+    return (visibility === 'public' || isPublicFlag)
+      ? 'certificate.create.public'
+      : 'certificate.create.private';
+  }
+  if (method === 'POST' && path === '/api/certificates/sas') {
+    return 'certificate.download';
+  }
+  return null;
+}
+
 function getResourceFromRequest(req) {
   const path = normalizePath(req);
   const segments = path.split('/').filter(Boolean);
@@ -87,6 +103,8 @@ function shouldAuditResponse(req, statusCode) {
 function inferAction(req) {
   const authAction = getAuthAction(req);
   if (authAction) return authAction;
+  const certificateAction = getCertificateAction(req);
+  if (certificateAction) return certificateAction;
 
   const { resourceType } = getResourceFromRequest(req);
   const method = String(req.method || '').toUpperCase();

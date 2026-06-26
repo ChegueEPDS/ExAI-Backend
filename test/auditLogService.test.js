@@ -40,6 +40,10 @@ test('audits API 5xx responses even for read requests', () => {
 test('infers stable action names from auth paths and resources', () => {
   assert.equal(inferAction(req({ method: 'POST', originalUrl: '/api/login' })), 'auth.login');
   assert.equal(inferAction(req({ method: 'POST', originalUrl: '/api/renew-token' })), 'auth.renewToken');
+  assert.equal(inferAction(req({ method: 'POST', originalUrl: '/api/certificates/upload', body: { visibility: 'public' } })), 'certificate.create.public');
+  assert.equal(inferAction(req({ method: 'POST', originalUrl: '/api/certificates/upload', body: { visibility: 'private' } })), 'certificate.create.private');
+  assert.equal(inferAction(req({ method: 'POST', originalUrl: '/api/certificates/upload', body: { isPublic: 'true' } })), 'certificate.create.public');
+  assert.equal(inferAction(req({ method: 'POST', originalUrl: '/api/certificates/sas' })), 'certificate.download');
   assert.equal(inferAction(req({ method: 'PATCH', originalUrl: '/api/users/123/professions' })), 'users.update');
   assert.equal(inferAction(req({ method: 'DELETE', originalUrl: '/api/user/123' })), 'user.delete');
 });
