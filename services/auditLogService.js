@@ -68,6 +68,22 @@ function shouldAuditRequest(req) {
   return WRITE_METHODS.has(String(req.method || '').toUpperCase());
 }
 
+function shouldSkipAuditResponse(req, statusCode) {
+  return (
+    Number(statusCode) === 401 &&
+    ['/api/renew-token', '/api/auth/refresh'].includes(normalizePath(req))
+  );
+}
+
+function shouldAuditResponse(req, statusCode) {
+  if (!req || req.auditDisabled) return false;
+  const path = normalizePath(req);
+  if (path.startsWith('/api/admin/audit-logs')) return false;
+  if (shouldSkipAuditResponse(req, statusCode)) return false;
+  if (shouldAuditRequest(req)) return true;
+  return path.startsWith('/api/') && Number(statusCode) >= 500;
+}
+
 function inferAction(req) {
   const authAction = getAuthAction(req);
   if (authAction) return authAction;
@@ -87,13 +103,31 @@ function toObjectId(value) {
   return mongoose.Types.ObjectId.isValid(raw) ? new mongoose.Types.ObjectId(raw) : undefined;
 }
 
+function serializeError(error) {
+  if (!error) return undefined;
+  const err = error instanceof Error ? error : new Error(String(error));
+  const stackLines = String(err.stack || '').split('\n').slice(0, 8).join('\n');
+  return {
+    errorName: err.name || 'Error',
+    errorMessage: String(err.message || '').slice(0, 1000),
+    errorCode: err.code ? String(err.code).slice(0, 100) : undefined,
+    stack: stackLines ? stackLines.slice(0, 3000) : undefined,
+  };
+}
+
+function normalizeMetadata(metadata) {
+  const raw = metadata || {};
+  if (!raw.responseError) return raw;
+  return {
+    ...raw,
+    errorMessage: raw.errorMessage || String(raw.responseError).slice(0, 1000),
+  };
+}
+
 async function writeAuditLog(req, res, overrides = {}) {
   try {
     const statusCode = overrides.statusCode || res?.statusCode;
-    if (
-      Number(statusCode) === 401 &&
-      ['/api/renew-token', '/api/auth/refresh'].includes(normalizePath(req))
-    ) {
+    if (shouldSkipAuditResponse(req, statusCode)) {
       return;
     }
 
@@ -118,15 +152,40 @@ async function writeAuditLog(req, res, overrides = {}) {
       clientType: req.headers?.['x-client'] ? String(req.headers['x-client']) : undefined,
       ipHash: stableHash(getClientIp(req)),
       userAgentHash: stableHash(req.headers?.['user-agent']),
-      metadata: overrides.metadata,
+      metadata: {
+        ...normalizeMetadata(overrides.metadata),
+        ...(overrides.error ? serializeError(overrides.error) : {}),
+      },
     });
   } catch (err) {
     console.warn('[audit] Failed to write audit log:', err?.message || err);
   }
 }
 
+async function writeSystemAuditLog({ action, error, metadata } = {}) {
+  try {
+    await AuditLog.create({
+      action: action || 'server.error',
+      method: 'SYSTEM',
+      path: 'process',
+      resourceType: 'server-error',
+      statusCode: 500,
+      success: false,
+      metadata: {
+        ...(metadata || {}),
+        ...(error ? serializeError(error) : {}),
+      },
+    });
+  } catch (err) {
+    console.warn('[audit] Failed to write system audit log:', err?.message || err);
+  }
+}
+
 module.exports = {
   inferAction,
+  serializeError,
+  shouldAuditResponse,
   shouldAuditRequest,
   writeAuditLog,
+  writeSystemAuditLog,
 };

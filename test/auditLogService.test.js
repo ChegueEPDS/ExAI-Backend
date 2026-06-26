@@ -2,7 +2,13 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const AuditLog = require('../models/auditLog');
-const { inferAction, shouldAuditRequest, writeAuditLog } = require('../services/auditLogService');
+const {
+  inferAction,
+  serializeError,
+  shouldAuditRequest,
+  shouldAuditResponse,
+  writeAuditLog
+} = require('../services/auditLogService');
 
 function req(overrides = {}) {
   return {
@@ -23,6 +29,12 @@ test('should audit auth endpoints but not the audit table itself', () => {
   assert.equal(shouldAuditRequest(req({ method: 'POST', originalUrl: '/api/login' })), true);
   assert.equal(shouldAuditRequest(req({ method: 'POST', originalUrl: '/api/logout' })), true);
   assert.equal(shouldAuditRequest(req({ method: 'GET', originalUrl: '/api/admin/audit-logs' })), false);
+});
+
+test('audits API 5xx responses even for read requests', () => {
+  assert.equal(shouldAuditResponse(req({ method: 'GET', originalUrl: '/api/users' }), 500), true);
+  assert.equal(shouldAuditResponse(req({ method: 'GET', originalUrl: '/api/users' }), 200), false);
+  assert.equal(shouldAuditResponse(req({ method: 'GET', originalUrl: '/api/admin/audit-logs' }), 500), false);
 });
 
 test('infers stable action names from auth paths and resources', () => {
@@ -48,4 +60,12 @@ test('skips noisy failed renew-token audit rows', async () => {
   } finally {
     AuditLog.create = originalCreate;
   }
+});
+
+test('serializes error details for diagnostics', () => {
+  const details = serializeError(Object.assign(new Error('database exploded'), { code: 'E_DB' }));
+  assert.equal(details.errorName, 'Error');
+  assert.equal(details.errorMessage, 'database exploded');
+  assert.equal(details.errorCode, 'E_DB');
+  assert.match(details.stack, /database exploded/);
 });

@@ -12,8 +12,10 @@ if (process.env.WORKER_ONLY === '1' || process.env.WORKER_ONLY === 'true') {
 
 const requestIdMiddleware = require('./middlewares/requestIdMiddleware');
 const auditMiddleware = require('./middlewares/auditMiddleware');
+const errorAuditMiddleware = require('./middlewares/errorAuditMiddleware');
 const limiter = require('./middlewares/rateLimiter');
 const systemSettingsStore = require('./services/systemSettingsStore');
+const { writeSystemAuditLog } = require('./services/auditLogService');
 const { seedInitialSuperAdminIfEmpty } = require('./services/bootstrapSuperAdmin');
 const { backgroundJobsDisabled, startWorkerRuntime } = require('./services/workerRuntime');
 const path = require('path');
@@ -402,6 +404,7 @@ app.use('/api', customFieldRoutes);
 app.use('/api', schemaRoutes);
 app.use('/api/public', publicRotRoutes);
 app.use('/api', trainingRoutes);
+app.use(errorAuditMiddleware);
 
 if (!backgroundJobsDisabled()) {
   startWorkerRuntime();
@@ -450,9 +453,11 @@ if (fs.existsSync(frontendDist)) {
 console.log("Starting application...");
 process.on('unhandledRejection', (reason) => {
   logger.error(`Unhandled Rejection: ${reason instanceof Error ? reason.stack : reason}`);
+  writeSystemAuditLog({ action: 'server.unhandledRejection', error: reason });
 });
 process.on('uncaughtException', (err) => {
   logger.error(`Uncaught Exception: ${err.stack || err.message}`);
+  writeSystemAuditLog({ action: 'server.uncaughtException', error: err });
   // Consider graceful shutdown in production
 });
 
