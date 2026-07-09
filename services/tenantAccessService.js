@@ -5,7 +5,7 @@ const TenantAccessGroup = require('../models/tenantAccessGroup');
 const TenantAccessGroupMembership = require('../models/tenantAccessGroupMembership');
 const { computePermissions, hasAnyPermission } = require('../helpers/rbac');
 
-const FEATURE_KEYS = Object.freeze(['maintenance', 'professionRbac', 'groupRbac', 'customFields', 'customSchemas']);
+const FEATURE_KEYS = Object.freeze(['maintenance', 'professionRbac', 'groupRbac', 'customFields', 'customSchemas', 'documentation']);
 
 function toObjectId(value) {
   if (!value) return null;
@@ -27,6 +27,7 @@ function normalizeTenantFeatures(tenant) {
     groupRbac: type === 'personal' ? false : Boolean(raw.groupRbac),
     customFields: Boolean(raw.customFields),
     customSchemas: Boolean(raw.customSchemas),
+    documentation: type === 'personal' ? false : Boolean(raw.documentation),
   };
 }
 
@@ -64,6 +65,7 @@ function groupHasFeatureAccess(group, featureKey) {
     groupRbac: 'user',
     customFields: 'customField',
     customSchemas: 'customSchema',
+    documentation: 'documentation',
   };
   const resource = map[featureKey];
   return resource ? groupHasAnyResourceAction(group, resource) : false;
@@ -82,6 +84,7 @@ function legacyPermissionFor(resource, action) {
     customSchema: { read: 'inspection:read', create: 'inspection:manage', update: 'inspection:manage', delete: 'inspection:manage' },
     manufacturer: { read: 'asset:read', create: 'asset:write', update: 'asset:write', delete: 'asset:write' },
     dashboard: { read: 'asset:read' },
+    documentation: { read: 'site:read', create: 'site:write', update: 'site:write', delete: 'site:write' },
     user: { read: '*:*', create: '*:*', update: '*:*', delete: '*:*' },
   };
   return map[r]?.[a] || `${r}:${a}`;

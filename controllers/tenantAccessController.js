@@ -54,6 +54,7 @@ function normalizePermissions(input) {
     'customSchema',
     'manufacturer',
     'dashboard',
+    'documentation',
     'user',
   ]);
   const out = [];
@@ -74,6 +75,7 @@ function normalizeFeatures(input) {
     groupRbac: Boolean(raw.groupRbac),
     customFields: Boolean(raw.customFields),
     customSchemas: Boolean(raw.customSchemas),
+    documentation: Boolean(raw.documentation),
   };
 }
 
@@ -89,7 +91,16 @@ function deriveFeaturesFromPermissions(permissions) {
     groupRbac: hasAnyActions(permissions, 'user'),
     customFields: hasAnyActions(permissions, 'customField'),
     customSchemas: hasAnyActions(permissions, 'customSchema'),
+    documentation: hasAnyActions(permissions, 'documentation'),
   };
+}
+
+function resourceEnabledForTenant(resource, tenantFeatures = {}) {
+  if (resource === 'maintenance') return tenantFeatures.maintenance === true;
+  if (resource === 'customField') return tenantFeatures.customFields === true;
+  if (resource === 'customSchema') return tenantFeatures.customSchemas === true;
+  if (resource === 'documentation') return tenantFeatures.documentation === true;
+  return true;
 }
 
 function normalizeScope(input) {
@@ -179,12 +190,15 @@ exports.upsertAccessGroup = async (req, res) => {
     const name = String(req.body?.name || '').trim();
     if (name.length < 2) return res.status(400).json({ message: 'Group name is required.' });
 
+    const tenantFeatures = normalizeTenantFeatures(tenant);
+    const permissions = normalizePermissions(req.body?.permissions)
+      .filter((permission) => resourceEnabledForTenant(permission.resource, tenantFeatures));
     const payload = {
       tenantId,
       name,
       description: String(req.body?.description || '').trim(),
       active: req.body?.active !== false,
-      permissions: normalizePermissions(req.body?.permissions),
+      permissions,
       scope: normalizeScope(req.body?.scope),
       updatedBy: req.scope?.userId || req.user?.id || null,
     };

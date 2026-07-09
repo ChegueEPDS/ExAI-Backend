@@ -9,7 +9,7 @@ const TenantAccessGroupMembership = require('../models/tenantAccessGroupMembersh
 
 const DEFAULT_PASSWORD = 'tesz100';
 const CRUD_ACTIONS = ['read', 'create', 'update', 'delete'];
-const ALL_RESOURCES = ['site', 'zone', 'equipment', 'inspection', 'maintenance', 'customField', 'customSchema', 'manufacturer', 'dashboard', 'user'];
+const ALL_RESOURCES = ['site', 'zone', 'equipment', 'inspection', 'maintenance', 'customField', 'customSchema', 'manufacturer', 'dashboard', 'documentation', 'user'];
 const POWERUSER_RESOURCES = ['site', 'zone', 'equipment', 'inspection', 'maintenance', 'customField', 'customSchema', 'manufacturer'];
 
 function argValue(name, fallback = '') {
@@ -47,6 +47,7 @@ function featureDefaults() {
     groupRbac: true,
     customFields: true,
     customSchemas: true,
+    documentation: false,
   };
 }
 
@@ -71,6 +72,7 @@ function featuresFromPermissions(permissions) {
     groupRbac: hasActions('user'),
     customFields: hasActions('customField'),
     customSchemas: hasActions('customSchema'),
+    documentation: hasActions('documentation'),
   };
 }
 

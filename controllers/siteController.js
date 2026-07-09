@@ -17,6 +17,10 @@ const { recordTombstone } = require('../services/syncTombstoneService');
 const { sanitizeCustomFields } = require('../services/customFieldService');
 const { getMaterializedSummary, scheduleDashboardStatsDirty } = require('../services/dashboardSummaryService');
 const tenantAccess = require('../services/tenantAccessService');
+const documentationService = require('../services/documentationService');
+const DocumentationAssignment = require('../models/documentationAssignment');
+const Tenant = require('../models/tenant');
+const { isFeatureEnabled } = require('../middlewares/tenantFeatureMiddleware');
 
 // LEGACY: const axios = require('axios');
 
@@ -578,7 +582,11 @@ exports.getFilesOfSite = async (req, res) => {
     const site = await Site.findOne({ _id: req.params.id, tenantId: tenantObjectId });
     if (!site) return res.status(404).json({ message: "Site not found" });
 
-    res.status(200).json(site.documents || []);
+    const tenant = await Tenant.findById(tenantObjectId).select('type features').lean();
+    const files = isFeatureEnabled(tenant, 'documentation')
+      ? await documentationService.mergeFilesForSite(site, tenantObjectId)
+      : (site.documents || []);
+    res.status(200).json(files || []);
   } catch (error) {
     console.error("❌ File list fetch error:", error.message || error);
     res.status(500).json({ message: "Failed to fetch files", error: error.message });
@@ -595,6 +603,27 @@ exports.deleteFileFromSite = async (req, res) => {
 
     const site = await Site.findOne({ _id: siteId, tenantId: tenantObjectId });
     if (!site) return res.status(404).json({ message: "Site not found" });
+
+    const fileObjectId = toObjectId(fileId);
+    if (fileObjectId) {
+      const globalAssignment = await DocumentationAssignment.findOne({
+        tenantId: tenantObjectId,
+        targetType: 'site',
+        targetId: site._id,
+        $or: [{ _id: fileObjectId }, { documentationId: fileObjectId }],
+      });
+      if (globalAssignment) {
+        const tenant = await Tenant.findById(tenantObjectId).select('type features').lean();
+        if (!isFeatureEnabled(tenant, 'documentation')) {
+          return res.status(403).json({ error: 'Tenant feature disabled', feature: 'documentation' });
+        }
+        if (!(await tenantAccess.can(req, 'documentation', 'update'))) {
+          return res.status(403).json({ error: 'Access denied', resource: 'documentation', action: 'update' });
+        }
+        await DocumentationAssignment.deleteOne({ _id: globalAssignment._id });
+        return res.status(200).json({ message: "Documentation detached from site" });
+      }
+    }
 
     const fileToDelete = site.documents.find(
       doc => doc._id.toString() === fileId || doc.blobPath === fileId || doc.oneDriveId === fileId

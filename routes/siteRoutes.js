@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const siteController = require('../controllers/siteController');
+const documentationController = require('../controllers/documentationController');
 const healthMetricsController = require('../controllers/healthMetricsController');
 const authMiddleware = require('../middlewares/authMiddleware');
 const { requireAccess } = require('../middlewares/tenantAccessMiddleware');
@@ -38,6 +39,20 @@ router.post(
     authMiddleware(),
     requireAccess('site', 'read'),
     siteController.getFilesOfSite
+  );
+  router.post(
+    '/:siteId/documentations/:documentationId',
+    authMiddleware(),
+    requireTenantFeature('documentation'),
+    requireAccess('documentation', 'update'),
+    documentationController.attachToTarget
+  );
+  router.delete(
+    '/:siteId/documentations/:documentationId',
+    authMiddleware(),
+    requireTenantFeature('documentation'),
+    requireAccess('documentation', 'update'),
+    documentationController.detachFromTarget
   );
 
 module.exports = router;

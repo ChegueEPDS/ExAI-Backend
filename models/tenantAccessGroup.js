@@ -11,9 +11,10 @@ const RESOURCES = Object.freeze([
   'customSchema',
   'manufacturer',
   'dashboard',
+  'documentation',
   'user',
 ]);
-const FEATURES = Object.freeze(['maintenance', 'professionRbac', 'groupRbac', 'customFields', 'customSchemas']);
+const FEATURES = Object.freeze(['maintenance', 'professionRbac', 'groupRbac', 'customFields', 'customSchemas', 'documentation']);
 
 const PermissionSchema = new mongoose.Schema(
   {
@@ -55,6 +56,7 @@ const TenantAccessGroupSchema = new mongoose.Schema(
       groupRbac: { type: Boolean, default: false },
       customFields: { type: Boolean, default: false },
       customSchemas: { type: Boolean, default: false },
+      documentation: { type: Boolean, default: false },
     },
     scope: { type: ScopeSchema, default: () => ({}) },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },

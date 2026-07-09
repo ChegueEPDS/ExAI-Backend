@@ -19,6 +19,10 @@ const { ensureRbAssignment } = require('../services/rbSchemaValueService');
 const { normalizeRbValues } = require('../services/schemaRules/rbRules');
 const { getMaterializedSummary, scheduleDashboardStatsDirty } = require('../services/dashboardSummaryService');
 const tenantAccess = require('../services/tenantAccessService');
+const documentationService = require('../services/documentationService');
+const DocumentationAssignment = require('../models/documentationAssignment');
+const Tenant = require('../models/tenant');
+const { isFeatureEnabled } = require('../middlewares/tenantFeatureMiddleware');
 
 // Helper: convert string tenantId to ObjectId safely
 const toObjectId = (id) => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null);
@@ -907,7 +911,11 @@ exports.getFilesOfZone = async (req, res) => {
     await tenantAccess.assertLocationAccess(req, { zoneId: req.params.id });
     const zone = await Unit.findOne({ _id: req.params.id, tenantId: tenantObjectId });
     if (!zone) return res.status(404).json({ message: "Zone not found" });
-    res.status(200).json(zone.documents || []);
+    const tenant = await Tenant.findById(tenantObjectId).select('type features').lean();
+    const files = isFeatureEnabled(tenant, 'documentation')
+      ? await documentationService.mergeFilesForZone(zone, tenantObjectId)
+      : (zone.documents || []);
+    res.status(200).json(files || []);
   } catch (error) {
     res.status(500).json({ message: "Fetch failed", error: error.message });
   }
@@ -922,6 +930,27 @@ exports.deleteFileFromZone = async (req, res) => {
     await tenantAccess.assertLocationAccess(req, { zoneId });
     const zone = await Unit.findOne({ _id: zoneId, tenantId: tenantObjectId });
     if (!zone) return res.status(404).json({ message: "Zone not found" });
+
+    const fileObjectId = toObjectId(fileId);
+    if (fileObjectId) {
+      const globalAssignment = await DocumentationAssignment.findOne({
+        tenantId: tenantObjectId,
+        targetType: 'zone',
+        targetId: zone._id,
+        $or: [{ _id: fileObjectId }, { documentationId: fileObjectId }],
+      });
+      if (globalAssignment) {
+        const tenant = await Tenant.findById(tenantObjectId).select('type features').lean();
+        if (!isFeatureEnabled(tenant, 'documentation')) {
+          return res.status(403).json({ error: 'Tenant feature disabled', feature: 'documentation' });
+        }
+        if (!(await tenantAccess.can(req, 'documentation', 'update'))) {
+          return res.status(403).json({ error: 'Access denied', resource: 'documentation', action: 'update' });
+        }
+        await DocumentationAssignment.deleteOne({ _id: globalAssignment._id });
+        return res.status(200).json({ message: "Documentation detached from zone" });
+      }
+    }
 
     const fileToDelete = zone.documents.find(doc =>
       doc._id.toString() === fileId || doc.blobPath === fileId || doc.oneDriveId === fileId

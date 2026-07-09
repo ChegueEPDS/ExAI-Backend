@@ -13,6 +13,7 @@ const ALL_RESOURCES = Object.freeze([
   'customSchema',
   'manufacturer',
   'dashboard',
+  'documentation',
   'user',
 ]);
 const POWERUSER_RESOURCES = Object.freeze([
@@ -47,6 +48,7 @@ function featuresFromPermissions(permissions, tenantFeatures = {}) {
     groupRbac: Boolean(tenantFeatures.groupRbac && hasActions('user')),
     customFields: Boolean(tenantFeatures.customFields && hasActions('customField')),
     customSchemas: Boolean(tenantFeatures.customSchemas && hasActions('customSchema')),
+    documentation: Boolean(tenantFeatures.documentation && hasActions('documentation')),
   };
 }
 

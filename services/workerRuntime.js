@@ -4,6 +4,7 @@ const reportExportCleanup = require('./reportExportCleanup');
 const mobileSyncWorker = require('./mobileSyncWorker');
 const certificatePreviewWorker = require('./certificatePreviewWorker');
 const certificateDraftWorker = require('./certificateDraftWorker');
+const documentationExpiryNotifier = require('./documentationExpiryNotifier');
 const reportExportController = require('../controllers/exportInspectionReport');
 const { withLock } = require('./distributedLockService');
 const logger = require('../config/logger');
@@ -51,6 +52,12 @@ function startWorkerRuntime() {
     () => withLock('subscriptions:sweep-expired', 20 * 60 * 1000, subscriptionSweeper.sweepExpiredSubscriptions),
     60 * 60 * 1000
   );
+  scheduleInterval(
+    () => withLock('documentations:expiry-notifications', 30 * 60 * 1000, documentationExpiryNotifier.sweepDocumentationExpiryNotifications),
+    24 * 60 * 60 * 1000
+  );
+  withLock('documentations:expiry-notifications', 30 * 60 * 1000, documentationExpiryNotifier.sweepDocumentationExpiryNotifications)
+    .catch((err) => logger.warn('[worker-runtime] documentation expiry sweep failed', err?.message || err));
 
   mobileSyncWorker.start({ intervalMs: 5000 });
 
@@ -60,7 +67,8 @@ function startWorkerRuntime() {
     reportExportCleanup: true,
     certificatePreviewWorker: true,
     certificateDraftWorker: true,
-    mobileSyncWorker: true
+    mobileSyncWorker: true,
+    documentationExpiryNotifier: true
   });
 
   return { started: true };

@@ -26,6 +26,7 @@ function normalizeFeatures(features, tenantType, legacy = {}) {
   const hasGroupRbac = features && Object.prototype.hasOwnProperty.call(features, 'groupRbac');
   const hasCustomFields = features && Object.prototype.hasOwnProperty.call(features, 'customFields');
   const hasCustomSchemas = features && Object.prototype.hasOwnProperty.call(features, 'customSchemas');
+  const hasDocumentation = features && Object.prototype.hasOwnProperty.call(features, 'documentation');
   return {
     maintenance: String(tenantType || '').toLowerCase() === 'personal'
       ? false
@@ -36,6 +37,9 @@ function normalizeFeatures(features, tenantType, legacy = {}) {
       : (hasGroupRbac ? Boolean(features.groupRbac) : false),
     customFields: hasCustomFields ? Boolean(features.customFields) : false,
     customSchemas: hasCustomSchemas ? Boolean(features.customSchemas) : false,
+    documentation: String(tenantType || '').toLowerCase() === 'personal'
+      ? false
+      : (hasDocumentation ? Boolean(features.documentation) : false),
   };
 }
 
@@ -201,7 +205,8 @@ exports.createTenant = async (req, res) => {
         professionRbac: false,
         groupRbac: false,
         customFields: false,
-        customSchemas: false
+        customSchemas: false,
+        documentation: false
       }
     });
 
@@ -387,6 +392,9 @@ exports.updateTenant = async (req, res) => {
         }
         if (features.customSchemas !== undefined) {
           updates['features.customSchemas'] = nextFeatures.customSchemas;
+        }
+        if (features.documentation !== undefined) {
+          updates['features.documentation'] = nextFeatures.documentation;
         }
       } else {
         return res.status(400).json({ message: 'Invalid features payload.' });

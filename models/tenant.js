@@ -89,6 +89,10 @@ const TenantSchema = new mongoose.Schema(
       customSchemas: {
         type: Boolean,
         default: false
+      },
+      documentation: {
+        type: Boolean,
+        default: false
       }
     },
 
@@ -125,7 +129,8 @@ TenantSchema.pre('validate', function (next) {
     this.features = {
       ...(this.features || {}),
       maintenance: false,
-      groupRbac: false
+      groupRbac: false,
+      documentation: false
     };
   }
   if (this.professionRbacEnabled && this.features) {

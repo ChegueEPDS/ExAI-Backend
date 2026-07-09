@@ -60,6 +60,7 @@ function inferFeatures(tenant, usage, options = {}) {
     groupRbac: isPersonal ? false : (hasOwn(raw, 'groupRbac') ? bool(raw.groupRbac) : Boolean(options.enableGroupRbac && tenantHas(usage.groups, tenantId))),
     customFields: hasOwn(raw, 'customFields') ? bool(raw.customFields) : hasCustomFieldData,
     customSchemas: hasOwn(raw, 'customSchemas') ? bool(raw.customSchemas) : hasTenantSchemas,
+    documentation: isPersonal ? false : (hasOwn(raw, 'documentation') ? bool(raw.documentation) : false),
   };
 }
 
@@ -267,7 +268,7 @@ async function main() {
       nextFeatures.groupRbac = true;
     }
     const current = tenant.features || {};
-    const needsUpdate = ['maintenance', 'professionRbac', 'groupRbac', 'customFields', 'customSchemas']
+    const needsUpdate = ['maintenance', 'professionRbac', 'groupRbac', 'customFields', 'customSchemas', 'documentation']
       .some((key) => current[key] !== nextFeatures[key]);
     const nextProfessionRbacEnabled = nextFeatures.professionRbac;
     const professionFlagNeedsUpdate = bool(tenant.professionRbacEnabled) !== nextProfessionRbacEnabled;
@@ -283,6 +284,7 @@ async function main() {
           groupRbac: current.groupRbac,
           customFields: current.customFields,
           customSchemas: current.customSchemas,
+          documentation: current.documentation,
           professionRbacEnabled: tenant.professionRbacEnabled,
         },
         to: {
@@ -301,6 +303,7 @@ async function main() {
               'features.groupRbac': nextFeatures.groupRbac,
               'features.customFields': nextFeatures.customFields,
               'features.customSchemas': nextFeatures.customSchemas,
+              'features.documentation': nextFeatures.documentation,
               professionRbacEnabled: nextProfessionRbacEnabled,
             }
           },

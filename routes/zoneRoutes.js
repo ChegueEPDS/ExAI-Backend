@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const zoneController = require('../controllers/zoneController');
+const documentationController = require('../controllers/documentationController');
 const healthMetricsController = require('../controllers/healthMetricsController');
 const authMiddleware = require('../middlewares/authMiddleware');
 const { requireAccess } = require('../middlewares/tenantAccessMiddleware');
@@ -60,6 +61,20 @@ router.post(
     authMiddleware(),
     requireAccess('zone', 'update'),
     zoneController.deleteFileFromZone
+  );
+  router.post(
+    '/:zoneId/documentations/:documentationId',
+    authMiddleware(),
+    requireTenantFeature('documentation'),
+    requireAccess('documentation', 'update'),
+    documentationController.attachToTarget
+  );
+  router.delete(
+    '/:zoneId/documentations/:documentationId',
+    authMiddleware(),
+    requireTenantFeature('documentation'),
+    requireAccess('documentation', 'update'),
+    documentationController.detachFromTarget
   );
 
   // Összes eszközkép törlése egy zónán belül
