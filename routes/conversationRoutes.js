@@ -9,14 +9,15 @@ const {
   getConversations,
   getConversationById,
   uploadAndAskStream,
+  uploadChatFile,
   sendMessageStream,
   setStandardExplorer
 } = require('../controllers/conversationController');
 const { chatGovernedStream } = require('../controllers/governedChatController');
 const authMiddleware = require('../middlewares/authMiddleware');
-const multer = require('multer');
+const { memoryUpload } = require('../middlewares/uploadFactory');
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024, files: 10 } });
+const upload = memoryUpload({ fileSizeMb: 25, files: 10, fields: 50 });
 
 const router = express.Router();
 
@@ -49,6 +50,7 @@ function safeUploadArray(fieldName, maxCount) {
 router.post('/new-conversation', authMiddleware(), startNewConversation);
 router.post('/chat', authMiddleware(), ...sendMessage);
 router.post('/chat/stream', authMiddleware(), sendMessageStream);
+router.post('/chat/files', authMiddleware(), ...uploadChatFile);
 router.post('/rate-message', authMiddleware(), rateMessage);
 router.post('/save-feedback', authMiddleware(), saveFeedback);
 router.delete('/conversation/:threadId', authMiddleware(), deleteConversation);

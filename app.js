@@ -13,6 +13,7 @@ if (process.env.WORKER_ONLY === '1' || process.env.WORKER_ONLY === 'true') {
 const requestIdMiddleware = require('./middlewares/requestIdMiddleware');
 const auditMiddleware = require('./middlewares/auditMiddleware');
 const errorAuditMiddleware = require('./middlewares/errorAuditMiddleware');
+const apiErrorHandler = require('./middlewares/apiErrorHandler');
 const limiter = require('./middlewares/rateLimiter');
 const systemSettingsStore = require('./services/systemSettingsStore');
 const { writeSystemAuditLog } = require('./services/auditLogService');
@@ -407,6 +408,7 @@ app.use('/api', schemaRoutes);
 app.use('/api/public', publicRotRoutes);
 app.use('/api', trainingRoutes);
 app.use(errorAuditMiddleware);
+app.use(apiErrorHandler);
 
 if (!backgroundJobsDisabled()) {
   startWorkerRuntime();

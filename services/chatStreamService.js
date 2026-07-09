@@ -23,11 +23,31 @@ function sha256Short(text) {
   }
 }
 
+function normalizeFileIds(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => String(item || '').trim())
+    .filter((item) => /^file-[A-Za-z0-9_-]+$/.test(item))
+    .slice(0, 10);
+}
+
+function buildResponseInput(message, fileIds) {
+  if (!fileIds.length) return [{ role: 'user', content: message }];
+  return [{
+    role: 'user',
+    content: [
+      ...fileIds.map((fileId) => ({ type: 'input_file', file_id: fileId })),
+      { type: 'input_text', text: message },
+    ],
+  }];
+}
+
 async function handleSendMessageStream(req, res) {
   const send = initSse(req, res);
 
   try {
     const { message, threadId, category, vectorStoreId } = req.body || {};
+    const fileIds = normalizeFileIds(req.body?.fileIds);
     const userId = req.userId;
 
     // ---- Validations ----
@@ -152,6 +172,12 @@ async function handleSendMessageStream(req, res) {
 
     let finalInstructions = baseInstructions;
     if (tabularHint) finalInstructions = `${finalInstructions}\n\n${tabularHint}`;
+    if (fileIds.length) {
+      finalInstructions = `${finalInstructions}\n\nThe user attached files directly to this message. Treat those attached files as the primary subject of the answer. You may use the tenant knowledge base only as supporting reference when it is relevant, and clearly distinguish uploaded-file facts from knowledge-base context.`;
+    }
+    if (vectorStoreId && typeof vectorStoreId === 'string' && vectorStoreId.trim()) {
+      finalInstructions = `${finalInstructions}\n\nUse the uploaded file_search documents as the primary evidence for this answer. If the answer is not present in the uploaded documents, say that it is not found in the uploaded file instead of answering from general knowledge.`;
+    }
     if (applicableInjection) {
       finalInstructions =
         `${finalInstructions}\n\n` +
@@ -167,7 +193,7 @@ async function handleSendMessageStream(req, res) {
       stream: true,
       store: true,
       instructions: finalInstructions,
-      input: [{ role: 'user', content: message }],
+      input: buildResponseInput(message, fileIds),
       ...(conversation?.lastResponseId ? { previous_response_id: String(conversation.lastResponseId) } : {}),
       ...(vectorStoreId && typeof vectorStoreId === 'string' && vectorStoreId.trim()
         ? { tools: [{ type: 'file_search', vector_store_ids: [vectorStoreId.trim()] }] }
@@ -203,6 +229,7 @@ async function handleSendMessageStream(req, res) {
       previousResponseId: conversation?.lastResponseId ? String(conversation.lastResponseId) : null,
       vectorStoreId: usedVectorStoreId,
       vectorStoreSource,
+      attachedFileCount: fileIds.length,
       temperature: chatTuning.temperature,
       topP: chatTuning.topP,
       maxOutputTokens: chatTuning.maxOutputTokens,
@@ -385,7 +412,6 @@ async function handleSendMessageStream(req, res) {
     logger.error('[STREAM] Hiba az üzenetküldés során:', {
       message: error.message,
       stack: error.stack,
-      response: error.response?.data,
       status: error.response?.status,
     });
     // Extra detail for non-JSON or opaque error bodies
@@ -405,7 +431,7 @@ async function handleSendMessageStream(req, res) {
     }
     if (error?.response?.status === 400) {
       try {
-        logger.error(`[STREAM] 400 detailed body: ${JSON.stringify(error.response.data)}`);
+        logger.error(`[STREAM] 400 detailed body: ${JSON.stringify(error.response.data).slice(0, 2048)}`);
       } catch (_) {
         logger.error(`[STREAM] 400 detailed text: ${String(error?.response?.data || error.message)}`);
       }

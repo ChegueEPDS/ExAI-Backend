@@ -1,11 +1,11 @@
 const express = require('express');
-const multer = require('multer');
 const visionController = require('../controllers/visionController');
+const { memoryUpload } = require('../middlewares/uploadFactory');
 
 const router = express.Router();
 
 // Multer beállítások (memóriában tároljuk a fájlokat)
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = memoryUpload({ fileSizeMb: 15, files: 1, fields: 20 });
 
 // Feltöltés endpoint
 router.post('/upload', upload.single('image'), visionController.uploadImage);

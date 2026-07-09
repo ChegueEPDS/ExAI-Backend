@@ -18,10 +18,12 @@ exports.listMailboxMessages = async (req, res) => {
   try {
     const folder = String(req.query?.folder || 'inbox').trim().toLowerCase();
     const top = Number(req.query?.top || 25);
-    const items = await mailSvc.listMailboxMessages({ folder, top });
+    const skip = Number(req.query?.skip || 0);
+    const items = await mailSvc.listMailboxMessages({ folder, top, skip });
     return res.json({
       mailbox: process.env.MAIL_SENDER_UPN || null,
       folder,
+      skip: Math.max(skip || 0, 0),
       items,
     });
   } catch (err) {

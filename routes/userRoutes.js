@@ -1,7 +1,6 @@
 // routes/userRoutes.js
 
 const express = require('express');
-const multer = require('multer');
 const {
   getUserProfile,
   updateUserProfile,
@@ -14,14 +13,12 @@ const {
   manualSendContributionReward
 } = require('../controllers/userController');
 const authMiddleware = require('../middlewares/authMiddleware');
+const { memoryUpload } = require('../middlewares/uploadFactory');
 
 const router = express.Router();
 
 // Signature / tenant logo upload handled in-memory; max ~2 MB per image
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 2 * 1024 * 1024, files: 2 }
-});
+const upload = memoryUpload({ fileSizeMb: 2, files: 2, fields: 40 });
 
 // List users (Admin: same tenant, SuperAdmin: all)
 router.get('/users', authMiddleware(['Admin', 'SuperAdmin']), listUsers);

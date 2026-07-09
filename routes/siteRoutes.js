@@ -6,8 +6,8 @@ const healthMetricsController = require('../controllers/healthMetricsController'
 const authMiddleware = require('../middlewares/authMiddleware');
 const { requireAccess } = require('../middlewares/tenantAccessMiddleware');
 const { requireTenantFeature } = require('../middlewares/tenantFeatureMiddleware');
-const multer = require('multer');
-const upload = multer({ dest: 'uploads/' }); // ideiglenes mappa
+const { diskUpload } = require('../middlewares/uploadFactory');
+const upload = diskUpload({ fileSizeMb: 50, files: 20, fields: 50 }); // ideiglenes mappa
 
 
 
@@ -25,7 +25,7 @@ router.post(
     '/:id/upload-file',
     authMiddleware(),
     requireAccess('site', 'update'),
-    upload.array('files'),
+    upload.array('files', 20),
     siteController.uploadFileToSite
   );
   router.delete(

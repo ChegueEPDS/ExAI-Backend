@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const { body } = require('express-validator');
-const multer = require('multer');
+const { memoryUpload } = require('../middlewares/uploadFactory');
 const logger = require('../config/logger');
 const Conversation = require('../models/conversation');
 const User = require('../models/user');
@@ -12,13 +12,19 @@ const { handleSendMessageStream } = require('../services/chatStreamService');
 exports.sendMessageStream = (req, res) => handleSendMessageStream(req, res);
 
 const { handleUploadAndAskStream } = require('../services/uploadAndAskService');
+const { handleUploadChatFile } = require('../services/chatFileService');
 
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = memoryUpload({ fileSizeMb: 25, files: 10, fields: 50 });
 exports.uploadMulter = upload;
 
 exports.uploadAndAskStream = [
   upload.array('files', 10),
   (req, res) => handleUploadAndAskStream(req, res)
+];
+
+exports.uploadChatFile = [
+  upload.single('file'),
+  (req, res) => handleUploadChatFile(req, res)
 ];
 
 const { handleSendMessage } = require('../services/chatMessageService');

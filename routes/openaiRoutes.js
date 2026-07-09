@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
-const multer = require('multer');
-const upload = multer({ dest: 'uploads/' });
+const { diskUpload } = require('../middlewares/uploadFactory');
+const upload = diskUpload({ fileSizeMb: 100, files: 1, fields: 20 });
 
 const { authMiddleware } = require('../middlewares/authMiddleware');
 const openAIController = require('../controllers/openaiController');

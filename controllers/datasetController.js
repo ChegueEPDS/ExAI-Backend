@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const multer = require('multer');
+const { memoryUpload } = require('../middlewares/uploadFactory');
 const Dataset = require('../models/dataset');
 const DatasetFile = require('../models/datasetFile');
 const logger = require('../config/logger');
@@ -8,7 +8,7 @@ const azureBlob = require('../services/azureBlobService');
 const systemSettings = require('../services/systemSettingsStore');
 const { notifyAndStore } = require('../lib/notifications/notifier');
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024, files: 10 } });
+const upload = memoryUpload({ fileSizeMb: 25, files: 10, fields: 50 });
 exports.uploadMulter = upload;
 
 function requireProjectId(req) {

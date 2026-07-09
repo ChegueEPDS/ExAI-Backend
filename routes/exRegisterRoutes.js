@@ -5,24 +5,27 @@ const maintenanceController = require('../controllers/maintenanceController');
 const authMiddleware = require('../middlewares/authMiddleware');
 const { requireAccess } = require('../middlewares/tenantAccessMiddleware');
 const { requireTenantFeature } = require('../middlewares/tenantFeatureMiddleware');
-const multer = require('multer'); 
-const upload = multer({ dest: 'uploads/' });
+const { diskUpload } = require('../middlewares/uploadFactory');
+const imageUpload = diskUpload({ fileSizeMb: 15, files: 20, fields: 120 });
+const documentUpload = diskUpload({ fileSizeMb: 50, files: 20, fields: 120 });
+const xlsxUpload = diskUpload({ fileSizeMb: 25, files: 1, fields: 30 });
+const zipUpload = diskUpload({ fileSizeMb: 500, files: 1, fields: 30 });
 
 
 
 // Létrehozás
-router.post('/exreg', authMiddleware(), requireAccess('equipment', 'create'), upload.array('pictures'), exRegisterController.createEquipment);
+router.post('/exreg', authMiddleware(), requireAccess('equipment', 'create'), imageUpload.array('pictures', 20), exRegisterController.createEquipment);
 
 router.post('/exreg/import', authMiddleware(), requireAccess('equipment', 'create'), express.json(), exRegisterController.createEquipment);
 
-router.post('/exreg/:id/upload-images', authMiddleware(), requireAccess('equipment', 'update'), upload.array('pictures'), exRegisterController.uploadImagesToEquipment);
+router.post('/exreg/:id/upload-images', authMiddleware(), requireAccess('equipment', 'update'), imageUpload.array('pictures', 20), exRegisterController.uploadImagesToEquipment);
 
 // Equipment documents (images + files) upload / list / delete
 router.post(
   '/exreg/:id/upload-documents',
   authMiddleware(),
   requireAccess('equipment', 'update'),
-  upload.array('files'),
+  documentUpload.array('files', 20),
   exRegisterController.uploadDocumentsToEquipment
 );
 
@@ -30,7 +33,7 @@ router.post(
   '/exreg/import-xlsx',
   authMiddleware(),
   requireAccess('equipment', 'create'),
-  upload.single('file'),
+  xlsxUpload.single('file'),
   exRegisterController.importEquipmentXLSX
 );
 
@@ -45,7 +48,7 @@ router.post(
   '/exreg/import-documents-zip',
   authMiddleware(),
   requireAccess('equipment', 'create'),
-  upload.single('file'),
+  zipUpload.single('file'),
   exRegisterController.importEquipmentDocumentsZip
 );
 
@@ -129,7 +132,7 @@ router.post('/exreg/:id/maintenance/repairs/:repairId/complete', authMiddleware(
 router.post('/exreg/:id/maintenance/schemas/:schemaId/activities', authMiddleware(), requireTenantFeature('maintenance'), requireAccess('maintenance', 'create'), express.json(), maintenanceController.createCustomActivity);
 
 // Módosítás
-router.put('/exreg/:id', authMiddleware(), requireAccess('equipment', 'update'), upload.array('pictures'), exRegisterController.updateEquipment);
+router.put('/exreg/:id', authMiddleware(), requireAccess('equipment', 'update'), imageUpload.array('pictures', 20), exRegisterController.updateEquipment);
 
 // Törlés
 router.delete('/exreg/:id', authMiddleware(), requireAccess('equipment', 'delete'), exRegisterController.deleteEquipment);

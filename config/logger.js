@@ -1,5 +1,6 @@
 const { createLogger, format, transports } = require('winston');
 const DailyRotateFile = require('winston-daily-rotate-file');
+const stringify = require('safe-stable-stringify');
 
 const level = process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug');
 
@@ -16,7 +17,7 @@ const logger = createLogger({
         format.printf((info) => {
           const { level, message, timestamp, ...rest } = info || {};
           const metaKeys = Object.keys(rest || {}).filter(k => rest[k] !== undefined);
-          const meta = metaKeys.length ? ` ${JSON.stringify(rest)}` : '';
+          const meta = metaKeys.length ? ` ${stringify(rest)}` : '';
           return `${timestamp} [${level}]: ${message}${meta}`;
         })
       )

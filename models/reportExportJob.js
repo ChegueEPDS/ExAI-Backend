@@ -9,7 +9,8 @@ const ReportExportJobSchema = new mongoose.Schema(
     params: {
       siteId: { type: mongoose.Schema.Types.ObjectId, ref: 'Site' },
       zoneId: { type: mongoose.Schema.Types.ObjectId, ref: 'Zone' },
-      includeImages: { type: Boolean, default: true }
+      includeImages: { type: Boolean, default: true },
+      format: { type: String, enum: ['xlsx', 'pdf'], default: 'xlsx' }
     },
     status: { type: String, enum: ['queued', 'running', 'succeeded', 'failed'], default: 'queued', index: true },
     blobPath: { type: String },

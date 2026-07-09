@@ -112,7 +112,7 @@ class GraphMailService {
     });
   }
 
-  async listMailboxMessages({ folder = 'inbox', top = 25 } = {}) {
+  async listMailboxMessages({ folder = 'inbox', top = 25, skip = 0 } = {}) {
     const sender = this.defaultSender;
     if (!sender) throw new Error('MAIL_SENDER_UPN is not set');
 
@@ -123,6 +123,7 @@ class GraphMailService {
     }
 
     const limit = Math.min(Math.max(Number(top) || 25, 1), 100);
+    const offset = Math.max(Number(skip) || 0, 0);
     const resp = await this.client
       .api(`/users/${encodeURIComponent(sender)}/mailFolders/${normalizedFolder}/messages`)
       .select([
@@ -140,6 +141,7 @@ class GraphMailService {
         'conversationId'
       ].join(','))
       .top(limit)
+      .skip(offset)
       .orderby('receivedDateTime DESC')
       .get();
 

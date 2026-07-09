@@ -1,8 +1,8 @@
 const questionsController = require('../controllers/questionsController');
 const authMiddleware = require('../middlewares/authMiddleware');
 const express = require('express');
-const multer = require('multer');
-const upload = multer({ dest: 'uploads/' });
+const { diskUpload } = require('../middlewares/uploadFactory');
+const upload = diskUpload({ fileSizeMb: 20, files: 1, fields: 20 });
 
 const router = express.Router();
 

@@ -424,11 +424,20 @@ function detectHeaderRow(worksheet) {
   for (let i = 1; i <= limit; i += 1) {
     const row = worksheet.getRow(i);
     const headerMap = buildHeaderMap(row);
-    if (headerMap['EqID'] || headerMap['TagNo'] || headerMap['Description']) {
+    if (headerMap._id || headerMap['EqID'] || headerMap['TagNo'] || headerMap['Description']) {
       return { headerRowNumber: i, headerMap };
     }
   }
   return null;
+}
+
+function hasImportColumn(headerMap, label) {
+  return !!headerMap?.[label];
+}
+
+function setIfImportColumn(target, headerMap, label, targetKey, value) {
+  if (!hasImportColumn(headerMap, label)) return;
+  target[targetKey] = value;
 }
 
 function cellValueToPrimitive(cellValue) {
@@ -758,13 +767,13 @@ function findColumnIndex(headerMap, column) {
   return null;
 }
 
-function collectDynamicCustomFieldValues(row, headerMap, dynamicColumns) {
+function collectDynamicCustomFieldValues(row, headerMap, dynamicColumns, { includeBlankValues = false } = {}) {
   const values = {};
   (dynamicColumns || []).filter((column) => column.kind === 'custom').forEach((column) => {
     const idx = findColumnIndex(headerMap, column);
     if (!idx) return;
     const raw = getCellStringByIndex(row, idx);
-    if (raw === '') return;
+    if (raw === '' && !includeBlankValues) return;
     values[column.key] = column.field?.fieldType === 'multiselect' ? splitMultiValue(raw) : raw;
   });
   return values;
@@ -859,8 +868,8 @@ function mergeImportedSchemaAssignments(existingAssignments = [], importedAssign
   return next;
 }
 
-function equipmentImportBaseColumns({ includeProjectSkid }) {
-  const columns = [
+function equipmentImportBaseColumns() {
+  return [
     { header: '_id', group: 'IDENTIFICATION', width: 26, comment: 'Optional. Keep this value when updating rows exported from the system. Leave empty for new equipment.' },
     { header: '#', group: 'IDENTIFICATION', width: 8, comment: 'Optional order number inside the unit. Leave empty to auto-assign the next number.' },
     { header: 'TagNo', group: 'IDENTIFICATION', width: 16, comment: 'Optional tag number.' },
@@ -882,14 +891,6 @@ function equipmentImportBaseColumns({ includeProjectSkid }) {
     { header: 'Certificate No', group: 'CERTIFICATION', width: 24, comment: 'Certificate number. If this is empty, Declaration of conformity may be used as certificate reference.' },
     { header: 'Declaration of conformity', group: 'CERTIFICATION', width: 28, comment: 'Manufacturer declaration number. Used as certificate reference when Certificate No is empty.' }
   ];
-  if (includeProjectSkid) {
-    columns.push(
-      { header: 'Skid ID', group: 'PROJECT / SKID', width: 18, comment: 'Optional project/skid context. When filled, the unit skid value is updated from the latest non-empty value.' },
-      { header: 'Skid Description', group: 'PROJECT / SKID', width: 28, comment: 'Optional project/skid description. When filled, the unit skid description is updated from the latest non-empty value.' },
-      { header: 'Project ID', group: 'PROJECT / SKID', width: 18, comment: 'Optional project ID. When filled, the unit project value is updated from the latest non-empty value.' }
-    );
-  }
-  return columns;
 }
 
 function equipmentImportInspectionColumns() {
@@ -1939,11 +1940,9 @@ exports.downloadEquipmentImportTemplate = async (req, res) => {
       return res.status(401).json({ message: 'Missing tenantId from auth.' });
     }
 
-    const tenantName = (req.scope?.tenantName || '').toLowerCase();
-    const includeProjectSkid = isProjectSkidTenantSlug(tenantName) || isInspExRequestHost(req);
     const dynamicColumns = await loadEquipmentImportDynamicColumns(tenantId);
     const columns = [
-      ...equipmentImportBaseColumns({ includeProjectSkid }),
+      ...equipmentImportBaseColumns(),
       ...dynamicColumns.map((column) => ({
         header: column.header,
         group: column.group || 'CUSTOM DATA',
@@ -2065,15 +2064,10 @@ exports.importEquipmentXLSX = async (req, res) => {
   }
 
   try {
-    const tenantName = (req.scope?.tenantName || '').toLowerCase();
-    const includeProjectSkid = isProjectSkidTenantSlug(tenantName) || isInspExRequestHost(req);
     const zone = await Zone.findOne({ _id: zoneId, tenantId }).lean();
     if (!zone) {
       return res.status(404).json({ message: 'Zone not found for this tenant.' });
     }
-    let latestSkidId = zone?.SkidID || null;
-    let latestSkidDescription = zone?.SkidDescription || null;
-    let latestProjectId = zone?.ProjectID || null;
 
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.readFile(uploadedFile.path);
@@ -2123,18 +2117,11 @@ exports.importEquipmentXLSX = async (req, res) => {
       const inspectionTypeRaw = getCellString(row, headerInfo.headerMap, 'Type');
       const inspectionType = inspectionTypeRaw ? normalizeInspectionType(inspectionTypeRaw) : null;
       const inspectionDate = getCellDate(row, headerInfo.headerMap, 'Inspection Date');
-      let skidId = '';
-      let skidDescription = '';
-      let projectId = '';
-      if (includeProjectSkid) {
-        skidId = getCellString(row, headerInfo.headerMap, 'Skid ID');
-        skidDescription = getCellString(row, headerInfo.headerMap, 'Skid Description');
-        projectId = getCellString(row, headerInfo.headerMap, 'Project ID');
-        if (skidId) latestSkidId = skidId;
-        if (skidDescription) latestSkidDescription = skidDescription;
-        if (projectId) latestProjectId = projectId;
-      }
-      const customFieldsRaw = collectDynamicCustomFieldValues(row, headerInfo.headerMap, dynamicImportColumns);
+      const presentColumn = (label) => hasImportColumn(headerInfo.headerMap, label);
+      const isPatchUpdate = !!mongoId;
+      const customFieldsRaw = collectDynamicCustomFieldValues(row, headerInfo.headerMap, dynamicImportColumns, {
+        includeBlankValues: isPatchUpdate
+      });
       let schemaAssignmentsRaw = [];
       try {
         schemaAssignmentsRaw = collectDynamicSchemaAssignments(row, headerInfo.headerMap, dynamicImportColumns, userId);
@@ -2145,6 +2132,39 @@ exports.importEquipmentXLSX = async (req, res) => {
         });
         return;
       }
+
+      const patchBaseHeadersPresent = [
+        '#',
+        'EqID',
+        'TagNo',
+        'Description',
+        'Manufacturer',
+        'Model',
+        'Serial Number',
+        'IP rating',
+        'Temp. Range',
+        'Qualitycheck',
+        'Remarks'
+      ].some(presentColumn);
+      const patchExHeadersPresent = [
+        'EPL',
+        'Equipment Group',
+        'Equipment Category',
+        'Environment',
+        'SubGroup',
+        'Temperature Class',
+        'Protection Concept',
+        'Certificate No',
+        'Declaration of conformity'
+      ].some(presentColumn);
+      const patchInspectionHeadersPresent = ['Inspection Date', 'Type', 'Status'].some(presentColumn);
+      const patchDynamicHeadersPresent = dynamicImportColumns.some((column) => !!findColumnIndex(headerInfo.headerMap, column));
+      const rowHasPatchIntent = isPatchUpdate && (
+        patchBaseHeadersPresent ||
+        patchExHeadersPresent ||
+        patchInspectionHeadersPresent ||
+        patchDynamicHeadersPresent
+      );
 
       const rowHasData = [
         eqId,
@@ -2165,9 +2185,37 @@ exports.importEquipmentXLSX = async (req, res) => {
 
       const rowHasExData = [epl, equipmentGroup, equipmentCategory, environment, subGroup, tempClass, protectionConcept].some(Boolean);
 
-      if (!rowHasData && !rowHasExData) {
+      if (!rowHasData && !rowHasExData && !rowHasPatchIntent) {
         // teljesen üres sor – kihagyjuk
         return;
+      }
+
+      const base = isPatchUpdate ? {} : {
+        EqID: eqId,
+        TagNo: tagNo || '',
+        'Equipment Type': description || '',
+        Manufacturer: manufacturer || '',
+        'Model/Type': model || '',
+        'Serial Number': serialNumber || '',
+        'IP rating': ipRating || '',
+        'Max Ambient Temp': tempRange || '',
+        Qualitycheck: qualitycheck === true,
+        'Other Info': remarks || '',
+        'Ex Marking': [],
+        'X condition': { X: false, Specific: '' },
+        customFields: {}
+      };
+      if (isPatchUpdate) {
+        setIfImportColumn(base, headerInfo.headerMap, 'EqID', 'EqID', eqId);
+        setIfImportColumn(base, headerInfo.headerMap, 'TagNo', 'TagNo', tagNo || '');
+        setIfImportColumn(base, headerInfo.headerMap, 'Description', 'Equipment Type', description || '');
+        setIfImportColumn(base, headerInfo.headerMap, 'Manufacturer', 'Manufacturer', manufacturer || '');
+        setIfImportColumn(base, headerInfo.headerMap, 'Model', 'Model/Type', model || '');
+        setIfImportColumn(base, headerInfo.headerMap, 'Serial Number', 'Serial Number', serialNumber || '');
+        setIfImportColumn(base, headerInfo.headerMap, 'IP rating', 'IP rating', ipRating || '');
+        setIfImportColumn(base, headerInfo.headerMap, 'Temp. Range', 'Max Ambient Temp', tempRange || '');
+        if (presentColumn('Qualitycheck')) base.Qualitycheck = qualitycheck === true;
+        setIfImportColumn(base, headerInfo.headerMap, 'Remarks', 'Other Info', remarks || '');
       }
 
       // EqID nem egyedi: minden sor önálló "entry" (akkor is, ha EqID üres)
@@ -2178,28 +2226,16 @@ exports.importEquipmentXLSX = async (req, res) => {
           eqId,
           mongoId,
           orderIndex: orderIndex,
-          base: {
-            EqID: eqId,
-            TagNo: tagNo || '',
-            'Equipment Type': description || '',
-            Manufacturer: manufacturer || '',
-            'Model/Type': model || '',
-            'Serial Number': serialNumber || '',
-            'IP rating': ipRating || '',
-            'Max Ambient Temp': tempRange || '',
-            Qualitycheck: qualitycheck === true,
-            'Other Info': remarks || '',
-            'Ex Marking': [],
-            'X condition': { X: false, Specific: '' },
-            customFields: {}
-          },
+          base,
           inspectionDate: inspectionDate || null,
           inspectionStatus,
           inspectionType: inspectionType || null,
           schemaAssignments: [],
           inspectionRemarks: remarks || '',
           rbCertificateNo: certificateNo || declarationNo || '',
-          rbCompliance: inspectionStatus || 'NA'
+          rbCertificatePresent: presentColumn('Certificate No') || presentColumn('Declaration of conformity'),
+          rbCompliance: inspectionStatus || 'NA',
+          rbCompliancePresent: presentColumn('Status')
         });
       }
 
@@ -2211,17 +2247,17 @@ exports.importEquipmentXLSX = async (req, res) => {
         entry.orderIndex = orderIndex;
       }
 
-      if (tagNo && !entry.base.TagNo) entry.base.TagNo = tagNo;
-      if (description) entry.base['Equipment Type'] = description;
-      if (manufacturer) entry.base.Manufacturer = manufacturer;
-      if (model) entry.base['Model/Type'] = model;
-      if (serialNumber) entry.base['Serial Number'] = serialNumber;
-      if (ipRating) entry.base['IP rating'] = ipRating;
-      if (tempRange) entry.base['Max Ambient Temp'] = tempRange;
-      if (qualitycheck != null) entry.base.Qualitycheck = qualitycheck;
+      if (presentColumn('TagNo') && tagNo && !entry.base.TagNo) entry.base.TagNo = tagNo;
+      if (presentColumn('Description') && description) entry.base['Equipment Type'] = description;
+      if (presentColumn('Manufacturer') && manufacturer) entry.base.Manufacturer = manufacturer;
+      if (presentColumn('Model') && model) entry.base['Model/Type'] = model;
+      if (presentColumn('Serial Number') && serialNumber) entry.base['Serial Number'] = serialNumber;
+      if (presentColumn('IP rating') && ipRating) entry.base['IP rating'] = ipRating;
+      if (presentColumn('Temp. Range') && tempRange) entry.base['Max Ambient Temp'] = tempRange;
+      if (presentColumn('Qualitycheck') && qualitycheck != null) entry.base.Qualitycheck = qualitycheck;
       if (certificateNo && !entry.rbCertificateNo) entry.rbCertificateNo = certificateNo;
-      if (remarks) entry.base['Other Info'] = remarks;
-      if (remarks) entry.inspectionRemarks = remarks;
+      if (presentColumn('Remarks') && remarks) entry.base['Other Info'] = remarks;
+      if (presentColumn('Remarks') && remarks) entry.inspectionRemarks = remarks;
       if (Object.keys(customFieldsRaw).length) {
         entry.base.customFields = {
           ...(entry.base.customFields || {}),
@@ -2241,6 +2277,7 @@ exports.importEquipmentXLSX = async (req, res) => {
       }
 
       if (epl || equipmentGroup || equipmentCategory || environment || subGroup || tempClass || protectionConcept) {
+        if (!Array.isArray(entry.base['Ex Marking'])) entry.base['Ex Marking'] = [];
         const autoMarking = buildMarkingString(protectionConcept, subGroup, tempClass);
         const inferredEnvironment = environment || determineEnvironmentFromSubGroup(subGroup);
 
@@ -2306,27 +2343,39 @@ exports.importEquipmentXLSX = async (req, res) => {
         const importedExMarkings = (payload['Ex Marking'] || []).filter(mark =>
           Object.values(mark).some(value => !!String(value || '').trim())
         );
-        const rbValues = valuesFromEquipmentMarkings(importedExMarkings);
-        rbValues.certificateNo = entry.rbCertificateNo || payload['Certificate No'] || '';
-        rbValues.compliance = entry.rbCompliance || payload.Compliance || 'NA';
+        const rbValues = importedExMarkings.length ? valuesFromEquipmentMarkings(importedExMarkings) : {};
+        if (entry.rbCertificatePresent) {
+          rbValues.certificateNo = entry.rbCertificateNo || payload['Certificate No'] || '';
+        }
+        if (entry.rbCompliancePresent) {
+          rbValues.compliance = entry.rbCompliance || payload.Compliance || 'NA';
+        }
+        if (!entry.rbCertificatePresent) delete rbValues.certificateNo;
+        if (!entry.rbCompliancePresent) delete rbValues.compliance;
         delete payload['Ex Marking'];
         delete payload['Certificate No'];
         delete payload.Compliance;
         const hasRbValues =
           importedExMarkings.length ||
-          String(rbValues.certificateNo || '').trim() ||
-          String(rbValues.compliance || 'NA') !== 'NA';
+          entry.rbCertificatePresent ||
+          entry.rbCompliancePresent;
         const rbSchema = hasRbValues ? await ensureRbSchema() : null;
 
         let equipmentDoc = null;
 
         // 1) Első próbálkozás: explicit _id alapján frissítés (ha az exportból visszatöltötték)
-        if (entry.mongoId && mongoose.Types.ObjectId.isValid(entry.mongoId)) {
+        if (entry.mongoId) {
+          if (!mongoose.Types.ObjectId.isValid(entry.mongoId)) {
+            throw new Error(`Invalid _id value: ${entry.mongoId}`);
+          }
           equipmentDoc = await Equipment.findOne({
             _id: entry.mongoId,
             tenantId,
             Zone: zone._id
           });
+          if (!equipmentDoc) {
+            throw new Error(`Equipment with _id ${entry.mongoId} was not found in the selected zone.`);
+          }
           if (equipmentDoc) {
             const updateData = { ...payload, ModifiedBy: userId };
             if (payload.customFields && Object.keys(payload.customFields).length) {
@@ -2347,7 +2396,10 @@ exports.importEquipmentXLSX = async (req, res) => {
               );
             }
             if (rbSchema) {
-              ensureRbAssignment(updateData, rbSchema, rbValues, userId);
+              ensureRbAssignment(updateData, rbSchema, {
+                ...getRbValues(equipmentDoc),
+                ...rbValues
+              }, userId);
             }
             if (entry.orderIndex == null) {
               delete updateData.orderIndex;
@@ -2415,22 +2467,6 @@ exports.importEquipmentXLSX = async (req, res) => {
           rows: entry.rows,
           message: entryError.message || String(entryError)
         });
-      }
-    }
-
-    if (includeProjectSkid) {
-      const zoneUpdate = {};
-      if (latestSkidId && latestSkidId !== zone.SkidID) {
-        zoneUpdate.SkidID = latestSkidId;
-      }
-      if (latestSkidDescription && latestSkidDescription !== zone.SkidDescription) {
-        zoneUpdate.SkidDescription = latestSkidDescription;
-      }
-      if (latestProjectId && latestProjectId !== zone.ProjectID) {
-        zoneUpdate.ProjectID = latestProjectId;
-      }
-      if (Object.keys(zoneUpdate).length) {
-        await Zone.updateOne({ _id: zone._id }, { $set: zoneUpdate });
       }
     }
 

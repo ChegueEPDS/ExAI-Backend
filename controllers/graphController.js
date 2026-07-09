@@ -1,6 +1,6 @@
 /* graphController.js */
 const axios = require('axios');
-const multer = require('multer');
+const { diskUpload } = require('../middlewares/uploadFactory');
 const fs = require('fs');
 const {
     getOrCreateSharePointFolder,
@@ -11,7 +11,7 @@ const {
     moveSharePointItemToFolder,
   } = require('../helpers/sharePointHelpers');
 
-const upload = multer({ dest: 'uploads/' }); // Ideiglenes fájlok mentése
+const upload = diskUpload({ fileSizeMb: 50, files: 1, fields: 30 }); // Ideiglenes fájlok mentése
 
 /**
  * 📂 Általános mappa létrehozása vagy keresése az ExAI mappán belül
@@ -122,9 +122,9 @@ exports.getOneDriveFiles = async (req, res) => {
 /**
  * 📄 Fájl feltöltése az ExAI mappába
  */
-exports.uploadOneDriveFile = async (req, res) => {
+exports.uploadOneDriveFile = async (req, res, next) => {
     upload.single("file")(req, res, async (err) => {
-        if (err) return res.status(500).send("❌ Fájl feltöltési hiba.");
+        if (err) return next(err);
 
         const accessToken = req.headers.authorization?.split(" ")[1];
         const filePath = req.file.path;
@@ -282,9 +282,9 @@ exports.renameOneDriveItemById = async (itemId, accessToken, newName) => {
     }
   };
 
-  exports.uploadSharePointFileHandler = async (req, res) => {
+  exports.uploadSharePointFileHandler = async (req, res, next) => {
     upload.single("file")(req, res, async (err) => {
-        if (err) return res.status(500).send("❌ File upload error");x
+        if (err) return next(err);
 
         const accessToken = req.headers['x-ms-graph-token'];
         const filePath = req.file.path;
@@ -389,4 +389,3 @@ exports.moveSharePointItem = async (req, res) => {
       res.status(500).json({ error: "Failed to move item" });
     }
   };
-

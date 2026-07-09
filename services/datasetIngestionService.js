@@ -1,5 +1,4 @@
 const crypto = require('crypto');
-const xlsx = require('xlsx');
 const { get_encoding } = require('tiktoken');
 const OpenAI = require('openai');
 
@@ -16,6 +15,7 @@ const pinecone = require('./pineconeService');
 const systemSettings = require('./systemSettingsStore');
 const embeddingContext = require('./embeddingContext');
 const logger = require('../config/logger');
+const { cellAddress, loadWorkbookFromBuffer, worksheetCells, worksheetToRows } = require('./spreadsheetWorkbookReader');
 
 const encoder = get_encoding('o200k_base');
 
@@ -175,10 +175,14 @@ async function ingestTabularFileBuffer({
   trace = null,
 }) {
   const lowerName = String(filename || '').toLowerCase();
-  const isXls = lowerName.endsWith('.xls') || lowerName.endsWith('.xlsx');
+  const isLegacyXls = lowerName.endsWith('.xls') && !lowerName.endsWith('.xlsx');
+  const isXls = lowerName.endsWith('.xlsx');
   const isCsv = lowerName.endsWith('.csv');
+  if (isLegacyXls) {
+    throw new Error('Legacy .xls files are not supported. Please upload .xlsx or .csv.');
+  }
   if (!isXls && !isCsv) {
-    throw new Error('Tabular ingestion requires a spreadsheet (.xls, .xlsx, .csv).');
+    throw new Error('Tabular ingestion requires a spreadsheet (.xlsx, .csv).');
   }
 
   const sha256 = crypto.createHash('sha256').update(fileBuffer).digest('hex');
@@ -222,12 +226,11 @@ async function ingestTabularFileBuffer({
 
     let wb;
     try {
-      wb = xlsx.read(fileBuffer, { type: 'buffer', cellText: false, cellDates: true });
+      wb = await loadWorkbookFromBuffer(fileBuffer, { filename, contentType });
     } catch (e) {
-      // SheetJS sometimes throws cryptic "Could not find workbook" for non-spreadsheets.
-      throw new Error('Could not parse spreadsheet (invalid or unsupported workbook).');
+      throw new Error(e?.message || 'Could not parse spreadsheet (invalid or unsupported workbook).');
     }
-    const sheetNames = (wb.SheetNames || []).slice(0, 12);
+    const worksheets = (wb.worksheets || []).slice(0, 12);
     let totalRows = 0;
     let totalCells = 0;
 
@@ -255,24 +258,19 @@ async function ingestTabularFileBuffer({
     const previewMaxRows = Math.max(5, Math.min(Number(systemSettings.getNumber('TABLE_SCHEMA_PREVIEW_ROWS') || 60), 120));
     const previewMaxCols = Math.max(5, Math.min(Number(systemSettings.getNumber('TABLE_SCHEMA_PREVIEW_COLS') || 20), 50));
     const workbookPreview = { sheets: [] };
-    for (const sheetName of sheetNames.slice(0, 8)) {
-      const ws = wb.Sheets[sheetName];
-      if (!ws) continue;
-      const ref = ws['!ref'];
-      if (!ref) continue;
-      const range = xlsx.utils.decode_range(ref);
+    for (const ws of worksheets.slice(0, 8)) {
       const rows = [];
-      for (let r = range.s.r; r <= Math.min(range.e.r, range.s.r + previewMaxRows - 1); r += 1) {
-        const row = [];
-        for (let c = range.s.c; c <= Math.min(range.e.c, range.s.c + previewMaxCols - 1); c += 1) {
-          const addr = xlsx.utils.encode_cell({ r, c });
-          const cell = ws[addr];
-          const v = cell && (cell.w !== undefined ? cell.w : cell.v !== undefined ? cell.v : '');
-          row.push({ cell: addr, v: v === undefined || v === null ? '' : String(v).slice(0, 120) });
-        }
-        rows.push({ row: r + 1, cells: row });
-      }
-      workbookPreview.sheets.push({ sheet: sheetName, rows });
+      worksheetToRows(ws, { maxRows: previewMaxRows, maxCols: previewMaxCols })
+        .forEach((values, rowIdx) => {
+          rows.push({
+            row: rowIdx + 1,
+            cells: values.map((v, colIdx) => ({
+              cell: cellAddress(rowIdx + 1, colIdx + 1),
+              v: v === undefined || v === null ? '' : String(v).slice(0, 120),
+            })),
+          });
+        });
+      workbookPreview.sheets.push({ sheet: ws.name, rows });
     }
 
     let inferredSchema = null;
@@ -296,15 +294,9 @@ async function ingestTabularFileBuffer({
       }
     }
 
-    for (const sheetName of sheetNames) {
-      const ws = wb.Sheets[sheetName];
-      if (!ws) continue;
-      const ref = ws['!ref'];
-      if (!ref) continue;
-      const range = xlsx.utils.decode_range(ref);
-      const rangeRow0 = Number(range?.s?.r || 0);
-      const rangeCol0 = Number(range?.s?.c || 0);
-      const rows = xlsx.utils.sheet_to_json(ws, { header: 1, blankrows: true, defval: '' });
+    for (const ws of worksheets) {
+      const sheetName = ws.name;
+      const rows = worksheetToRows(ws);
       if (!Array.isArray(rows) || rows.length < 2) continue;
 
       const headers = (Array.isArray(rows[0]) ? rows[0] : []).map((h, idx) => {
@@ -364,8 +356,8 @@ async function ingestTabularFileBuffer({
       };
 
       for (let r = 1; r < maxRows; r += 1) {
-        const row = Array.isArray(rows[r]) ? rows[r] : [];
-        const rowIndex = rangeRow0 + r + 1; // 1-based Excel row number (best-effort)
+        const row = (Array.isArray(rows[r]) ? rows[r] : []).slice(0, maxCols);
+        const rowIndex = r + 1; // 1-based Excel row number
         const text = buildRowText({ filename, sheet: sheetName, rowIndex, headers, row });
         const tokens = encoder.encode(text).length;
         const embeddingText = embeddingContext.buildEmbeddingText({
@@ -388,7 +380,6 @@ async function ingestTabularFileBuffer({
       // Capture numeric cells with real addresses (A1) from worksheet cells.
       const maxCells = Number(systemSettings.getNumber('DATASET_MAX_NUMERIC_CELLS') || 200000);
       try {
-        const keys = Object.keys(ws).filter(k => k && k[0] !== '!' && /^[A-Z]+[0-9]+$/.test(k));
         const ops = [];
         const bulkSize = Math.max(50, Math.min(Number(process.env.DATASET_CELL_BULK_SIZE || 500), 5000));
         const flushOps = async () => {
@@ -397,17 +388,13 @@ async function ingestTabularFileBuffer({
             await DatasetTableCell.bulkWrite(ops.splice(0, ops.length), { ordered: false });
           } catch { }
         };
-        for (const addr of keys) {
+        for (const cell of worksheetCells(ws, { maxCells })) {
           if (totalCells >= maxCells) break;
-          const cellObj = ws[addr];
-          if (!cellObj) continue;
-          const raw0 = (cellObj.w !== undefined ? cellObj.w : cellObj.v);
-          const raw = String(raw0 ?? '').trim();
+          const raw = String(cell.text ?? cell.value ?? '').trim();
           const n = parseNumberLoose(raw);
           if (!Number.isFinite(n)) continue;
-          const decoded = xlsx.utils.decode_cell(addr);
-          const rowIndex = decoded.r + 1;
-          const colIndex = decoded.c + 1;
+          const rowIndex = cell.rowNumber;
+          const colIndex = cell.colNumber;
           totalCells += 1;
           ops.push({
             updateOne: {
@@ -423,8 +410,8 @@ async function ingestTabularFileBuffer({
                   sheet: sheetName,
                   rowIndex,
                   colIndex,
-                  cell: addr,
-                  colHeader: String(headers[colIndex - (rangeCol0 + 1)] ?? '').trim(),
+                  cell: cell.address,
+                  colHeader: String(headers[colIndex - 1] ?? '').trim(),
                   valueRaw: raw,
                   valueNumber: n,
                 }

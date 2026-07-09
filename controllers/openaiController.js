@@ -6,14 +6,20 @@ const axios = require('axios');
 const logger = require('../config/logger');
 const User = require('../models/user');
 const fs = require('fs');
+const path = require('path');
 const FormData = require('form-data');
 const tenantSettingsStore = require('../services/tenantSettingsStore');
+const { loadWorkbookFromBuffer, worksheetToRows } = require('../services/spreadsheetWorkbookReader');
 
 function getAuthHeaders() {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error('OPENAI_API_KEY missing');
   }
   return { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function getTenantIdFromReq(req) {
@@ -39,6 +45,131 @@ async function getKbVectorStoreIdOrThrow(req) {
     throw err;
   }
   return id;
+}
+
+function isChatScopedUpload(req) {
+  return String(req.body?.scope || '').trim().toLowerCase() === 'chat';
+}
+
+async function createChatVectorStore(req) {
+  const threadId = String(req.body?.threadId || '').trim();
+  const suffix = threadId ? threadId.slice(0, 36) : new Date().toISOString();
+  const resp = await axios.post(
+    'https://api.openai.com/v1/vector_stores',
+    { name: `chat-upload-${suffix}` },
+    { headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' }, timeout: 60_000 }
+  );
+  const id = String(resp.data?.id || '').trim();
+  if (!id) throw new Error('OpenAI did not return a vector store id.');
+  return id;
+}
+
+async function resolveUploadVectorStoreId(req) {
+  if (!isChatScopedUpload(req)) {
+    return { vectorStoreId: await getKbVectorStoreIdOrThrow(req), scope: 'tenant' };
+  }
+
+  const existing = String(req.body?.vectorStoreId || '').trim();
+  if (existing) return { vectorStoreId: existing, scope: 'chat' };
+
+  return { vectorStoreId: await createChatVectorStore(req), scope: 'chat' };
+}
+
+async function waitForVectorStoreFile(vectorStoreId, fileId) {
+  const timeoutMs = Math.max(5_000, Number(process.env.OPENAI_VS_FILE_READY_TIMEOUT_MS || 60_000));
+  const started = Date.now();
+  let last = null;
+
+  while (Date.now() - started < timeoutMs) {
+    const resp = await axios.get(
+      `https://api.openai.com/v1/vector_stores/${vectorStoreId}/files/${fileId}`,
+      { headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' }, timeout: 30_000 }
+    );
+    last = resp.data || null;
+    const status = String(last?.status || '').toLowerCase();
+    if (status === 'completed') return last;
+    if (status === 'failed' || status === 'cancelled') {
+      const detail = last?.last_error?.message || `Vector store file processing ${status}.`;
+      const err = new Error(detail);
+      err.status = 502;
+      throw err;
+    }
+    await sleep(1000);
+  }
+
+  const err = new Error('Vector store file processing did not finish in time. Please try again shortly.');
+  err.status = 504;
+  err.vectorStoreFile = last;
+  throw err;
+}
+
+function jsonUploadName(filename) {
+  const parsed = path.parse(String(filename || 'spreadsheet'));
+  const base = (parsed.name || 'spreadsheet').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120);
+  return `${base || 'spreadsheet'}.json`;
+}
+
+function sheetToJsonPayload(sheet, { maxRows = 10000, maxCols = 100 } = {}) {
+  const rows = worksheetToRows(sheet, { maxRows, maxCols });
+  if (!rows.length) {
+    return { name: sheet.name, columns: [], rows: [] };
+  }
+
+  const columns = rows[0].map((header, idx) => {
+    const value = String(header ?? '').replace(/\s+/g, ' ').trim();
+    return value || `col_${idx + 1}`;
+  });
+
+  const dataRows = rows.slice(1)
+    .filter((row) => row.some((value) => String(value ?? '').trim()))
+    .map((row, idx) => {
+      const item = { rowNumber: idx + 2 };
+      columns.forEach((column, colIdx) => {
+        item[column] = row[colIdx] ?? '';
+      });
+      return item;
+    });
+
+  return { name: sheet.name, columns, rows: dataRows };
+}
+
+async function appendFileForVectorStore(form, file) {
+  const originalName = String(file?.originalname || 'file');
+  const lower = originalName.toLowerCase();
+  const contentType = String(file?.mimetype || '').toLowerCase();
+  const isCsv = lower.endsWith('.csv') || contentType.includes('csv');
+  const isXlsx = lower.endsWith('.xlsx') || contentType.includes('spreadsheetml');
+  const isLegacyXls = lower.endsWith('.xls') && !lower.endsWith('.xlsx');
+
+  if (isLegacyXls) {
+    const err = new Error('Legacy .xls files are not supported for vector store upload. Please upload .xlsx or .csv.');
+    err.status = 400;
+    throw err;
+  }
+
+  if (isCsv || isXlsx) {
+    const buffer = await fs.promises.readFile(file.path);
+    const workbook = await loadWorkbookFromBuffer(buffer, {
+      filename: originalName,
+      contentType: file.mimetype,
+    });
+    const payload = {
+      sourceFile: originalName,
+      convertedFrom: isCsv ? 'csv' : 'xlsx',
+      sheets: workbook.worksheets.map((sheet) => sheetToJsonPayload(sheet)),
+    };
+    const json = JSON.stringify(payload, null, 2);
+    const filename = jsonUploadName(originalName);
+
+    form.append('file', Buffer.from(json, 'utf8'), {
+      filename,
+      contentType: 'application/json',
+    });
+    return { converted: true, filename, format: 'json' };
+  }
+
+  form.append('file', fs.createReadStream(file.path), originalName);
+  return { converted: false, filename: originalName, format: 'original' };
 }
 
 // --- Vector stores (admin) ---
@@ -222,7 +353,7 @@ exports.listAssistantFiles = async (req, res) => {
 
 exports.uploadAssistantFile = async (req, res) => {
   try {
-    const vectorStoreId = await getKbVectorStoreIdOrThrow(req);
+    const { vectorStoreId, scope } = await resolveUploadVectorStoreId(req);
 
     const file = req.file;
     if (!file || !file.path) return res.status(400).json({ error: 'Nem érkezett fájl a kérésben vagy hiányzik az útvonal.' });
@@ -230,7 +361,7 @@ exports.uploadAssistantFile = async (req, res) => {
     const form = new FormData();
     // Note: purpose value still applies to file_search/vector_store ingestion.
     form.append('purpose', 'assistants');
-    form.append('file', fs.createReadStream(file.path), file.originalname);
+    const uploadInfo = await appendFileForVectorStore(form, file);
 
     const uploadRes = await axios.post('https://api.openai.com/v1/files', form, {
       headers: { ...getAuthHeaders(), ...form.getHeaders() },
@@ -240,25 +371,37 @@ exports.uploadAssistantFile = async (req, res) => {
 
     const fileId = uploadRes.data.id;
 
-    await axios.post(
+    const vectorStoreFileRes = await axios.post(
       `https://api.openai.com/v1/vector_stores/${vectorStoreId}/files`,
       { file_id: fileId },
       { headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' }, timeout: 120_000 }
     );
+    const vectorStoreFile = await waitForVectorStoreFile(vectorStoreId, fileId);
 
-    try {
-      fs.unlinkSync(file.path);
-    } catch {}
-
-    return res.status(201).json({ message: 'Fájl sikeresen feltöltve és hozzárendelve.', fileId, vectorStoreId });
+    return res.status(201).json({
+      message: 'Fájl sikeresen feltöltve és hozzárendelve.',
+      fileId,
+      vectorStoreId,
+      scope,
+      vectorStoreFileId: vectorStoreFileRes.data?.id || fileId,
+      status: vectorStoreFile?.status || vectorStoreFileRes.data?.status || null,
+      converted: uploadInfo.converted,
+      filename: uploadInfo.filename,
+      format: uploadInfo.format,
+    });
   } catch (err) {
     const status = err?.status || err?.response?.status || 500;
+    const upstreamMessage = err?.response?.data?.error?.message;
     logger.error('openai.vector_store.files.upload failed', {
       message: err?.message || String(err),
       status,
       data: err?.response?.data || null,
     });
-    return res.status(status).json({ ok: false, error: err?.message || 'Nem sikerült feltölteni a fájlt.' });
+    return res.status(status).json({ ok: false, error: upstreamMessage || err?.message || 'Nem sikerült feltölteni a fájlt.' });
+  } finally {
+    try {
+      if (req.file?.path) fs.unlinkSync(req.file.path);
+    } catch {}
   }
 };
 

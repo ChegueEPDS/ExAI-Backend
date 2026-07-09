@@ -3,7 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const https = require('https');
-const multer = require('multer');
+const { diskUpload } = require('../middlewares/uploadFactory');
 const { v4: uuidv4 } = require('uuid');
 const { uploadPdfWithFormRecognizerInternal } = require('../helpers/ocrHelper');
 const { generateDocxFile, generateDocxBuffer } = require('../helpers/docx');
@@ -13,7 +13,7 @@ const { extractCertFieldsFromOCR } = require('../helpers/openaiCertExtractor');
 const mongoose = require('mongoose');
 const User = require('../models/user');
 const Tenant = require('../models/tenant');
-const upload = multer({ dest: 'uploads/' });
+const upload = diskUpload({ fileSizeMb: 50, files: 20, fields: 50 });
 const DraftCertificate = require('../models/draftCertificate.js');
 const CompanyCertificateLink = require('../models/companyCertificateLink');
 const UploadBatch = require('../models/uploadBatch');
@@ -368,7 +368,7 @@ async function downloadBlobToBufferViaSAS(blobPath, ttlSeconds = 600) {
 
 // 🔹 POST /api/certificates/bulk-upload
 exports.bulkUpload = [
-  upload.array('files', 20), // max 100
+  upload.array('files', 20),
   async (req, res) => {
     try {
       if (!req.files || req.files.length === 0) {

@@ -6,12 +6,12 @@ const { get_encoding } = require('tiktoken');
 const http = require('http');
 const https = require('https');
 const mammoth = require('mammoth');
-const xlsx = require('xlsx');
 const logger = require('../config/logger');
 const systemSettings = require('./systemSettingsStore');
 const { initSse } = require('../services/sseService');
 const { buildTabularHint } = require('../services/chatPromptService');
 const { resolveUserAndTenant, ensureConversationOwnership } = require('../services/chatAccessService');
+const { loadWorkbookFromBuffer, worksheetToCsv } = require('./spreadsheetWorkbookReader');
 
 const encoder = get_encoding('o200k_base');
 
@@ -134,14 +134,21 @@ async function handleUploadAndAskStream(req, res) {
             // XLS/XLSX
             if (
               mt.includes('excel') || mt.includes('spreadsheetml') ||
+              file.originalname.toLowerCase().endsWith('.csv') ||
               file.originalname.toLowerCase().endsWith('.xls') ||
               file.originalname.toLowerCase().endsWith('.xlsx')
             ) {
-              const wb = xlsx.read(file.buffer, { type: 'buffer' });
+              if (file.originalname.toLowerCase().endsWith('.xls') && !file.originalname.toLowerCase().endsWith('.xlsx')) {
+                return 'Legacy .xls files are not supported. Please upload .xlsx or .csv.';
+              }
+              const wb = await loadWorkbookFromBuffer(file.buffer, {
+                filename: file.originalname,
+                contentType: file.mimetype,
+              });
               const parts = [];
-              wb.SheetNames.forEach(sheet => {
-                const csv = xlsx.utils.sheet_to_csv(wb.Sheets[sheet], { blankrows: false });
-                parts.push(`-- SHEET: ${sheet} --\n${csv}`);
+              wb.worksheets.forEach(sheet => {
+                const csv = worksheetToCsv(sheet);
+                parts.push(`-- SHEET: ${sheet.name} --\n${csv}`);
               });
               return parts.join('\n\n');
             }

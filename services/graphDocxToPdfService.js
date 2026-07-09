@@ -51,11 +51,25 @@ async function ensureFolderPath(client, driveId, rootId, folderPath) {
   return parentId;
 }
 
-async function uploadBufferToFolder(client, driveId, folderId, fileName, buffer) {
+function officeContentTypeForFileName(fileName) {
+  const lower = String(fileName || '').toLowerCase();
+  if (lower.endsWith('.xlsx')) {
+    return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  }
+  if (lower.endsWith('.xlsm')) {
+    return 'application/vnd.ms-excel.sheet.macroEnabled.12';
+  }
+  if (lower.endsWith('.pptx')) {
+    return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+  }
+  return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+}
+
+async function uploadBufferToFolder(client, driveId, folderId, fileName, buffer, contentType = null) {
   const safe = safeName(fileName, 140);
   const item = await client
     .api(`/drives/${driveId}/items/${folderId}:/${encodeURIComponent(safe)}:/content`)
-    .header('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+    .header('Content-Type', contentType || officeContentTypeForFileName(safe))
     .put(buffer);
   if (!item?.id) throw new Error('Graph: upload did not return item id');
   return { itemId: item.id, name: item.name || safe };
@@ -76,21 +90,22 @@ async function deleteItem(client, driveId, itemId) {
 }
 
 /**
- * Convert a DOCX buffer to a PDF buffer using Microsoft Graph (app-only).
+ * Convert an Office document buffer to a PDF buffer using Microsoft Graph (app-only).
  * Requires env vars for app credential and access to a SharePoint site drive.
  */
-async function convertDocxBufferToPdfBuffer(docxBuffer, opts = {}) {
+async function convertOfficeBufferToPdfBuffer(fileBuffer, opts = {}) {
   const hostname = opts.hostname || process.env.GRAPH_SP_HOSTNAME || 'exworkss.sharepoint.com';
   const sitePath = opts.sitePath || process.env.GRAPH_SP_SITE_PATH || '/sites/ExAI';
   const folderPath = opts.folderPath || process.env.GRAPH_SP_CONVERT_FOLDER || 'rot-convert';
-  const fileName = opts.fileName || `rot-${Date.now()}.docx`;
+  const fileName = opts.fileName || `office-${Date.now()}.docx`;
+  const contentType = opts.contentType || officeContentTypeForFileName(fileName);
 
   const client = getGraphClient();
   try {
     const { driveId, rootId } = await getSiteAndDriveIds(client, hostname, sitePath);
     const folderId = await ensureFolderPath(client, driveId, rootId, folderPath);
 
-    const { itemId } = await uploadBufferToFolder(client, driveId, folderId, fileName, docxBuffer);
+    const { itemId } = await uploadBufferToFolder(client, driveId, folderId, fileName, fileBuffer, contentType);
     try {
       return await downloadPdfForItem(client, driveId, itemId);
     } finally {
@@ -113,6 +128,25 @@ async function convertDocxBufferToPdfBuffer(docxBuffer, opts = {}) {
   }
 }
 
+async function convertDocxBufferToPdfBuffer(docxBuffer, opts = {}) {
+  return convertOfficeBufferToPdfBuffer(docxBuffer, {
+    ...opts,
+    fileName: opts.fileName || `rot-${Date.now()}.docx`,
+    contentType: opts.contentType || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  });
+}
+
+async function convertXlsxBufferToPdfBuffer(xlsxBuffer, opts = {}) {
+  return convertOfficeBufferToPdfBuffer(xlsxBuffer, {
+    ...opts,
+    fileName: opts.fileName || `workbook-${Date.now()}.xlsx`,
+    folderPath: opts.folderPath || process.env.GRAPH_SP_XLSX_CONVERT_FOLDER || process.env.GRAPH_SP_CONVERT_FOLDER || 'itr-convert',
+    contentType: opts.contentType || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  });
+}
+
 module.exports = {
-  convertDocxBufferToPdfBuffer
+  convertOfficeBufferToPdfBuffer,
+  convertDocxBufferToPdfBuffer,
+  convertXlsxBufferToPdfBuffer
 };

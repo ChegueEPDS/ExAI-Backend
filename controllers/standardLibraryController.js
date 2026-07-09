@@ -1,4 +1,4 @@
-const multer = require('multer');
+const { memoryUpload } = require('../middlewares/uploadFactory');
 const Standard = require('../models/standard');
 const StandardClause = require('../models/standardClause');
 const StandardSet = require('../models/standardSet');
@@ -8,7 +8,7 @@ const { ingestStandardFiles, deleteStandard } = require('../services/standardIng
 const azureBlob = require('../services/azureBlobService');
 const systemSettings = require('../services/systemSettingsStore');
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024, files: 10 } });
+const upload = memoryUpload({ fileSizeMb: 50, files: 10, fields: 50 });
 exports.uploadMulter = upload;
 
 async function resolveStandardIdForTenant({ tenantId, standardRef }) {

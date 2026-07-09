@@ -73,6 +73,41 @@ function detectUnsupportedParamFromError(data) {
   return m?.[1] ? String(m[1]) : '';
 }
 
+function isReadableStream(value) {
+  return value && typeof value === 'object' && typeof value.on === 'function' && typeof value.pipe === 'function';
+}
+
+async function readStreamBody(stream, maxBytes = 64 * 1024) {
+  return new Promise((resolve) => {
+    let total = 0;
+    const chunks = [];
+    stream.on('data', (chunk) => {
+      if (total >= maxBytes) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      const remaining = maxBytes - total;
+      chunks.push(buf.length > remaining ? buf.subarray(0, remaining) : buf);
+      total += Math.min(buf.length, remaining);
+    });
+    stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    stream.on('error', () => resolve(''));
+  });
+}
+
+async function normalizeAxiosErrorResponse(error) {
+  const data = error?.response?.data;
+  if (!isReadableStream(data)) return error;
+
+  const text = await readStreamBody(data);
+  let parsed = text;
+  try {
+    parsed = text ? JSON.parse(text) : text;
+  } catch {
+    parsed = text;
+  }
+  error.response.data = parsed;
+  return error;
+}
+
 async function createResponse({
   model,
   instructions = '',
@@ -127,6 +162,7 @@ async function createResponse({
     });
     return resp.data;
   } catch (e) {
+    await normalizeAxiosErrorResponse(e);
     const status = e?.response?.status;
     const data = e?.response?.data;
     const detail = (data && typeof data === 'object') ? safeJsonStringify(data) : (data ? String(data).slice(0, 2000) : '');
@@ -269,6 +305,7 @@ async function createResponseStream({
           });
           return resp2.data;
         } catch (e2) {
+          await normalizeAxiosErrorResponse(e2);
           const status2 = e2?.response?.status;
           if (status2 !== 400) throw e2;
         }

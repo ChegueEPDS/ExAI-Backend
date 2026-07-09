@@ -1,14 +1,11 @@
-const multer = require('multer');
 const logger = require('../config/logger');
 const { ocrImageBufferToDataplatePrompt, formatDataplateText } = require('../helpers/azureVisionOcr');
 const { extractDataplateFieldsFromOcrText } = require('../helpers/dataplateJsonExtractor');
 const { resolveUserAndTenant } = require('../services/chatAccessService');
 const systemSettings = require('../services/systemSettingsStore');
+const { memoryUpload } = require('../middlewares/uploadFactory');
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024, files: 5 },
-});
+const upload = memoryUpload({ fileSizeMb: 10, files: 5, fields: 50 });
 
 function previewText(raw, { head = 1200, tail = 600 } = {}) {
   const s = String(raw ?? '')

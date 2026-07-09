@@ -32,8 +32,10 @@ const {
   primaryEquipmentMarking,
   zoneView
 } = require('../services/rbSchemaValueService');
+const { convertXlsxBufferToPdfBuffer } = require('../services/xlsxPdfService');
 
 const EXCEL_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+const PDF_CONTENT_TYPE = 'application/pdf';
 const DEFAULT_COLUMNS = [
   { header: '', key: 'A', width: 8 },   // A
   { header: '', key: 'B', width: 10 },  // B
@@ -77,6 +79,7 @@ const REPORT_JOB_TYPES = {
   LATEST_INSPECTIONS: 'latest_inspections'
 };
 const REPORT_BLOB_PREFIX = 'report-exports';
+const PRINTABLE_PAGE_HEIGHT_POINTS = 720;
 function displayInspectionTypeForReport(type) {
   return String(type || '') === 'Initial Detailed (Index)' ? 'Initial Detailed' : (type || '');
 }
@@ -189,6 +192,96 @@ const REPORT_EQUIPMENT_SELECT = Object.fromEntries(
 );
 
 const REPORT_INSPECTOR_SELECT = 'firstName lastName name position positionInfo signatureBlobUrl signatureBlobPath email';
+
+function applyOnePageWidePrintSetup(ws) {
+  ws.pageSetup = ws.pageSetup || {};
+  ws.pageSetup.fitToPage = true;
+  ws.pageSetup.fitToWidth = 1;
+  ws.pageSetup.fitToHeight = 0;
+  ws.pageSetup.horizontalCentered = true;
+  ws.pageSetup.verticalCentered = false;
+  ws.pageSetup.margins = {
+    left: 0.25,
+    right: 0.25,
+    top: 0.3,
+    bottom: 0.3,
+    header: 0,
+    footer: 0
+  };
+  ws.pageSetup.printArea = 'A:N';
+}
+
+function rowHeightPoints(row) {
+  const h = Number(row?.height || 0);
+  return Number.isFinite(h) && h > 0 ? h : 15;
+}
+
+function getCurrentPrintPageHeight(ws, pageHeight = PRINTABLE_PAGE_HEIGHT_POINTS) {
+  let current = 0;
+  for (let rn = 1; rn <= ws.rowCount; rn += 1) {
+    const row = ws.getRow(rn);
+    current += rowHeightPoints(row);
+    if (row?.model?.pageBreak || row?.pageBreak) {
+      current = 0;
+      continue;
+    }
+    if (current > pageHeight) {
+      current = rowHeightPoints(row);
+    }
+  }
+  return current;
+}
+
+function addPageBreakBeforeNextRow(ws) {
+  const lastRow = ws.lastRow;
+  if (!lastRow) return false;
+  if (typeof lastRow.addPageBreak === 'function') {
+    lastRow.addPageBreak();
+  } else {
+    lastRow.pageBreak = true;
+  }
+  return true;
+}
+
+function ensureNextBlockFitsOnPage(ws, requiredHeight, pageHeight = PRINTABLE_PAGE_HEIGHT_POINTS) {
+  const required = Number(requiredHeight || 0);
+  if (!Number.isFinite(required) || required <= 0 || required >= pageHeight) return false;
+  const current = getCurrentPrintPageHeight(ws, pageHeight);
+  if (current > 0 && current + required > pageHeight) {
+    return addPageBreakBeforeNextRow(ws);
+  }
+  return false;
+}
+
+function normalizeInspectionExportFormat(raw) {
+  const value = String(raw || '').trim().toLowerCase();
+  return value === 'pdf' ? 'pdf' : 'xlsx';
+}
+
+function replaceFileExtension(fileName, extension) {
+  const ext = String(extension || '').startsWith('.') ? extension : `.${extension || 'bin'}`;
+  return String(fileName || 'report.xlsx').replace(/\.[^.]+$/i, '') + ext;
+}
+
+async function buildInspectionFileBuffer(workbook, fileName, format = 'xlsx') {
+  const normalizedFormat = normalizeInspectionExportFormat(format);
+  const xlsxBuffer = await workbook.xlsx.writeBuffer();
+  if (normalizedFormat !== 'pdf') {
+    return {
+      buffer: xlsxBuffer,
+      fileName,
+      contentType: EXCEL_CONTENT_TYPE
+    };
+  }
+
+  const pdfFileName = replaceFileExtension(fileName, '.pdf');
+  const pdfBuffer = await convertXlsxBufferToPdfBuffer(Buffer.from(xlsxBuffer), { fileName });
+  return {
+    buffer: pdfBuffer,
+    fileName: pdfFileName,
+    contentType: PDF_CONTENT_TYPE
+  };
+}
 
 function normalizeInspectionSeverity(value) {
   if (value === null || value === undefined) return null;
@@ -373,13 +466,15 @@ function fetchImageBuffer(url) {
   });
 }
 
-async function logoFitSize(buffer, maxWidth = 117.5, maxHeight = 53.5) {
+async function logoFitSize(buffer, maxWidth = 117.5, maxHeight = 53.5, fit = 'contain') {
   try {
     const meta = await sharp(buffer).metadata();
     const width = Number(meta.width || 0);
     const height = Number(meta.height || 0);
     if (!width || !height) return { width: maxWidth, height: maxHeight };
-    const scale = Math.min(maxWidth / width, maxHeight / height, 1);
+    const scale = fit === 'cover'
+      ? Math.max(maxWidth / width, maxHeight / height)
+      : Math.min(maxWidth / width, maxHeight / height);
     return {
       width: Math.max(1, width * scale),
       height: Math.max(1, height * scale)
@@ -1184,6 +1279,10 @@ async function appendItrEquipmentImagesSection(ws, workbook, equipment, attachme
 
   if (!preparedImages.length) return;
 
+  const firstPair = preparedImages.slice(0, 2);
+  const firstImageRowHeight = Math.max(40, ...firstPair.map(img => (img.heightPx * 72) / 96)) + 10;
+  ensureNextBlockFitsOnPage(ws, 7 + 22 + 18 + firstImageRowHeight);
+
   const spacerBefore = ws.addRow([]);
   spacerBefore.height = 7;
 
@@ -1204,6 +1303,9 @@ async function appendItrEquipmentImagesSection(ws, workbook, equipment, attachme
 
   for (let i = 0; i < preparedImages.length; i += 2) {
     const pair = preparedImages.slice(i, i + 2);
+    const maxHeightPoints = Math.max(40, ...pair.map(img => (img.heightPx * 72) / 96));
+    const imageRowHeight = maxHeightPoints + 10;
+    ensureNextBlockFitsOnPage(ws, 18 + imageRowHeight);
 
     const titleRow = ws.addRow([]);
     titleRow.height = 18;
@@ -1223,8 +1325,7 @@ async function appendItrEquipmentImagesSection(ws, workbook, equipment, attachme
     });
 
     const imageRow = ws.addRow([]);
-    const maxHeightPoints = Math.max(40, ...pair.map(img => (img.heightPx * 72) / 96));
-    imageRow.height = maxHeightPoints + 10;
+    imageRow.height = imageRowHeight;
 
     pair.forEach((img, idx) => {
       const range = `${columnRanges[idx].startCol}${imageRow.number}:${columnRanges[idx].endCol}${imageRow.number}`;
@@ -1264,7 +1365,13 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   // -------- Excel workbook + sheet --------
   const workbook = new ExcelJS.Workbook();
   const ws = workbook.addWorksheet('Inspection Report');
-  const topRowHeight = 23;
+  const topRowHeight = 25;
+  const areaEquipmentRowHeight = 30;
+  const checklistHeaderRowHeight = 18;
+  const checklistMinRowHeight = 18;
+  const checklistLineHeight = 17;
+  const titleHeaderRowHeight = 19;
+  const logoHeaderHeightPx = Math.round(titleHeaderRowHeight * 2 * 96 / 72);
 
   const setHeaderCell = (range, text) => {
     ws.mergeCells(range);
@@ -1291,7 +1398,19 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       return Math.max(max, len);
     }, 1);
     const lineCount = Math.max(1, Math.ceil(maxTextLength / 23));
-    return Math.max(topRowHeight, lineCount * 15);
+    return Math.max(topRowHeight, lineCount * 16);
+  };
+
+  const estimateWrappedLineCount = (text, charsPerLine) => {
+    const safeCharsPerLine = Math.max(1, Number(charsPerLine) || 1);
+    const parts = String(text || '')
+      .split(/\r?\n/)
+      .map(part => part.trim());
+    if (!parts.length) return 1;
+    return parts.reduce((sum, part) => {
+      const len = part.length || 1;
+      return sum + Math.max(1, Math.ceil(len / safeCharsPerLine));
+    }, 0);
   };
 
   // Oszlopszélességek – kb. a tervhez igazítva
@@ -1324,11 +1443,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   const hasNonElectricalProtection = protectionTokens.some(token => nonElectricalProtectionTypes.has(token));
   const hasElectricalProtection = protectionTokens.some(token => !nonElectricalProtectionTypes.has(token));
 
-  // Oldalbeállítás: 1 oldal szélesre igazítás
-  ws.pageSetup = ws.pageSetup || {};
-  ws.pageSetup.fitToPage = true;
-  ws.pageSetup.fitToWidth = 1;   // Szélesség: 1 lap
-  ws.pageSetup.fitToHeight = 0;  // Magasság: Automatikus
+  applyOnePageWidePrintSetup(ws);
 
   // ========= 1. sor – tenant logo + cím + electrical marker + dátum =========
   try {
@@ -1337,10 +1452,9 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       buffer: logoBuffer,
       extension: 'png'
     });
-    const logoSize = await logoFitSize(logoBuffer);
-    // A méret a régi logóboxon belül marad, de az eredeti képarányt megtartja.
+    const logoSize = await logoFitSize(logoBuffer, 125, logoHeaderHeightPx, 'cover');
     ws.addImage(imageId, {
-      tl: { col: 0, row: 0 },      // A1
+      tl: { col: 0, row: 0 },
       ext: logoSize
     });
     ws.mergeCells('A1:B2');
@@ -1412,9 +1526,8 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   });
 
   // Címsorok magassága – két soros cím + fix méretű logó
-  const headerRowHeight = 15;
-  ws.getRow(1).height = headerRowHeight;
-  ws.getRow(2).height = headerRowHeight;
+  ws.getRow(1).height = titleHeaderRowHeight;
+  ws.getRow(2).height = titleHeaderRowHeight;
 
   // üres sor (3)
   const emptyRow3 = ws.addRow([]);
@@ -1623,8 +1736,8 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   ws.getCell(`M${equipmentInfoRow}`).fill = HEADER_FILL;
   ws.getCell(`N${equipmentInfoRow}`).value = exMarking['Equipment Protection Level'] || '';
 
-  ws.getRow(areaRow).height = topRowHeight;
-  ws.getRow(equipmentInfoRow).height = topRowHeight;
+  ws.getRow(areaRow).height = areaEquipmentRowHeight;
+  ws.getRow(equipmentInfoRow).height = areaEquipmentRowHeight;
 
   const borderRows = [clientRow, equipmentRow, certificateRow, areaRow, equipmentInfoRow];
   if (hasTagId && tagRowIndex) borderRows.splice(1, 0, tagRowIndex);
@@ -1649,7 +1762,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   // enforce Area / Equipment comparison heights again (some cells wrap)
   [areaRow, equipmentInfoRow].forEach(rn => {
     const row = ws.getRow(rn);
-    row.height = topRowHeight;
+    row.height = areaEquipmentRowHeight;
   });
   ws.getRow(spacerRowIndex).height = spacerHeight;
   ws.getRow(spacerAfterBlockIndex).height = spacerHeight;
@@ -1839,13 +1952,37 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
     fgColor: { argb: 'FFD9D9D9' }
   };
 
-  const checklistApproxCharsPerLine = isIndexTenant ? 95 : 65;
+  const checklistCheckCharsPerLine = isIndexTenant ? 82 : 62;
+  const checklistCommentCharsPerLine = isIndexTenant ? 34 : 46;
+  const groupHeaderRowHeight = 18;
+
+  const estimateQuestionRowHeight = (result) => {
+    const questionText =
+      (result?.questionText && (result.questionText.hu || result.questionText.eng)) ||
+      result?.question ||
+      '';
+    const imageNames = attachmentLookup ? attachmentLookup.getFileNamesForResult(result) : [];
+    const commentCellInfo = buildCommentCellValueWithSeverity(result?.note, result?.severity, imageNames);
+    const checkLineCount = estimateWrappedLineCount(questionText, checklistCheckCharsPerLine);
+    const commentLineCount = estimateWrappedLineCount(commentCellInfo.text, checklistCommentCharsPerLine);
+    const lineCount = Math.max(1, checkLineCount, commentLineCount);
+    return Math.max(checklistMinRowHeight, lineCount * checklistLineHeight);
+  };
 
   sortedGroupNames.forEach((groupName, groupIndex) => {
+    const firstResult = grouped[groupName]?.[0] || null;
+    if (firstResult) {
+      ensureNextBlockFitsOnPage(
+        ws,
+        groupHeaderRowHeight + checklistHeaderRowHeight + estimateQuestionRowHeight(firstResult)
+      );
+    }
+
     // Csoportcím sor – teljes szélesség merge
     const groupRow = ws.addRow([groupName]);
     const gr = groupRow.number;
     ws.mergeCells(`A${gr}:N${gr}`);
+    groupRow.height = groupHeaderRowHeight;
 
     // A teljes sor (A–N) formázása
     ['A','B','C','D','E','F','G','H','I','J','K','L','M','N'].forEach(col => {
@@ -1896,6 +2033,7 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       cell.border = BORDER_THIN;
       cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
     });
+    headerRow.height = checklistHeaderRowHeight;
 
     // Kérdések
     grouped[groupName].forEach(r => {
@@ -1956,9 +2094,8 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
 
       // Sor magasság becslése a kérdés hossza alapján,
       // hogy a teljes szöveg látható legyen több sorban is.
-      const textLength = (questionText?.length || 0) + (commentCellInfo.text?.length || 0) || 1;
-      const lineCount = Math.max(1, Math.ceil(textLength / checklistApproxCharsPerLine));
-      ws.getRow(rn).height = lineCount * 15; // 15 pont / sor, szükség esetén növelhető
+      const rowHeight = estimateQuestionRowHeight(r);
+      ws.getRow(rn).height = rowHeight;
     });
 
     // Üres sor csak a csoportok között, a végső Remarks sor előtt ne legyen hézag.
@@ -1975,9 +2112,8 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
     ws.getCell(`A${remarksR}`).value = 'Remarks';
     ws.getCell(`A${remarksR}`).font = { bold: true };
     ws.getCell(`B${remarksR}`).value = inspection?.remarks || '';
-    const remarksTextLength = (inspection?.remarks?.length || 0) || 1;
-    const remarksLineCount = Math.max(1, Math.ceil(remarksTextLength / checklistApproxCharsPerLine));
-    remarksRow.height = remarksLineCount * 15;
+    const remarksLineCount = estimateWrappedLineCount(inspection?.remarks || '', 105);
+    remarksRow.height = Math.max(checklistMinRowHeight, remarksLineCount * checklistLineHeight);
 
     ['A','B','C','D','E','F','G','H','I','J','K','L','M','N'].forEach(col => {
       const cell = ws.getCell(`${col}${remarksR}`);
@@ -2022,6 +2158,12 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
   setFooterField(positionR, 'Position:', inspectorPosition || '');
   setFooterField(copcR, 'IECEx CoPC#:', inspectorPositionInfo || '');
 
+  // Sor magasság beállítása a signature anchor előtt, hogy az image pozíció stabil legyen.
+  const footerRowHeight = 22;
+  ws.getRow(nameR).height = footerRowHeight;
+  ws.getRow(positionR).height = footerRowHeight;
+  ws.getRow(copcR).height = footerRowHeight;
+
   // jobb oldali blokk: Signature (H–N oszlop, 3 sor magas)
   ws.mergeCells(`H${nameR}:N${copcR}`);
   const signatureCell = ws.getCell(`H${nameR}`);
@@ -2043,8 +2185,8 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
       const origWidth = meta.width || 400;
       const origHeight = meta.height || 150;
 
-      // Cél magasság: 2 cm (≈ 0.787 in) → px (96 dpi)
-      const targetHeight = Math.round((2 / 2.54) * 96); // ~76 px
+      // Keep the signature on the line without dropping into the Date row.
+      const targetHeight = 58;
       const scale = targetHeight / origHeight;
       const targetWidth = Math.round(origWidth * scale);
 
@@ -2060,27 +2202,14 @@ async function buildInspectionWorkbook(inspection, equipment, site, zone, scheme
         extension
       });
 
-      // A Signature vonal fölé tegyük a képet.
-      // Egyszerű közelítés: fix vízszintes offset a H oszlophoz képest.
-      const tlCol = 10.3; // kissé jobbra tolva, hogy ne lógjon a "Signature:" szóra
-
-      // A blokk közepére pozicionáljuk függőlegesen.
       ws.addImage(imageId, {
-        // Vízszintesen középre: H (7)–N (13) blokk közepe ≈ 10.5
-        // Függőlegesen vissza az eredeti, jól bevált pozícióra.
-        tl: { col: 10.5, row: nameR - 1 + 0.8 },
+        tl: { col: 10.45, row: nameR - 1 + 0.28 },
         ext: { width: targetWidth, height: targetHeight }
       });
     } catch (e) {
       console.warn('⚠️ Failed to embed inspector signature image:', e?.message || e);
     }
   }
-
-  // Sor magasság beállítása: mindhárom sor azonos magasságú legyen
-  ws.getRow(nameR).height = 22;
-  ws.getRow(positionR).height = 22;
-  ws.getRow(copcR).height = 22;
-
 
   await appendItrEquipmentImagesSection(ws, workbook, equipment, attachmentLookup, { site, zone, inspection });
 
@@ -2424,11 +2553,7 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
 
   ws.columns = DEFAULT_COLUMNS;
 
-  // Oldalbeállítás: 1 oldal szélesre igazítás
-  ws.pageSetup = ws.pageSetup || {};
-  ws.pageSetup.fitToPage = true;
-  ws.pageSetup.fitToWidth = 1;   // Szélesség: 1 lap
-  ws.pageSetup.fitToHeight = 0;  // Magasság: Automatikus
+  applyOnePageWidePrintSetup(ws);
 
   const dateValue = reportDate ? new Date(reportDate) : new Date();
 
@@ -2656,7 +2781,7 @@ function buildPunchlistWorkbook({ site, zone, failures, reportDate, scopeLabel }
   return { workbook, fileName };
 }
 
-async function generateProjectReportArchive({ tenantId, siteId, tenantName, requestHost }, targetStream, progressCb = null) {
+async function generateProjectReportArchive({ tenantId, siteId, tenantName, requestHost, format = 'xlsx' }, targetStream, progressCb = null) {
   const site = await Site.findOne({ _id: siteId, tenantId }).lean();
   if (!site) {
     throw new Error('Project not found.');
@@ -2755,9 +2880,9 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName, requ
       attachmentLookup,
       { tenantName: tenantName || '' }
     );
-    const itrBuffer = await itrWorkbook.xlsx.writeBuffer();
-    archive.append(itrBuffer, {
-      name: path.posix.join(PROJECT_REPORT_DIRS.INSPECTIONS, itrFileName)
+    const itrFile = await buildInspectionFileBuffer(itrWorkbook, itrFileName, format);
+    archive.append(itrFile.buffer, {
+      name: path.posix.join(PROJECT_REPORT_DIRS.INSPECTIONS, itrFile.fileName)
     });
 
     const equipmentDocs = collectEquipmentDocuments(eq, sanitizedIdentifier, {
@@ -2877,7 +3002,7 @@ async function generateProjectReportArchive({ tenantId, siteId, tenantName, requ
 }
 
 async function generateLatestInspectionArchive(
-  { tenantId, siteId, zoneId, includeImages, tenantName, requestHost, jobId = null },
+  { tenantId, siteId, zoneId, includeImages, tenantName, requestHost, jobId = null, format = 'xlsx' },
   targetStream,
   progressCb = null
 ) {
@@ -2983,8 +3108,8 @@ async function generateLatestInspectionArchive(
         attachmentLookup,
         { tenantName: tenantName || '' }
       );
-      const buffer = await workbook.xlsx.writeBuffer();
-      archive.append(buffer, { name: fileName });
+      const exportFile = await buildInspectionFileBuffer(workbook, fileName, format);
+      archive.append(exportFile.buffer, { name: exportFile.fileName });
       fileCount++;
 
       if (includeImages && attachmentLookup?.all?.length) {
@@ -3211,7 +3336,13 @@ async function runReportExportJob(jobId) {
     const progressCallback = createProgressCallback(job);
     if (job.type === REPORT_JOB_TYPES.PROJECT_FULL) {
       result = await generateProjectReportArchive(
-        { tenantId: job.tenantId, siteId: job.params?.siteId, tenantName, requestHost },
+        {
+          tenantId: job.tenantId,
+          siteId: job.params?.siteId,
+          tenantName,
+          requestHost,
+          format: normalizeInspectionExportFormat(job.params?.format)
+        },
         uploadStream,
         progressCallback
       );
@@ -3224,7 +3355,8 @@ async function runReportExportJob(jobId) {
           includeImages: job.params?.includeImages !== false,
           tenantName,
           requestHost,
-          jobId: job.jobId
+          jobId: job.jobId,
+          format: normalizeInspectionExportFormat(job.params?.format)
         },
         uploadStream,
         progressCallback
@@ -3400,6 +3532,7 @@ exports.exportInspectionXLSX = async (req, res) => {
   try {
     const { id } = req.params;
     const includeImages = req.query?.includeImages === 'true';
+    const format = normalizeInspectionExportFormat(req.query?.format);
 
     const inspection = await Inspection.findById(id)
       .populate(
@@ -3454,14 +3587,14 @@ exports.exportInspectionXLSX = async (req, res) => {
       { tenantName: req.scope?.tenantName || '' }
     );
 
+    const exportFile = await buildInspectionFileBuffer(workbook, fileName, format);
+
     if (!includeImages) {
-      setDownloadHeaders(res, fileName, EXCEL_CONTENT_TYPE);
-      await workbook.xlsx.write(res);
-      res.end();
+      setDownloadHeaders(res, exportFile.fileName, exportFile.contentType);
+      res.end(exportFile.buffer);
       return;
     }
 
-    const workbookBuffer = await workbook.xlsx.writeBuffer();
     const zipIdentifier = sanitizeFileNameSegment(eqIdentifier);
     const zipName = `Inspection_${zipIdentifier}_${Date.now()}.zip`;
 
@@ -3478,7 +3611,7 @@ exports.exportInspectionXLSX = async (req, res) => {
     });
 
     archive.pipe(res);
-    archive.append(workbookBuffer, { name: fileName });
+    archive.append(exportFile.buffer, { name: exportFile.fileName });
     if (attachmentLookup?.all?.length) {
       await appendImagesToArchive(archive, attachmentLookup.all);
     }
@@ -3654,6 +3787,7 @@ exports.exportProjectFullReport = async (req, res) => {
     const tenantId = req.scope?.tenantId;
     const userId = req.scope?.userId;
     const siteId = req.query?.siteId;
+    const format = normalizeInspectionExportFormat(req.query?.format);
 
     if (!tenantId) {
       return res.status(401).json({ message: 'Missing tenant context.' });
@@ -3672,7 +3806,7 @@ exports.exportProjectFullReport = async (req, res) => {
       tenantId,
       userId,
       type: REPORT_JOB_TYPES.PROJECT_FULL,
-      params: { siteId },
+      params: { siteId, format },
       tenantName: req.scope?.tenantName || '',
       meta: {
         siteName: site?.Name || site?.SiteName || '',
@@ -3693,6 +3827,7 @@ exports.exportLatestInspectionReportsZip = async (req, res) => {
     const userId = req.scope?.userId;
     const { zoneId, siteId } = req.query || {};
     const includeImages = (req.query?.includeImages ?? 'true') !== 'false';
+    const format = normalizeInspectionExportFormat(req.query?.format);
 
     if (!tenantId) {
       return res.status(400).json({ message: 'tenantId is missing from auth' });
@@ -3724,7 +3859,7 @@ exports.exportLatestInspectionReportsZip = async (req, res) => {
       tenantId,
       userId,
       type: REPORT_JOB_TYPES.LATEST_INSPECTIONS,
-      params: { zoneId, siteId, includeImages },
+      params: { zoneId, siteId, includeImages, format },
       tenantName: req.scope?.tenantName || '',
       meta
     });

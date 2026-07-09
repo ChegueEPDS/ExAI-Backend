@@ -3,7 +3,7 @@ const path = require('path');
 const Inspection = require('../models/inspection');
 const Equipment = require('../models/dataplate');
 const mongoose = require('mongoose');
-const multer = require('multer');
+const { diskUpload } = require('../middlewares/uploadFactory');
 const azureBlob = require('../services/azureBlobService');
 const QuestionTypeMapping = require('../models/questionTypeMapping');
 const SchemaDefinition = require('../models/schemaDefinition');
@@ -18,7 +18,7 @@ const {
 } = require('../services/schemaCycleService');
 const { scheduleDashboardStatsDirty } = require('../services/dashboardSummaryService');
 
-const upload = multer({ dest: 'uploads/' });
+const upload = diskUpload({ fileSizeMb: 25, files: 1, fields: 50 });
 
 /**
  * Segédfüggvény: összefoglaló statisztika számítása
@@ -802,11 +802,11 @@ exports.listInspections = async (req, res) => {
  *  - questionKey (optional) e.g. "T1-G2-3" or "SC1"
  *  - note (optional)
  */
-exports.uploadInspectionAttachment = (req, res) => {
+exports.uploadInspectionAttachment = (req, res, next) => {
   upload.single('file')(req, res, async (err) => {
     if (err) {
       console.error('❌ Attachment upload failed:', err);
-      return res.status(500).json({ message: 'Attachment upload failed' });
+      return next(err);
     }
 
     const file = req.file;

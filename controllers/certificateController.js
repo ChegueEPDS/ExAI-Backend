@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const Certificate = require('../models/certificate');
 const CompanyCertificateLink = require('../models/companyCertificateLink');
 const User = require('../models/user'); // 🔹 Importáljuk a User modellt
-const multer = require('multer');
+const { diskUpload } = require('../middlewares/uploadFactory');
 const { generateDocxFile } = require('../helpers/docx'); // 🔹 DOCX generálás importálása
 const azureBlobService = require('../services/azureBlobService');
 const { getReadSasUrl, toBlobPath } = azureBlobService;
@@ -20,7 +20,7 @@ const contributionRewardService = require('../services/contributionRewardService
 const CertificatePreviewJob = require('../models/certificatePreviewJob');
 const { buildLooseCertNoRegex, buildSubstringRegex } = require('../helpers/certificateSearch');
 
-const upload = multer({ dest: 'uploads/' });
+const upload = diskUpload({ fileSizeMb: 50, files: 1, fields: 30 });
 
 const today = new Date();
 
@@ -326,9 +326,9 @@ async function processCertificatePreviewJob(jobId) {
 exports.processCertificatePreviewJob = processCertificatePreviewJob;
 
 // Fájl feltöltési endpoint
-exports.uploadCertificate = async (req, res) => {
+exports.uploadCertificate = async (req, res, next) => {
   upload.single('file')(req, res, async (err) => {
-    if (err) return res.status(500).send('❌ Fájl feltöltési hiba.');
+    if (err) return next(err);
 
     // Guard: check if file was provided
     if (!req.file) {
@@ -1373,9 +1373,9 @@ exports.deletePreviewAtexJob = async (req, res) => {
 };
 
 // ATEX előnézet OCR+AI feldolgozással (nem ment DB-be, csak visszaadja az eredményt)
-exports.previewAtex = async (req, res) => {
+exports.previewAtex = async (req, res, next) => {
   upload.single('file')(req, res, async (err) => {
-    if (err) return res.status(500).send('❌ Fájl feltöltési hiba.');
+    if (err) return next(err);
     if (!req.file) {
       return res.status(400).json({ message: '❌ Hiányzó fájl a kérésben.' });
     }

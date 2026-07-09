@@ -7,7 +7,6 @@ const mongoose = require('mongoose');
 const fs = require('fs');
 const azureBlob = require('../services/azureBlobService');
 const { recordTombstone } = require('../services/syncTombstoneService');
-const xlsx = require('xlsx');
 const mime = require('mime-types');
 const ExcelJS = require('exceljs');
 const sharp = require('sharp');
@@ -23,6 +22,7 @@ const documentationService = require('../services/documentationService');
 const DocumentationAssignment = require('../models/documentationAssignment');
 const Tenant = require('../models/tenant');
 const { isFeatureEnabled } = require('../middlewares/tenantFeatureMiddleware');
+const { loadWorkbookFromBuffer, worksheetToObjects } = require('../services/spreadsheetWorkbookReader');
 
 // Helper: convert string tenantId to ObjectId safely
 const toObjectId = (id) => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null);
@@ -568,13 +568,15 @@ exports.importZonesFromXlsx = async (req, res) => {
     }
     await tenantAccess.assertLocationAccess(req, { siteId: site._id, zoneId: parentUnit?._id || null });
 
-    const workbook = xlsx.readFile(file.path);
-    const firstSheetName = workbook.SheetNames[0];
-    if (!firstSheetName) {
+    const workbook = await loadWorkbookFromBuffer(await fs.promises.readFile(file.path), {
+      filename: file.originalname,
+      contentType: file.mimetype,
+    });
+    const firstSheet = workbook.worksheets[0];
+    if (!firstSheet) {
       return res.status(400).json({ message: 'The uploaded workbook does not contain any worksheet.' });
     }
-    const sheet = workbook.Sheets[firstSheetName];
-    const rows = xlsx.utils.sheet_to_json(sheet, { defval: '' });
+    const rows = worksheetToObjects(firstSheet);
 
     if (!rows.length) {
       return res.status(400).json({ message: 'No data rows found in the uploaded XLSX.' });

@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const logger = require('../config/logger');
+const { customUpload } = require('../middlewares/uploadFactory');
 const DocumentIntelligence = require("@azure-rest/ai-document-intelligence").default;
 const { getLongRunningPoller, isUnexpected } = require("@azure-rest/ai-document-intelligence");
 
@@ -50,9 +51,11 @@ const storage = multer.diskStorage({
   }
 });
 
-const upload = multer({
+const upload = customUpload({
   storage,
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
+  fileSizeMb: 15,
+  files: 5,
+  fields: 50,
   fileFilter: (req, file, cb) => {
     const ok = file.mimetype?.startsWith('image/') || file.mimetype === 'application/pdf';
     cb(ok ? null : new Error('Unsupported file type'), ok);

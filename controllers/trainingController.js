@@ -1,5 +1,4 @@
 // controllers/trainingController.js
-const multer = require('multer');
 const mongoose = require('mongoose');
 const crypto = require('crypto');
 
@@ -17,11 +16,9 @@ const { convertDocxBufferToPdfBuffer } = require('../services/graphDocxToPdfServ
 const { stampPdfWithQr } = require('../services/pdfQrStampService');
 const systemSettings = require('../services/systemSettingsStore');
 const { signPdfBuffer } = require('../services/pdfSigningService');
+const { memoryUpload } = require('../middlewares/uploadFactory');
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 30 * 1024 * 1024 } // 30MB
-});
+const upload = memoryUpload({ fileSizeMb: 30, files: 1, fields: 50 });
 
 const ROT_COUNTER_KEY = 'global';
 

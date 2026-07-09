@@ -6,8 +6,9 @@ const healthMetricsController = require('../controllers/healthMetricsController'
 const authMiddleware = require('../middlewares/authMiddleware');
 const { requireAccess } = require('../middlewares/tenantAccessMiddleware');
 const { requireTenantFeature } = require('../middlewares/tenantFeatureMiddleware');
-const multer = require('multer');
-const upload = multer({ dest: 'uploads/' });
+const { diskUpload } = require('../middlewares/uploadFactory');
+const fileUpload = diskUpload({ fileSizeMb: 50, files: 20, fields: 50 });
+const xlsxUpload = diskUpload({ fileSizeMb: 25, files: 1, fields: 30 });
 
 // Új projekt létrehozása
 router.post('/', authMiddleware(), requireAccess('zone', 'create'), zoneController.createZone);
@@ -36,7 +37,7 @@ router.post(
     '/:id/upload-file',
     authMiddleware(),
     requireAccess('zone', 'update'),
-    upload.array('files'),
+    fileUpload.array('files', 20),
     zoneController.uploadFileToZone
   );
 
@@ -45,7 +46,7 @@ router.post(
   '/import-xlsx',
   authMiddleware(),
   requireAccess('zone', 'create'),
-  upload.single('file'),
+  xlsxUpload.single('file'),
   zoneController.importZonesFromXlsx
 );
   
