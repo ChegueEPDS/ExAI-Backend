@@ -4,6 +4,7 @@ const reportExportCleanup = require('./reportExportCleanup');
 const mobileSyncWorker = require('./mobileSyncWorker');
 const certificatePreviewWorker = require('./certificatePreviewWorker');
 const certificateDraftWorker = require('./certificateDraftWorker');
+const equipmentImportWorker = require('./equipmentImportWorker');
 const documentationExpiryNotifier = require('./documentationExpiryNotifier');
 const reportExportController = require('../controllers/exportInspectionReport');
 const { withLock } = require('./distributedLockService');
@@ -35,6 +36,7 @@ function startWorkerRuntime() {
   reportExportController.startReportExportWorker?.();
   certificatePreviewWorker.start();
   certificateDraftWorker.start();
+  equipmentImportWorker.start();
 
   scheduleInterval(
     () => withLock('cleanup:empty-conversations', 30 * 60 * 1000, cleanupService.removeEmptyConversations),
@@ -46,6 +48,10 @@ function startWorkerRuntime() {
   );
   scheduleInterval(
     () => withLock('cleanup:equipment-doc-import-errors', 2 * 60 * 60 * 1000, cleanupService.cleanupEquipmentDocsImportErrorReports),
+    24 * 60 * 60 * 1000
+  );
+  scheduleInterval(
+    () => withLock('cleanup:equipment-import-jobs', 2 * 60 * 60 * 1000, cleanupService.cleanupEquipmentImportJobs),
     24 * 60 * 60 * 1000
   );
   scheduleInterval(
@@ -67,6 +73,7 @@ function startWorkerRuntime() {
     reportExportCleanup: true,
     certificatePreviewWorker: true,
     certificateDraftWorker: true,
+    equipmentImportWorker: true,
     mobileSyncWorker: true,
     documentationExpiryNotifier: true
   });
@@ -82,6 +89,7 @@ async function stopWorkerRuntime({ drainTimeoutMs = 120_000 } = {}) {
     reportExportController.stopReportExportWorker?.(options),
     certificatePreviewWorker.stop?.(options),
     certificateDraftWorker.stop?.(options),
+    equipmentImportWorker.stop?.(options),
     mobileSyncWorker.stop?.(options),
   ]);
   started = false;

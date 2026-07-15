@@ -24,6 +24,7 @@ const {
 const { notifyAndStore } = require('../lib/notifications/notifier');
 const { v4: uuidv4 } = require('uuid');
 const cleanupService = require('../services/cleanupService');
+const EquipmentImportJob = require('../models/equipmentImportJob');
 const EquipmentDataVersion = require('../models/equipmentDataVersion');
 const { createEquipmentDataVersion } = require('../services/equipmentVersioningService');
 const { recordTombstone } = require('../services/syncTombstoneService');
@@ -2044,514 +2045,600 @@ exports.downloadEquipmentImportTemplate = async (req, res) => {
   }
 };
 
+function buildEquipmentImportSourceBlobPath(tenantId, jobId, originalFileName = 'equipment-import.xlsx') {
+  const fileName = cleanFileName(path.basename(originalFileName || 'equipment-import.xlsx')) || 'equipment-import.xlsx';
+  return `equipment-import-jobs/${tenantId}/${jobId}/source/${fileName}`;
+}
+
+function buildEquipmentImportErrorBlobPath(tenantId, jobId) {
+  return `equipment-import-jobs/${tenantId}/${jobId}/equipment-import-errors.xlsx`;
+}
+
+async function notifyEquipmentImportXlsxStatus(userId, {
+  jobId,
+  status,
+  createdCount = null,
+  updatedCount = null,
+  inspectionsCreated = null,
+  issuesCount = null,
+  errorMessage = null,
+  processed = null,
+  total = null,
+  downloadUrl = null,
+} = {}) {
+  if (!userId || !jobId || !status) return;
+
+  let message;
+  switch (status) {
+    case 'queued':
+      message = 'Equipment XLSX import queued.';
+      break;
+    case 'running':
+      message = 'Equipment XLSX import is running...';
+      break;
+    case 'succeeded': {
+      const parts = [];
+      if (createdCount != null) parts.push(`created: ${createdCount}`);
+      if (updatedCount != null) parts.push(`updated: ${updatedCount}`);
+      if (inspectionsCreated != null) parts.push(`inspections: ${inspectionsCreated}`);
+      if (issuesCount) parts.push(`issues: ${issuesCount}`);
+      message = `Equipment XLSX import completed${parts.length ? ` (${parts.join(', ')})` : ''}.`;
+      break;
+    }
+    case 'failed':
+      message = `Equipment XLSX import failed${errorMessage ? `: ${errorMessage}` : '.'}`;
+      break;
+    default:
+      message = `Equipment XLSX import status: ${status}.`;
+  }
+
+  const data = { jobId, jobType: 'equipment-import', status };
+  if (createdCount != null) data.createdCount = createdCount;
+  if (updatedCount != null) data.updatedCount = updatedCount;
+  if (inspectionsCreated != null) data.inspectionsCreated = inspectionsCreated;
+  if (issuesCount != null) data.issuesCount = issuesCount;
+  if (typeof processed === 'number' && typeof total === 'number' && total > 0) {
+    data.progress = { processed, total };
+  }
+  if (downloadUrl) data.downloadUrl = downloadUrl;
+
+  try {
+    await notifyAndStore(userId, {
+      type: 'equipment-import',
+      title: 'Equipment XLSX import',
+      message,
+      data,
+      meta: { route: '/notifications', jobId }
+    });
+  } catch (err) {
+    console.warn('⚠️ Failed to push equipment XLSX import status notification', err?.message || err);
+  }
+}
+
+async function runEquipmentImportXlsxCore({
+  tenantId,
+  userId,
+  zoneId,
+  workbookBuffer,
+  originalFileName = 'equipment-import.xlsx',
+  onProgress = null,
+}) {
+  const zone = await Zone.findOne({ _id: zoneId, tenantId }).lean();
+  if (!zone) {
+    const err = new Error('Zone not found for this tenant.');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(workbookBuffer);
+  const worksheet = workbook.worksheets?.[0];
+  if (!worksheet) {
+    const err = new Error('The uploaded workbook does not contain any worksheet.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const headerInfo = detectHeaderRow(worksheet);
+  if (!headerInfo) {
+    const err = new Error('Unable to detect header row. Please use the provided export template.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const equipmentMap = new Map();
+  const parseErrors = [];
+  const dynamicImportColumns = await loadEquipmentImportDynamicColumns(tenantId);
+
+  worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+    if (rowNumber <= headerInfo.headerRowNumber) return;
+
+    const idRaw = getCellString(row, headerInfo.headerMap, '_id');
+    const eqIdRaw = getCellString(row, headerInfo.headerMap, 'EqID');
+    const eqId = eqIdRaw ? eqIdRaw.trim() : '';
+    const mongoId = idRaw ? idRaw.trim() : '';
+    const tagNo = getCellString(row, headerInfo.headerMap, 'TagNo');
+    const description = getCellString(row, headerInfo.headerMap, 'Description');
+    const manufacturer = getCellString(row, headerInfo.headerMap, 'Manufacturer');
+    const model = getCellString(row, headerInfo.headerMap, 'Model');
+    const serialNumber = getCellString(row, headerInfo.headerMap, 'Serial Number');
+    const ipRating = getCellString(row, headerInfo.headerMap, 'IP rating');
+    const tempRange = getCellString(row, headerInfo.headerMap, 'Temp. Range');
+    const qualitycheck = getCellBoolean(row, headerInfo.headerMap, 'Qualitycheck');
+    const certificateNo = getCellString(row, headerInfo.headerMap, 'Certificate No');
+    const declarationNo = getCellString(row, headerInfo.headerMap, 'Declaration of conformity');
+    const remarks = getCellString(row, headerInfo.headerMap, 'Remarks');
+    const epl = getCellString(row, headerInfo.headerMap, 'EPL');
+    const equipmentGroup = getCellString(row, headerInfo.headerMap, 'Equipment Group');
+    const equipmentCategory = getCellString(row, headerInfo.headerMap, 'Equipment Category');
+    const environment = getCellString(row, headerInfo.headerMap, 'Environment');
+    const subGroup = getCellString(row, headerInfo.headerMap, 'SubGroup');
+    const tempClass = getCellString(row, headerInfo.headerMap, 'Temperature Class');
+    const protectionConcept = getCellString(row, headerInfo.headerMap, 'Protection Concept');
+    const indexRaw = getCellString(row, headerInfo.headerMap, '#');
+    const parsedIndex = indexRaw ? parseInt(indexRaw, 10) : null;
+    const orderIndex = Number.isFinite(parsedIndex) && parsedIndex > 0 ? parsedIndex : null;
+    const inspectionStatus = normalizeComplianceStatus(getCellString(row, headerInfo.headerMap, 'Status'));
+    const inspectionTypeRaw = getCellString(row, headerInfo.headerMap, 'Type');
+    const inspectionType = inspectionTypeRaw ? normalizeInspectionType(inspectionTypeRaw) : null;
+    const inspectionDate = getCellDate(row, headerInfo.headerMap, 'Inspection Date');
+    const presentColumn = (label) => hasImportColumn(headerInfo.headerMap, label);
+    const isPatchUpdate = !!mongoId;
+    const customFieldsRaw = collectDynamicCustomFieldValues(row, headerInfo.headerMap, dynamicImportColumns, {
+      includeBlankValues: isPatchUpdate
+    });
+    let schemaAssignmentsRaw = [];
+    try {
+      schemaAssignmentsRaw = collectDynamicSchemaAssignments(row, headerInfo.headerMap, dynamicImportColumns, userId);
+    } catch (schemaError) {
+      parseErrors.push({
+        row: rowNumber,
+        message: schemaError.message || String(schemaError)
+      });
+      return;
+    }
+
+    const patchBaseHeadersPresent = [
+      '#', 'EqID', 'TagNo', 'Description', 'Manufacturer', 'Model',
+      'Serial Number', 'IP rating', 'Temp. Range', 'Qualitycheck', 'Remarks'
+    ].some(presentColumn);
+    const patchExHeadersPresent = [
+      'EPL', 'Equipment Group', 'Equipment Category', 'Environment',
+      'SubGroup', 'Temperature Class', 'Protection Concept',
+      'Certificate No', 'Declaration of conformity'
+    ].some(presentColumn);
+    const patchInspectionHeadersPresent = ['Inspection Date', 'Type', 'Status'].some(presentColumn);
+    const patchDynamicHeadersPresent = dynamicImportColumns.some((column) => !!findColumnIndex(headerInfo.headerMap, column));
+    const rowHasPatchIntent = isPatchUpdate && (
+      patchBaseHeadersPresent ||
+      patchExHeadersPresent ||
+      patchInspectionHeadersPresent ||
+      patchDynamicHeadersPresent
+    );
+
+    const rowHasData = [
+      eqId, tagNo, description, manufacturer, model, serialNumber, ipRating, tempRange,
+      qualitycheck == null ? '' : String(qualitycheck), certificateNo, declarationNo, remarks,
+      ...Object.values(customFieldsRaw),
+      ...schemaAssignmentsRaw.flatMap((assignment) => Object.values(assignment.values || {}))
+    ].some(Boolean);
+    const rowHasExData = [epl, equipmentGroup, equipmentCategory, environment, subGroup, tempClass, protectionConcept].some(Boolean);
+    if (!rowHasData && !rowHasExData && !rowHasPatchIntent) return;
+
+    const base = isPatchUpdate ? {} : {
+      EqID: eqId,
+      TagNo: tagNo || '',
+      'Equipment Type': description || '',
+      Manufacturer: manufacturer || '',
+      'Model/Type': model || '',
+      'Serial Number': serialNumber || '',
+      'IP rating': ipRating || '',
+      'Max Ambient Temp': tempRange || '',
+      Qualitycheck: qualitycheck === true,
+      'Other Info': remarks || '',
+      'Ex Marking': [],
+      'X condition': { X: false, Specific: '' },
+      customFields: {}
+    };
+    if (isPatchUpdate) {
+      setIfImportColumn(base, headerInfo.headerMap, 'EqID', 'EqID', eqId);
+      setIfImportColumn(base, headerInfo.headerMap, 'TagNo', 'TagNo', tagNo || '');
+      setIfImportColumn(base, headerInfo.headerMap, 'Description', 'Equipment Type', description || '');
+      setIfImportColumn(base, headerInfo.headerMap, 'Manufacturer', 'Manufacturer', manufacturer || '');
+      setIfImportColumn(base, headerInfo.headerMap, 'Model', 'Model/Type', model || '');
+      setIfImportColumn(base, headerInfo.headerMap, 'Serial Number', 'Serial Number', serialNumber || '');
+      setIfImportColumn(base, headerInfo.headerMap, 'IP rating', 'IP rating', ipRating || '');
+      setIfImportColumn(base, headerInfo.headerMap, 'Temp. Range', 'Max Ambient Temp', tempRange || '');
+      if (presentColumn('Qualitycheck')) base.Qualitycheck = qualitycheck === true;
+      setIfImportColumn(base, headerInfo.headerMap, 'Remarks', 'Other Info', remarks || '');
+    }
+
+    const entryKey = `${eqId || 'NO_EQID'}__row_${rowNumber}`;
+    if (!equipmentMap.has(entryKey)) {
+      equipmentMap.set(entryKey, {
+        rows: [],
+        eqId,
+        mongoId,
+        orderIndex,
+        base,
+        inspectionDate: inspectionDate || null,
+        inspectionStatus,
+        inspectionType: inspectionType || null,
+        schemaAssignments: [],
+        inspectionRemarks: remarks || '',
+        rbCertificateNo: certificateNo || declarationNo || '',
+        rbCertificatePresent: presentColumn('Certificate No') || presentColumn('Declaration of conformity'),
+        rbCompliance: inspectionStatus || 'NA',
+        rbCompliancePresent: presentColumn('Status')
+      });
+    }
+
+    const entry = equipmentMap.get(entryKey);
+    entry.rows.push(rowNumber);
+    if (orderIndex != null && entry.orderIndex == null) entry.orderIndex = orderIndex;
+    if (presentColumn('TagNo') && tagNo && !entry.base.TagNo) entry.base.TagNo = tagNo;
+    if (presentColumn('Description') && description) entry.base['Equipment Type'] = description;
+    if (presentColumn('Manufacturer') && manufacturer) entry.base.Manufacturer = manufacturer;
+    if (presentColumn('Model') && model) entry.base['Model/Type'] = model;
+    if (presentColumn('Serial Number') && serialNumber) entry.base['Serial Number'] = serialNumber;
+    if (presentColumn('IP rating') && ipRating) entry.base['IP rating'] = ipRating;
+    if (presentColumn('Temp. Range') && tempRange) entry.base['Max Ambient Temp'] = tempRange;
+    if (presentColumn('Qualitycheck') && qualitycheck != null) entry.base.Qualitycheck = qualitycheck;
+    if (certificateNo && !entry.rbCertificateNo) entry.rbCertificateNo = certificateNo;
+    if (presentColumn('Remarks') && remarks) entry.base['Other Info'] = remarks;
+    if (presentColumn('Remarks') && remarks) entry.inspectionRemarks = remarks;
+    if (Object.keys(customFieldsRaw).length) {
+      entry.base.customFields = { ...(entry.base.customFields || {}), ...customFieldsRaw };
+    }
+    if (schemaAssignmentsRaw.length) {
+      entry.schemaAssignments = mergeImportedSchemaAssignments(entry.schemaAssignments || [], schemaAssignmentsRaw);
+    }
+    if (inspectionStatus && inspectionStatus !== 'NA') entry.rbCompliance = inspectionStatus;
+    if (!entry.inspectionDate && inspectionDate) entry.inspectionDate = inspectionDate;
+    if (entry.inspectionStatus === 'NA' && inspectionStatus !== 'NA') entry.inspectionStatus = inspectionStatus;
+    if (inspectionType && (!entry.inspectionType || entry.inspectionType === 'Detailed')) entry.inspectionType = inspectionType;
+
+    if (epl || equipmentGroup || equipmentCategory || environment || subGroup || tempClass || protectionConcept) {
+      if (!Array.isArray(entry.base['Ex Marking'])) entry.base['Ex Marking'] = [];
+      const autoMarking = buildMarkingString(protectionConcept, subGroup, tempClass);
+      const inferredEnvironment = environment || determineEnvironmentFromSubGroup(subGroup);
+      if (autoMarking && !entry.base.Marking) entry.base.Marking = autoMarking;
+      const markingEntry = {
+        'Equipment Protection Level': epl || '',
+        'Equipment Group': equipmentGroup || '',
+        'Equipment Category': equipmentCategory || '',
+        'Gas / Dust Group': subGroup || '',
+        'Temperature Class': tempClass || '',
+        'Type of Protection': protectionConcept || ''
+      };
+      if (autoMarking) markingEntry.Marking = autoMarking;
+      if (inferredEnvironment) markingEntry.Environment = inferredEnvironment;
+      entry.base['Ex Marking'].push(markingEntry);
+    }
+  });
+
+  const entries = Array.from(equipmentMap.values());
+  if (!entries.length) {
+    if (!parseErrors.length) {
+      const err = new Error('No usable rows detected in the uploaded file.');
+      err.statusCode = 400;
+      throw err;
+    }
+  }
+
+  const stats = { created: 0, updated: 0, inspections: 0, errors: [] };
+  const totalEntries = entries.length;
+  let processedEntries = 0;
+  if (typeof onProgress === 'function') await onProgress({ processed: 0, total: totalEntries });
+
+  for (const entry of entries) {
+    try {
+      const payload = { ...entry.base, Zone: zone._id, Unit: zone._id, Site: zone.Site || null };
+      if (entry.orderIndex != null) payload.orderIndex = entry.orderIndex;
+      if (payload.customFields && Object.keys(payload.customFields).length) {
+        payload.customFields = await sanitizeCustomFields({
+          tenantId,
+          entityType: 'equipment',
+          values: payload.customFields
+        });
+      } else {
+        delete payload.customFields;
+      }
+
+      const importedExMarkings = (payload['Ex Marking'] || []).filter(mark =>
+        Object.values(mark).some(value => !!String(value || '').trim())
+      );
+      const rbValues = importedExMarkings.length ? valuesFromEquipmentMarkings(importedExMarkings) : {};
+      if (entry.rbCertificatePresent) rbValues.certificateNo = entry.rbCertificateNo || payload['Certificate No'] || '';
+      if (entry.rbCompliancePresent) rbValues.compliance = entry.rbCompliance || payload.Compliance || 'NA';
+      if (!entry.rbCertificatePresent) delete rbValues.certificateNo;
+      if (!entry.rbCompliancePresent) delete rbValues.compliance;
+      delete payload['Ex Marking'];
+      delete payload['Certificate No'];
+      delete payload.Compliance;
+      const hasRbValues = importedExMarkings.length || entry.rbCertificatePresent || entry.rbCompliancePresent;
+      const rbSchema = hasRbValues ? await ensureRbSchema() : null;
+
+      let equipmentDoc = null;
+      if (entry.mongoId) {
+        if (!mongoose.Types.ObjectId.isValid(entry.mongoId)) {
+          throw new Error(`Invalid _id value: ${entry.mongoId}`);
+        }
+        equipmentDoc = await Equipment.findOne({ _id: entry.mongoId, tenantId, Zone: zone._id });
+        if (!equipmentDoc) {
+          throw new Error(`Equipment with _id ${entry.mongoId} was not found in the selected zone.`);
+        }
+        const updateData = { ...payload, ModifiedBy: userId };
+        if (payload.customFields && Object.keys(payload.customFields).length) {
+          const currentCustomFields = equipmentDoc.customFields instanceof Map
+            ? Object.fromEntries(equipmentDoc.customFields.entries())
+            : (equipmentDoc.customFields && typeof equipmentDoc.customFields === 'object' ? equipmentDoc.customFields : {});
+          updateData.customFields = { ...currentCustomFields, ...payload.customFields };
+        }
+        delete updateData.CreatedBy;
+        delete updateData.tenantId;
+        if (rbSchema || entry.schemaAssignments?.length) {
+          updateData.schemaAssignments = mergeImportedSchemaAssignments(
+            Array.isArray(equipmentDoc.schemaAssignments) ? equipmentDoc.schemaAssignments : [],
+            entry.schemaAssignments || []
+          );
+        }
+        if (rbSchema) {
+          ensureRbAssignment(updateData, rbSchema, { ...getRbValues(equipmentDoc), ...rbValues }, userId);
+        }
+        if (entry.orderIndex == null) delete updateData.orderIndex;
+        equipmentDoc = await Equipment.findByIdAndUpdate(equipmentDoc._id, { $set: updateData }, { new: true });
+        stats.updated += 1;
+      }
+
+      if (!equipmentDoc) {
+        const createData = { ...payload, tenantId, CreatedBy: userId };
+        if (entry.schemaAssignments?.length) {
+          createData.schemaAssignments = mergeImportedSchemaAssignments(createData.schemaAssignments || [], entry.schemaAssignments);
+        }
+        if (rbSchema) ensureRbAssignment(createData, rbSchema, rbValues, userId);
+        if (createData.orderIndex == null) {
+          createData.orderIndex = await getNextOrderIndex(tenantId, createData.Site || null, createData.Zone || null);
+        }
+        equipmentDoc = await Equipment.create(createData);
+        stats.created += 1;
+      }
+
+      if (equipmentDoc && entry.inspectionStatus === 'Passed' && entry.inspectionDate instanceof Date) {
+        try {
+          await createAutoInspectionForImport(
+            equipmentDoc,
+            entry.inspectionDate,
+            userId,
+            tenantId,
+            entry.inspectionType || 'Detailed',
+            entry.inspectionRemarks || ''
+          );
+          stats.inspections += 1;
+        } catch (inspectionError) {
+          stats.errors.push({
+            eqId: equipmentDoc.EqID,
+            rows: entry.rows,
+            message: `Auto inspection creation failed: ${inspectionError.message || inspectionError}`
+          });
+        }
+      }
+    } catch (entryError) {
+      stats.errors.push({
+        eqId: entry.eqId,
+        id: entry.mongoId || null,
+        rows: entry.rows,
+        message: entryError.message || String(entryError)
+      });
+    } finally {
+      processedEntries += 1;
+      if (typeof onProgress === 'function') {
+        await onProgress({ processed: processedEntries, total: totalEntries });
+      }
+    }
+  }
+
+  const issues = [...parseErrors, ...stats.errors];
+  let errorWorkbookBuffer = null;
+  if (issues.length > 0) {
+    const workbookOut = new ExcelJS.Workbook();
+    await workbookOut.xlsx.load(workbookBuffer);
+    const worksheetOut = workbookOut.worksheets[0];
+
+    const summarySheet = workbookOut.addWorksheet('Import summary');
+    summarySheet.addRow(['Created', stats.created]);
+    summarySheet.addRow(['Updated', stats.updated]);
+    summarySheet.addRow(['Inspections', stats.inspections]);
+    summarySheet.addRow(['Error items', issues.length]);
+    summarySheet.getColumn(1).width = 15;
+    summarySheet.getColumn(2).width = 12;
+
+    const errorFill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFFFC0C0' }
+    };
+
+    issues.forEach((issue) => {
+      const rows = Array.isArray(issue.rows) ? issue.rows : (typeof issue.row === 'number' ? [issue.row] : []);
+      rows.forEach((rowNumber) => {
+        if (!rowNumber || !worksheetOut) return;
+        const row = worksheetOut.getRow(rowNumber);
+        row.eachCell((cell) => {
+          cell.fill = errorFill;
+        });
+        const noteCell = worksheetOut.getCell(`A${rowNumber}`);
+        const existingNote = typeof noteCell.note === 'string' && noteCell.note.length ? `${noteCell.note}\n` : '';
+        noteCell.note = `${existingNote}${issue.message || 'Invalid data in this row.'}`;
+      });
+    });
+
+    errorWorkbookBuffer = Buffer.from(await workbookOut.xlsx.writeBuffer());
+  }
+
+  return {
+    sourceFileName: originalFileName,
+    createdCount: stats.created,
+    updatedCount: stats.updated,
+    inspectionsCreated: stats.inspections,
+    issues,
+    errorWorkbookBuffer,
+  };
+}
+
+exports.processEquipmentImportXlsxJob = async (jobIdOrId) => {
+  const selector = mongoose.Types.ObjectId.isValid(String(jobIdOrId || ''))
+    ? { _id: jobIdOrId }
+    : { jobId: String(jobIdOrId || '') };
+  const now = new Date();
+  const job = await EquipmentImportJob.findOneAndUpdate(
+    { ...selector, status: 'queued' },
+    {
+      $set: { status: 'running', startedAt: now, lastHeartbeatAt: now },
+      $inc: { attempts: 1 }
+    },
+    { new: true }
+  );
+  if (!job) return false;
+
+  try {
+    await notifyEquipmentImportXlsxStatus(String(job.userId), { jobId: job.jobId, status: 'running' });
+    const workbookBuffer = await azureBlob.downloadToBuffer(job.sourceBlobPath);
+    const result = await runEquipmentImportXlsxCore({
+      tenantId: String(job.tenantId),
+      userId: String(job.userId),
+      zoneId: String(job.zoneId),
+      workbookBuffer,
+      originalFileName: job.sourceFileName || 'equipment-import.xlsx',
+      onProgress: async ({ processed, total }) => {
+        job.progress = { processed, total, updatedAt: new Date() };
+        job.lastHeartbeatAt = new Date();
+        await job.save();
+        if (processed === 0 || processed === total || processed % Math.max(1, Math.floor(total / 10) || 1) === 0) {
+          await notifyEquipmentImportXlsxStatus(String(job.userId), {
+            jobId: job.jobId,
+            status: 'running',
+            processed,
+            total,
+          });
+        }
+      }
+    });
+
+    let errorReportBlobPath = null;
+    let errorReportDownloadUrl = null;
+    if (result.errorWorkbookBuffer) {
+      errorReportBlobPath = await azureBlob.uploadBuffer(
+        buildEquipmentImportErrorBlobPath(String(job.tenantId), job.jobId),
+        result.errorWorkbookBuffer,
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      );
+      errorReportDownloadUrl = await azureBlob.getReadSasUrl(errorReportBlobPath, {
+        ttlSeconds: Number(systemSettings.getNumber('EQUIPMENT_IMPORT_ERROR_XLS_TTL_SECONDS') || 30 * 24 * 60 * 60),
+        filename: `equipment-import-errors-${job.jobId}.xlsx`,
+        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      });
+    }
+
+    job.status = 'succeeded';
+    job.finishedAt = new Date();
+    job.lastHeartbeatAt = new Date();
+    job.result = {
+      createdCount: result.createdCount,
+      updatedCount: result.updatedCount,
+      inspectionsCreated: result.inspectionsCreated,
+      issuesCount: result.issues.length,
+      errorReportBlobPath,
+      errorReportFileName: errorReportBlobPath ? `equipment-import-errors-${job.jobId}.xlsx` : null,
+      errorReportDownloadUrl,
+    };
+    await job.save();
+
+    await notifyEquipmentImportXlsxStatus(String(job.userId), {
+      jobId: job.jobId,
+      status: 'succeeded',
+      createdCount: result.createdCount,
+      updatedCount: result.updatedCount,
+      inspectionsCreated: result.inspectionsCreated,
+      issuesCount: result.issues.length,
+      processed: job.progress?.processed || 0,
+      total: job.progress?.total || 0,
+      downloadUrl: errorReportDownloadUrl || null,
+    });
+    return true;
+  } catch (error) {
+    console.error('❌ equipment XLSX import job failed:', error);
+    job.status = 'failed';
+    job.errorMessage = error.message || String(error);
+    job.finishedAt = new Date();
+    job.lastHeartbeatAt = new Date();
+    await job.save();
+    await notifyEquipmentImportXlsxStatus(String(job.userId), {
+      jobId: job.jobId,
+      status: 'failed',
+      errorMessage: job.errorMessage,
+    });
+    return false;
+  } finally {
+    if (job.sourceBlobPath) {
+      try {
+        await azureBlob.deleteFile(job.sourceBlobPath);
+      } catch (cleanupErr) {
+        console.warn('⚠️ Failed to delete equipment import source blob:', cleanupErr?.message || cleanupErr);
+      }
+    }
+  }
+};
+
 exports.importEquipmentXLSX = async (req, res) => {
   const tenantId = req.scope?.tenantId;
   const userId = req.userId;
   const uploadedFile = req.file;
   const zoneId = (req.body?.zoneId || req.query?.zoneId || '').trim();
 
-  if (!tenantId) {
-    return res.status(401).json({ message: 'Missing tenantId from auth.' });
-  }
-  if (!userId) {
-    return res.status(401).json({ message: 'Missing user context.' });
-  }
-  if (!uploadedFile) {
-    return res.status(400).json({ message: 'Missing XLSX file (field name: file).' });
-  }
+  if (!tenantId) return res.status(401).json({ message: 'Missing tenantId from auth.' });
+  if (!userId) return res.status(401).json({ message: 'Missing user context.' });
+  if (!uploadedFile) return res.status(400).json({ message: 'Missing XLSX file (field name: file).' });
   if (!zoneId || !mongoose.Types.ObjectId.isValid(zoneId)) {
     return res.status(400).json({ message: 'Valid zoneId must be provided in the form data.' });
   }
 
   try {
-    const zone = await Zone.findOne({ _id: zoneId, tenantId }).lean();
-    if (!zone) {
-      return res.status(404).json({ message: 'Zone not found for this tenant.' });
-    }
+    const zone = await Zone.findOne({ _id: zoneId, tenantId }).select('_id').lean();
+    if (!zone) return res.status(404).json({ message: 'Zone not found for this tenant.' });
 
-    const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.readFile(uploadedFile.path);
-    const worksheet = workbook.worksheets?.[0];
-    if (!worksheet) {
-      return res.status(400).json({ message: 'The uploaded workbook does not contain any worksheet.' });
-    }
-
-    const headerInfo = detectHeaderRow(worksheet);
-    if (!headerInfo) {
-      return res.status(400).json({ message: 'Unable to detect header row. Please use the provided export template.' });
-    }
-
-    const equipmentMap = new Map();
-    const parseErrors = [];
-    const dynamicImportColumns = await loadEquipmentImportDynamicColumns(tenantId);
-
-    worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
-      if (rowNumber <= headerInfo.headerRowNumber) return;
-
-      const idRaw = getCellString(row, headerInfo.headerMap, '_id');
-      const eqIdRaw = getCellString(row, headerInfo.headerMap, 'EqID');
-      const eqId = eqIdRaw ? eqIdRaw.trim() : '';
-      const mongoId = idRaw ? idRaw.trim() : '';
-      const tagNo = getCellString(row, headerInfo.headerMap, 'TagNo');
-      const description = getCellString(row, headerInfo.headerMap, 'Description');
-      const manufacturer = getCellString(row, headerInfo.headerMap, 'Manufacturer');
-      const model = getCellString(row, headerInfo.headerMap, 'Model');
-      const serialNumber = getCellString(row, headerInfo.headerMap, 'Serial Number');
-      const ipRating = getCellString(row, headerInfo.headerMap, 'IP rating');
-      const tempRange = getCellString(row, headerInfo.headerMap, 'Temp. Range');
-      const qualitycheck = getCellBoolean(row, headerInfo.headerMap, 'Qualitycheck');
-      const certificateNo = getCellString(row, headerInfo.headerMap, 'Certificate No');
-      const declarationNo = getCellString(row, headerInfo.headerMap, 'Declaration of conformity');
-      const remarks = getCellString(row, headerInfo.headerMap, 'Remarks');
-      const epl = getCellString(row, headerInfo.headerMap, 'EPL');
-      const equipmentGroup = getCellString(row, headerInfo.headerMap, 'Equipment Group');
-      const equipmentCategory = getCellString(row, headerInfo.headerMap, 'Equipment Category');
-      const environment = getCellString(row, headerInfo.headerMap, 'Environment');
-      const subGroup = getCellString(row, headerInfo.headerMap, 'SubGroup');
-      const tempClass = getCellString(row, headerInfo.headerMap, 'Temperature Class');
-      const protectionConcept = getCellString(row, headerInfo.headerMap, 'Protection Concept');
-      const indexRaw = getCellString(row, headerInfo.headerMap, '#');
-      const parsedIndex = indexRaw ? parseInt(indexRaw, 10) : null;
-      const orderIndex = Number.isFinite(parsedIndex) && parsedIndex > 0 ? parsedIndex : null;
-      const inspectionStatus = normalizeComplianceStatus(getCellString(row, headerInfo.headerMap, 'Status'));
-      const inspectionTypeRaw = getCellString(row, headerInfo.headerMap, 'Type');
-      const inspectionType = inspectionTypeRaw ? normalizeInspectionType(inspectionTypeRaw) : null;
-      const inspectionDate = getCellDate(row, headerInfo.headerMap, 'Inspection Date');
-      const presentColumn = (label) => hasImportColumn(headerInfo.headerMap, label);
-      const isPatchUpdate = !!mongoId;
-      const customFieldsRaw = collectDynamicCustomFieldValues(row, headerInfo.headerMap, dynamicImportColumns, {
-        includeBlankValues: isPatchUpdate
-      });
-      let schemaAssignmentsRaw = [];
-      try {
-        schemaAssignmentsRaw = collectDynamicSchemaAssignments(row, headerInfo.headerMap, dynamicImportColumns, userId);
-      } catch (schemaError) {
-        parseErrors.push({
-          row: rowNumber,
-          message: schemaError.message || String(schemaError)
-        });
-        return;
-      }
-
-      const patchBaseHeadersPresent = [
-        '#',
-        'EqID',
-        'TagNo',
-        'Description',
-        'Manufacturer',
-        'Model',
-        'Serial Number',
-        'IP rating',
-        'Temp. Range',
-        'Qualitycheck',
-        'Remarks'
-      ].some(presentColumn);
-      const patchExHeadersPresent = [
-        'EPL',
-        'Equipment Group',
-        'Equipment Category',
-        'Environment',
-        'SubGroup',
-        'Temperature Class',
-        'Protection Concept',
-        'Certificate No',
-        'Declaration of conformity'
-      ].some(presentColumn);
-      const patchInspectionHeadersPresent = ['Inspection Date', 'Type', 'Status'].some(presentColumn);
-      const patchDynamicHeadersPresent = dynamicImportColumns.some((column) => !!findColumnIndex(headerInfo.headerMap, column));
-      const rowHasPatchIntent = isPatchUpdate && (
-        patchBaseHeadersPresent ||
-        patchExHeadersPresent ||
-        patchInspectionHeadersPresent ||
-        patchDynamicHeadersPresent
+    const jobId = `equipment-import-${Date.now()}-${uuidv4().slice(0, 8)}`;
+    const sourceBlobPath = buildEquipmentImportSourceBlobPath(tenantId, jobId, uploadedFile.originalname || 'equipment-import.xlsx');
+    try {
+      await azureBlob.uploadFile(
+        uploadedFile.path,
+        sourceBlobPath,
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
       );
 
-      const rowHasData = [
-        eqId,
-        tagNo,
-        description,
-        manufacturer,
-        model,
-        serialNumber,
-        ipRating,
-        tempRange,
-        qualitycheck == null ? '' : String(qualitycheck),
-        certificateNo,
-        declarationNo,
-        remarks,
-        ...Object.values(customFieldsRaw),
-        ...schemaAssignmentsRaw.flatMap((assignment) => Object.values(assignment.values || {}))
-      ].some(Boolean);
-
-      const rowHasExData = [epl, equipmentGroup, equipmentCategory, environment, subGroup, tempClass, protectionConcept].some(Boolean);
-
-      if (!rowHasData && !rowHasExData && !rowHasPatchIntent) {
-        // teljesen üres sor – kihagyjuk
-        return;
-      }
-
-      const base = isPatchUpdate ? {} : {
-        EqID: eqId,
-        TagNo: tagNo || '',
-        'Equipment Type': description || '',
-        Manufacturer: manufacturer || '',
-        'Model/Type': model || '',
-        'Serial Number': serialNumber || '',
-        'IP rating': ipRating || '',
-        'Max Ambient Temp': tempRange || '',
-        Qualitycheck: qualitycheck === true,
-        'Other Info': remarks || '',
-        'Ex Marking': [],
-        'X condition': { X: false, Specific: '' },
-        customFields: {}
-      };
-      if (isPatchUpdate) {
-        setIfImportColumn(base, headerInfo.headerMap, 'EqID', 'EqID', eqId);
-        setIfImportColumn(base, headerInfo.headerMap, 'TagNo', 'TagNo', tagNo || '');
-        setIfImportColumn(base, headerInfo.headerMap, 'Description', 'Equipment Type', description || '');
-        setIfImportColumn(base, headerInfo.headerMap, 'Manufacturer', 'Manufacturer', manufacturer || '');
-        setIfImportColumn(base, headerInfo.headerMap, 'Model', 'Model/Type', model || '');
-        setIfImportColumn(base, headerInfo.headerMap, 'Serial Number', 'Serial Number', serialNumber || '');
-        setIfImportColumn(base, headerInfo.headerMap, 'IP rating', 'IP rating', ipRating || '');
-        setIfImportColumn(base, headerInfo.headerMap, 'Temp. Range', 'Max Ambient Temp', tempRange || '');
-        if (presentColumn('Qualitycheck')) base.Qualitycheck = qualitycheck === true;
-        setIfImportColumn(base, headerInfo.headerMap, 'Remarks', 'Other Info', remarks || '');
-      }
-
-      // EqID nem egyedi: minden sor önálló "entry" (akkor is, ha EqID üres)
-      const entryKey = `${eqId || 'NO_EQID'}__row_${rowNumber}`;
-      if (!equipmentMap.has(entryKey)) {
-        equipmentMap.set(entryKey, {
-          rows: [],
-          eqId,
-          mongoId,
-          orderIndex: orderIndex,
-          base,
-          inspectionDate: inspectionDate || null,
-          inspectionStatus,
-          inspectionType: inspectionType || null,
-          schemaAssignments: [],
-          inspectionRemarks: remarks || '',
-          rbCertificateNo: certificateNo || declarationNo || '',
-          rbCertificatePresent: presentColumn('Certificate No') || presentColumn('Declaration of conformity'),
-          rbCompliance: inspectionStatus || 'NA',
-          rbCompliancePresent: presentColumn('Status')
-        });
-      }
-
-      const entry = equipmentMap.get(entryKey);
-      entry.rows.push(rowNumber);
-
-       // Ha több soron keresztül jön ugyanahhoz az EqID-hez index, az első nem üres érték nyer
-      if (orderIndex != null && entry.orderIndex == null) {
-        entry.orderIndex = orderIndex;
-      }
-
-      if (presentColumn('TagNo') && tagNo && !entry.base.TagNo) entry.base.TagNo = tagNo;
-      if (presentColumn('Description') && description) entry.base['Equipment Type'] = description;
-      if (presentColumn('Manufacturer') && manufacturer) entry.base.Manufacturer = manufacturer;
-      if (presentColumn('Model') && model) entry.base['Model/Type'] = model;
-      if (presentColumn('Serial Number') && serialNumber) entry.base['Serial Number'] = serialNumber;
-      if (presentColumn('IP rating') && ipRating) entry.base['IP rating'] = ipRating;
-      if (presentColumn('Temp. Range') && tempRange) entry.base['Max Ambient Temp'] = tempRange;
-      if (presentColumn('Qualitycheck') && qualitycheck != null) entry.base.Qualitycheck = qualitycheck;
-      if (certificateNo && !entry.rbCertificateNo) entry.rbCertificateNo = certificateNo;
-      if (presentColumn('Remarks') && remarks) entry.base['Other Info'] = remarks;
-      if (presentColumn('Remarks') && remarks) entry.inspectionRemarks = remarks;
-      if (Object.keys(customFieldsRaw).length) {
-        entry.base.customFields = {
-          ...(entry.base.customFields || {}),
-          ...customFieldsRaw
-        };
-      }
-      if (schemaAssignmentsRaw.length) {
-        entry.schemaAssignments = mergeImportedSchemaAssignments(entry.schemaAssignments || [], schemaAssignmentsRaw);
-      }
-      if (inspectionStatus && inspectionStatus !== 'NA') entry.rbCompliance = inspectionStatus;
-      if (!entry.inspectionDate && inspectionDate) entry.inspectionDate = inspectionDate;
-      if (entry.inspectionStatus === 'NA' && inspectionStatus !== 'NA') {
-        entry.inspectionStatus = inspectionStatus;
-      }
-      if (inspectionType && (!entry.inspectionType || entry.inspectionType === 'Detailed')) {
-        entry.inspectionType = inspectionType;
-      }
-
-      if (epl || equipmentGroup || equipmentCategory || environment || subGroup || tempClass || protectionConcept) {
-        if (!Array.isArray(entry.base['Ex Marking'])) entry.base['Ex Marking'] = [];
-        const autoMarking = buildMarkingString(protectionConcept, subGroup, tempClass);
-        const inferredEnvironment = environment || determineEnvironmentFromSubGroup(subGroup);
-
-        if (autoMarking && !entry.base.Marking) {
-          entry.base.Marking = autoMarking;
-        }
-
-        const markingEntry = {
-          'Equipment Protection Level': epl || '',
-          'Equipment Group': equipmentGroup || '',
-          'Equipment Category': equipmentCategory || '',
-          'Gas / Dust Group': subGroup || '',
-          'Temperature Class': tempClass || '',
-          'Type of Protection': protectionConcept || ''
-        };
-
-        if (autoMarking) {
-          markingEntry['Marking'] = autoMarking;
-        }
-        if (inferredEnvironment) {
-          markingEntry['Environment'] = inferredEnvironment;
-        }
-
-        entry.base['Ex Marking'].push(markingEntry);
-      }
-    });
-
-    const entries = Array.from(equipmentMap.values());
-    if (parseErrors.length) {
-      return res.status(400).json({
-        message: 'The uploaded file contains invalid values.',
-        issues: parseErrors
+      await EquipmentImportJob.create({
+        jobId,
+        tenantId,
+        userId,
+        zoneId,
+        sourceBlobPath,
+        sourceFileName: uploadedFile.originalname || 'equipment-import.xlsx',
+        progress: { processed: 0, total: 0, updatedAt: new Date() }
       });
-    }
-    if (!entries.length) {
-      const baseMessage = 'No usable rows detected in the uploaded file.';
-      if (parseErrors.length) {
-        return res.status(400).json({ message: baseMessage, issues: parseErrors });
-      }
-      return res.status(400).json({ message: baseMessage });
+    } catch (queueErr) {
+      try { await azureBlob.deleteFile(sourceBlobPath); } catch {}
+      throw queueErr;
     }
 
-    const stats = { created: 0, updated: 0, inspections: 0, errors: [] };
-
-    for (const entry of entries) {
-      try {
-        const payload = { ...entry.base };
-        payload.Zone = zone._id;
-        payload.Unit = zone._id;
-        payload.Site = zone.Site || null;
-        if (entry.orderIndex != null) {
-          payload.orderIndex = entry.orderIndex;
-        }
-        if (payload.customFields && Object.keys(payload.customFields).length) {
-          payload.customFields = await sanitizeCustomFields({
-            tenantId,
-            entityType: 'equipment',
-            values: payload.customFields
-          });
-        } else {
-          delete payload.customFields;
-        }
-        const importedExMarkings = (payload['Ex Marking'] || []).filter(mark =>
-          Object.values(mark).some(value => !!String(value || '').trim())
-        );
-        const rbValues = importedExMarkings.length ? valuesFromEquipmentMarkings(importedExMarkings) : {};
-        if (entry.rbCertificatePresent) {
-          rbValues.certificateNo = entry.rbCertificateNo || payload['Certificate No'] || '';
-        }
-        if (entry.rbCompliancePresent) {
-          rbValues.compliance = entry.rbCompliance || payload.Compliance || 'NA';
-        }
-        if (!entry.rbCertificatePresent) delete rbValues.certificateNo;
-        if (!entry.rbCompliancePresent) delete rbValues.compliance;
-        delete payload['Ex Marking'];
-        delete payload['Certificate No'];
-        delete payload.Compliance;
-        const hasRbValues =
-          importedExMarkings.length ||
-          entry.rbCertificatePresent ||
-          entry.rbCompliancePresent;
-        const rbSchema = hasRbValues ? await ensureRbSchema() : null;
-
-        let equipmentDoc = null;
-
-        // 1) Első próbálkozás: explicit _id alapján frissítés (ha az exportból visszatöltötték)
-        if (entry.mongoId) {
-          if (!mongoose.Types.ObjectId.isValid(entry.mongoId)) {
-            throw new Error(`Invalid _id value: ${entry.mongoId}`);
-          }
-          equipmentDoc = await Equipment.findOne({
-            _id: entry.mongoId,
-            tenantId,
-            Zone: zone._id
-          });
-          if (!equipmentDoc) {
-            throw new Error(`Equipment with _id ${entry.mongoId} was not found in the selected zone.`);
-          }
-          if (equipmentDoc) {
-            const updateData = { ...payload, ModifiedBy: userId };
-            if (payload.customFields && Object.keys(payload.customFields).length) {
-              const currentCustomFields = equipmentDoc.customFields instanceof Map
-                ? Object.fromEntries(equipmentDoc.customFields.entries())
-                : (equipmentDoc.customFields && typeof equipmentDoc.customFields === 'object' ? equipmentDoc.customFields : {});
-              updateData.customFields = {
-                ...currentCustomFields,
-                ...payload.customFields
-              };
-            }
-            delete updateData.CreatedBy;
-            delete updateData.tenantId;
-            if (rbSchema || entry.schemaAssignments?.length) {
-              updateData.schemaAssignments = mergeImportedSchemaAssignments(
-                Array.isArray(equipmentDoc.schemaAssignments) ? equipmentDoc.schemaAssignments : [],
-                entry.schemaAssignments || []
-              );
-            }
-            if (rbSchema) {
-              ensureRbAssignment(updateData, rbSchema, {
-                ...getRbValues(equipmentDoc),
-                ...rbValues
-              }, userId);
-            }
-            if (entry.orderIndex == null) {
-              delete updateData.orderIndex;
-            }
-            equipmentDoc = await Equipment.findByIdAndUpdate(
-              equipmentDoc._id,
-              { $set: updateData },
-              { new: true }
-            );
-            stats.updated += 1;
-          }
-        }
-
-        // 2) Ha így sem találtunk, új eszközt hozunk létre
-        if (!equipmentDoc) {
-          const createData = {
-            ...payload,
-            tenantId,
-            CreatedBy: userId
-          };
-          if (entry.schemaAssignments?.length) {
-            createData.schemaAssignments = mergeImportedSchemaAssignments(createData.schemaAssignments || [], entry.schemaAssignments);
-          }
-          if (rbSchema) {
-            ensureRbAssignment(createData, rbSchema, rbValues, userId);
-          }
-          if (createData.orderIndex == null) {
-            createData.orderIndex = await getNextOrderIndex(
-              tenantId,
-              createData.Site || null,
-              createData.Zone || null
-            );
-          }
-          equipmentDoc = await Equipment.create(createData);
-          stats.created += 1;
-        }
-
-        if (
-          equipmentDoc &&
-          entry.inspectionStatus === 'Passed' &&
-          entry.inspectionDate instanceof Date
-        ) {
-          try {
-            await createAutoInspectionForImport(
-              equipmentDoc,
-              entry.inspectionDate,
-              userId,
-              tenantId,
-              entry.inspectionType || 'Detailed',
-              entry.inspectionRemarks || ''
-            );
-            stats.inspections += 1;
-          } catch (inspectionError) {
-            stats.errors.push({
-              eqId: equipmentDoc.EqID,
-              rows: entry.rows,
-              message: `Auto inspection creation failed: ${inspectionError.message || inspectionError}`
-            });
-          }
-        }
-      } catch (entryError) {
-        stats.errors.push({
-          eqId: entry.eqId,
-          id: entry.mongoId || null,
-          rows: entry.rows,
-          message: entryError.message || String(entryError)
-        });
-      }
-    }
-
-    const issues = [...parseErrors, ...stats.errors];
-
-    // Ha volt bármilyen hiba, generáljunk egy válasz XLSX-et a hibás sorokkal
-    if (issues.length > 0) {
-      try {
-        const workbookOut = new ExcelJS.Workbook();
-        await workbookOut.xlsx.readFile(uploadedFile.path);
-        const worksheet = workbookOut.worksheets[0];
-
-        const summarySheet = workbookOut.addWorksheet('Import summary');
-        summarySheet.addRow(['Created', stats.created]);
-        summarySheet.addRow(['Updated', stats.updated]);
-        summarySheet.addRow(['Inspections', stats.inspections]);
-        summarySheet.addRow(['Error items', issues.length]);
-        summarySheet.getColumn(1).width = 15;
-        summarySheet.getColumn(2).width = 12;
-
-        const errorFill = {
-          type: 'pattern',
-          pattern: 'solid',
-          fgColor: { argb: 'FFFFC0C0' } // halvány piros
-        };
-
-        issues.forEach((issue) => {
-          const rows = Array.isArray(issue.rows)
-            ? issue.rows
-            : (typeof issue.row === 'number' ? [issue.row] : []);
-
-          rows.forEach((rowNumber) => {
-            if (!rowNumber || !worksheet) return;
-            const row = worksheet.getRow(rowNumber);
-            row.eachCell((cell) => {
-              cell.fill = errorFill;
-            });
-
-            // Megjegyzés hozzáadása az első oszlophoz
-            const noteCell = worksheet.getCell(`A${rowNumber}`);
-            const existingNote =
-              typeof noteCell.note === 'string' && noteCell.note.length
-                ? `${noteCell.note}\n`
-                : '';
-            noteCell.note = `${existingNote}${issue.message || 'Invalid data in this row.'}`;
-          });
-        });
-
-        const buffer = await workbookOut.xlsx.writeBuffer();
-        res.setHeader(
-          'Content-Type',
-          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        );
-        res.setHeader(
-          'Content-Disposition',
-          'attachment; filename=\"equipment-import-errors.xlsx\"'
-        );
-        return res.status(200).send(Buffer.from(buffer));
-      } catch (excelErr) {
-        console.warn(
-          '⚠️ Failed to generate error XLSX for equipment import:',
-          excelErr?.message || excelErr
-        );
-        // Ha az XLSX generálás is elhasal, essünk vissza JSON-re
-        return res.status(200).json({
-          message: 'Import completed with errors.',
-          createdCount: stats.created,
-          updatedCount: stats.updated,
-          inspectionsCreated: stats.inspections,
-          issues
-        });
-      }
-    }
-
-    // Ha nem volt hiba, marad a JSON válasz
-    return res.json({
-      message: 'Import completed.',
-      createdCount: stats.created,
-      updatedCount: stats.updated,
-      inspectionsCreated: stats.inspections,
-      issues: []
+    await notifyEquipmentImportXlsxStatus(userId, { jobId, status: 'queued' });
+    return res.status(202).json({
+      queued: true,
+      message: 'Equipment import queued.',
+      jobId
     });
   } catch (error) {
-    console.error('❌ importEquipmentXLSX error:', error);
-    return res.status(500).json({ message: 'Failed to import XLSX.', error: error.message || String(error) });
+    console.error('❌ importEquipmentXLSX queue error:', error);
+    return res.status(500).json({ message: 'Failed to queue XLSX import.', error: error.message || String(error) });
   } finally {
     if (uploadedFile?.path) {
       try { fs.unlinkSync(uploadedFile.path); } catch (cleanupErr) {

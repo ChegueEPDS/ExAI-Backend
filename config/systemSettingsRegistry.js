@@ -112,6 +112,10 @@ const SETTINGS = [
   // Equip docs import
   { key: 'EQUIP_DOCS_IMPORT_ERROR_XLS_TTL', group: 'Equip docs import', type: 'number', defaultValue: 86400, description: 'TTL for error XLS artifacts (seconds).' },
   { key: 'EQUIP_DOCS_IMPORT_ERROR_XLS_RETENTION_DAYS', group: 'Equip docs import', type: 'number', defaultValue: 7, description: 'Retention days for error XLS artifacts.' },
+
+  // Equipment XLSX import
+  { key: 'EQUIPMENT_IMPORT_ERROR_XLS_TTL_SECONDS', group: 'Equipment import', type: 'number', defaultValue: 2592000, description: 'Signed URL TTL for XLSX import error files (seconds).' },
+  { key: 'EQUIPMENT_IMPORT_JOB_RETENTION_DAYS', group: 'Equipment import', type: 'number', defaultValue: 30, description: 'Retention days for XLSX import jobs and error files.' },
 ];
 
 const REGISTRY_MAP = new Map(SETTINGS.map((s) => [s.key, s]));

@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const Conversation = require('../models/conversation');
+const EquipmentImportJob = require('../models/equipmentImportJob');
 const logger = require('../config/logger');
 const azureBlob = require('./azureBlobService');
 const systemSettings = require('./systemSettingsStore');
@@ -76,5 +77,32 @@ exports.cleanupEquipmentDocsImportErrorReports = async () => {
     await azureBlob.deleteOldUnderPrefix(prefix, olderThanMs);
   } catch (err) {
     logger.warn('⚠️ Failed to cleanup equipment docs import error reports', err?.message || err);
+  }
+};
+
+exports.cleanupEquipmentImportJobs = async () => {
+  try {
+    const retentionDays = Number(systemSettings.getNumber('EQUIPMENT_IMPORT_JOB_RETENTION_DAYS') || 30);
+    if (!retentionDays || retentionDays <= 0) return;
+    const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+    const jobs = await EquipmentImportJob.find({
+      finishedAt: { $lte: cutoff },
+      status: { $in: ['succeeded', 'failed'] }
+    }).select('_id sourceBlobPath result.errorReportBlobPath').limit(100).lean();
+    for (const job of jobs || []) {
+      try {
+        if (job.sourceBlobPath) await azureBlob.deleteFile(job.sourceBlobPath);
+      } catch (err) {
+        logger.warn('⚠️ Failed to cleanup equipment import source blob', err?.message || err);
+      }
+      try {
+        if (job?.result?.errorReportBlobPath) await azureBlob.deleteFile(job.result.errorReportBlobPath);
+      } catch (err) {
+        logger.warn('⚠️ Failed to cleanup equipment import error blob', err?.message || err);
+      }
+      await EquipmentImportJob.deleteOne({ _id: job._id });
+    }
+  } catch (err) {
+    logger.warn('⚠️ Failed to cleanup equipment import jobs', err?.message || err);
   }
 };

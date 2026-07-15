@@ -104,12 +104,12 @@ exports.deleteNotification = async (req, res) => {
   const doc = await Notification.findOne({ _id: id, userId });
   if (!doc) return res.status(404).json({ error: 'Not found' });
 
-  // Best-effort: ha ez egy equipment-docs-import értesítés error XLS-szel, töröljük a blobot is.
+  // Best-effort: ha ez egy import értesítés letölthető XLS-szel, töröljük a blobot is.
   try {
     const type = doc.type;
     const data = doc.data || {};
     const downloadUrl = data.downloadUrl || (data.meta && data.meta.downloadUrl);
-    if (type === 'equipment-docs-import' && downloadUrl) {
+    if ((type === 'equipment-docs-import' || type === 'equipment-import') && downloadUrl) {
       const blobPath = azureBlob.toBlobPath(downloadUrl);
       if (blobPath) {
         await azureBlob.deleteFile(blobPath);
