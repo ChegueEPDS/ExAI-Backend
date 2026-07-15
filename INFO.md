@@ -9,7 +9,7 @@ Key Vault mapping (App Service references) is documented in `KEYVAULT.md`.
 Requirements:
 - Node.js (LTS recommended)
 - MongoDB
-- (Optional) Azure services / OpenAI / Pinecone depending on features used
+- Optional Azure services and OpenAI depending on features used
 
 Install dependencies:
 ```bash
@@ -26,10 +26,8 @@ cp .env.example .env
 Key groups (see `.env.example` for the full, commented list):
 - Server / URLs / CORS: `NODE_ENV`, `HOST`, `PORT`, `BASE_URL`, `FRONTEND_BASE_URL`, `CORS_ALLOWED_ORIGINS`
 - Database / Auth: `MONGO_URI`, `JWT_SECRET`, `JWT_EXPIRES_IN_*`
-- OpenAI: `OPENAI_API_KEY` (model/dataset/rerank tuning is configured via **System settings** in the UI; SuperAdmin only)
+- OpenAI: `OPENAI_API_KEY` (chat model tuning is configured via **System settings** in the UI; SuperAdmin only)
 - OpenAI (tenant AI profile): configured in **Admin → AI settings** (no Assistants API dependency)
-- Governed RAG: dataset limits, chunking, rerank, standard explorer settings
-- Pinecone (optional): `PINECONE_*`
 - Azure: Blob, Document Intelligence, OCR, Custom Vision, Search, Entra ID
 - Mail / Brevo: `MAIL_*`, `BREVO_*`
 - Billing / Stripe: `STRIPE_*`, `BILLING_*`
@@ -65,6 +63,11 @@ npm run dev
 Base URL: `http://localhost:3000` (or `PORT` from `.env`)
 All routes below are mounted under `/api` unless noted.
 
+### Health
+- GET `/health/live` (process liveness)
+- GET `/health/ready` (API initialization, MongoDB and system settings readiness)
+- GET `/health` (readiness alias for existing infrastructure probes)
+
 ### System settings (SuperAdmin)
 - GET `/api/admin/system-settings`
 - PUT `/api/admin/system-settings`
@@ -85,14 +88,12 @@ All routes below are mounted under `/api` unless noted.
 - POST `/api/new-conversation`
 - POST `/api/chat`
 - POST `/api/chat/stream` (SSE)
-- POST `/api/chat/governed/stream` (SSE, governed RAG)
 - POST `/api/upload-and-ask/stream` (SSE)
 - POST `/api/rate-message`
 - POST `/api/save-feedback`
 - DELETE `/api/conversation/:threadId`
 - GET `/api/conversations`
 - GET `/api/conversation`
-- POST `/api/conversation/standard-explorer`
 
 ### Assistant Instructions + Vector Store Files
 - GET `/api/instructions`
@@ -100,26 +101,6 @@ All routes below are mounted under `/api` unless noted.
 - GET `/api/vector-files`
 - POST `/api/vector-files` (multipart: `file`)
 - DELETE `/api/vector-files/:fileId`
-
-### Governed RAG: Datasets & Standards
-- POST `/api/projects/:projectId/datasets`
-- GET `/api/projects/:projectId/datasets`
-- GET `/api/projects/:projectId/datasets/:version/files`
-- POST `/api/projects/:projectId/datasets/:version/files` (multipart)
-- POST `/api/projects/:projectId/datasets/:version/files/stream` (SSE + multipart)
-- PATCH `/api/projects/:projectId/dataset-files/:datasetFileId/approval`
-- DELETE `/api/projects/:projectId/dataset-files/:datasetFileId`
-- POST `/api/projects/:projectId/datasets/:version/approve`
-
-- GET `/api/standards`
-- GET `/api/standards/:standardRef`
-- GET `/api/standards/:standardRef/pdf`
-- GET `/api/standards/:standardRef/clauses`
-- POST `/api/standards/upload` (multipart)
-- DELETE `/api/standards/:standardRef`
-- GET `/api/standard-sets`
-- POST `/api/standard-sets`
-- DELETE `/api/standard-sets/:setId`
 
 ### OCR / Vision
 - POST `/api/plate`

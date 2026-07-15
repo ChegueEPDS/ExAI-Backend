@@ -19,10 +19,6 @@ const authMiddleware = (roles = []) => {
       if (!token) {
         return res.status(401).json({ error: 'No token provided' });
       }
-      if (!validateCsrf(req, source)) {
-        return res.status(403).json({ error: 'Invalid CSRF token' });
-      }
-
       const { decoded, session, user } = await authenticateAccessToken(token);
 
       // Szerepkör ellenőrzés (ha szükséges)
@@ -57,6 +53,10 @@ const authMiddleware = (roles = []) => {
         plan: req.user.plan || null,
         sessionId: String(session._id),
       };
+
+      if (!(await validateCsrf(req, source))) {
+        return res.status(403).json({ error: 'Invalid CSRF token' });
+      }
 
       next();
     } catch (err) {

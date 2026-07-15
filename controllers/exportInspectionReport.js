@@ -3165,7 +3165,9 @@ const reportJobQueue = [];
 const queuedReportJobIds = new Set();
 let activeReportJobs = 0;
 let reportWorkerTimer = null;
+let reportWorkerInitialTimer = null;
 let reportWorkerRunning = false;
+let reportWorkerStopping = false;
 
 function reportBackgroundJobsDisabled() {
   return (
@@ -3196,6 +3198,7 @@ function getReportJobMaxAttempts() {
 }
 
 function drainReportJobQueue() {
+  if (reportWorkerStopping) return;
   const maxConcurrency = getReportJobConcurrency();
   while (activeReportJobs < maxConcurrency && reportJobQueue.length) {
     const jobId = reportJobQueue.shift();
@@ -3215,7 +3218,7 @@ function drainReportJobQueue() {
 }
 
 function scheduleReportJob(job) {
-  if (reportBackgroundJobsDisabled()) return;
+  if (reportBackgroundJobsDisabled() || reportWorkerStopping) return;
   if (!job?.jobId) return;
   if (queuedReportJobIds.has(job.jobId)) return;
   queuedReportJobIds.add(job.jobId);
@@ -3289,8 +3292,9 @@ async function pollReportExportJobs() {
 function startReportExportWorker() {
   if (reportBackgroundJobsDisabled()) return;
   if (reportWorkerTimer) return;
-  const firstRunTimer = setTimeout(() => pollReportExportJobs().catch(() => {}), 1500);
-  if (typeof firstRunTimer.unref === 'function') firstRunTimer.unref();
+  reportWorkerStopping = false;
+  reportWorkerInitialTimer = setTimeout(() => pollReportExportJobs().catch(() => {}), 1500);
+  if (typeof reportWorkerInitialTimer.unref === 'function') reportWorkerInitialTimer.unref();
   reportWorkerTimer = setInterval(() => {
     pollReportExportJobs().catch(() => {});
   }, getReportJobPollMs());
@@ -3298,6 +3302,23 @@ function startReportExportWorker() {
 }
 
 exports.startReportExportWorker = startReportExportWorker;
+
+async function stopReportExportWorker({ drainTimeoutMs = 120_000 } = {}) {
+  reportWorkerStopping = true;
+  if (reportWorkerTimer) clearInterval(reportWorkerTimer);
+  if (reportWorkerInitialTimer) clearTimeout(reportWorkerInitialTimer);
+  reportWorkerTimer = null;
+  reportWorkerInitialTimer = null;
+  reportJobQueue.length = 0;
+  queuedReportJobIds.clear();
+  const deadline = Date.now() + Math.max(0, Number(drainTimeoutMs) || 0);
+  while ((reportWorkerRunning || activeReportJobs > 0) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return { drained: !reportWorkerRunning && activeReportJobs === 0 };
+}
+
+exports.stopReportExportWorker = stopReportExportWorker;
 
 async function runReportExportJob(jobId) {
   const now = new Date();

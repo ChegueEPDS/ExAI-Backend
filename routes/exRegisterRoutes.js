@@ -9,7 +9,11 @@ const { diskUpload } = require('../middlewares/uploadFactory');
 const imageUpload = diskUpload({ fileSizeMb: 15, files: 20, fields: 120 });
 const documentUpload = diskUpload({ fileSizeMb: 50, files: 20, fields: 120 });
 const xlsxUpload = diskUpload({ fileSizeMb: 25, files: 1, fields: 30 });
-const zipUpload = diskUpload({ fileSizeMb: 500, files: 1, fields: 30 });
+const zipUpload = diskUpload({
+  fileSizeMb: Math.max(100, Number(process.env.EQUIPMENT_ZIP_MAX_MB || 2048)),
+  files: 1,
+  fields: 30
+});
 
 
 

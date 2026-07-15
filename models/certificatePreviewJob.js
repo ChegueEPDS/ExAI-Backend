@@ -26,5 +26,6 @@ const CertificatePreviewJobSchema = new mongoose.Schema(
 
 CertificatePreviewJobSchema.index({ tenantId: 1, createdBy: 1, createdAt: -1 });
 CertificatePreviewJobSchema.index({ status: 1, updatedAt: 1 });
+CertificatePreviewJobSchema.index({ status: 1, startedAt: 1 });
 
 module.exports = mongoose.model('CertificatePreviewJob', CertificatePreviewJobSchema);

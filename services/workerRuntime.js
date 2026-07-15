@@ -74,7 +74,24 @@ function startWorkerRuntime() {
   return { started: true };
 }
 
+async function stopWorkerRuntime({ drainTimeoutMs = 120_000 } = {}) {
+  for (const timer of timers.splice(0, timers.length)) clearInterval(timer);
+  const options = { drainTimeoutMs };
+  const results = await Promise.allSettled([
+    reportExportCleanup.stop?.(options),
+    reportExportController.stopReportExportWorker?.(options),
+    certificatePreviewWorker.stop?.(options),
+    certificateDraftWorker.stop?.(options),
+    mobileSyncWorker.stop?.(options),
+  ]);
+  started = false;
+  const drained = results.every((result) => result.status === 'fulfilled' && result.value?.drained !== false);
+  logger.info('[worker-runtime] stopped', { drained });
+  return { stopped: true, drained };
+}
+
 module.exports = {
   backgroundJobsDisabled,
-  startWorkerRuntime
+  startWorkerRuntime,
+  stopWorkerRuntime
 };

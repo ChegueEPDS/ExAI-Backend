@@ -14,10 +14,12 @@ async function waitForHealth(baseUrl, { timeoutMs = 30_000 } = {}) {
 
   while (Date.now() < deadline) {
     try {
-      const { statusCode, body } = await request(`${baseUrl}/health`, { method: 'GET' });
+      const { statusCode, body } = await request(`${baseUrl}/health/ready`, { method: 'GET' });
       const text = await body.text();
-      if (statusCode === 200 && text.trim() === 'OK') return;
-      lastError = new Error(`Unexpected /health response: ${statusCode} ${text}`);
+      let payload = null;
+      try { payload = JSON.parse(text); } catch {}
+      if (statusCode === 200 && payload?.ok === true) return;
+      lastError = new Error(`Unexpected /health/ready response: ${statusCode} ${text}`);
     } catch (err) {
       lastError = err;
     }

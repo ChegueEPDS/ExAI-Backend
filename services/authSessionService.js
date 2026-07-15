@@ -113,6 +113,27 @@ function randomToken(bytes = 48) {
   return crypto.randomBytes(bytes).toString('base64url');
 }
 
+function ensureSessionCsrfToken(session) {
+  if (!session) return null;
+  if (session.csrfToken) return session.csrfToken;
+  session.csrfToken = randomToken(24);
+  return session.csrfToken;
+}
+
+async function prepareResponseCsrfToken(req, result = null) {
+  const session =
+    result?.session?.clientType === 'web'
+      ? result.session
+      : req?.session?.clientType === 'web'
+        ? req.session
+        : null;
+  const csrfToken = ensureSessionCsrfToken(session);
+  if (csrfToken && session?.isModified?.('csrfToken')) {
+    await session.save();
+  }
+  return csrfToken;
+}
+
 async function getTenantMeta(tenantId) {
   if (!tenantId) return { name: null, type: null, professionRbacEnabled: false };
   const t = await Tenant.findById(tenantId).lean().select('name type features professionRbacEnabled plan seats seatsManaged');
@@ -297,6 +318,7 @@ function buildSessionMetadata(session, accessToken = null) {
 
 async function createSession({ user, clientType, req }) {
   const refreshToken = randomToken();
+  const csrfToken = clientType === 'web' ? randomToken(24) : null;
   const now = Date.now();
   const absoluteExpiresAt = new Date(now + absoluteTtlMs(clientType));
   const expiresAt = minDate(new Date(now + refreshTtlMs(clientType)), absoluteExpiresAt);
@@ -305,6 +327,7 @@ async function createSession({ user, clientType, req }) {
     tenantId: user.tenantId,
     clientType,
     refreshTokenHash: hashToken(refreshToken),
+    csrfToken,
     expiresAt,
     absoluteExpiresAt,
     userAgent: String(req?.headers?.['user-agent'] || '').slice(0, 500),
@@ -312,7 +335,14 @@ async function createSession({ user, clientType, req }) {
   });
   const accessToken = await signAccessToken(user, session);
   const userContext = await buildUserContext(user, session);
-  return { session, accessToken, refreshToken, user: userContext, sessionMeta: buildSessionMetadata(session, accessToken) };
+  return {
+    session,
+    accessToken,
+    refreshToken,
+    csrfToken,
+    user: userContext,
+    sessionMeta: buildSessionMetadata(session, accessToken),
+  };
 }
 
 async function rotateRefreshToken({ refreshToken, req }) {
@@ -343,12 +373,17 @@ async function rotateRefreshToken({ refreshToken, req }) {
 
     const user = await User.findById(session.userId);
     if (!user || !user.tenantId) throw new Error('Invalid session user');
+    const csrfToken = ensureSessionCsrfToken(session);
+    if (csrfToken && session.isModified?.('csrfToken')) {
+      await session.save();
+    }
     const accessToken = await signAccessToken(user, session);
     const userContext = await buildUserContext(user, session);
     return {
       session,
       accessToken,
       refreshToken: null,
+      csrfToken,
       user: userContext,
       sessionMeta: buildSessionMetadata(session, accessToken),
       refreshRotated: false,
@@ -392,12 +427,17 @@ async function rotateRefreshToken({ refreshToken, req }) {
   );
   if (!updated) throw new Error('Refresh token rotation conflict');
 
+  const csrfToken = ensureSessionCsrfToken(updated);
+  if (csrfToken && updated.isModified?.('csrfToken')) {
+    await updated.save();
+  }
   const accessToken = await signAccessToken(user, updated);
   const userContext = await buildUserContext(user, updated);
   return {
     session: updated,
     accessToken,
     refreshToken: nextRefreshToken,
+    csrfToken,
     user: userContext,
     sessionMeta: buildSessionMetadata(updated, accessToken),
     refreshRotated: true,
@@ -467,11 +507,9 @@ async function revokeRefreshToken(refreshToken) {
 function setAuthCookies(res, req, result) {
   const refreshMs = Math.max(0, new Date(result.session.expiresAt).getTime() - Date.now());
   const accessMs = parseDurationMs(accessTtl('web'), 15 * 60_000);
-  const csrf = randomToken(24);
   res.cookie(ACCESS_COOKIE, result.accessToken, cookieOptions(req, accessMs, true));
   if (result.refreshToken) {
     res.cookie(REFRESH_COOKIE, result.refreshToken, cookieOptions(req, refreshMs, true));
-    res.cookie(CSRF_COOKIE, csrf, cookieOptions(req, refreshMs, false));
   }
 }
 
@@ -510,16 +548,40 @@ function getAccessTokenFromRequest(req) {
   return { token: null, source: null };
 }
 
-function validateCsrf(req, tokenSource) {
+async function validateCsrf(req, tokenSource) {
   const configured = String(process.env.AUTH_REQUIRE_CSRF || '').trim().toLowerCase();
   const required = configured ? configured === 'true' : process.env.NODE_ENV === 'production';
   if (!required) return true;
   if (tokenSource !== 'cookie') return true;
   if (['GET', 'HEAD', 'OPTIONS'].includes(String(req.method || '').toUpperCase())) return true;
-  const cookies = parseCookies(req);
-  const cookieToken = cookies[CSRF_COOKIE];
+  let session =
+    req.session ||
+    (req.scope?.sessionId ? await Session.findById(req.scope.sessionId) : null) ||
+    (req.auth?.sessionId ? await Session.findById(req.auth.sessionId) : null);
+  if (!session) {
+    const refreshToken = getRefreshTokenFromRequest(req);
+    if (refreshToken) {
+      const refreshHash = hashToken(refreshToken);
+      const nowDate = new Date();
+      session = await Session.findOne({
+        revokedAt: null,
+        expiresAt: { $gt: nowDate },
+        $or: [
+          { refreshTokenHash: refreshHash },
+          {
+            previousRefreshTokenHash: refreshHash,
+            previousRefreshTokenGraceUntil: { $gt: nowDate },
+          },
+        ],
+      });
+    }
+  }
+  const csrfToken = ensureSessionCsrfToken(session);
+  if (csrfToken && session?.isModified?.('csrfToken')) {
+    await session.save();
+  }
   const headerToken = req.headers['x-csrf-token'];
-  return Boolean(cookieToken && headerToken && String(cookieToken) === String(headerToken));
+  return Boolean(csrfToken && headerToken && String(csrfToken) === String(headerToken));
 }
 
 module.exports = {
@@ -531,6 +593,7 @@ module.exports = {
   buildSessionMetadata,
   clearAuthCookies,
   createSession,
+  prepareResponseCsrfToken,
   getAccessTokenFromRequest,
   getRefreshTokenFromRequest,
   getRefreshTokenSourceFromRequest,

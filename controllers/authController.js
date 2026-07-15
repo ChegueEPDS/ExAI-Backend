@@ -18,6 +18,7 @@ const {
   buildUserContext,
   clearAuthCookies,
   createSession,
+  prepareResponseCsrfToken,
   getRefreshTokenFromRequest,
   getRefreshTokenSourceFromRequest,
   revokeSession,
@@ -255,10 +256,16 @@ function getClientType(req) {
   return String(req?.headers?.['x-client'] || '').toLowerCase() === 'mobile' ? 'mobile' : 'web';
 }
 
-function sendAuthResult(req, res, result, extra = {}) {
+async function sendAuthResult(req, res, result, extra = {}) {
   if (result.session.clientType === 'web') {
     setAuthCookies(res, req, result);
-    return res.status(200).json({ user: result.user, session: result.sessionMeta, ...extra });
+    const csrfToken = await prepareResponseCsrfToken(req, result);
+    return res.status(200).json({
+      user: result.user,
+      session: result.sessionMeta,
+      csrfToken,
+      ...extra,
+    });
   }
   return res.status(200).json({
     accessToken: result.accessToken,
@@ -684,7 +691,7 @@ exports.renewToken = async (req, res) => {
   try {
     const refreshToken = getRefreshTokenFromRequest(req);
     if (!refreshToken) return res.status(401).json({ error: 'Refresh token is required' });
-    if (getRefreshTokenSourceFromRequest(req) === 'cookie' && !validateCsrf(req, 'cookie')) {
+    if (getRefreshTokenSourceFromRequest(req) === 'cookie' && !(await validateCsrf(req, 'cookie'))) {
       return res.status(403).json({ error: 'Invalid CSRF token' });
     }
     const authResult = await rotateRefreshToken({ refreshToken, req });
@@ -700,7 +707,7 @@ exports.renewToken = async (req, res) => {
 exports.logout = async (req, res) => {
   try {
     const refreshToken = getRefreshTokenFromRequest(req);
-    if (getRefreshTokenSourceFromRequest(req) === 'cookie' && !validateCsrf(req, 'cookie')) {
+    if (getRefreshTokenSourceFromRequest(req) === 'cookie' && !(await validateCsrf(req, 'cookie'))) {
       clearAuthCookies(res, req);
       return res.status(403).json({ error: 'Invalid CSRF token' });
     }
@@ -720,9 +727,11 @@ exports.logout = async (req, res) => {
 exports.me = async (req, res) => {
   const session = buildSessionMetadata(req.session || null);
   if (req.auth?.exp) session.accessExpiresAt = new Date(req.auth.exp * 1000).toISOString();
+  const csrfToken = await prepareResponseCsrfToken(req);
   return res.json({
     user: req.user,
     session,
+    csrfToken,
   });
 };
 

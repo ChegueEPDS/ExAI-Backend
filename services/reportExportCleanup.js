@@ -14,7 +14,9 @@ function getCleanupIntervalMs() {
 }
 
 let timer = null;
+let initialTimer = null;
 let running = false;
+let stopping = false;
 
 async function cleanupOnce(batchSize = 50) {
   const retentionDays = getRetentionDays();
@@ -72,6 +74,7 @@ function start() {
   };
 
   const scheduleNext = (delayMs) => {
+    if (stopping) return;
     const delay = clampInterval(delayMs);
     timer = setTimeout(async () => {
       timer = null;
@@ -81,16 +84,18 @@ function start() {
         logger.error('[report-export] cleanup schedule error', err);
       } finally {
         // Re-read interval each time so changes apply without restart.
-        scheduleNext(getCleanupIntervalMs());
+        if (!stopping) scheduleNext(getCleanupIntervalMs());
       }
     }, delay);
     if (typeof timer.unref === 'function') timer.unref();
   };
 
+  stopping = false;
   scheduleNext(getCleanupIntervalMs());
 
   // kick off after startup
-  setTimeout(() => cleanupOnce().catch(err => logger.error('[report-export] initial cleanup error', err)), 15 * 1000);
+  initialTimer = setTimeout(() => cleanupOnce().catch(err => logger.error('[report-export] initial cleanup error', err)), 15 * 1000);
+  if (typeof initialTimer.unref === 'function') initialTimer.unref();
 
   logger.info(
     '[report-export] cleanup scheduler started (dynamic interval, current %d ms, retention %d days)',
@@ -99,4 +104,17 @@ function start() {
   );
 }
 
-module.exports = { start, cleanupOnce };
+async function stop({ drainTimeoutMs = 120_000 } = {}) {
+  stopping = true;
+  if (timer) clearTimeout(timer);
+  if (initialTimer) clearTimeout(initialTimer);
+  timer = null;
+  initialTimer = null;
+  const deadline = Date.now() + Math.max(0, Number(drainTimeoutMs) || 0);
+  while (running && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return { drained: !running };
+}
+
+module.exports = { start, stop, cleanupOnce };

@@ -76,22 +76,6 @@ const ConversationSchema = new mongoose.Schema({
   lastAssistantId: { type: String, default: null },
   lastModel: { type: String, default: null },
 
-  // Governed RAG: internal project identifier used to scope datasets + Pinecone namespace
-  governedProjectId: { type: String, default: null, index: true },
-
-  // Persist which backend should handle follow-up messages for this thread.
-  // - normal: /api/chat/stream
-  // - governed: /api/chat/governed/stream (Pinecone + tenant standards + project dataset)
-  chatBackend: { type: String, enum: ['normal', 'governed'], default: 'normal', index: true },
-
-  // Standard Explorer (tenant library): optional "standards-only" governed chat mode.
-  // When enabled, the UI opens the selected standard PDF from Blob and routes messages to governed retrieval,
-  // prioritizing this standard but allowing fallback to the full tenant library if needed.
-  standardExplorer: {
-    enabled: { type: Boolean, default: false, index: true },
-    standardRef: { type: mongoose.Schema.Types.ObjectId, ref: 'Standard', default: null, index: true },
-  },
-
   messages: { type: [MessageSchema], default: [] },
 
   // háttérfeladat a beszélgetéshez rögzítve (1 konverzáció = 1 task egyszerre)

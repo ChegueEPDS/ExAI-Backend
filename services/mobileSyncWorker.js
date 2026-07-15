@@ -11,9 +11,16 @@ const { buildCertificateCacheForTenant, resolveCertificateFromCache } = require(
 const { notifyAndStore } = require('../lib/notifications/notifier');
 const { processDataplateForEquipment } = require('./dataplateProcessingService');
 const { certificateNo, complianceStatus, protectionText } = require('./rbSchemaValueService');
+const { withLock } = require('./distributedLockService');
 
 let isRunning = false;
+let pollTimer = null;
+let emptyPolls = 0;
+let lastStaleRecoveryAt = 0;
+let stopping = false;
 const certCacheByTenant = new Map(); // tenantId -> { ts, map }
+
+const STALE_RECOVERY_INTERVAL_MS = Math.max(60_000, Number(process.env.MOBILE_SYNC_STALE_RECOVERY_MS || 5 * 60_000));
 
 function addYears(date, years) {
   const d = new Date(date);
@@ -553,50 +560,53 @@ async function processOneJob(job) {
 }
 
 async function tick() {
-  if (isRunning) return;
+  if (isRunning) return false;
   isRunning = true;
   let job = null;
   try {
     const now = new Date();
-    const staleMinutes = Math.max(Number(process.env.MOBILE_SYNC_STALE_MINUTES || 120), 15);
-    const staleBefore = new Date(now.getTime() - staleMinutes * 60 * 1000);
-    const staleJobs = await ProcessingJob.find({
-      type: 'mobileSync',
-      status: 'processing',
-      startedAt: { $lte: staleBefore }
-    }).select('_id tenantId equipmentIds').lean();
-    for (const staleJob of staleJobs || []) {
-      await ProcessingJob.updateOne(
-        { _id: staleJob._id, status: 'processing' },
-        {
-          $set: {
-            status: 'error',
-            finishedAt: now,
-            errorMessage: `Mobile sync job exceeded ${staleMinutes} minutes without finishing.`
+    if (Date.now() - lastStaleRecoveryAt >= STALE_RECOVERY_INTERVAL_MS) {
+      const staleMinutes = Math.max(Number(process.env.MOBILE_SYNC_STALE_MINUTES || 120), 15);
+      const staleBefore = new Date(now.getTime() - staleMinutes * 60 * 1000);
+      const staleJobs = await ProcessingJob.find({
+        type: 'mobileSync',
+        status: 'processing',
+        startedAt: { $lte: staleBefore }
+      }).select('_id tenantId equipmentIds').lean();
+      for (const staleJob of staleJobs || []) {
+        await ProcessingJob.updateOne(
+          { _id: staleJob._id, status: 'processing' },
+          {
+            $set: {
+              status: 'error',
+              finishedAt: now,
+              errorMessage: `Mobile sync job exceeded ${staleMinutes} minutes without finishing.`
+            }
           }
-        }
-      );
-      await Equipment.updateMany(
-        {
-          _id: { $in: staleJob.equipmentIds || [] },
-          tenantId: staleJob.tenantId,
-          'mobileSync.jobId': String(staleJob._id)
-        },
-        {
-          $set: {
-            'mobileSync.status': 'error',
-            'mobileSync.finishedAt': now,
-            isProcessed: true
+        );
+        await Equipment.updateMany(
+          {
+            _id: { $in: staleJob.equipmentIds || [] },
+            tenantId: staleJob.tenantId,
+            'mobileSync.jobId': String(staleJob._id)
+          },
+          {
+            $set: {
+              'mobileSync.status': 'error',
+              'mobileSync.finishedAt': now,
+              isProcessed: true
+            }
           }
-        }
-      );
+        );
+      }
+      lastStaleRecoveryAt = Date.now();
     }
     job = await ProcessingJob.findOneAndUpdate(
       { type: 'mobileSync', status: 'queued' },
       { $set: { status: 'processing', startedAt: now } },
       { sort: { createdAt: 1 }, new: true }
     );
-    if (!job) return;
+    if (!job) return false;
 
     try {
       console.info('[mobile-sync-worker] job picked', {
@@ -655,6 +665,7 @@ async function tick() {
     } catch {
       // ignore notification failures
     }
+    return true;
   } catch (err) {
     if (job?._id) {
       try {
@@ -672,17 +683,43 @@ async function tick() {
         // Best-effort failure marking; worker must not crash the server.
       }
     }
+    return false;
   } finally {
     isRunning = false;
   }
 }
 
 function start({ intervalMs = 5000 } = {}) {
-  setInterval(() => {
-    tick().catch(() => {});
-  }, intervalMs);
-  // also run soon after boot
-  setTimeout(() => tick().catch(() => {}), 1500);
+  if (pollTimer) return { started: false, reason: 'already_started' };
+  const baseMs = Math.max(1000, Number(intervalMs) || 5000);
+  stopping = false;
+  const scheduleNext = (delayMs) => {
+    if (stopping) return;
+    pollTimer = setTimeout(async () => {
+      try {
+        const didWork = await withLock('worker:mobile-sync:poll', Math.max(baseMs * 4, 60_000), tick);
+        emptyPolls = didWork ? 0 : Math.min(emptyPolls + 1, 2);
+      } catch {
+        emptyPolls = Math.min(emptyPolls + 1, 2);
+      }
+      const nextDelay = emptyPolls === 0 ? baseMs : (emptyPolls === 1 ? Math.max(baseMs, 10_000) : Math.max(baseMs, 30_000));
+      if (!stopping) scheduleNext(nextDelay);
+    }, delayMs);
+    if (typeof pollTimer.unref === 'function') pollTimer.unref();
+  };
+  scheduleNext(1500);
+  return { started: true };
 }
 
-module.exports = { start, ensureAutoInspectionFromMobileSync };
+async function stop({ drainTimeoutMs = 120_000 } = {}) {
+  stopping = true;
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
+  const deadline = Date.now() + Math.max(0, Number(drainTimeoutMs) || 0);
+  while (isRunning && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return { drained: !isRunning };
+}
+
+module.exports = { start, stop, ensureAutoInspectionFromMobileSync };

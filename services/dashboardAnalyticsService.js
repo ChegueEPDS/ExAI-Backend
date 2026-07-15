@@ -528,7 +528,7 @@ async function computeDashboardAnalytics({ tenantId, siteId = null, zoneId = nul
 
   const [slaTargets, materialized] = await Promise.all([
     loadSlaTargets(tenantObjectId),
-    loadMaterializedIncidents({ tenantId: tenantObjectId, equipmentIds })
+    loadMaterializedIncidents({ tenantId: tenantObjectId, equipmentIds, from, to })
   ]);
 
   let complianceIncidents;

@@ -41,6 +41,7 @@ function normalizeToType(def, value) {
 // In-memory overrides loaded from DB (and updated on writes).
 const overrides = new Map(); // key -> value
 let started = false;
+let startPromise = null;
 let reloadTimer = null;
 let lastLoadedAt = null;
 
@@ -60,7 +61,7 @@ async function reloadFromDb() {
 }
 
 function start({ reloadIntervalMs = 60_000 } = {}) {
-  if (started) return;
+  if (startPromise) return startPromise;
   started = true;
 
   const tryLoad = async () => {
@@ -73,18 +74,17 @@ function start({ reloadIntervalMs = 60_000 } = {}) {
     }
   };
 
-  // Load once DB is connected
-  if (isDbReady()) {
-    void tryLoad();
-  } else {
-    mongoose.connection.once('connected', () => void tryLoad());
-    mongoose.connection.once('open', () => void tryLoad());
-  }
+  startPromise = (async () => {
+    if (!isDbReady()) throw new Error('Cannot start system settings before MongoDB is connected');
+    await reloadFromDb();
 
-  if (reloadIntervalMs > 0) {
-    reloadTimer = setInterval(() => void tryLoad(), reloadIntervalMs);
-    if (typeof reloadTimer.unref === 'function') reloadTimer.unref();
-  }
+    if (reloadIntervalMs > 0) {
+      reloadTimer = setInterval(() => void tryLoad(), reloadIntervalMs);
+      if (typeof reloadTimer.unref === 'function') reloadTimer.unref();
+    }
+  })();
+
+  return startPromise;
 }
 
 function getEffectiveValue(key) {
@@ -178,6 +178,11 @@ async function resetToDefault(keys, { updatedBy = null } = {}) {
   lastLoadedAt = new Date();
 }
 
+function stop() {
+  if (reloadTimer) clearInterval(reloadTimer);
+  reloadTimer = null;
+}
+
 // Test helper: do not persist, only override in-memory
 function _setInMemoryForTests(valuesByKey) {
   for (const [key, value] of Object.entries(valuesByKey || {})) {
@@ -193,6 +198,7 @@ function _resetInMemoryForTests() {
 
 module.exports = {
   start,
+  stop,
   reloadFromDb,
   getEffectiveValue,
   getString,
@@ -204,5 +210,5 @@ module.exports = {
   // tests
   _setInMemoryForTests,
   _resetInMemoryForTests,
-  _debug: () => ({ started, lastLoadedAt, size: overrides.size }),
+  _debug: () => ({ started, ready: Boolean(lastLoadedAt), lastLoadedAt, size: overrides.size }),
 };

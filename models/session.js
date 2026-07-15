@@ -8,6 +8,7 @@ const SessionSchema = new mongoose.Schema(
     refreshTokenHash: { type: String, required: true, index: true },
     previousRefreshTokenHash: { type: String, default: null, index: true },
     previousRefreshTokenGraceUntil: { type: Date, default: null },
+    csrfToken: { type: String, default: null },
     revokedAt: { type: Date, default: null, index: true },
     expiresAt: { type: Date, required: true },
     absoluteExpiresAt: { type: Date, required: false, index: true },

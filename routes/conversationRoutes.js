@@ -10,10 +10,8 @@ const {
   getConversationById,
   uploadAndAskStream,
   uploadChatFile,
-  sendMessageStream,
-  setStandardExplorer
+  sendMessageStream
 } = require('../controllers/conversationController');
-const { chatGovernedStream } = require('../controllers/governedChatController');
 const authMiddleware = require('../middlewares/authMiddleware');
 const { memoryUpload } = require('../middlewares/uploadFactory');
 
@@ -58,19 +56,11 @@ router.get('/conversations', authMiddleware(), getConversations);
 
 // Korábbi beszélgetés betöltése
 router.get('/conversation', authMiddleware(), getConversationById);
-router.post('/conversation/standard-explorer', authMiddleware(), setStandardExplorer);
 
 router.post(
   '/upload-and-ask/stream',
   authMiddleware(),
   uploadAndAskStream
-);
-
-// Governed RAG (project + dataset version + approval + numeric traceability)
-router.post(
-  '/chat/governed/stream',
-  authMiddleware(),
-  chatGovernedStream
 );
 
 module.exports = router;

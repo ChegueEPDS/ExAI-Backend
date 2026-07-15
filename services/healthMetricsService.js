@@ -392,7 +392,7 @@ async function computeHealthMetrics({
   const fromMs = from ? toMillis(from) : null;
   const toMs = to ? toMillis(to) : null;
   const normalizedMode = normalizeMode(mode);
-  const materialized = await loadMaterializedIncidents({ tenantId, equipmentIds });
+  const materialized = await loadMaterializedIncidents({ tenantId, equipmentIds, from, to });
   let compliance;
   let complianceSchemas;
   let maintenance;

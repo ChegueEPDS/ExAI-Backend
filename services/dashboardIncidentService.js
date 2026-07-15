@@ -305,13 +305,21 @@ function scheduleBackfillMissingIncidents({ tenantId, equipmentIds, delayMs = RE
   if (typeof timer.unref === 'function') timer.unref();
 }
 
-async function loadMaterializedIncidents({ tenantId, equipmentIds }) {
+async function loadMaterializedIncidents({ tenantId, equipmentIds, from = null, to = null }) {
   const tenantObjectId = toObjectId(tenantId) || tenantId;
   const ids = (equipmentIds || []).filter(Boolean);
   if (!tenantObjectId || !ids.length) return { complete: false, incidents: [] };
+  const incidentFilter = { tenantId: tenantObjectId, equipmentId: { $in: ids } };
+  const fromDate = from ? new Date(from) : null;
+  const toDate = to ? new Date(to) : null;
+  if (toDate && !Number.isNaN(toDate.getTime())) incidentFilter.startAt = { $lte: toDate };
+  if (fromDate && !Number.isNaN(fromDate.getTime())) {
+    incidentFilter.$or = [{ endAt: null }, { endAt: { $gte: fromDate } }];
+  }
+
   const [states, incidents] = await Promise.all([
     DashboardIncidentState.find({ tenantId: tenantObjectId, equipmentId: { $in: ids } }).select('equipmentId').lean(),
-    DashboardIncident.find({ tenantId: tenantObjectId, equipmentId: { $in: ids } }).lean()
+    DashboardIncident.find(incidentFilter).lean()
   ]);
   const covered = new Set((states || []).map((state) => String(state.equipmentId)));
   const missingEquipmentIds = ids.filter((id) => !covered.has(String(id)));

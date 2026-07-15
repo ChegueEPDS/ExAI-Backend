@@ -2,6 +2,7 @@ require('dotenv').config();
 const util = require('util');
 const express = require('express');
 const cors = require('cors');
+const mongoose = require('mongoose');
 const connectDB = require('./config/db');
 const logger = require('./config/logger');
 
@@ -18,7 +19,7 @@ const limiter = require('./middlewares/rateLimiter');
 const systemSettingsStore = require('./services/systemSettingsStore');
 const { writeSystemAuditLog } = require('./services/auditLogService');
 const { seedInitialSuperAdminIfEmpty } = require('./services/bootstrapSuperAdmin');
-const { backgroundJobsDisabled, startWorkerRuntime } = require('./services/workerRuntime');
+const { backgroundJobsDisabled, startWorkerRuntime, stopWorkerRuntime } = require('./services/workerRuntime');
 const path = require('path');
 const fs = require('fs');
 
@@ -46,14 +47,11 @@ const upgradeRoutes = require('./routes/upgrade');
 const tenantRoutes = require('./routes/tenantRoutes');
 const healthMetricsRoutes = require('./routes/healthMetricsRoutes');
 const inviteRoutes = require('./routes/inviteRoutes');
-const mailRoutes = require('./routes/mailRoutes');
 const consentRoutes = require('./routes/consentRoutes');
 const certificateRequestRoutes = require('./routes/certificateRequestRoutes');
 const inspectionRoutes = require('./routes/inspectionRoutes');
 const downloadRoutes = require('./routes/downloadRoutes');
 const mobileSyncRoutes = require('./routes/mobileSyncRoutes');
-const datasetRoutes = require('./routes/datasetRoutes');
-const standardRoutes = require('./routes/standardRoutes');
 const statusSummaryRoutes = require('./routes/statusSummaryRoutes');
 const rootCauseRoutes = require('./routes/rootCauseRoutes');
 const maintenanceSeverityRoutes = require('./routes/maintenanceSeverityRoutes');
@@ -76,6 +74,15 @@ const documentationRoutes = require('./routes/documentationRoutes');
 const app = express();
 app.set('trust proxy', 1); // Csak teszt környezetben
 const port = process.env.PORT || 3000;
+const runtimeState = {
+  initialized: false,
+  settingsReady: false,
+  workerStarted: false,
+  shuttingDown: false,
+};
+let server = null;
+const openSockets = new Set();
+const sseResponses = new Set();
 
 function formatConsoleArg(arg) {
   if (arg instanceof Error) return arg.stack || arg.message;
@@ -103,17 +110,6 @@ console.warn = (...args) => {
 console.error = (...args) => {
   logger.error(formatConsoleArgs(args));
 };
-
-connectDB().then(async () => {
-  console.log('Database connected successfully');
-  await seedInitialSuperAdminIfEmpty();
-}).catch((err) => {
-  console.error('Database connection failed:', err);
-  process.exit(1); // Exit if DB connection fails
-});
-
-// Start global system settings loader (DB-backed overrides with code defaults)
-systemSettingsStore.start();
 
 function normalizeCorsToken(v) {
   const s = String(v || '').trim();
@@ -263,6 +259,54 @@ app.use((req, res, next) => {
 // Request correlation id (used in logs and returned as response header)
 app.use(requestIdMiddleware);
 
+const NORMAL_REQUEST_TIMEOUT_MS = Math.max(30_000, Number(process.env.HTTP_REQUEST_TIMEOUT_MS || 120_000));
+const LONG_REQUEST_TIMEOUT_MS = Math.max(10 * 60_000, Number(process.env.HTTP_LONG_REQUEST_TIMEOUT_MS || 2 * 60 * 60_000));
+const UNLIMITED_TIMEOUT_PATHS = [
+  /^\/api\/exreg\/import-documents-zip(?:\/|$)/,
+  /^\/api\/notifications\/stream(?:\/|$)/,
+  /^\/api\/chat\/stream(?:\/|$)/,
+  /^\/api\/upload-and-ask\/stream(?:\/|$)/,
+];
+const LONG_TIMEOUT_PATHS = [
+  /^\/api\/exreg\/(?:import|import-xlsx|export|export-xlsx|export-ui-xlsx)(?:\/|$)/,
+  /^\/api\/exreg\/certificate-summary(?:-compact)?(?:\/|$)/,
+  /^\/api\/mobile\/sync(?:\/|$)/,
+  /^\/api\/certificates\/(?:bulk-upload|drafts\/process|drafts\/reprocess|drafts\/finalize)(?:\/|$)/,
+  /^\/api\/(?:pdfcert|dataplate\/extract)(?:\/|$)/,
+  /^\/api\/inspections\/(?:punchlist|project-report|export-zip|[^/]+\/export-xlsx)(?:\/|$)/,
+  /^\/api\/admin\/trainings\/[^/]+\/(?:generate|zip|stamp-qr)(?:\/|$)/,
+  /^\/api\/vector-files(?:\/|$)/,
+];
+
+function timeoutForRequest(req) {
+  const requestPath = req.path || req.url || '';
+  if (UNLIMITED_TIMEOUT_PATHS.some((pattern) => pattern.test(requestPath))) return 0;
+  if (LONG_TIMEOUT_PATHS.some((pattern) => pattern.test(requestPath))) return LONG_REQUEST_TIMEOUT_MS;
+  return NORMAL_REQUEST_TIMEOUT_MS;
+}
+
+app.use((req, res, next) => {
+  const timeoutMs = timeoutForRequest(req);
+  req.setTimeout(timeoutMs);
+  const deadlineTimer = timeoutMs > 0
+    ? setTimeout(() => {
+        if (res.headersSent) return res.destroy();
+        return res.status(504).json({ ok: false, error: 'Request timed out', requestId: req.requestId || null });
+      }, timeoutMs)
+    : null;
+  if (deadlineTimer && typeof deadlineTimer.unref === 'function') deadlineTimer.unref();
+  const clearDeadline = () => {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+  };
+  res.once('finish', clearDeadline);
+  res.once('close', clearDeadline);
+  res.setTimeout(timeoutMs, () => {
+    if (res.headersSent) return res.destroy();
+    return res.status(504).json({ ok: false, error: 'Request timed out', requestId: req.requestId || null });
+  });
+  next();
+});
+
 // Hint proxies not to buffer (useful for SSE)
 app.use((req, res, next) => {
   res.setHeader('Vary', 'Origin');
@@ -279,8 +323,31 @@ app.use(limiter);
 app.use(auditMiddleware);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/results', express.static(path.join(__dirname, 'results')));
-app.get('/health', (req, res) => {
-  res.status(200).send('OK');
+function readinessSnapshot() {
+  const mongoReady = mongoose.connection.readyState === 1;
+  const settingsReady = runtimeState.settingsReady && systemSettingsStore._debug().ready;
+  const ready = !runtimeState.shuttingDown && runtimeState.initialized && mongoReady && settingsReady;
+  return {
+    ok: ready,
+    role: 'api',
+    checks: {
+      initialized: runtimeState.initialized,
+      shuttingDown: runtimeState.shuttingDown,
+      mongo: mongoReady,
+      systemSettings: settingsReady,
+      worker: backgroundJobsDisabled() ? 'external-or-disabled' : (runtimeState.workerStarted ? 'started' : 'not-started'),
+    },
+  };
+}
+
+app.get('/health/live', (_req, res) => {
+  res.status(200).json({ ok: true, role: 'api' });
+});
+
+app.get(['/health', '/health/ready'], (_req, res) => {
+  const snapshot = readinessSnapshot();
+  if (!snapshot.ok) return res.status(503).json(snapshot);
+  return res.status(200).json(snapshot);
 });
 
 /**
@@ -308,6 +375,8 @@ app.use((req, res, next) => {
     res.setHeader('Connection', 'keep-alive');
     // Mark request for downstream handlers (controllers) if needed
     req.isSSE = true;
+    sseResponses.add(res);
+    res.once('close', () => sseResponses.delete(res));
 
 	    if (res.socket && typeof res.socket.setTimeout === 'function') {
 	      res.socket.setTimeout(0); // disable idle socket timeout for SSE
@@ -392,13 +461,10 @@ app.use('/api', dashboardSettingsRoutes);
 app.use('/api', dashboardAnalyticsRoutes);
 app.use('/api', plannedInspectionRoutes);
 app.use('/api', inviteRoutes);
-app.use('/api', mailRoutes);
 app.use('/api', consentRoutes);
 app.use('/api', inspectionRoutes);
 app.use('/api', downloadRoutes);
 app.use('/api', mobileSyncRoutes);
-app.use('/api', datasetRoutes);
-app.use('/api', standardRoutes);
 app.use('/api', systemSettingsRoutes);
 app.use('/api', tenantSettingsRoutes);
 app.use('/api', manufacturerRoutes);
@@ -409,11 +475,6 @@ app.use('/api/public', publicRotRoutes);
 app.use('/api', trainingRoutes);
 app.use(errorAuditMiddleware);
 app.use(apiErrorHandler);
-
-if (!backgroundJobsDisabled()) {
-  startWorkerRuntime();
-}
-
 
 /**
  * -----------------------------
@@ -454,28 +515,108 @@ if (fs.existsSync(frontendDist)) {
   console.warn('[SPA] Frontend dist folder not found:', frontendDist);
 }
 
-console.log("Starting application...");
+let shutdownPromise = null;
+
+function closeHttpServer() {
+  if (!server) return Promise.resolve();
+  return new Promise((resolve) => {
+    server.close(() => resolve());
+    server.closeIdleConnections?.();
+  });
+}
+
+async function shutdown(reason, exitCode = 0) {
+  if (shutdownPromise) return shutdownPromise;
+  shutdownPromise = (async () => {
+    runtimeState.shuttingDown = true;
+    runtimeState.initialized = false;
+    const graceMs = Math.max(30_000, Number(process.env.SHUTDOWN_GRACE_MS || 10 * 60_000));
+    logger.warn('Application shutdown started', { reason, graceMs });
+
+    for (const res of sseResponses) {
+      try { res.end(); } catch {}
+    }
+    sseResponses.clear();
+
+    const drain = Promise.allSettled([
+      closeHttpServer(),
+      stopWorkerRuntime({ drainTimeoutMs: graceMs }),
+    ]);
+    let forced = false;
+    await Promise.race([
+      drain,
+      new Promise((resolve) => setTimeout(() => {
+        forced = true;
+        for (const socket of openSockets) socket.destroy();
+        resolve();
+      }, graceMs)),
+    ]);
+
+    systemSettingsStore.stop();
+    await mongoose.connection.close(false).catch((err) => {
+      logger.error('MongoDB close failed during shutdown', { error: err?.message || String(err) });
+    });
+    logger.warn('Application shutdown completed', { reason, forced });
+    process.exit(exitCode);
+  })();
+  return shutdownPromise;
+}
+
+process.once('SIGTERM', () => void shutdown('SIGTERM', 0));
+process.once('SIGINT', () => void shutdown('SIGINT', 0));
 process.on('unhandledRejection', (reason) => {
   logger.error(`Unhandled Rejection: ${reason instanceof Error ? reason.stack : reason}`);
-  writeSystemAuditLog({ action: 'server.unhandledRejection', error: reason });
+  void writeSystemAuditLog({ action: 'server.unhandledRejection', error: reason });
+  void shutdown('unhandledRejection', 1);
 });
 process.on('uncaughtException', (err) => {
   logger.error(`Uncaught Exception: ${err.stack || err.message}`);
-  writeSystemAuditLog({ action: 'server.uncaughtException', error: err });
-  // Consider graceful shutdown in production
+  void writeSystemAuditLog({ action: 'server.uncaughtException', error: err });
+  void shutdown('uncaughtException', 1);
 });
 
-// Ensure the server is reachable from other devices on the LAN (mobile testing).
-// You can override with HOST env var (e.g. HOST=127.0.0.1 to restrict).
-const host = process.env.HOST || '0.0.0.0';
-const server = app.listen(port, host, () => {
+async function main() {
+  console.log('Starting application...');
+  await connectDB();
+  console.log('Database connected successfully');
+
+  const seedResult = await seedInitialSuperAdminIfEmpty();
+  if (seedResult?.reason === 'failed') {
+    throw seedResult.error || new Error('Initial SuperAdmin seed failed');
+  }
+
+  await systemSettingsStore.start();
+  runtimeState.settingsReady = true;
+
+  if (!backgroundJobsDisabled()) {
+    const workerResult = startWorkerRuntime();
+    runtimeState.workerStarted = Boolean(workerResult.started || workerResult.reason === 'already_started');
+    if (!runtimeState.workerStarted) {
+      throw new Error(`Worker runtime failed to start: ${workerResult.reason || 'unknown'}`);
+    }
+  }
+
+  runtimeState.initialized = true;
+
+  const host = process.env.HOST || '0.0.0.0';
+  server = await new Promise((resolve, reject) => {
+    const listeningServer = app.listen(port, host, () => resolve(listeningServer));
+    listeningServer.once('error', reject);
+  });
+
   console.log(`Server listening on http://${host}:${port}`);
-});
+  // Body upload ceiling; route-specific response deadlines are enforced by middleware above.
+  server.requestTimeout = LONG_REQUEST_TIMEOUT_MS;
+  server.keepAliveTimeout = 75_000;
+  server.headersTimeout = 80_000;
+  server.on('connection', (socket) => {
+    openSockets.add(socket);
+    socket.once('close', () => openSockets.delete(socket));
+  });
+}
 
-// --- Keep long SSE connections alive and avoid premature timeouts ---
-// Never time out HTTP requests (Node's default can cut long streams)
-server.requestTimeout = 0;
-// Keep the TCP connection alive long enough for proxies (ALB/Nginx) to stay happy
-server.keepAliveTimeout = 75_000;
-// Must be greater than keepAliveTimeout (Node requirement)
-server.headersTimeout = 80_000;
+main().catch((err) => {
+  runtimeState.initialized = false;
+  logger.error(`Application startup failed: ${err?.stack || err?.message || err}`);
+  process.exit(1);
+});

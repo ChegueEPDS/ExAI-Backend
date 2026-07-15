@@ -6,6 +6,8 @@ const DashboardStatsVersion = require('../models/dashboardStatsVersion');
 const rebuildQueue = new Map();
 const activeRebuilds = new Set();
 const pendingDirtyTenants = new Map();
+const responseCache = new Map();
+const inFlightLoads = new Map();
 let drainTimer = null;
 let dirtyTimer = null;
 
@@ -25,6 +27,36 @@ const DIRTY_FLUSH_DELAY_MS = Math.max(
   100,
   Math.min(Number(process.env.DASHBOARD_SUMMARY_DIRTY_FLUSH_DELAY_MS || 250), 30000)
 );
+const RESPONSE_CACHE_TTL_MS = Math.max(
+  30_000,
+  Math.min(Number(process.env.DASHBOARD_RESPONSE_CACHE_TTL_MS || 60_000), 120_000)
+);
+
+function cacheSummary(key, summary) {
+  responseCache.set(key.summaryId, {
+    tenantId: String(key.tenantId),
+    expiresAt: Date.now() + RESPONSE_CACHE_TTL_MS,
+    summary
+  });
+  return summary;
+}
+
+function getCachedSummary(key) {
+  const cached = responseCache.get(key.summaryId);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    responseCache.delete(key.summaryId);
+    return null;
+  }
+  return cached.summary;
+}
+
+function invalidateTenantCache(tenantId) {
+  const target = String(tenantId);
+  for (const [key, cached] of responseCache.entries()) {
+    if (cached.tenantId === target) responseCache.delete(key);
+  }
+}
 
 function toObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
@@ -127,7 +159,7 @@ async function saveFreshSummary(key, sourceVersion, summary) {
     },
     { upsert: true }
   );
-  return summary;
+  return cacheSummary(key, summary);
 }
 
 async function rebuildSummary(job) {
@@ -215,6 +247,9 @@ async function getMaterializedSummary({
   if (!key.kind) throw new Error('Missing summary kind');
   if (typeof loader !== 'function') throw new Error('Missing summary loader');
 
+  const cached = getCachedSummary(key);
+  if (cached) return cached;
+
   const sourceVersion = await getCurrentVersion(key.tenantId);
   const doc = await DashboardSummary.findOne({ _id: key.summaryId }).lean();
 
@@ -223,21 +258,29 @@ async function getMaterializedSummary({
     Number(doc.sourceVersion || 0) === sourceVersion &&
     isFreshEnough(doc, maxAgeMs)
   ) {
-    return doc.summary || {};
+    return cacheSummary(key, doc.summary || {});
   }
 
   if (doc?.summary && Object.keys(doc.summary).length) {
     enqueueRebuild({ key, loader, sourceVersion });
-    return doc.summary;
+    return cacheSummary(key, doc.summary);
   }
 
-  const summary = await loader();
-  return saveFreshSummary(key, sourceVersion, summary);
+  const existingLoad = inFlightLoads.get(key.queueKey);
+  if (existingLoad) return existingLoad;
+
+  const loadPromise = (async () => {
+    const summary = await loader();
+    return saveFreshSummary(key, sourceVersion, summary);
+  })().finally(() => inFlightLoads.delete(key.queueKey));
+  inFlightLoads.set(key.queueKey, loadPromise);
+  return loadPromise;
 }
 
 async function markDashboardStatsDirty({ tenantId, reason = 'data_changed' }) {
   const tenantObjectId = toObjectId(tenantId) || tenantId;
   if (!tenantObjectId) return;
+  invalidateTenantCache(tenantObjectId);
   const now = new Date();
   await DashboardStatsVersion.updateOne(
     { _id: `tenant:${String(tenantObjectId)}` },

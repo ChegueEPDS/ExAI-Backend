@@ -37,23 +37,18 @@ exports.startNewConversation = async (req, res) => {
     // the model state is chained via Responses API previous_response_id (store:true).
     const threadId = `c_${crypto.randomBytes(12).toString('hex')}`;
 
-    // Internal project id used by governed chat + dataset ingestion.
-    // Keep it opaque and stable for the lifetime of the conversation.
-    const governedProjectId = `p_${crypto.randomBytes(8).toString('hex')}`;
-
     const newConversation = new Conversation({
       threadId,
       messages: [],
       userId,
       tenantId: req.scope?.tenantId || undefined,
-      governedProjectId,
       lastResponseId: null,
     });
 
     await newConversation.save();
     logger.info('Új szál létrehozva:', threadId);
 
-    res.status(200).json({ threadId, governedProjectId });
+    res.status(200).json({ threadId });
   } catch (error) {
     logger.error('Hiba az új szál létrehozása során:', error.message);
     res.status(500).json({ error: 'Nem sikerült új szálat létrehozni.' });
@@ -130,7 +125,7 @@ exports.getConversations = async (req, res) => {
     const conversations = await Conversation
       .find({ userId, tenantId })
       .sort({ updatedAt: -1, createdAt: -1 })
-      .select('threadId messages job hasBackgroundJob governedProjectId chatBackend standardExplorer updatedAt createdAt')
+      .select('threadId messages job hasBackgroundJob updatedAt createdAt')
       .lean();
 
     const conversationList = conversations.map(c => ({
@@ -138,9 +133,6 @@ exports.getConversations = async (req, res) => {
       messages: c.messages,
       job: c.job || null,
       hasBackgroundJob: !!c.hasBackgroundJob,
-      governedProjectId: c.governedProjectId || null,
-      chatBackend: c.chatBackend || 'normal',
-      standardExplorer: c.standardExplorer || { enabled: false, standardRef: null },
       updatedAt: c.updatedAt,
     }));
 
@@ -148,42 +140,6 @@ exports.getConversations = async (req, res) => {
   } catch (error) {
     logger.error('Hiba a beszélgetések lekérése során:', error.message);
     res.status(500).json({ error: 'Váratlan hiba történt.' });
-  }
-};
-
-// Enable Standard Explorer (tenant standard library) for a thread and pin a primary standard.
-// POST /api/conversation/standard-explorer { threadId, standardRef }
-exports.setStandardExplorer = async (req, res) => {
-  try {
-    const tenantId = req.scope?.tenantId || undefined;
-    const userId = req.userId;
-    const threadId = String(req.body?.threadId || '').trim();
-    const standardRef = String(req.body?.standardRef || '').trim();
-    const enabled = String(req.body?.enabled ?? 'true').trim().toLowerCase() !== 'false';
-
-    if (!threadId) return res.status(400).json({ ok: false, error: 'threadId is required' });
-    if (enabled && !standardRef) return res.status(400).json({ ok: false, error: 'standardRef is required' });
-
-    const conversation = await Conversation.findOne({ threadId, userId, tenantId });
-    if (!conversation) return res.status(404).json({ ok: false, error: 'not found' });
-
-    conversation.standardExplorer = {
-      enabled: !!enabled,
-      standardRef: enabled ? standardRef : null,
-    };
-    // Standard explorer always routes to governed (standards-only retrieval).
-    conversation.chatBackend = enabled ? 'governed' : (conversation.chatBackend || 'normal');
-    await conversation.save();
-
-    return res.json({
-      ok: true,
-      threadId: conversation.threadId,
-      chatBackend: conversation.chatBackend,
-      standardExplorer: conversation.standardExplorer,
-    });
-  } catch (e) {
-    logger.error('standardExplorer.set.error', { message: e?.message });
-    return res.status(500).json({ ok: false, error: e?.message || 'failed' });
   }
 };
 
@@ -238,103 +194,6 @@ exports.deleteConversation = async (req, res) => {
     };
 
     // OpenAI thread cleanup removed: threadId is an internal conversation id (Responses API uses response ids).
-
-    // Governed RAG cleanup (best-effort): delete all datasets + vectors + blobs under this conversation's internal projectId.
-    await (async () => {
-      const projectId = String(conversation.governedProjectId || '').trim();
-      if (!projectId) return;
-      try {
-        logger.info('[DELETE][CLEANUP] governed project cleanup start', { tenantId: String(tenantId), projectId, threadId });
-      } catch { }
-
-      const Dataset = require('../models/dataset');
-      const DatasetFile = require('../models/datasetFile');
-      const DatasetRowChunk = require('../models/datasetRowChunk');
-      const DatasetTableCell = require('../models/datasetTableCell');
-      const DatasetDocChunk = require('../models/datasetDocChunk');
-      const DatasetImageChunk = require('../models/datasetImageChunk');
-      const DatasetDerivedMetric = require('../models/datasetDerivedMetric');
-      const DatasetTableSchema = require('../models/datasetTableSchema');
-      const azureBlob = require('../services/azureBlobService');
-      const pinecone = require('../services/pineconeService');
-
-      // 1) Pinecone vectors (scoped by tenant+project namespace)
-      if (pinecone.isPineconeEnabled()) {
-        const namespace = pinecone.resolveNamespace({ tenantId, projectId });
-        // Most robust: wipe everything in this per-project namespace (works for serverless + pod indexes).
-        const rAll = await pinecone.deleteAll({ namespace, bestEffort: true });
-        if (rAll?.ok) {
-          logger.info('[DELETE][CLEANUP] pinecone deleteAll done', { tenantId: String(tenantId), projectId: String(projectId), namespace });
-        } else {
-          logger.warn('[DELETE][CLEANUP] pinecone deleteAll failed (bestEffort)', { tenantId: String(tenantId), projectId: String(projectId), namespace, error: rAll?.error || 'unknown' });
-        }
-
-        // Fallback: delete by IDs (works for serverless + pod indexes). Then also try a filter delete
-        // to clean up any legacy/orphan vectors (best-effort) in case deleteAll isn't supported by the environment.
-        const batch = [];
-        let deletedByIds = 0;
-        const flush = async () => {
-          if (!batch.length) return;
-          const r = await pinecone.deleteByIds({ namespace, ids: batch.splice(0, batch.length), bestEffort: true });
-          if (!r?.ok) {
-            logger.warn('[DELETE][CLEANUP] pinecone deleteByIds failed (bestEffort)', { tenantId: String(tenantId), projectId: String(projectId), error: r?.error || 'unknown' });
-            return;
-          }
-          deletedByIds += Number(r.deleted || 0);
-        };
-
-        const collectIds = async (Model, prefix) => {
-          try {
-            const cursor = Model.find({ tenantId, projectId }).select('_id').lean().cursor();
-            for await (const doc of cursor) {
-              const id = doc?._id ? String(doc._id) : '';
-              if (!id) continue;
-              batch.push(`${prefix}${id}`);
-              if (batch.length >= 500) {
-                await flush();
-              }
-            }
-          } catch (e) {
-            logger.warn('[DELETE][CLEANUP] pinecone id collection failed', { tenantId: String(tenantId), projectId: String(projectId), error: e?.message || String(e) });
-          }
-        };
-
-        await collectIds(DatasetRowChunk, 'row:');
-        await collectIds(DatasetDocChunk, 'doc:');
-        await collectIds(DatasetImageChunk, 'img:');
-        await flush();
-
-        if (!rAll?.ok) {
-          logger.info('[DELETE][CLEANUP] pinecone deleteByIds done', { tenantId: String(tenantId), projectId: String(projectId), namespace, deleted: deletedByIds });
-
-          const rFilter = await pinecone.deleteByFilter({
-            namespace,
-            filter: { tenantId: String(tenantId), projectId: String(projectId) },
-            bestEffort: true,
-          });
-          if (!rFilter?.ok) {
-            logger.warn('[DELETE][CLEANUP] pinecone deleteByFilter failed (bestEffort)', { tenantId: String(tenantId), projectId: String(projectId), error: rFilter?.error || 'unknown' });
-          }
-        }
-      }
-
-      // 2) DB records
-      await safeDelete(() => DatasetRowChunk.deleteMany({ tenantId, projectId }));
-      await safeDelete(() => DatasetTableCell.deleteMany({ tenantId, projectId }));
-      await safeDelete(() => DatasetDocChunk.deleteMany({ tenantId, projectId }));
-      await safeDelete(() => DatasetImageChunk.deleteMany({ tenantId, projectId }));
-      await safeDelete(() => DatasetDerivedMetric.deleteMany({ tenantId, projectId }));
-      await safeDelete(() => DatasetTableSchema.deleteMany({ tenantId, projectId }));
-      await safeDelete(() => DatasetFile.deleteMany({ tenantId, projectId }));
-      await safeDelete(() => Dataset.deleteMany({ tenantId, projectId }));
-
-      // 3) Blobs under datasets/<tenantId>/<projectId>/
-      await safeDelete(() => azureBlob.deletePrefix(`datasets/${tenantId}/${projectId}/`));
-
-      try {
-        logger.info('[DELETE][CLEANUP] governed project cleanup done', { tenantId: String(tenantId), projectId, threadId });
-      } catch { }
-    })();
 
     // Finally, remove conversation from DB
     await safeDelete(() => deleteConversationStats(conversation));
