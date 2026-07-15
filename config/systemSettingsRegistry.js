@@ -116,6 +116,9 @@ const SETTINGS = [
   // Equipment XLSX import
   { key: 'EQUIPMENT_IMPORT_ERROR_XLS_TTL_SECONDS', group: 'Equipment import', type: 'number', defaultValue: 2592000, description: 'Signed URL TTL for XLSX import error files (seconds).' },
   { key: 'EQUIPMENT_IMPORT_JOB_RETENTION_DAYS', group: 'Equipment import', type: 'number', defaultValue: 30, description: 'Retention days for XLSX import jobs and error files.' },
+
+  // Equipment bulk delete
+  { key: 'EQUIPMENT_BULK_DELETE_JOB_RETENTION_DAYS', group: 'Equipment delete', type: 'number', defaultValue: 30, description: 'Retention days for bulk equipment delete jobs.' },
 ];
 
 const REGISTRY_MAP = new Map(SETTINGS.map((s) => [s.key, s]));

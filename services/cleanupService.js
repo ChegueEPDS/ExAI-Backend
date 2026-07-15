@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const Conversation = require('../models/conversation');
+const EquipmentBulkDeleteJob = require('../models/equipmentBulkDeleteJob');
 const EquipmentImportJob = require('../models/equipmentImportJob');
 const logger = require('../config/logger');
 const azureBlob = require('./azureBlobService');
@@ -104,5 +105,19 @@ exports.cleanupEquipmentImportJobs = async () => {
     }
   } catch (err) {
     logger.warn('⚠️ Failed to cleanup equipment import jobs', err?.message || err);
+  }
+};
+
+exports.cleanupEquipmentBulkDeleteJobs = async () => {
+  try {
+    const retentionDays = Number(systemSettings.getNumber('EQUIPMENT_BULK_DELETE_JOB_RETENTION_DAYS') || 30);
+    if (!retentionDays || retentionDays <= 0) return;
+    const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+    await EquipmentBulkDeleteJob.deleteMany({
+      finishedAt: { $lte: cutoff },
+      status: { $in: ['succeeded', 'failed'] }
+    });
+  } catch (err) {
+    logger.warn('⚠️ Failed to cleanup equipment bulk delete jobs', err?.message || err);
   }
 };

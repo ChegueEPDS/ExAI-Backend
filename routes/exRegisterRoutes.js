@@ -143,5 +143,6 @@ router.delete('/exreg/:id', authMiddleware(), requireAccess('equipment', 'delete
 
 // Tömeges törlés
 router.post('/exreg/bulk-delete', authMiddleware(), requireAccess('equipment', 'delete'), express.json(), exRegisterController.bulkDeleteEquipment);
+router.get('/exreg/bulk-delete-jobs/:jobId', authMiddleware(), requireAccess('equipment', 'delete'), exRegisterController.getEquipmentBulkDeleteJob);
 
 module.exports = router;

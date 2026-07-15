@@ -5,6 +5,7 @@ const mobileSyncWorker = require('./mobileSyncWorker');
 const certificatePreviewWorker = require('./certificatePreviewWorker');
 const certificateDraftWorker = require('./certificateDraftWorker');
 const equipmentImportWorker = require('./equipmentImportWorker');
+const equipmentBulkDeleteWorker = require('./equipmentBulkDeleteWorker');
 const documentationExpiryNotifier = require('./documentationExpiryNotifier');
 const reportExportController = require('../controllers/exportInspectionReport');
 const { withLock } = require('./distributedLockService');
@@ -37,6 +38,7 @@ function startWorkerRuntime() {
   certificatePreviewWorker.start();
   certificateDraftWorker.start();
   equipmentImportWorker.start();
+  equipmentBulkDeleteWorker.start();
 
   scheduleInterval(
     () => withLock('cleanup:empty-conversations', 30 * 60 * 1000, cleanupService.removeEmptyConversations),
@@ -52,6 +54,10 @@ function startWorkerRuntime() {
   );
   scheduleInterval(
     () => withLock('cleanup:equipment-import-jobs', 2 * 60 * 60 * 1000, cleanupService.cleanupEquipmentImportJobs),
+    24 * 60 * 60 * 1000
+  );
+  scheduleInterval(
+    () => withLock('cleanup:equipment-bulk-delete-jobs', 2 * 60 * 60 * 1000, cleanupService.cleanupEquipmentBulkDeleteJobs),
     24 * 60 * 60 * 1000
   );
   scheduleInterval(
@@ -74,6 +80,7 @@ function startWorkerRuntime() {
     certificatePreviewWorker: true,
     certificateDraftWorker: true,
     equipmentImportWorker: true,
+    equipmentBulkDeleteWorker: true,
     mobileSyncWorker: true,
     documentationExpiryNotifier: true
   });
@@ -90,6 +97,7 @@ async function stopWorkerRuntime({ drainTimeoutMs = 120_000 } = {}) {
     certificatePreviewWorker.stop?.(options),
     certificateDraftWorker.stop?.(options),
     equipmentImportWorker.stop?.(options),
+    equipmentBulkDeleteWorker.stop?.(options),
     mobileSyncWorker.stop?.(options),
   ]);
   started = false;

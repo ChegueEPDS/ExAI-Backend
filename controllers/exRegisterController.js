@@ -24,6 +24,7 @@ const {
 const { notifyAndStore } = require('../lib/notifications/notifier');
 const { v4: uuidv4 } = require('uuid');
 const cleanupService = require('../services/cleanupService');
+const EquipmentBulkDeleteJob = require('../models/equipmentBulkDeleteJob');
 const EquipmentImportJob = require('../models/equipmentImportJob');
 const EquipmentDataVersion = require('../models/equipmentDataVersion');
 const { createEquipmentDataVersion } = require('../services/equipmentVersioningService');
@@ -5549,6 +5550,11 @@ exports.getEquipmentDataVersion = async (req, res) => {
 
 // Törlés (DELETE /exreg/:id)
 async function deleteEquipmentInternal(equipment, tenantId, tenantName) {
+  return deleteEquipmentInternalWithOptions(equipment, tenantId, tenantName, {});
+}
+
+async function deleteEquipmentInternalWithOptions(equipment, tenantId, tenantName, options = {}) {
+  const { skipOrderIndexRebuild = false } = options;
   const siteIdForPrefix = equipment.Site ? String(equipment.Site) : null;
   const unitIdForPrefix = equipment.Unit || equipment.Zone ? String(equipment.Unit || equipment.Zone) : null;
   const eqPrefix = buildEquipmentPrefix(tenantName, tenantId, siteIdForPrefix, unitIdForPrefix, equipment.EqID);
@@ -5598,13 +5604,88 @@ async function deleteEquipmentInternal(equipment, tenantId, tenantName) {
   scheduleDashboardStatsDirty({ tenantId, reason: 'equipment_deleted' });
 
   // 🧹 Sorszámok újraszámozása az adott zónán/projekten belül
-  if (deletedOrderIndex != null) {
+  if (!skipOrderIndexRebuild && deletedOrderIndex != null) {
     const scopeFilter = { tenantId, orderIndex: { $gt: deletedOrderIndex } };
     if (equipment.Zone) scopeFilter.Zone = equipment.Zone;
     if (equipment.Site) scopeFilter.Site = equipment.Site;
 
     await Equipment.updateMany(scopeFilter, { $inc: { orderIndex: -1 } });
   }
+}
+
+function buildEquipmentOrderScopeKey(equipment) {
+  return JSON.stringify({
+    siteId: equipment?.Site ? String(equipment.Site) : '',
+    zoneId: equipment?.Zone ? String(equipment.Zone) : '',
+  });
+}
+
+async function normalizeEquipmentOrderIndexesForScopes(tenantId, scopeKeys = []) {
+  for (const scopeKey of scopeKeys || []) {
+    if (!scopeKey) continue;
+    let parsed = null;
+    try { parsed = JSON.parse(scopeKey); } catch { parsed = null; }
+    if (!parsed) continue;
+    const filter = { tenantId };
+    if (parsed.zoneId) filter.Zone = parsed.zoneId;
+    if (parsed.siteId) filter.Site = parsed.siteId;
+    const equipments = await Equipment.find(filter)
+      .sort({ orderIndex: 1, createdAt: 1, _id: 1 })
+      .select('_id orderIndex')
+      .lean();
+    if (!equipments.length) continue;
+    const ops = equipments.map((eq, idx) => ({
+      updateOne: {
+        filter: { _id: eq._id },
+        update: { $set: { orderIndex: idx + 1 } }
+      }
+    }));
+    if (ops.length) await Equipment.bulkWrite(ops, { ordered: true });
+  }
+}
+
+async function notifyEquipmentBulkDeleteStatus(userId, {
+  jobId,
+  status,
+  deletedCount = null,
+  failedCount = null,
+  processed = null,
+  total = null,
+  errorMessage = null,
+} = {}) {
+  if (!userId || !jobId || !status) return;
+  let message;
+  switch (status) {
+    case 'queued':
+      message = 'Equipment delete queued.';
+      break;
+    case 'running':
+      message = 'Equipment delete is running...';
+      break;
+    case 'succeeded':
+      message = `Equipment delete completed${deletedCount != null ? ` (deleted: ${deletedCount}${failedCount ? `, failed: ${failedCount}` : ''})` : ''}.`;
+      break;
+    case 'failed':
+      message = `Equipment delete failed${errorMessage ? `: ${errorMessage}` : '.'}`;
+      break;
+    default:
+      message = `Equipment delete status: ${status}.`;
+  }
+  const data = { jobId, jobType: 'equipment-bulk-delete', status };
+  if (deletedCount != null) data.deletedCount = deletedCount;
+  if (failedCount != null) data.failedCount = failedCount;
+  if (typeof processed === 'number' && typeof total === 'number' && total > 0) {
+    data.progress = { processed, total };
+  }
+  await notifyAndStore(userId, {
+    type: 'equipment-bulk-delete',
+    title: 'Equipment delete',
+    message,
+    data,
+    meta: { route: '/notifications', jobId }
+  }).catch((err) => {
+    console.warn('⚠️ Failed to push equipment bulk delete status notification', err?.message || err);
+  });
 }
 
 exports.deleteEquipment = async (req, res) => {
@@ -5689,54 +5770,160 @@ exports.bulkDeleteEquipment = async (req, res) => {
       );
     } catch {}
 
-    const results = [];
-    // Limitált párhuzamosság: egyszerre max 5 törlés fusson
-    const concurrency = 5;
-    let index = 0;
+    const jobId = `equipment-delete-${Date.now()}-${uuidv4().slice(0, 8)}`;
+    await EquipmentBulkDeleteJob.create({
+      jobId,
+      tenantId,
+      userId: req.userId,
+      tenantName,
+      equipmentIds: equipments.map((eq) => eq._id),
+      progress: { processed: 0, total: equipments.length, updatedAt: new Date() }
+    });
+    await notifyEquipmentBulkDeleteStatus(req.userId, {
+      jobId,
+      status: 'queued',
+      processed: 0,
+      total: equipments.length,
+    });
 
-    async function runNextBatch() {
-      const batch = equipments.slice(index, index + concurrency);
-      if (!batch.length) return;
-      index += concurrency;
-
-      await Promise.all(
-        batch.map(async eq => {
-          try {
-            await deleteEquipmentInternal(eq, tenantId, tenantName);
-            results.push({ id: String(eq._id), status: 'deleted' });
-          } catch (err) {
-            console.error('❌ Hiba az eszköz tömeges törlésekor:', err);
-            results.push({
-              id: String(eq._id),
-              status: 'error',
-              error: err?.message || 'Ismeretlen hiba a törlés során.'
-            });
-          }
-        })
-      );
-
-      return runNextBatch();
-    }
-
-    await runNextBatch();
-
-    const deletedCount = results.filter(r => r.status === 'deleted').length;
-    const failed = results.filter(r => r.status === 'error');
-
-    const message =
-      failed.length === 0
-        ? 'Minden kijelölt eszköz és kapcsolódó inspection sikeresen törölve.'
-        : 'A legtöbb eszköz törlése sikeres volt, de néhánynál hiba történt.';
-
-    return res.status(failed.length ? 207 : 200).json({
-      message,
-      deletedCount,
-      failedCount: failed.length,
-      results
+    return res.status(202).json({
+      queued: true,
+      message: 'Equipment delete queued.',
+      jobId,
+      total: equipments.length
     });
   } catch (error) {
     console.error('❌ Hiba a tömeges eszköz törlésekor:', error);
     return res.status(500).json({ error: 'Nem sikerült a tömeges eszköz törlés.' });
+  }
+};
+
+exports.processEquipmentBulkDeleteJob = async (jobIdOrId) => {
+  const selector = mongoose.Types.ObjectId.isValid(String(jobIdOrId || ''))
+    ? { _id: jobIdOrId }
+    : { jobId: String(jobIdOrId || '') };
+  const now = new Date();
+  const job = await EquipmentBulkDeleteJob.findOneAndUpdate(
+    { ...selector, status: 'queued' },
+    { $set: { status: 'running', startedAt: now, lastHeartbeatAt: now }, $inc: { attempts: 1 } },
+    { new: true }
+  );
+  if (!job) return false;
+
+  try {
+    await notifyEquipmentBulkDeleteStatus(String(job.userId), {
+      jobId: job.jobId,
+      status: 'running',
+      processed: 0,
+      total: Array.isArray(job.equipmentIds) ? job.equipmentIds.length : 0
+    });
+
+    const tenantName = job.tenantName || '';
+    const tenantId = String(job.tenantId);
+    const equipments = await Equipment.find({ _id: { $in: job.equipmentIds || [] }, tenantId });
+    const failures = [];
+    const scopeKeys = new Set();
+    let deletedCount = 0;
+    const total = Array.isArray(job.equipmentIds) ? job.equipmentIds.length : 0;
+    let processed = 0;
+
+    for (const eqId of job.equipmentIds || []) {
+      const eq = equipments.find((item) => String(item._id) === String(eqId));
+      if (!eq) {
+        failures.push({ id: String(eqId), error: 'Equipment not found.' });
+        processed += 1;
+      } else {
+        try {
+          scopeKeys.add(buildEquipmentOrderScopeKey(eq));
+          await deleteEquipmentInternalWithOptions(eq, tenantId, tenantName, { skipOrderIndexRebuild: true });
+          deletedCount += 1;
+        } catch (err) {
+          console.error('❌ Hiba az eszköz tömeges törlésekor:', err);
+          failures.push({ id: String(eq._id), error: err?.message || 'Ismeretlen hiba a törlés során.' });
+        } finally {
+          processed += 1;
+        }
+      }
+
+      job.progress = { processed, total, updatedAt: new Date() };
+      job.lastHeartbeatAt = new Date();
+      await job.save();
+      if (processed === total || processed === 1 || processed % Math.max(1, Math.floor(total / 10) || 1) === 0) {
+        await notifyEquipmentBulkDeleteStatus(String(job.userId), {
+          jobId: job.jobId,
+          status: 'running',
+          processed,
+          total,
+        });
+      }
+    }
+
+    await normalizeEquipmentOrderIndexesForScopes(tenantId, Array.from(scopeKeys));
+
+    job.status = 'succeeded';
+    job.finishedAt = new Date();
+    job.lastHeartbeatAt = new Date();
+    job.result = {
+      deletedCount,
+      failedCount: failures.length,
+      failures,
+    };
+    await job.save();
+
+    await notifyEquipmentBulkDeleteStatus(String(job.userId), {
+      jobId: job.jobId,
+      status: 'succeeded',
+      deletedCount,
+      failedCount: failures.length,
+      processed,
+      total,
+    });
+    return true;
+  } catch (error) {
+    console.error('❌ Hiba a tömeges eszköz törlés workerben:', error);
+    job.status = 'failed';
+    job.errorMessage = error?.message || String(error);
+    job.finishedAt = new Date();
+    job.lastHeartbeatAt = new Date();
+    await job.save();
+    await notifyEquipmentBulkDeleteStatus(String(job.userId), {
+      jobId: job.jobId,
+      status: 'failed',
+      errorMessage: job.errorMessage,
+    });
+    return false;
+  }
+};
+
+exports.getEquipmentBulkDeleteJob = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const userId = req.scope?.userId || req.userId;
+    if (!tenantId || !userId) {
+      return res.status(401).json({ error: 'Missing auth context.' });
+    }
+    const job = await EquipmentBulkDeleteJob.findOne({
+      jobId: String(req.params.jobId || ''),
+      tenantId,
+      userId,
+    }).lean();
+    if (!job) {
+      return res.status(404).json({ error: 'Bulk delete job not found.' });
+    }
+    return res.json({
+      jobId: job.jobId,
+      status: job.status,
+      progress: job.progress || { processed: 0, total: 0, updatedAt: null },
+      result: job.result || { deletedCount: 0, failedCount: 0, failures: [] },
+      errorMessage: job.errorMessage || null,
+      startedAt: job.startedAt || null,
+      finishedAt: job.finishedAt || null,
+      createdAt: job.createdAt || null,
+      updatedAt: job.updatedAt || null,
+    });
+  } catch (error) {
+    console.error('❌ Hiba a bulk delete job lekérdezésekor:', error);
+    return res.status(500).json({ error: 'Nem sikerült a bulk delete job lekérdezése.' });
   }
 };
 
