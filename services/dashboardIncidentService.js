@@ -15,7 +15,10 @@ let activeRecomputes = 0;
 
 const RECOMPUTE_DELAY_MS = 2000;
 const RECOMPUTE_BATCH_SIZE = 50;
-const RECOMPUTE_MAX_CONCURRENCY = 2;
+const RECOMPUTE_MAX_CONCURRENCY = Math.max(
+  1,
+  Math.min(Number(process.env.DASHBOARD_INCIDENT_RECOMPUTE_CONCURRENCY || 1), 2)
+);
 
 function toObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;

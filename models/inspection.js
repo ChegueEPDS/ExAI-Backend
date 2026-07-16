@@ -140,6 +140,7 @@ const InspectionSchema = new Schema(
       default: 'manual',
       index: true
     },
+    importKey: { type: String, default: null },
     finalizedAt: { type: Date, default: null },
     finalizedBy: { type: Schema.Types.ObjectId, ref: 'User', required: false }
   },
@@ -156,6 +157,14 @@ InspectionSchema.index({
   inspectionDate: 1,
   _id: 1
 });
+InspectionSchema.index(
+  { tenantId: 1, importKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { importKey: { $type: 'string' } },
+    name: 'uniq_inspection_import_key'
+  }
+);
 InspectionSchema.index({
   tenantId: 1,
   equipmentId: 1,
@@ -179,18 +188,24 @@ InspectionSchema.index({
   _id: -1
 });
 
+InspectionSchema.pre('save', function rememberNewInspectionState(next) {
+  this.$locals.wasNewInspection = this.isNew;
+  next();
+});
+
 InspectionSchema.post('save', function scheduleDashboardIncidentRefresh(doc) {
   try {
-    if (!doc?.tenantId || !doc?.equipmentId) return;
-    require('../services/dashboardIncidentService').scheduleRecomputeEquipmentIncidents({
-      tenantId: doc.tenantId,
-      equipmentId: doc.equipmentId
-    });
+    if (doc?.tenantId && doc?.equipmentId && !doc.$locals?.deferImportDerivedRefresh) {
+      require('../services/dashboardIncidentService').scheduleRecomputeEquipmentIncidents({
+        tenantId: doc.tenantId,
+        equipmentId: doc.equipmentId
+      });
+    }
   } catch {
     // Best-effort cache refresh; never block inspection writes.
   }
   try {
-    if (doc?.tenantId) {
+    if (doc?.tenantId && !doc.$locals?.deferImportDerivedRefresh) {
       require('../services/dashboardSummaryService').scheduleDashboardStatsDirty({
         tenantId: doc.tenantId,
         reason: 'inspection_saved'
@@ -200,7 +215,10 @@ InspectionSchema.post('save', function scheduleDashboardIncidentRefresh(doc) {
     // Best-effort materialized summary invalidation; never block inspection writes.
   }
   try {
-    require('../services/rootCauseStatsService').syncInspectionRootCauseStats(doc).catch(() => {});
+    const newPassedInspection = doc.$locals?.wasNewInspection && doc.status === 'Passed';
+    if (!doc.$locals?.deferImportDerivedRefresh && !newPassedInspection) {
+      require('../services/rootCauseStatsService').scheduleInspectionRootCauseStats(doc);
+    }
   } catch {
     // Best-effort stats mirror; never block inspection writes.
   }

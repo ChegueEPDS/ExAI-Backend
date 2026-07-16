@@ -61,31 +61,32 @@ async function buildCertificateCacheForCertNos(tenantId, certNosRaw) {
         .map((value) => value.trim())
         .filter(Boolean)
     )
-  ).slice(0, 250);
+  );
   if (!rawCandidates.length) return new Map();
 
-  const query = {
-    certNo: { $ne: null },
-    $and: [
-      { $or: [{ visibility: 'public' }, ...(tenantId ? [{ tenantId }] : [])] },
-      {
-        $or: rawCandidates.map((value) => ({
-          certNo: { $regex: `^${escapeRegex(value)}$`, $options: 'i' }
-        }))
-      }
-    ]
-  };
-
-  const docs = await Certificate.find(query)
-    .select('_id certNo docType specCondition issueDate visibility manufacturer equipment tenantId scheme fileUrl sharePointFileUrl docxUrl sharePointDocxUrl alias name CertNo')
-    .lean();
   const map = new Map();
-
-  docs.forEach(doc => {
-    const norm = normalizeCertNo(doc.certNo || '');
-    if (!norm || !wanted.has(norm)) return;
-    if (!map.has(norm)) map.set(norm, doc);
-  });
+  for (let offset = 0; offset < rawCandidates.length; offset += 200) {
+    const part = rawCandidates.slice(offset, offset + 200);
+    const query = {
+      certNo: { $ne: null },
+      $and: [
+        { $or: [{ visibility: 'public' }, ...(tenantId ? [{ tenantId }] : [])] },
+        {
+          $or: part.map((value) => ({
+            certNo: { $regex: `^${escapeRegex(value)}$`, $options: 'i' }
+          }))
+        }
+      ]
+    };
+    const docs = await Certificate.find(query)
+      .select('_id certNo docType specCondition issueDate visibility manufacturer equipment tenantId scheme fileUrl sharePointFileUrl docxUrl sharePointDocxUrl alias name CertNo')
+      .lean();
+    docs.forEach(doc => {
+      const norm = normalizeCertNo(doc.certNo || '');
+      if (!norm || !wanted.has(norm)) return;
+      if (!map.has(norm)) map.set(norm, doc);
+    });
+  }
 
   return map;
 }

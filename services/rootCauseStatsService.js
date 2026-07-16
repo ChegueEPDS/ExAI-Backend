@@ -1,5 +1,13 @@
 const RootCauseStat = require('../models/rootCauseStat');
 
+const pendingInspectionSyncs = new Map();
+let inspectionSyncTimer = null;
+let activeInspectionSyncs = 0;
+const INSPECTION_SYNC_CONCURRENCY = Math.max(
+  1,
+  Math.min(Number(process.env.ROOT_CAUSE_SYNC_CONCURRENCY || 1), 4)
+);
+
 function normalizeNote(value) {
   const text = String(value || '').trim();
   return text ? text.toLowerCase() : 'Unspecified';
@@ -50,6 +58,33 @@ async function syncInspectionRootCauseStats(inspection) {
     },
     { upsert: true }
   );
+}
+
+function drainInspectionSyncQueue() {
+  inspectionSyncTimer = null;
+  while (activeInspectionSyncs < INSPECTION_SYNC_CONCURRENCY && pendingInspectionSyncs.size) {
+    const [key, inspection] = pendingInspectionSyncs.entries().next().value;
+    pendingInspectionSyncs.delete(key);
+    activeInspectionSyncs += 1;
+    syncInspectionRootCauseStats(inspection)
+      .catch(() => {})
+      .finally(() => {
+        activeInspectionSyncs -= 1;
+        if (pendingInspectionSyncs.size) scheduleInspectionSyncDrain(50);
+      });
+  }
+}
+
+function scheduleInspectionSyncDrain(delayMs = 50) {
+  if (inspectionSyncTimer) return;
+  inspectionSyncTimer = setTimeout(drainInspectionSyncQueue, delayMs);
+  if (typeof inspectionSyncTimer.unref === 'function') inspectionSyncTimer.unref();
+}
+
+function scheduleInspectionRootCauseStats(inspection) {
+  if (!inspection?._id) return;
+  pendingInspectionSyncs.set(String(inspection._id), inspection);
+  scheduleInspectionSyncDrain();
 }
 
 async function syncMaintenanceRootCauseStats(event) {
@@ -105,6 +140,7 @@ async function getRootCauseTop({ tenantId, kind, equipmentIds = null, from = nul
 
 module.exports = {
   getRootCauseTop,
+  scheduleInspectionRootCauseStats,
   syncInspectionRootCauseStats,
   syncMaintenanceRootCauseStats
 };

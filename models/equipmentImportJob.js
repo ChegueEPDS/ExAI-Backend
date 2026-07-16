@@ -8,6 +8,7 @@ const EquipmentImportJobSchema = new mongoose.Schema(
     zoneId: { type: mongoose.Schema.Types.ObjectId, ref: 'Zone', required: true, index: true },
     sourceBlobPath: { type: String, required: true },
     sourceFileName: { type: String, default: 'equipment-import.xlsx' },
+    sourceHash: { type: String, default: null, index: true },
     status: { type: String, enum: ['queued', 'running', 'succeeded', 'failed'], default: 'queued', index: true },
     progress: {
       processed: { type: Number, default: 0 },
@@ -41,5 +42,12 @@ EquipmentImportJobSchema.index({ userId: 1, createdAt: -1 });
 EquipmentImportJobSchema.index({ status: 1, createdAt: 1 });
 EquipmentImportJobSchema.index({ status: 1, lastHeartbeatAt: 1 });
 EquipmentImportJobSchema.index({ finishedAt: 1 });
+EquipmentImportJobSchema.index(
+  { tenantId: 1, zoneId: 1, sourceHash: 1, status: 1 },
+  {
+    partialFilterExpression: { sourceHash: { $type: 'string' } },
+    name: 'equipment_import_source_guard'
+  }
+);
 
 module.exports = mongoose.model('EquipmentImportJob', EquipmentImportJobSchema);

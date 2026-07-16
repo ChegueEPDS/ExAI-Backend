@@ -8,6 +8,7 @@ const Question = require('../models/questions');
 const QuestionTypeMapping = require('../models/questionTypeMapping');
 const CustomFieldDefinition = require('../models/customFieldDefinition');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 const fs = require('fs');
 const azureBlob = require('../services/azureBlobService');
 const systemSettings = require('../services/systemSettingsStore');
@@ -1362,7 +1363,24 @@ function clientReqDisplays(clientReq) {
   };
 }
 
-async function loadAutoInspectionQuestions(equipmentDoc, tenantId, inspectionType = 'Detailed') {
+function filterAutoInspectionQuestions(questions, equipmentDoc, inspectionType) {
+  const protections = extractProtectionTypesFromEquipment(equipmentDoc);
+  const protectionSet = new Set(protections.map((value) => String(value).trim().toLowerCase()));
+  return (Array.isArray(questions) ? questions : []).filter((question) => {
+    const questionProtections = Array.isArray(question.protectionTypes) ? question.protectionTypes : [];
+    const protectionMatches = !protections.length || questionProtections.some(
+      (value) => protectionSet.has(String(value).trim().toLowerCase())
+    );
+    if (!protectionMatches) return false;
+    const types = Array.isArray(question.inspectionTypes) ? question.inspectionTypes : [];
+    return !types.length || types.includes(inspectionType);
+  });
+}
+
+async function loadAutoInspectionQuestions(equipmentDoc, tenantId, inspectionType = 'Detailed', importContext = null) {
+  if (Array.isArray(importContext?.questions)) {
+    return filterAutoInspectionQuestions(importContext.questions, equipmentDoc, inspectionType);
+  }
   try {
     const protections = extractProtectionTypesFromEquipment(equipmentDoc);
     const filter = {};
@@ -1399,7 +1417,7 @@ async function loadAutoInspectionQuestions(equipmentDoc, tenantId, inspectionTyp
   }
 }
 
-async function getRelevantEquipmentTypesForDevice(equipmentDoc, tenantId) {
+async function getRelevantEquipmentTypesForDevice(equipmentDoc, tenantId, importContext = null) {
   const rawType =
     (equipmentDoc && typeof equipmentDoc === 'object'
       ? equipmentDoc['Equipment Type'] || equipmentDoc.EquipmentType || ''
@@ -1418,12 +1436,14 @@ async function getRelevantEquipmentTypesForDevice(equipmentDoc, tenantId) {
   }
 
   try {
-    const mappings = await QuestionTypeMapping.find({
-      tenantId: tenantObjectId,
-      active: true
-    })
-      .select('equipmentPattern equipmentTypes')
-      .lean();
+    const mappings = Array.isArray(importContext?.questionTypeMappings)
+      ? importContext.questionTypeMappings
+      : await QuestionTypeMapping.find({
+        tenantId: tenantObjectId,
+        active: true
+      })
+        .select('equipmentPattern equipmentTypes')
+        .lean();
 
     mappings.forEach((m) => {
       const pattern = String(m.equipmentPattern || '').toLowerCase().trim();
@@ -1495,6 +1515,20 @@ async function buildSpecialConditionResult(equipmentDoc, tenantId, certificateCa
       hun: ''
     }
   };
+}
+
+async function buildAutoInspectionImportContext(tenantId, certificateNos) {
+  const [certificateCache, questions, questionTypeMappings, rbSchema] = await Promise.all([
+    certificateNos.length
+      ? buildCertificateCacheForCertNos(tenantId, certificateNos)
+      : new Map(),
+    Question.find({ tenantId }).lean(),
+    QuestionTypeMapping.find({ tenantId, active: true })
+      .select('equipmentPattern equipmentTypes')
+      .lean(),
+    ensureRbSchema()
+  ]);
+  return { certificateCache, questions, questionTypeMappings, rbSchema };
 }
 
 function summarizeAutoInspectionResults(results) {
@@ -2129,6 +2163,7 @@ async function notifyEquipmentImportXlsxStatus(userId, {
 }
 
 async function runEquipmentImportXlsxCore({
+  jobId = null,
   tenantId,
   userId,
   zoneId,
@@ -2369,17 +2404,26 @@ async function runEquipmentImportXlsxCore({
       const existing = entry.mongoId ? existingEquipmentById.get(String(entry.mongoId)) : null;
       return [entry.rbCertificateNo, existing ? certificateNo(existing) : null].filter(Boolean);
     });
-  const importCertificateCache = importCertificateNos.length
-    ? await buildCertificateCacheForCertNos(tenantId, importCertificateNos)
-    : new Map();
+  const hasAutoInspections = entries.slice(processedEntries).some(
+    (entry) => entry.inspectionStatus === 'Passed' && entry.inspectionDate instanceof Date
+  );
+  const autoInspectionContext = hasAutoInspections
+    ? await buildAutoInspectionImportContext(tenantId, importCertificateNos)
+    : null;
   let rbSchemaPromise = null;
   let nextOrderIndex = null;
+  const importedInspectionEquipmentIds = new Set();
   if (typeof onProgress === 'function') {
     await onProgress({ processed: processedEntries, total: totalEntries, ...stats });
   }
 
-  for (const entry of entries.slice(processedEntries)) {
+  for (let entryIndex = processedEntries; entryIndex < entries.length; entryIndex += 1) {
+    const entry = entries[entryIndex];
+    const rowKey = entry.rows?.length ? entry.rows.join(',') : String(entryIndex + 1);
     try {
+      if (!entry.mongoId && !String(entry.eqId || entry.base?.EqID || '').trim()) {
+        throw new Error('EqID is required when creating new equipment.');
+      }
       const payload = { ...entry.base, Zone: zone._id, Unit: zone._id, Site: zone.Site || null };
       if (entry.orderIndex != null) payload.orderIndex = entry.orderIndex;
       if (payload.customFields && Object.keys(payload.customFields).length) {
@@ -2435,13 +2479,28 @@ async function runEquipmentImportXlsxCore({
           ensureRbAssignment(updateData, rbSchema, { ...getRbValues(equipmentDoc), ...rbValues }, userId);
         }
         if (entry.orderIndex == null) delete updateData.orderIndex;
-        equipmentDoc = await Equipment.findByIdAndUpdate(equipmentDoc._id, { $set: updateData }, { new: true });
+        equipmentDoc = await Equipment.findByIdAndUpdate(
+          equipmentDoc._id,
+          { $set: updateData },
+          { new: true, deferImportDerivedRefresh: true }
+        );
         existingEquipmentById.set(String(equipmentDoc._id), equipmentDoc);
         stats.updated += 1;
       }
 
       if (!equipmentDoc) {
+        if (jobId) {
+          equipmentDoc = await Equipment.findOne({
+            tenantId,
+            'importMeta.jobId': jobId,
+            'importMeta.rowKey': rowKey
+          });
+        }
+      }
+
+      if (!equipmentDoc) {
         const createData = { ...payload, tenantId, CreatedBy: userId };
+        if (jobId) createData.importMeta = { jobId, rowKey };
         if (entry.schemaAssignments?.length) {
           createData.schemaAssignments = mergeImportedSchemaAssignments(createData.schemaAssignments || [], entry.schemaAssignments);
         }
@@ -2452,23 +2511,45 @@ async function runEquipmentImportXlsxCore({
           }
           createData.orderIndex = nextOrderIndex++;
         }
-        equipmentDoc = await Equipment.create(createData);
+        try {
+          const newEquipment = new Equipment(createData);
+          newEquipment.$locals.skipCreatedByLookup = true;
+          newEquipment.$locals.deferImportDerivedRefresh = true;
+          equipmentDoc = await newEquipment.save();
+        } catch (createError) {
+          if (createError?.code !== 11000 || !jobId) throw createError;
+          equipmentDoc = await Equipment.findOne({
+            tenantId,
+            'importMeta.jobId': jobId,
+            'importMeta.rowKey': rowKey
+          });
+          if (!equipmentDoc) throw createError;
+        }
+        stats.created += 1;
+      } else if (!entry.mongoId) {
+        // The row was created before a worker interruption but not checkpointed yet.
         stats.created += 1;
       }
 
       if (equipmentDoc && entry.inspectionStatus === 'Passed' && entry.inspectionDate instanceof Date) {
         try {
-          await createAutoInspectionForImport(
-            equipmentDoc,
-            entry.inspectionDate,
-            userId,
-            tenantId,
-            entry.inspectionType || 'Detailed',
-            entry.inspectionRemarks || '',
-            importCertificateCache
+          await retryTransientDatabaseOperation(
+            () => createAutoInspectionForImport(
+              equipmentDoc,
+              entry.inspectionDate,
+              userId,
+              tenantId,
+              entry.inspectionType || 'Detailed',
+              entry.inspectionRemarks || '',
+              autoInspectionContext,
+              jobId ? `${jobId}:${rowKey}` : null
+            ),
+            { operation: 'auto inspection creation' }
           );
           stats.inspections += 1;
+          importedInspectionEquipmentIds.add(String(equipmentDoc._id));
         } catch (inspectionError) {
+          if (isRetryableDatabaseError(inspectionError)) throw inspectionError;
           stats.errors.push({
             eqId: equipmentDoc.EqID,
             rows: entry.rows,
@@ -2477,19 +2558,39 @@ async function runEquipmentImportXlsxCore({
         }
       }
     } catch (entryError) {
+      if (isRetryableDatabaseError(entryError)) throw entryError;
       stats.errors.push({
         eqId: entry.eqId,
         id: entry.mongoId || null,
         rows: entry.rows,
         message: entryError.message || String(entryError)
       });
-    } finally {
-      processedEntries += 1;
-      if (typeof onProgress === 'function') {
-        await onProgress({ processed: processedEntries, total: totalEntries, ...stats });
-      }
+    }
+    processedEntries += 1;
+    if (typeof onProgress === 'function') {
+      await onProgress({ processed: processedEntries, total: totalEntries, ...stats });
     }
   }
+
+  if (jobId) {
+    const importedEquipments = await Equipment.find({
+      tenantId,
+      'importMeta.jobId': jobId
+    }).select('_id').lean();
+    importedEquipments.forEach((equipment) => importedInspectionEquipmentIds.add(String(equipment._id)));
+  }
+  entries
+    .filter((entry) => entry.mongoId && entry.inspectionStatus === 'Passed' && entry.inspectionDate instanceof Date)
+    .forEach((entry) => importedInspectionEquipmentIds.add(String(entry.mongoId)));
+
+  if (importedInspectionEquipmentIds.size) {
+    require('../services/dashboardIncidentService').scheduleBackfillMissingIncidents({
+      tenantId,
+      equipmentIds: Array.from(importedInspectionEquipmentIds),
+      delayMs: 5000
+    });
+  }
+  scheduleDashboardStatsDirty({ tenantId, reason: 'equipment_import_completed' });
 
   const issues = [...parseErrors, ...stats.errors];
   let errorWorkbookBuffer = null;
@@ -2554,8 +2655,33 @@ function isRetryableDatabaseError(error) {
   ].some((token) => message.includes(token)) || ['MongoNetworkError', 'MongoServerSelectionError'].includes(error?.name);
 }
 
+async function retryTransientDatabaseOperation(operation, { operation: operationName = 'database operation' } = {}) {
+  const maxAttempts = Math.min(
+    5,
+    Math.max(1, Number(process.env.EQUIPMENT_IMPORT_DB_RETRY_ATTEMPTS) || 3)
+  );
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableDatabaseError(error) || attempt >= maxAttempts) throw error;
+      const delayMs = Math.min(10_000, 500 * (2 ** (attempt - 1)));
+      console.warn(`[equipment-import] transient ${operationName} failure; retrying`, {
+        attempt,
+        maxAttempts,
+        delayMs,
+        error: error?.message || String(error)
+      });
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError;
+}
+
 function getEquipmentImportMaxAttempts() {
-  return Math.min(10, Math.max(1, Number(process.env.EQUIPMENT_IMPORT_MAX_ATTEMPTS) || 3));
+  return Math.min(10, Math.max(1, Number(process.env.EQUIPMENT_IMPORT_MAX_ATTEMPTS) || 10));
 }
 
 exports.processEquipmentImportXlsxJob = async (jobIdOrId) => {
@@ -2582,6 +2708,7 @@ exports.processEquipmentImportXlsxJob = async (jobIdOrId) => {
     });
     const workbookBuffer = await azureBlob.downloadToBuffer(job.sourceBlobPath);
     const result = await runEquipmentImportXlsxCore({
+      jobId: job.jobId,
       tenantId: String(job.tenantId),
       userId: String(job.userId),
       zoneId: String(job.zoneId),
@@ -2713,6 +2840,30 @@ exports.importEquipmentXLSX = async (req, res) => {
     const zone = await Zone.findOne({ _id: zoneId, tenantId }).select('_id').lean();
     if (!zone) return res.status(404).json({ message: 'Zone not found for this tenant.' });
 
+    const sourceHash = crypto
+      .createHash('sha256')
+      .update(await fs.promises.readFile(uploadedFile.path))
+      .digest('hex');
+    const existingJob = await EquipmentImportJob.findOne({
+      tenantId,
+      zoneId,
+      sourceHash,
+      status: { $in: ['queued', 'running', 'failed'] }
+    })
+      .sort({ createdAt: -1 })
+      .select('jobId status progress')
+      .lean();
+    if (existingJob) {
+      return res.status(409).json({
+        message: existingJob.status === 'failed'
+          ? 'This file already has a partial failed import. Retry the existing job instead of creating duplicates.'
+          : 'This file already has an active import.',
+        jobId: existingJob.jobId,
+        status: existingJob.status,
+        progress: existingJob.progress || null
+      });
+    }
+
     const jobId = `equipment-import-${Date.now()}-${uuidv4().slice(0, 8)}`;
     const sourceBlobPath = buildEquipmentImportSourceBlobPath(tenantId, jobId, uploadedFile.originalname || 'equipment-import.xlsx');
     try {
@@ -2729,6 +2880,7 @@ exports.importEquipmentXLSX = async (req, res) => {
         zoneId,
         sourceBlobPath,
         sourceFileName: uploadedFile.originalname || 'equipment-import.xlsx',
+        sourceHash,
         progress: { processed: 0, total: 0, updatedAt: new Date() }
       });
     } catch (queueErr) {
@@ -2835,6 +2987,7 @@ exports.retryEquipmentImportXlsxJob = async (req, res) => {
     job.finishedAt = null;
     job.nextAttemptAt = new Date();
     job.lastHeartbeatAt = null;
+    job.attempts = 0;
     await job.save();
     await notifyEquipmentImportXlsxStatus(String(job.userId), {
       jobId: job.jobId,
@@ -3418,7 +3571,8 @@ async function createAutoInspectionForImport(
   tenantId,
   inspectionType = 'Detailed',
   remarks = '',
-  certificateCache = null
+  importContext = null,
+  importKey = null
 ) {
   const date = new Date(inspectionDate);
   if (Number.isNaN(date.getTime())) {
@@ -3432,12 +3586,14 @@ async function createAutoInspectionForImport(
   const questionDocs = await loadAutoInspectionQuestions(
     equipmentDoc,
     tenantId,
-    normalizedInspectionType
+    normalizedInspectionType,
+    importContext
   );
   const basePassedTypes = new Set(['general', 'environment', 'additional checks', 'installation']);
   const relevantTypes = await getRelevantEquipmentTypesForDevice(
     equipmentDoc,
-    tenantId
+    tenantId,
+    importContext
   ); // lowercased equipmentType-ok
   let results = [];
 
@@ -3484,7 +3640,11 @@ async function createAutoInspectionForImport(
     }];
   }
 
-  const specialResult = await buildSpecialConditionResult(equipmentDoc, tenantId, certificateCache);
+  const specialResult = await buildSpecialConditionResult(
+    equipmentDoc,
+    tenantId,
+    importContext?.certificateCache || null
+  );
   if (specialResult) {
     results.push(specialResult);
   }
@@ -3492,7 +3652,7 @@ async function createAutoInspectionForImport(
 
   const { summary, status } = summarizeAutoInspectionResults(results);
 
-  const inspection = new Inspection({
+  let inspection = new Inspection({
     equipmentId: equipmentDoc._id,
     eqId: equipmentDoc.EqID,
     tenantId,
@@ -3506,13 +3666,22 @@ async function createAutoInspectionForImport(
     attachments: [],
     remarks: String(remarks || '').trim(),
     summary,
-    status
+    status,
+    source: 'import',
+    importKey
   });
 
-  await inspection.save();
+  inspection.$locals.deferImportDerivedRefresh = true;
+  try {
+    await inspection.save();
+  } catch (inspectionSaveError) {
+    if (inspectionSaveError?.code !== 11000 || !importKey) throw inspectionSaveError;
+    inspection = await Inspection.findOne({ tenantId, importKey });
+    if (!inspection) throw inspectionSaveError;
+  }
 
   {
-    const rbSchema = await ensureRbSchema();
+    const rbSchema = importContext?.rbSchema || await ensureRbSchema();
     ensureRbAssignment(equipmentDoc, rbSchema, {
       ...getRbValues(equipmentDoc),
       compliance: status
@@ -3523,6 +3692,8 @@ async function createAutoInspectionForImport(
   equipmentDoc.lastInspectionValidUntil = validUntil;
   equipmentDoc.lastInspectionStatus = status;
   equipmentDoc.lastInspectionId = inspection._id;
+  equipmentDoc.$locals.skipCreatedByLookup = true;
+  equipmentDoc.$locals.deferImportDerivedRefresh = true;
   await equipmentDoc.save();
 
   return inspection;

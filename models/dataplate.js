@@ -39,6 +39,10 @@ const EquipmentSchema = new mongoose.Schema({
     status: { type: String, enum: ['queued', 'processing', 'done', 'error', null], default: null },
     finishedAt: { type: Date, default: null }
   },
+  importMeta: {
+    jobId: { type: String, default: null },
+    rowKey: { type: String, default: null }
+  },
   // Mobile sync review workflow: the auto-generated inspection is pending until reviewed in web.
   pendingReview: { type: Boolean, default: false, index: true },
   pendingInspectionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Inspection', default: null },
@@ -109,6 +113,17 @@ const EquipmentSchema = new mongoose.Schema({
 
 // Lookup helper for mobile sync retries (not unique to avoid migration issues if old duplicates exist).
 EquipmentSchema.index({ tenantId: 1, 'mobileSync.tempId': 1 });
+EquipmentSchema.index(
+  { tenantId: 1, 'importMeta.jobId': 1, 'importMeta.rowKey': 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      'importMeta.jobId': { $type: 'string' },
+      'importMeta.rowKey': { $type: 'string' }
+    },
+    name: 'uniq_equipment_import_row'
+  }
+);
 EquipmentSchema.index({ tenantId: 1, isProcessed: 1, orderIndex: 1, _id: 1 });
 EquipmentSchema.index({ tenantId: 1, Site: 1, isProcessed: 1, orderIndex: 1, _id: 1 });
 EquipmentSchema.index({ tenantId: 1, Zone: 1, isProcessed: 1, orderIndex: 1, _id: 1 });
@@ -190,14 +205,16 @@ EquipmentSchema.pre('save', async function (next) {
             this.searchTrigrams = searchFields.searchTrigrams;
         }
 
-        const user = await mongoose.model('User').findById(this.CreatedBy).select('company tenantId');
-        if (!user) {
-            return next(new Error('Invalid CreatedBy user.'));
-        }
+        if (!this.$locals.skipCreatedByLookup) {
+            const user = await mongoose.model('User').findById(this.CreatedBy).select('company tenantId');
+            if (!user) {
+                return next(new Error('Invalid CreatedBy user.'));
+            }
 
-        // Fill tenantId if missing
-        if (!this.tenantId && user.tenantId) {
-            this.tenantId = user.tenantId;
+            // Fill tenantId if missing
+            if (!this.tenantId && user.tenantId) {
+                this.tenantId = user.tenantId;
+            }
         }
 
         next();
@@ -207,6 +224,7 @@ EquipmentSchema.pre('save', async function (next) {
 });
 
 EquipmentSchema.post('save', function scheduleDashboardSummaryInvalidation(doc) {
+    if (doc?.$locals?.deferImportDerivedRefresh) return;
     if (!doc?.$locals?.dashboardSummaryRelevantChange) return;
     scheduleDashboardSummaryDirtyForEquipment(doc, doc.isNew ? 'equipment_created' : 'equipment_saved');
 });
@@ -263,6 +281,7 @@ EquipmentSchema.pre('findOneAndUpdate', async function (next) {
 });
 
 EquipmentSchema.post('findOneAndUpdate', function scheduleDashboardSummaryInvalidation(doc) {
+    if (this.options?.deferImportDerivedRefresh) return;
     if (!this.options?.dashboardSummaryRelevantChange) return;
     scheduleDashboardSummaryDirtyForEquipment(doc, 'equipment_updated');
 });
