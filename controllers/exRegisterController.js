@@ -2528,7 +2528,7 @@ async function runEquipmentImportXlsxCore({
   };
 }
 
-function isRetryableEquipmentImportError(error) {
+function isRetryableDatabaseError(error) {
   const message = String(error?.message || error || '').toLowerCase();
   return [
     'timed out while checking out a connection',
@@ -2655,7 +2655,7 @@ exports.processEquipmentImportXlsxJob = async (jobIdOrId) => {
     return true;
   } catch (error) {
     console.error('❌ equipment XLSX import job failed:', error);
-    const retryable = isRetryableEquipmentImportError(error) && job.attempts < getEquipmentImportMaxAttempts();
+    const retryable = isRetryableDatabaseError(error) && job.attempts < getEquipmentImportMaxAttempts();
     job.status = retryable ? 'queued' : 'failed';
     job.errorMessage = retryable
       ? `Transient failure; retry scheduled: ${error.message || String(error)}`
@@ -5999,6 +5999,7 @@ exports.bulkDeleteEquipment = async (req, res) => {
       userId: req.userId,
       tenantName,
       equipmentIds: equipments.map((eq) => eq._id),
+      orderScopeKeys: Array.from(new Set(equipments.map(buildEquipmentOrderScopeKey))),
       progress: { processed: 0, total: equipments.length, updatedAt: new Date() }
     });
     await notifyEquipmentBulkDeleteStatus(req.userId, {
@@ -6027,7 +6028,10 @@ exports.processEquipmentBulkDeleteJob = async (jobIdOrId) => {
   const now = new Date();
   const job = await EquipmentBulkDeleteJob.findOneAndUpdate(
     { ...selector, status: 'queued' },
-    { $set: { status: 'running', startedAt: now, lastHeartbeatAt: now }, $inc: { attempts: 1 } },
+    {
+      $set: { status: 'running', startedAt: now, lastHeartbeatAt: now, nextAttemptAt: null, errorMessage: null },
+      $inc: { attempts: 1 }
+    },
     { new: true }
   );
   if (!job) return false;
@@ -6044,7 +6048,8 @@ exports.processEquipmentBulkDeleteJob = async (jobIdOrId) => {
     const tenantId = String(job.tenantId);
     const equipments = await Equipment.find({ _id: { $in: job.equipmentIds || [] }, tenantId });
     const failures = [];
-    const scopeKeys = new Set();
+    // Persisted scopes let a retry finish order normalization after the equipment rows are gone.
+    const scopeKeys = new Set(job.orderScopeKeys || []);
     let deletedCount = 0;
     const total = Array.isArray(job.equipmentIds) ? job.equipmentIds.length : 0;
     let processed = 0;
@@ -6069,6 +6074,7 @@ exports.processEquipmentBulkDeleteJob = async (jobIdOrId) => {
       }
 
       job.progress = { processed, total, updatedAt: new Date() };
+      job.orderScopeKeys = Array.from(scopeKeys);
       job.lastHeartbeatAt = new Date();
       await job.save();
       if (processed === total || processed === 1 || processed % Math.max(1, Math.floor(total / 10) || 1) === 0) {
@@ -6104,15 +6110,24 @@ exports.processEquipmentBulkDeleteJob = async (jobIdOrId) => {
     return true;
   } catch (error) {
     console.error('❌ Hiba a tömeges eszköz törlés workerben:', error);
-    job.status = 'failed';
-    job.errorMessage = error?.message || String(error);
-    job.finishedAt = new Date();
+    const maxAttempts = Math.min(10, Math.max(1, Number(process.env.EQUIPMENT_BULK_DELETE_MAX_ATTEMPTS) || 3));
+    const retryable = isRetryableDatabaseError(error) && job.attempts < maxAttempts;
+    job.status = retryable ? 'queued' : 'failed';
+    job.errorMessage = retryable
+      ? `Transient failure; retry scheduled: ${error?.message || String(error)}`
+      : (error?.message || String(error));
+    job.finishedAt = retryable ? null : new Date();
+    job.nextAttemptAt = retryable
+      ? new Date(Date.now() + Math.min(5 * 60_000, Math.max(30_000, Number(job.attempts) * 30_000)))
+      : null;
     job.lastHeartbeatAt = new Date();
     await job.save();
     await notifyEquipmentBulkDeleteStatus(String(job.userId), {
       jobId: job.jobId,
-      status: 'failed',
+      status: retryable ? 'queued' : 'failed',
       errorMessage: job.errorMessage,
+      processed: Number(job.progress?.processed) || 0,
+      total: Number(job.progress?.total) || 0,
     });
     return false;
   }

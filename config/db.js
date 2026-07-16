@@ -24,7 +24,13 @@ const connectDB = async () => {
       autoIndex,
       appName: workerOnly ? 'exai-worker' : 'exai-api',
     });
-    console.log('MongoDB connected OK');
+    console.log('MongoDB connected OK', {
+      role: workerOnly ? 'worker' : 'api',
+      maxPoolSize,
+      minPoolSize,
+      maxIdleTimeMS,
+      waitQueueTimeoutMS
+    });
   } catch (err) {
     console.error('MongoDB connection error:', err.message);
     process.exit(1);

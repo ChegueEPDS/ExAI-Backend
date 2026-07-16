@@ -89,7 +89,7 @@ function start(options = {}) {
   if (timer) return { started: false, reason: 'already_started' };
   const intervalMs = Number(options.intervalMs || getPollMs());
   stopping = false;
-  scheduleNext(intervalMs, 1500);
+  scheduleNext(intervalMs, Number(options.initialDelayMs || 6000));
   logger.info('[equipment-import-worker] started', { intervalMs });
   return { started: true };
 }

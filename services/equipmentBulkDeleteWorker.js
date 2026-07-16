@@ -43,7 +43,10 @@ async function pollEquipmentBulkDeleteJobs() {
       await recoverStaleJobs();
       lastStaleRecoveryAt = Date.now();
     }
-    const jobs = await EquipmentBulkDeleteJob.find({ status: 'queued' })
+    const jobs = await EquipmentBulkDeleteJob.find({
+      status: 'queued',
+      $or: [{ nextAttemptAt: null }, { nextAttemptAt: { $lte: new Date() } }]
+    })
       .sort({ updatedAt: 1, createdAt: 1 })
       .select('_id')
       .limit(2)
@@ -80,7 +83,7 @@ function start(options = {}) {
   if (timer) return { started: false, reason: 'already_started' };
   const intervalMs = Number(options.intervalMs || getPollMs());
   stopping = false;
-  scheduleNext(intervalMs, 1500);
+  scheduleNext(intervalMs, Number(options.initialDelayMs || 7500));
   logger.info('[equipment-bulk-delete-worker] started', { intervalMs });
   return { started: true };
 }

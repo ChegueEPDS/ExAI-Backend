@@ -7,6 +7,7 @@ const EquipmentBulkDeleteJobSchema = new mongoose.Schema(
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     tenantName: { type: String, default: '' },
     equipmentIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Dataplate', required: true }],
+    orderScopeKeys: { type: [String], default: [] },
     status: { type: String, enum: ['queued', 'running', 'succeeded', 'failed'], default: 'queued', index: true },
     progress: {
       processed: { type: Number, default: 0 },
@@ -20,6 +21,7 @@ const EquipmentBulkDeleteJobSchema = new mongoose.Schema(
     },
     errorMessage: { type: String, default: null },
     attempts: { type: Number, default: 0 },
+    nextAttemptAt: { type: Date, default: null, index: true },
     lastHeartbeatAt: { type: Date, default: null },
     startedAt: { type: Date, default: null },
     finishedAt: { type: Date, default: null }
