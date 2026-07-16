@@ -1445,10 +1445,10 @@ async function getRelevantEquipmentTypesForDevice(equipmentDoc, tenantId) {
   return result;
 }
 
-async function findCertificateByCertNoForTenant(certNoRaw, tenantId) {
+async function findCertificateByCertNoForTenant(certNoRaw, tenantId, certificateCache = null) {
   if (!certNoRaw || !String(certNoRaw).trim()) return null;
   try {
-    const certMap = await buildCertificateCacheForTenant(tenantId);
+    const certMap = certificateCache || await buildCertificateCacheForTenant(tenantId);
     const hit = resolveCertificateFromCache(certMap, certNoRaw);
     if (!hit) return null;
     return { specCondition: hit.specCondition, certNo: hit.certNo };
@@ -1458,7 +1458,7 @@ async function findCertificateByCertNoForTenant(certNoRaw, tenantId) {
   }
 }
 
-async function buildSpecialConditionResult(equipmentDoc, tenantId) {
+async function buildSpecialConditionResult(equipmentDoc, tenantId, certificateCache = null) {
   const equipmentSpecific =
     (equipmentDoc &&
       typeof equipmentDoc === 'object' &&
@@ -1473,7 +1473,7 @@ async function buildSpecialConditionResult(equipmentDoc, tenantId) {
   if (!text) {
     const certNo = certificateNo(equipmentDoc);
     if (certNo) {
-      const certificate = await findCertificateByCertNoForTenant(certNo, tenantId);
+      const certificate = await findCertificateByCertNoForTenant(certNo, tenantId, certificateCache);
       text = certificate?.specCondition?.trim() || '';
     }
   }
@@ -2362,6 +2362,16 @@ async function runEquipmentImportXlsxCore({
       : []
   ]);
   const existingEquipmentById = new Map(existingEquipments.map((equipment) => [String(equipment._id), equipment]));
+  const importCertificateNos = entries
+    .slice(processedEntries)
+    .filter((entry) => entry.inspectionStatus === 'Passed' && entry.inspectionDate instanceof Date)
+    .flatMap((entry) => {
+      const existing = entry.mongoId ? existingEquipmentById.get(String(entry.mongoId)) : null;
+      return [entry.rbCertificateNo, existing ? certificateNo(existing) : null].filter(Boolean);
+    });
+  const importCertificateCache = importCertificateNos.length
+    ? await buildCertificateCacheForCertNos(tenantId, importCertificateNos)
+    : new Map();
   let rbSchemaPromise = null;
   let nextOrderIndex = null;
   if (typeof onProgress === 'function') {
@@ -2454,7 +2464,8 @@ async function runEquipmentImportXlsxCore({
             userId,
             tenantId,
             entry.inspectionType || 'Detailed',
-            entry.inspectionRemarks || ''
+            entry.inspectionRemarks || '',
+            importCertificateCache
           );
           stats.inspections += 1;
         } catch (inspectionError) {
@@ -3400,7 +3411,15 @@ exports.cleanupTempUploadsNow = async (_req, res) => {
   }
 };
 
-async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspectorId, tenantId, inspectionType = 'Detailed', remarks = '') {
+async function createAutoInspectionForImport(
+  equipmentDoc,
+  inspectionDate,
+  inspectorId,
+  tenantId,
+  inspectionType = 'Detailed',
+  remarks = '',
+  certificateCache = null
+) {
   const date = new Date(inspectionDate);
   if (Number.isNaN(date.getTime())) {
     throw new Error('Invalid inspection date provided.');
@@ -3465,7 +3484,7 @@ async function createAutoInspectionForImport(equipmentDoc, inspectionDate, inspe
     }];
   }
 
-  const specialResult = await buildSpecialConditionResult(equipmentDoc, tenantId);
+  const specialResult = await buildSpecialConditionResult(equipmentDoc, tenantId, certificateCache);
   if (specialResult) {
     results.push(specialResult);
   }
