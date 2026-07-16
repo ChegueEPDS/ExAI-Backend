@@ -2528,6 +2528,25 @@ async function runEquipmentImportXlsxCore({
   };
 }
 
+function isRetryableEquipmentImportError(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  return [
+    'timed out while checking out a connection',
+    'connection pool',
+    'connection slots',
+    'server selection',
+    'socket',
+    'network',
+    'connection closed',
+    'too many requests',
+    'request rate is large'
+  ].some((token) => message.includes(token)) || ['MongoNetworkError', 'MongoServerSelectionError'].includes(error?.name);
+}
+
+function getEquipmentImportMaxAttempts() {
+  return Math.min(10, Math.max(1, Number(process.env.EQUIPMENT_IMPORT_MAX_ATTEMPTS) || 3));
+}
+
 exports.processEquipmentImportXlsxJob = async (jobIdOrId) => {
   const selector = mongoose.Types.ObjectId.isValid(String(jobIdOrId || ''))
     ? { _id: jobIdOrId }
@@ -2536,7 +2555,7 @@ exports.processEquipmentImportXlsxJob = async (jobIdOrId) => {
   const job = await EquipmentImportJob.findOneAndUpdate(
     { ...selector, status: 'queued' },
     {
-      $set: { status: 'running', startedAt: now, lastHeartbeatAt: now },
+      $set: { status: 'running', startedAt: now, lastHeartbeatAt: now, nextAttemptAt: null, errorMessage: null },
       $inc: { attempts: 1 }
     },
     { new: true }
@@ -2636,19 +2655,27 @@ exports.processEquipmentImportXlsxJob = async (jobIdOrId) => {
     return true;
   } catch (error) {
     console.error('❌ equipment XLSX import job failed:', error);
-    job.status = 'failed';
-    job.errorMessage = error.message || String(error);
-    job.finishedAt = new Date();
+    const retryable = isRetryableEquipmentImportError(error) && job.attempts < getEquipmentImportMaxAttempts();
+    job.status = retryable ? 'queued' : 'failed';
+    job.errorMessage = retryable
+      ? `Transient failure; retry scheduled: ${error.message || String(error)}`
+      : (error.message || String(error));
+    job.finishedAt = retryable ? null : new Date();
+    job.nextAttemptAt = retryable
+      ? new Date(Date.now() + Math.min(5 * 60_000, Math.max(30_000, Number(job.attempts) * 30_000)))
+      : null;
     job.lastHeartbeatAt = new Date();
     await job.save();
     await notifyEquipmentImportXlsxStatus(String(job.userId), {
       jobId: job.jobId,
-      status: 'failed',
+      status: retryable ? 'queued' : 'failed',
       errorMessage: job.errorMessage,
+      processed: Number(job.progress?.processed) || 0,
+      total: Number(job.progress?.total) || 0,
     });
     return false;
   } finally {
-    if (job.sourceBlobPath) {
+    if (job.sourceBlobPath && job.status === 'succeeded') {
       try {
         await azureBlob.deleteFile(job.sourceBlobPath);
       } catch (cleanupErr) {
@@ -2760,6 +2787,64 @@ exports.getEquipmentImportXlsxJob = async (req, res) => {
   } catch (error) {
     console.error('❌ Equipment import job status error:', error);
     return res.status(500).json({ error: 'Failed to load equipment import job status.' });
+  }
+};
+
+exports.retryEquipmentImportXlsxJob = async (req, res) => {
+  const uploadedFile = req.file;
+  try {
+    const tenantId = req.scope?.tenantId;
+    const userId = req.scope?.userId || req.userId;
+    if (!tenantId || !userId) return res.status(401).json({ error: 'Missing auth context.' });
+
+    const job = await EquipmentImportJob.findOne({
+      jobId: String(req.params.jobId || ''),
+      tenantId,
+      userId
+    });
+    if (!job) return res.status(404).json({ error: 'Equipment import job not found.' });
+    if (job.status !== 'failed') {
+      return res.status(409).json({ error: `Only failed imports can be retried; current status is ${job.status}.` });
+    }
+
+    if (uploadedFile?.path) {
+      await azureBlob.uploadFile(
+        uploadedFile.path,
+        job.sourceBlobPath,
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      );
+    } else if (!(await azureBlob.fileExists(job.sourceBlobPath))) {
+      return res.status(409).json({
+        error: 'The source XLSX is no longer available. Retry the request with the original file in the file field.'
+      });
+    }
+
+    job.status = 'queued';
+    job.errorMessage = null;
+    job.finishedAt = null;
+    job.nextAttemptAt = new Date();
+    job.lastHeartbeatAt = null;
+    await job.save();
+    await notifyEquipmentImportXlsxStatus(String(job.userId), {
+      jobId: job.jobId,
+      status: 'queued',
+      processed: Number(job.progress?.processed) || 0,
+      total: Number(job.progress?.total) || 0
+    });
+
+    return res.status(202).json({
+      queued: true,
+      jobId: job.jobId,
+      resumeAfter: Number(job.progress?.processed) || 0,
+      total: Number(job.progress?.total) || 0
+    });
+  } catch (error) {
+    console.error('❌ Equipment import retry error:', error);
+    return res.status(500).json({ error: 'Failed to retry equipment import.', message: error.message || String(error) });
+  } finally {
+    if (uploadedFile?.path) {
+      try { await fs.promises.unlink(uploadedFile.path); } catch {}
+    }
   }
 };
 

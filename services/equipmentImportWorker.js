@@ -48,7 +48,10 @@ async function pollEquipmentImportJobs() {
       await recoverStaleEquipmentImportJobs();
       lastStaleRecoveryAt = Date.now();
     }
-    const jobs = await EquipmentImportJob.find({ status: 'queued' })
+    const jobs = await EquipmentImportJob.find({
+      status: 'queued',
+      $or: [{ nextAttemptAt: null }, { nextAttemptAt: { $lte: new Date() } }]
+    })
       .sort({ updatedAt: 1, createdAt: 1 })
       .select('_id')
       .limit(3)

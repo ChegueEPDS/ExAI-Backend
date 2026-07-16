@@ -257,6 +257,12 @@ module.exports = {
     return deleteResponse;
   },
 
+  async fileExists(blobNameOrPath) {
+    const blobPath = toBlobPath(blobNameOrPath);
+    if (!blobPath) return false;
+    return containerClient.getBlockBlobClient(blobPath).exists();
+  },
+
   async renameFile(oldBlobName, newBlobName) {
     const sourceBlob = containerClient.getBlobClient(oldBlobName);
     const targetBlob = containerClient.getBlockBlobClient(newBlobName);

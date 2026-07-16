@@ -28,6 +28,7 @@ const EquipmentImportJobSchema = new mongoose.Schema(
     },
     errorMessage: { type: String, default: null },
     attempts: { type: Number, default: 0 },
+    nextAttemptAt: { type: Date, default: null, index: true },
     lastHeartbeatAt: { type: Date, default: null },
     startedAt: { type: Date, default: null },
     finishedAt: { type: Date, default: null }

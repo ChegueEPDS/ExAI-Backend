@@ -48,6 +48,14 @@ router.get(
   exRegisterController.getEquipmentImportXlsxJob
 );
 
+router.post(
+  '/exreg/import-xlsx-jobs/:jobId/retry',
+  authMiddleware(),
+  requireAccess('equipment', 'create'),
+  xlsxUpload.single('file'),
+  exRegisterController.retryEquipmentImportXlsxJob
+);
+
 router.get(
   '/exreg/import-template',
   authMiddleware(),
