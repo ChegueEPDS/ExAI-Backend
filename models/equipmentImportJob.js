@@ -14,6 +14,9 @@ const EquipmentImportJobSchema = new mongoose.Schema(
       total: { type: Number, default: 0 },
       updatedAt: { type: Date, default: null }
     },
+    checkpoint: {
+      errors: { type: [mongoose.Schema.Types.Mixed], default: [] }
+    },
     result: {
       createdCount: { type: Number, default: 0 },
       updatedCount: { type: Number, default: 0 },

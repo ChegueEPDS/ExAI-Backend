@@ -42,6 +42,13 @@ router.post(
 );
 
 router.get(
+  '/exreg/import-xlsx-jobs/:jobId',
+  authMiddleware(),
+  requireAccess('equipment', 'create'),
+  exRegisterController.getEquipmentImportXlsxJob
+);
+
+router.get(
   '/exreg/import-template',
   authMiddleware(),
   exRegisterController.downloadEquipmentImportTemplate

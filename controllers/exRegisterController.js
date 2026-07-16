@@ -2135,6 +2135,8 @@ async function runEquipmentImportXlsxCore({
   workbookBuffer,
   originalFileName = 'equipment-import.xlsx',
   onProgress = null,
+  resumeAfter = 0,
+  initialStats = null,
 }) {
   const zone = await Zone.findOne({ _id: zoneId, tenantId }).lean();
   if (!zone) {
@@ -2339,9 +2341,14 @@ async function runEquipmentImportXlsxCore({
     }
   }
 
-  const stats = { created: 0, updated: 0, inspections: 0, errors: [] };
+  const stats = {
+    created: Math.max(0, Number(initialStats?.created) || 0),
+    updated: Math.max(0, Number(initialStats?.updated) || 0),
+    inspections: Math.max(0, Number(initialStats?.inspections) || 0),
+    errors: Array.isArray(initialStats?.errors) ? [...initialStats.errors] : []
+  };
   const totalEntries = entries.length;
-  let processedEntries = 0;
+  let processedEntries = Math.min(totalEntries, Math.max(0, Math.floor(Number(resumeAfter) || 0)));
   const updateIds = [...new Set(entries
     .map((entry) => entry.mongoId)
     .filter((id) => id && mongoose.Types.ObjectId.isValid(id)))];
@@ -2357,9 +2364,11 @@ async function runEquipmentImportXlsxCore({
   const existingEquipmentById = new Map(existingEquipments.map((equipment) => [String(equipment._id), equipment]));
   let rbSchemaPromise = null;
   let nextOrderIndex = null;
-  if (typeof onProgress === 'function') await onProgress({ processed: 0, total: totalEntries });
+  if (typeof onProgress === 'function') {
+    await onProgress({ processed: processedEntries, total: totalEntries, ...stats });
+  }
 
-  for (const entry of entries) {
+  for (const entry of entries.slice(processedEntries)) {
     try {
       const payload = { ...entry.base, Zone: zone._id, Unit: zone._id, Site: zone.Site || null };
       if (entry.orderIndex != null) payload.orderIndex = entry.orderIndex;
@@ -2466,7 +2475,7 @@ async function runEquipmentImportXlsxCore({
     } finally {
       processedEntries += 1;
       if (typeof onProgress === 'function') {
-        await onProgress({ processed: processedEntries, total: totalEntries });
+        await onProgress({ processed: processedEntries, total: totalEntries, ...stats });
       }
     }
   }
@@ -2536,6 +2545,11 @@ exports.processEquipmentImportXlsxJob = async (jobIdOrId) => {
 
   try {
     await notifyEquipmentImportXlsxStatus(String(job.userId), { jobId: job.jobId, status: 'running' });
+    console.info('[equipment-import] job started', {
+      jobId: job.jobId,
+      attempt: job.attempts,
+      resumeAfter: Number(job.progress?.processed) || 0
+    });
     const workbookBuffer = await azureBlob.downloadToBuffer(job.sourceBlobPath);
     const result = await runEquipmentImportXlsxCore({
       tenantId: String(job.tenantId),
@@ -2543,11 +2557,23 @@ exports.processEquipmentImportXlsxJob = async (jobIdOrId) => {
       zoneId: String(job.zoneId),
       workbookBuffer,
       originalFileName: job.sourceFileName || 'equipment-import.xlsx',
-      onProgress: async ({ processed, total }) => {
+      resumeAfter: Number(job.progress?.processed) || 0,
+      initialStats: {
+        created: Number(job.result?.createdCount) || 0,
+        updated: Number(job.result?.updatedCount) || 0,
+        inspections: Number(job.result?.inspectionsCreated) || 0,
+        errors: Array.isArray(job.checkpoint?.errors) ? job.checkpoint.errors : []
+      },
+      onProgress: async ({ processed, total, created, updated, inspections, errors }) => {
         job.progress = { processed, total, updatedAt: new Date() };
+        job.result.createdCount = created;
+        job.result.updatedCount = updated;
+        job.result.inspectionsCreated = inspections;
+        job.set('checkpoint.errors', Array.isArray(errors) ? errors : []);
         job.lastHeartbeatAt = new Date();
         await job.save();
         if (processed === 0 || processed === total || processed % Math.max(1, Math.floor(total / 10) || 1) === 0) {
+          console.info('[equipment-import] progress', { jobId: job.jobId, processed, total, created, updated, inspections });
           await notifyEquipmentImportXlsxStatus(String(job.userId), {
             jobId: job.jobId,
             status: 'running',
@@ -2585,7 +2611,16 @@ exports.processEquipmentImportXlsxJob = async (jobIdOrId) => {
       errorReportFileName: errorReportBlobPath ? `equipment-import-errors-${job.jobId}.xlsx` : null,
       errorReportDownloadUrl,
     };
+    job.checkpoint = { errors: [] };
     await job.save();
+
+    console.info('[equipment-import] job completed', {
+      jobId: job.jobId,
+      createdCount: result.createdCount,
+      updatedCount: result.updatedCount,
+      inspectionsCreated: result.inspectionsCreated,
+      issuesCount: result.issues.length
+    });
 
     await notifyEquipmentImportXlsxStatus(String(job.userId), {
       jobId: job.jobId,
@@ -2678,6 +2713,53 @@ exports.importEquipmentXLSX = async (req, res) => {
         console.warn('⚠️ Failed to remove uploaded XLSX file:', cleanupErr?.message || cleanupErr);
       }
     }
+  }
+};
+
+exports.getEquipmentImportXlsxJob = async (req, res) => {
+  try {
+    const tenantId = req.scope?.tenantId;
+    const userId = req.scope?.userId || req.userId;
+    if (!tenantId || !userId) return res.status(401).json({ error: 'Missing auth context.' });
+
+    const job = await EquipmentImportJob.findOne({
+      jobId: String(req.params.jobId || ''),
+      tenantId,
+      userId
+    }).lean();
+    if (!job) return res.status(404).json({ error: 'Equipment import job not found.' });
+
+    const staleMinutes = Math.max(5, Number(process.env.EQUIPMENT_IMPORT_STALE_MINUTES || 15));
+    const heartbeatAt = job.lastHeartbeatAt || job.startedAt || null;
+    const heartbeatAgeSeconds = heartbeatAt
+      ? Math.max(0, Math.floor((Date.now() - new Date(heartbeatAt).getTime()) / 1000))
+      : null;
+    const stale = job.status === 'running'
+      && heartbeatAgeSeconds != null
+      && heartbeatAgeSeconds >= staleMinutes * 60;
+    const recoveryEligibleAt = job.status === 'running' && heartbeatAt
+      ? new Date(new Date(heartbeatAt).getTime() + staleMinutes * 60 * 1000)
+      : null;
+
+    return res.json({
+      jobId: job.jobId,
+      status: job.status,
+      active: job.status === 'running' && !stale,
+      stale,
+      progress: job.progress || { processed: 0, total: 0, updatedAt: null },
+      result: job.result || null,
+      attempts: Number(job.attempts) || 0,
+      errorMessage: job.errorMessage || null,
+      lastHeartbeatAt: job.lastHeartbeatAt || null,
+      heartbeatAgeSeconds,
+      recoveryEligibleAt,
+      createdAt: job.createdAt || null,
+      startedAt: job.startedAt || null,
+      finishedAt: job.finishedAt || null
+    });
+  } catch (error) {
+    console.error('❌ Equipment import job status error:', error);
+    return res.status(500).json({ error: 'Failed to load equipment import job status.' });
   }
 };
 
