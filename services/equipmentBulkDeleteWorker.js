@@ -17,14 +17,20 @@ function getPollMs() {
 }
 
 function getStaleMinutes() {
-  const n = Number(process.env.EQUIPMENT_BULK_DELETE_STALE_MINUTES || 120);
-  return Number.isFinite(n) && n >= 15 ? Math.floor(n) : 120;
+  const n = Number(process.env.EQUIPMENT_BULK_DELETE_STALE_MINUTES || 15);
+  return Number.isFinite(n) && n >= 5 ? Math.floor(n) : 15;
 }
 
 async function recoverStaleJobs() {
   const staleBefore = new Date(Date.now() - getStaleMinutes() * 60 * 1000);
   await EquipmentBulkDeleteJob.updateMany(
-    { status: 'running', startedAt: { $lte: staleBefore } },
+    {
+      status: 'running',
+      $or: [
+        { lastHeartbeatAt: { $lte: staleBefore } },
+        { lastHeartbeatAt: null, startedAt: { $lte: staleBefore } }
+      ]
+    },
     { $set: { status: 'queued', errorMessage: `Retrying stale bulk delete job after ${getStaleMinutes()} minutes without completion.` } }
   );
 }

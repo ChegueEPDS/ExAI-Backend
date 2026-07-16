@@ -5885,7 +5885,8 @@ exports.processEquipmentBulkDeleteJob = async (jobIdOrId) => {
     for (const eqId of job.equipmentIds || []) {
       const eq = equipments.find((item) => String(item._id) === String(eqId));
       if (!eq) {
-        failures.push({ id: String(eqId), error: 'Equipment not found.' });
+        // A retried job may encounter equipment deleted before the previous worker stopped.
+        deletedCount += 1;
         processed += 1;
       } else {
         try {
