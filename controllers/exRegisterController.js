@@ -5599,6 +5599,13 @@ exports.listEquipment = async (req, res) => {
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const skipParam = parseInt(req.query.skip, 10);
     const skip = Number.isFinite(skipParam) && skipParam >= 0 ? skipParam : (page - 1) * pageSize;
+    const includeTotal = String(req.query.includeTotal ?? 'true').toLowerCase() !== 'false';
+    const countFilter = includeTotal
+      ? {
+          ...filter,
+          ...(Array.isArray(filter.$and) ? { $and: [...filter.$and] } : {})
+        }
+      : null;
     const keyset = buildEquipmentKeysetMatch({
       sortField,
       sortDir,
@@ -5610,7 +5617,6 @@ exports.listEquipment = async (req, res) => {
       else filter.$and = [keyset];
     }
 
-    const includeTotal = String(req.query.includeTotal ?? 'true').toLowerCase() !== 'false';
     const effectiveLimit = includeTotal ? pageSize : pageSize + 1;
 
     const query = Equipment.find(filter)
@@ -5622,7 +5628,7 @@ exports.listEquipment = async (req, res) => {
 
     const [rawEquipments, totalCount] = await Promise.all([
       query.lean(),
-      includeTotal ? Equipment.countDocuments(filter) : Promise.resolve(null)
+      includeTotal ? Equipment.countDocuments(countFilter) : Promise.resolve(null)
     ]);
     const hasNext = !includeTotal && rawEquipments.length > pageSize;
     const equipments = includeTotal ? rawEquipments : rawEquipments.slice(0, pageSize);
@@ -5706,7 +5712,7 @@ exports.listEquipment = async (req, res) => {
 
     return res.json({
       items: withPaths,
-      total: typeof totalCount === 'number' ? totalCount : skip + withPaths.length + (hasNext ? 1 : 0),
+      total: typeof totalCount === 'number' ? totalCount : null,
       hasNext,
       nextCursor: buildEquipmentNextCursor(equipments, sortField),
       page,
