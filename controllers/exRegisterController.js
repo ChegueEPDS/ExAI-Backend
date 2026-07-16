@@ -47,6 +47,11 @@ const SchemaDefinition = require('../models/schemaDefinition');
 const { applySchemaCycleDefaults } = require('../services/schemaCycleService');
 const { validateSchemaValues } = require('../services/schemaValidationService');
 const { scheduleDashboardStatsDirty } = require('../services/dashboardSummaryService');
+const {
+  SEARCHABLE_EQUIPMENT_FIELDS,
+  buildSearchTrigrams,
+  normalizeEquipmentSearchValue
+} = require('../helpers/equipmentSearch');
 
 const { BlobServiceClient } = require('@azure/storage-blob');
 const path = require('path');
@@ -184,19 +189,6 @@ function isInspExRequestHost(req) {
   if (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0') return true;
   return host === 'insp-ex.com' || host.endsWith('.insp-ex.com');
 }
-
-const SEARCHABLE_EQUIPMENT_FIELDS = [
-  'TagNo',
-  'EqID',
-  'Manufacturer',
-  'Model/Type',
-  'Serial Number',
-  'Equipment Type',
-  'Description',
-  'Certificate No',
-  'Compliance',
-  'Other Info'
-];
 
 const EQUIPMENT_LIST_SELECT_FIELDS = [
   'EqID',
@@ -546,6 +538,26 @@ async function convertHeicBufferIfNeeded(inputBuffer, originalName, originalMime
     );
     return { buffer: inputBuffer, name: originalName, contentType: originalMime };
   }
+}
+
+function createAsyncLimiter(concurrency) {
+  const limit = Math.max(1, Math.floor(Number(concurrency) || 1));
+  let active = 0;
+  const queue = [];
+  const release = () => {
+    active -= 1;
+    const next = queue.shift();
+    if (next) next();
+  };
+  return async (task) => {
+    if (active >= limit) await new Promise((resolve) => queue.push(resolve));
+    active += 1;
+    try {
+      return await task();
+    } finally {
+      release();
+    }
+  };
 }
 
 // 📄 XLSX sablon generálása a ZIP dokumentum-importhoz
@@ -1603,7 +1615,7 @@ exports.createEquipment = async (req, res) => {
       for (const file of equipmentFiles) {
         const originalName = file.originalname.split('__')[1] || file.originalname;
         const safeOriginal = cleanFileName(originalName);
-        const srcBuffer = fs.readFileSync(file.path);
+        const srcBuffer = await fs.promises.readFile(file.path);
         const { buffer, name: convertedName, contentType } =
           await convertHeicBufferIfNeeded(
             srcBuffer,
@@ -1624,7 +1636,7 @@ exports.createEquipment = async (req, res) => {
           uploadedAt: new Date(),
           tag: 'dataplate'
         });
-        try { fs.unlinkSync(file.path); } catch {}
+        try { await fs.promises.unlink(file.path); } catch {}
       }
 
       console.log('💾 Equipment mentésre készül:', {
@@ -1745,7 +1757,7 @@ exports.uploadImagesToEquipment = async (req, res) => {
     for (const file of files) {
       const originalName = file.originalname.split('__')[1] || file.originalname;
       const safeOriginal = cleanFileName(originalName);
-      const srcBuffer = fs.readFileSync(file.path);
+      const srcBuffer = await fs.promises.readFile(file.path);
       const { buffer, name: convertedName, contentType } =
         await convertHeicBufferIfNeeded(
           srcBuffer,
@@ -1766,7 +1778,7 @@ exports.uploadImagesToEquipment = async (req, res) => {
         uploadedAt: new Date(),
         tag: 'general'
       });
-      try { fs.unlinkSync(file.path); } catch {}
+      try { await fs.promises.unlink(file.path); } catch {}
     }
 
     equipment.Pictures = [...(equipment.Pictures || []), ...pictures];
@@ -1823,7 +1835,7 @@ exports.uploadDocumentsToEquipment = async (req, res) => {
 
     for (const file of files) {
       const safeOriginal = cleanFileName(file.originalname);
-      const srcBuffer = fs.readFileSync(file.path);
+      const srcBuffer = await fs.promises.readFile(file.path);
       const { buffer, name: convertedName, contentType } =
         await convertHeicBufferIfNeeded(
           srcBuffer,
@@ -1850,7 +1862,7 @@ exports.uploadDocumentsToEquipment = async (req, res) => {
         tag: typeValue === 'image' ? normalizeImageTag(requestedTag, 'general') : null
       });
 
-      try { fs.unlinkSync(file.path); } catch {}
+      try { await fs.promises.unlink(file.path); } catch {}
     }
 
     equipment.documents = [...(equipment.documents || []), ...docs];
@@ -2330,6 +2342,21 @@ async function runEquipmentImportXlsxCore({
   const stats = { created: 0, updated: 0, inspections: 0, errors: [] };
   const totalEntries = entries.length;
   let processedEntries = 0;
+  const updateIds = [...new Set(entries
+    .map((entry) => entry.mongoId)
+    .filter((id) => id && mongoose.Types.ObjectId.isValid(id)))];
+  const hasCustomFieldValues = entries.some((entry) => Object.keys(entry.base?.customFields || {}).length > 0);
+  const [existingEquipments, customFieldDefinitions] = await Promise.all([
+    updateIds.length
+      ? Equipment.find({ _id: { $in: updateIds }, tenantId, Zone: zone._id })
+      : [],
+    hasCustomFieldValues
+      ? CustomFieldDefinition.find({ tenantId, entityType: 'equipment', active: true }).lean()
+      : []
+  ]);
+  const existingEquipmentById = new Map(existingEquipments.map((equipment) => [String(equipment._id), equipment]));
+  let rbSchemaPromise = null;
+  let nextOrderIndex = null;
   if (typeof onProgress === 'function') await onProgress({ processed: 0, total: totalEntries });
 
   for (const entry of entries) {
@@ -2340,7 +2367,8 @@ async function runEquipmentImportXlsxCore({
         payload.customFields = await sanitizeCustomFields({
           tenantId,
           entityType: 'equipment',
-          values: payload.customFields
+          values: payload.customFields,
+          definitions: customFieldDefinitions
         });
       } else {
         delete payload.customFields;
@@ -2358,14 +2386,14 @@ async function runEquipmentImportXlsxCore({
       delete payload['Certificate No'];
       delete payload.Compliance;
       const hasRbValues = importedExMarkings.length || entry.rbCertificatePresent || entry.rbCompliancePresent;
-      const rbSchema = hasRbValues ? await ensureRbSchema() : null;
+      const rbSchema = hasRbValues ? await (rbSchemaPromise ||= ensureRbSchema()) : null;
 
       let equipmentDoc = null;
       if (entry.mongoId) {
         if (!mongoose.Types.ObjectId.isValid(entry.mongoId)) {
           throw new Error(`Invalid _id value: ${entry.mongoId}`);
         }
-        equipmentDoc = await Equipment.findOne({ _id: entry.mongoId, tenantId, Zone: zone._id });
+        equipmentDoc = existingEquipmentById.get(String(entry.mongoId)) || null;
         if (!equipmentDoc) {
           throw new Error(`Equipment with _id ${entry.mongoId} was not found in the selected zone.`);
         }
@@ -2389,6 +2417,7 @@ async function runEquipmentImportXlsxCore({
         }
         if (entry.orderIndex == null) delete updateData.orderIndex;
         equipmentDoc = await Equipment.findByIdAndUpdate(equipmentDoc._id, { $set: updateData }, { new: true });
+        existingEquipmentById.set(String(equipmentDoc._id), equipmentDoc);
         stats.updated += 1;
       }
 
@@ -2399,7 +2428,10 @@ async function runEquipmentImportXlsxCore({
         }
         if (rbSchema) ensureRbAssignment(createData, rbSchema, rbValues, userId);
         if (createData.orderIndex == null) {
-          createData.orderIndex = await getNextOrderIndex(tenantId, createData.Site || null, createData.Zone || null);
+          if (nextOrderIndex == null) {
+            nextOrderIndex = await getNextOrderIndex(tenantId, createData.Site || null, createData.Zone || null);
+          }
+          createData.orderIndex = nextOrderIndex++;
         }
         equipmentDoc = await Equipment.create(createData);
         stats.created += 1;
@@ -2642,7 +2674,7 @@ exports.importEquipmentXLSX = async (req, res) => {
     return res.status(500).json({ message: 'Failed to queue XLSX import.', error: error.message || String(error) });
   } finally {
     if (uploadedFile?.path) {
-      try { fs.unlinkSync(uploadedFile.path); } catch (cleanupErr) {
+      try { await fs.promises.unlink(uploadedFile.path); } catch (cleanupErr) {
         console.warn('⚠️ Failed to remove uploaded XLSX file:', cleanupErr?.message || cleanupErr);
       }
     }
@@ -2897,13 +2929,18 @@ async function runEquipmentDocumentsZipImportJob({
       ? Math.max(1, Math.floor(totalPlannedDocuments / PROGRESS_STEP_COUNT))
       : 0;
 
-    for (const [equipmentId, items] of docsByEquipment.entries()) {
-      const eqFilter = { _id: equipmentId, tenantId: tenantObjectId };
-      if (zoneObjectId) {
-        Object.assign(eqFilter, { $or: [{ Unit: zoneObjectId }, { Zone: zoneObjectId }] });
-      }
+    const equipmentIds = [...docsByEquipment.keys()].filter((id) => mongoose.Types.ObjectId.isValid(id));
+    const equipmentFilter = { _id: { $in: equipmentIds }, tenantId: tenantObjectId };
+    if (zoneObjectId) {
+      equipmentFilter.$or = [{ Unit: zoneObjectId }, { Zone: zoneObjectId }];
+    }
+    const equipments = equipmentIds.length ? await Equipment.find(equipmentFilter) : [];
+    const equipmentById = new Map(equipments.map((equipment) => [String(equipment._id), equipment]));
+    const blobConcurrency = Math.min(6, Math.max(1, Number(process.env.EQUIPMENT_IMPORT_BLOB_CONCURRENCY) || 3));
+    const limitHeic = createAsyncLimiter(Math.min(2, Math.max(1, Number(process.env.EQUIPMENT_IMPORT_HEIC_CONCURRENCY) || 1)));
 
-      const equipment = await Equipment.findOne(eqFilter);
+    for (const [equipmentId, items] of docsByEquipment.entries()) {
+      const equipment = equipmentById.get(String(equipmentId)) || null;
       if (!equipment) {
         const baseMsg = `Equipment ${equipmentId} not found for this tenant${zoneObjectId ? ' or does not belong to this zone' : ''}. Skipping its rows.`;
         const relatedRows = Array.isArray(items) ? items.map(it => it.rowNumber).filter(Boolean) : [];
@@ -2935,8 +2972,7 @@ async function runEquipmentDocumentsZipImportJob({
         equipment.EqID || equipment._id.toString()
       );
 
-      const docs = [];
-      for (const item of items) {
+      const processItem = async (item) => {
         try {
           const rawName = cleanFileName(path.posix.basename(item.fileName));
           const srcBuf = await item.entry.buffer();
@@ -2944,8 +2980,11 @@ async function runEquipmentDocumentsZipImportJob({
             mime.lookup(rawName) ||
             (item.type === 'image' ? 'image/jpeg' : 'application/octet-stream');
 
-          const { buffer, name: convertedName, contentType } =
-            await convertHeicBufferIfNeeded(srcBuf, rawName, inferredMime);
+          const isHeic = /\.(heic|heif)$/i.test(rawName) || /image\/hei[cf]/i.test(String(inferredMime));
+          const conversion = () => convertHeicBufferIfNeeded(srcBuf, rawName, inferredMime);
+          const { buffer, name: convertedName, contentType } = isHeic
+            ? await limitHeic(conversion)
+            : await conversion();
 
           const cleanName = convertedName;
           const aliasFromXlsx = (item.docAlias || '').trim();
@@ -2954,7 +2993,7 @@ async function runEquipmentDocumentsZipImportJob({
 
           await azureBlob.uploadBuffer(blobPath, buffer, guessedType);
 
-          docs.push({
+          return {
             name: cleanName,
             alias: item.type === 'document' && aliasFromXlsx
               ? aliasFromXlsx
@@ -2966,33 +3005,39 @@ async function runEquipmentDocumentsZipImportJob({
             size: buffer.length,
             uploadedAt: new Date(),
             tag: item.type === 'image' ? item.imageTag : null
-          });
+          };
         } catch (e) {
           issues.push({
             row: item.rowNumber || null,
             column: 4,
             message: `Equipment ${equipmentId}, file "${item.fileName}": ${e?.message || 'upload failed'}`
           });
-        }
-
-        // progress frissítés
-        processedDocuments += 1;
-        if (progressStep > 0 &&
-          (processedDocuments === totalPlannedDocuments ||
-            processedDocuments === 1 ||
-            processedDocuments % progressStep === 0)
-        ) {
-          try {
-            await notifyEquipmentImportStatus(userId, {
-              jobId,
-              status: 'running',
-              processed: processedDocuments,
-              total: totalPlannedDocuments
-            });
-          } catch (notifyErr) {
-            console.warn('⚠️ Failed to push running status notification for equipment import', notifyErr?.message || notifyErr);
+          return null;
+        } finally {
+          processedDocuments += 1;
+          if (progressStep > 0 &&
+            (processedDocuments === totalPlannedDocuments ||
+              processedDocuments === 1 ||
+              processedDocuments % progressStep === 0)
+          ) {
+            try {
+              await notifyEquipmentImportStatus(userId, {
+                jobId,
+                status: 'running',
+                processed: processedDocuments,
+                total: totalPlannedDocuments
+              });
+            } catch (notifyErr) {
+              console.warn('⚠️ Failed to push running status notification for equipment import', notifyErr?.message || notifyErr);
+            }
           }
         }
+      };
+
+      const docs = [];
+      for (let offset = 0; offset < items.length; offset += blobConcurrency) {
+        const batch = await Promise.all(items.slice(offset, offset + blobConcurrency).map(processItem));
+        docs.push(...batch.filter(Boolean));
       }
 
       if (docs.length) {
@@ -3105,7 +3150,7 @@ async function runEquipmentDocumentsZipImportJob({
   } finally {
     if (zipPath) {
       try {
-        fs.unlinkSync(zipPath);
+        await fs.promises.unlink(zipPath);
       } catch (cleanupErr) {
         console.warn('⚠️ Failed to remove uploaded ZIP file:', cleanupErr?.message || cleanupErr);
       }
@@ -5152,9 +5197,19 @@ exports.listEquipment = async (req, res) => {
     }
 
     if (searchTerm) {
-      const regex = new RegExp(escapeRegex(searchTerm), 'i');
-      const searchConditions = SEARCHABLE_EQUIPMENT_FIELDS.map(field => ({ [field]: regex }));
-      andConditions.push({ $or: searchConditions });
+      const normalizedSearch = normalizeEquipmentSearchValue(searchTerm);
+      const useNormalizedSearch = String(process.env.EQUIPMENT_NORMALIZED_SEARCH_ENABLED || 'false').toLowerCase() === 'true'
+        && normalizedSearch.length >= 3;
+      if (useNormalizedSearch) {
+        andConditions.push({
+          searchTrigrams: { $all: buildSearchTrigrams(normalizedSearch) },
+          searchNormalized: new RegExp(escapeRegex(normalizedSearch))
+        });
+      } else {
+        const regex = new RegExp(escapeRegex(searchTerm), 'i');
+        const searchConditions = SEARCHABLE_EQUIPMENT_FIELDS.map(field => ({ [field]: regex }));
+        andConditions.push({ $or: searchConditions });
+      }
     }
 
     if (andConditions.length === 1) {
@@ -5469,7 +5524,7 @@ exports.updateEquipment = async (req, res) => {
           size: file.size,
           uploadedAt: new Date()
         });
-        try { fs.unlinkSync(file.path); } catch {}
+        try { await fs.promises.unlink(file.path); } catch {}
       }
       updatedEquipment.Pictures = [...(updatedEquipment.Pictures || []), ...pictures];
       await updatedEquipment.save();

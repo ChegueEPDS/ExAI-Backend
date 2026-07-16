@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { SEARCHABLE_EQUIPMENT_FIELDS, buildEquipmentSearchFields } = require('../helpers/equipmentSearch');
 
 const SchemaAssignmentSchema = new mongoose.Schema(
   {
@@ -101,7 +102,9 @@ const EquipmentSchema = new mongoose.Schema({
   schemaAssignments: {
     type: [SchemaAssignmentSchema],
     default: []
-  }
+  },
+  searchNormalized: { type: String, default: '' },
+  searchTrigrams: { type: [String], default: [] }
 }, { timestamps: true }); // ⏳ Timestamps (createdAt, updatedAt)
 
 // Lookup helper for mobile sync retries (not unique to avoid migration issues if old duplicates exist).
@@ -116,6 +119,7 @@ EquipmentSchema.index({ tenantId: 1, Manufacturer: 1, 'Serial Number': 1, Qualit
 EquipmentSchema.index({ tenantId: 1, isProcessed: 1, lastInspectionStatus: 1, lastInspectionValidUntil: 1, _id: 1 });
 EquipmentSchema.index({ tenantId: 1, Site: 1, isProcessed: 1, lastInspectionStatus: 1, lastInspectionValidUntil: 1, _id: 1 });
 EquipmentSchema.index({ tenantId: 1, 'schemaAssignments.values.nextInspectionDate': 1, _id: 1 });
+EquipmentSchema.index({ tenantId: 1, searchTrigrams: 1 }, { name: 'tenant_search_trigrams' });
 
 const DASHBOARD_SUMMARY_RELEVANT_PATHS = [
     'tenantId',
@@ -180,6 +184,12 @@ EquipmentSchema.pre('save', async function (next) {
             this.Unit = this.Zone;
         }
 
+        if (this.isNew || SEARCHABLE_EQUIPMENT_FIELDS.some((path) => this.isModified(path))) {
+            const searchFields = buildEquipmentSearchFields(this);
+            this.searchNormalized = searchFields.searchNormalized;
+            this.searchTrigrams = searchFields.searchTrigrams;
+        }
+
         const user = await mongoose.model('User').findById(this.CreatedBy).select('company tenantId');
         if (!user) {
             return next(new Error('Invalid CreatedBy user.'));
@@ -211,6 +221,26 @@ EquipmentSchema.pre('findOneAndUpdate', async function (next) {
 
     if (update.$set && update.$set.Zone && !update.$set.Unit) {
         update.$set.Unit = update.$set.Zone;
+    }
+
+    const searchableChanged = SEARCHABLE_EQUIPMENT_FIELDS.some((path) =>
+        Object.prototype.hasOwnProperty.call(update.$set || {}, path) ||
+        Object.prototype.hasOwnProperty.call(update.$unset || {}, path) ||
+        Object.prototype.hasOwnProperty.call(update, path)
+    );
+    if (searchableChanged) {
+        const current = await this.model.findOne(this.getQuery()).select(SEARCHABLE_EQUIPMENT_FIELDS.join(' ')).lean();
+        if (current) {
+            const merged = { ...current, ...(update.$set || {}) };
+            for (const path of Object.keys(update.$unset || {})) delete merged[path];
+            for (const path of SEARCHABLE_EQUIPMENT_FIELDS) {
+                if (Object.prototype.hasOwnProperty.call(update, path)) merged[path] = update[path];
+            }
+            const searchFields = buildEquipmentSearchFields(merged);
+            update.$set = update.$set || {};
+            update.$set.searchNormalized = searchFields.searchNormalized;
+            update.$set.searchTrigrams = searchFields.searchTrigrams;
+        }
     }
 
     if (update.$set && update.$set.ModifiedBy) {

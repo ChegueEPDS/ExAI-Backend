@@ -33,6 +33,7 @@ const {
   zoneView
 } = require('../services/rbSchemaValueService');
 const { convertXlsxBufferToPdfBuffer } = require('../services/xlsxPdfService');
+const { withLock } = require('../services/distributedLockService');
 
 const EXCEL_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const PDF_CONTENT_TYPE = 'application/pdf';
@@ -3165,9 +3166,10 @@ const reportJobQueue = [];
 const queuedReportJobIds = new Set();
 let activeReportJobs = 0;
 let reportWorkerTimer = null;
-let reportWorkerInitialTimer = null;
 let reportWorkerRunning = false;
 let reportWorkerStopping = false;
+let reportWorkerEmptyPolls = 0;
+let reportWorkerLastStaleRecoveryAt = 0;
 
 function reportBackgroundJobsDisabled() {
   return (
@@ -3183,8 +3185,13 @@ function getReportJobConcurrency() {
 }
 
 function getReportJobPollMs() {
-  const n = Number(process.env.REPORT_EXPORT_WORKER_POLL_MS || 10000);
-  return Number.isFinite(n) && n >= 1000 ? Math.min(Math.floor(n), 60000) : 10000;
+  const n = Number(process.env.REPORT_EXPORT_WORKER_POLL_MS || 5000);
+  return Number.isFinite(n) && n >= 1000 ? Math.min(Math.floor(n), 60000) : 5000;
+}
+
+function getReportStaleRecoveryMs() {
+  const n = Number(process.env.REPORT_EXPORT_STALE_RECOVERY_MS || 5 * 60 * 1000);
+  return Number.isFinite(n) && n >= 60_000 ? Math.min(Math.floor(n), 60 * 60 * 1000) : 5 * 60 * 1000;
 }
 
 function getReportJobStaleMinutes() {
@@ -3274,41 +3281,66 @@ async function enqueueQueuedReportJobs(limit = 25) {
     .limit(limit)
     .lean();
   for (const job of jobs || []) scheduleReportJob(job);
+  return jobs.length;
 }
 
 async function pollReportExportJobs() {
-  if (reportWorkerRunning) return;
+  if (reportWorkerRunning) return false;
   reportWorkerRunning = true;
   try {
-    await recoverStaleReportJobs();
-    await enqueueQueuedReportJobs();
+    if (Date.now() - reportWorkerLastStaleRecoveryAt >= getReportStaleRecoveryMs()) {
+      await recoverStaleReportJobs();
+      reportWorkerLastStaleRecoveryAt = Date.now();
+    }
+    const queued = await enqueueQueuedReportJobs();
+    return queued > 0;
   } catch (err) {
     console.warn('⚠️ Report export worker poll failed', err?.message || err);
+    return false;
   } finally {
     reportWorkerRunning = false;
   }
+}
+
+function scheduleNextReportPoll(baseMs, delayMs = baseMs) {
+  if (reportWorkerStopping) return;
+  reportWorkerTimer = setTimeout(async () => {
+    reportWorkerTimer = null;
+    try {
+      const didWork = await withLock(
+        'worker:report-export:poll',
+        Math.max(baseMs * 4, 60_000),
+        pollReportExportJobs
+      );
+      reportWorkerEmptyPolls = didWork ? 0 : Math.min(reportWorkerEmptyPolls + 1, 2);
+    } catch (err) {
+      reportWorkerEmptyPolls = Math.min(reportWorkerEmptyPolls + 1, 2);
+      console.warn('⚠️ Report export worker lock failed', err?.message || err);
+    }
+    const nextDelay = reportWorkerEmptyPolls === 0
+      ? baseMs
+      : reportWorkerEmptyPolls === 1
+        ? Math.max(baseMs, 10_000)
+        : Math.max(baseMs, 30_000);
+    scheduleNextReportPoll(baseMs, nextDelay);
+  }, delayMs);
+  if (typeof reportWorkerTimer.unref === 'function') reportWorkerTimer.unref();
 }
 
 function startReportExportWorker() {
   if (reportBackgroundJobsDisabled()) return;
   if (reportWorkerTimer) return;
   reportWorkerStopping = false;
-  reportWorkerInitialTimer = setTimeout(() => pollReportExportJobs().catch(() => {}), 1500);
-  if (typeof reportWorkerInitialTimer.unref === 'function') reportWorkerInitialTimer.unref();
-  reportWorkerTimer = setInterval(() => {
-    pollReportExportJobs().catch(() => {});
-  }, getReportJobPollMs());
-  if (typeof reportWorkerTimer.unref === 'function') reportWorkerTimer.unref();
+  reportWorkerEmptyPolls = 0;
+  scheduleNextReportPoll(getReportJobPollMs(), 1500);
 }
 
 exports.startReportExportWorker = startReportExportWorker;
 
 async function stopReportExportWorker({ drainTimeoutMs = 120_000 } = {}) {
   reportWorkerStopping = true;
-  if (reportWorkerTimer) clearInterval(reportWorkerTimer);
-  if (reportWorkerInitialTimer) clearTimeout(reportWorkerInitialTimer);
+  if (reportWorkerTimer) clearTimeout(reportWorkerTimer);
   reportWorkerTimer = null;
-  reportWorkerInitialTimer = null;
   reportJobQueue.length = 0;
   queuedReportJobIds.clear();
   const deadline = Date.now() + Math.max(0, Number(drainTimeoutMs) || 0);

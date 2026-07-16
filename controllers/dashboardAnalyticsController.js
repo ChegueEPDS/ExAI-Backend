@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const Equipment = require('../models/dataplate');
+const Site = require('../models/site');
 const Unit = require('../models/unit');
 const MaintenanceEvent = require('../models/maintenanceEvent');
 const { computeDashboardAnalytics } = require('../services/dashboardAnalyticsService');
@@ -139,6 +140,23 @@ function toDrilldownItem(eq, status) {
   };
 }
 
+async function populateDrilldownLocations(equipments) {
+  const siteIds = [...new Set((equipments || []).map((eq) => eq?.Site).filter(Boolean).map(String))];
+  const unitIds = [...new Set((equipments || []).flatMap((eq) => [eq?.Unit, eq?.Zone]).filter(Boolean).map(String))];
+  const [sites, units] = await Promise.all([
+    siteIds.length ? Site.find({ _id: { $in: siteIds } }).select('_id Name').lean() : [],
+    unitIds.length ? Unit.find({ _id: { $in: unitIds } }).select('_id Name').lean() : []
+  ]);
+  const siteMap = new Map((sites || []).map((site) => [String(site._id), site]));
+  const unitMap = new Map((units || []).map((unit) => [String(unit._id), unit]));
+  return (equipments || []).map((eq) => ({
+    ...eq,
+    Site: eq.Site ? (siteMap.get(String(eq.Site)) || eq.Site) : null,
+    Unit: eq.Unit ? (unitMap.get(String(eq.Unit)) || eq.Unit) : null,
+    Zone: eq.Zone ? (unitMap.get(String(eq.Zone)) || eq.Zone) : null
+  }));
+}
+
 exports.getDashboardEquipmentDrilldown = async (req, res) => {
   try {
     const tenantId = req.scope?.tenantId;
@@ -150,14 +168,13 @@ exports.getDashboardEquipmentDrilldown = async (req, res) => {
     const category = String(req.query.category || '').trim();
     const bucket = normalizeBucket(req.query.bucket);
     const schemaId = req.query.schemaId ? String(req.query.schemaId) : null;
+    const page = Math.max(1, Math.floor(Number(req.query.page) || 1));
+    const pageSize = Math.min(200, Math.max(1, Math.floor(Number(req.query.pageSize) || 100)));
     if (!category || !bucket) return res.status(400).json({ message: 'category and bucket are required.' });
 
     const { filter, tenantObjectId } = await buildEquipmentScopeFilter({ tenantId, siteId, zoneId });
     const equipments = await Equipment.find(filter)
       .select('_id EqID TagNo Site Unit Zone operationalStatus lastInspectionStatus schemaAssignments')
-      .populate({ path: 'Site', select: 'Name', options: { lean: true } })
-      .populate({ path: 'Unit', select: 'Name', options: { lean: true } })
-      .populate({ path: 'Zone', select: 'Name', options: { lean: true } })
       .sort({ TagNo: 1, EqID: 1, _id: 1 })
       .lean();
 
@@ -172,7 +189,7 @@ exports.getDashboardEquipmentDrilldown = async (req, res) => {
       schemaSets = maintenanceSchemaIdSets(schemas);
     }
 
-    const items = [];
+    const matching = [];
     for (const eq of equipments || []) {
       const id = eq?._id ? String(eq._id) : '';
       if (!id) continue;
@@ -209,10 +226,16 @@ exports.getDashboardEquipmentDrilldown = async (req, res) => {
               : 'failed';
       }
 
-      if (status === bucket) items.push(toDrilldownItem(eq, status));
+      if (status === bucket) matching.push({ eq, status });
     }
 
-    return res.json({ category, bucket, schemaId, count: items.length, items });
+    const total = matching.length;
+    const offset = (page - 1) * pageSize;
+    const pageMatches = matching.slice(offset, offset + pageSize);
+    const populated = await populateDrilldownLocations(pageMatches.map((entry) => entry.eq));
+    const items = populated.map((eq, index) => toDrilldownItem(eq, pageMatches[index].status));
+
+    return res.json({ category, bucket, schemaId, count: total, total, page, pageSize, items });
   } catch (error) {
     console.error('❌ getDashboardEquipmentDrilldown error:', error);
     return res.status(500).json({ message: 'Failed to fetch dashboard equipment drilldown.' });

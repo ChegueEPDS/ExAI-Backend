@@ -139,16 +139,18 @@ function coerceValue(def, value) {
   return String(value ?? '');
 }
 
-async function sanitizeCustomFields({ tenantId, entityType, values }) {
+async function sanitizeCustomFields({ tenantId, entityType, values, definitions = null }) {
   assertEntityType(entityType);
   const tenantObjectId = toObjectId(tenantId);
   if (!tenantObjectId || !values || typeof values !== 'object' || Array.isArray(values)) return {};
 
-  const defs = await CustomFieldDefinition.find({
-    tenantId: tenantObjectId,
-    entityType,
-    active: true
-  }).lean();
+  const defs = Array.isArray(definitions)
+    ? definitions
+    : await CustomFieldDefinition.find({
+      tenantId: tenantObjectId,
+      entityType,
+      active: true
+    }).lean();
   const byKey = new Map(defs.map((d) => [String(d.key), d]));
   const out = {};
   Object.keys(values).forEach((key) => {

@@ -134,72 +134,76 @@ async function prepareResponseCsrfToken(req, result = null) {
   return csrfToken;
 }
 
-async function getTenantMeta(tenantId) {
-  if (!tenantId) return { name: null, type: null, professionRbacEnabled: false };
-  const t = await Tenant.findById(tenantId).lean().select('name type features professionRbacEnabled plan seats seatsManaged');
-  return t
-    ? {
-        name: t.name || null,
-        type: t.type || null,
-        professionRbacEnabled: Boolean(t.professionRbacEnabled),
-        tenant: t,
-      }
-    : { name: null, type: null, professionRbacEnabled: false, tenant: null };
-}
+async function getTenantSnapshot(tenantId) {
+  if (!tenantId) return { meta: { name: null, type: null, professionRbacEnabled: false, tenant: null }, subscription: null };
 
-async function getSubscriptionSnapshot(tenantId) {
-  if (!tenantId) return null;
+  const tenant = await Tenant.findById(tenantId)
+    .lean()
+    .select('name type features professionRbacEnabled plan seats seatsManaged stripeCustomerId stripeSubscriptionId');
+  if (!tenant) {
+    return {
+      meta: { name: null, type: null, professionRbacEnabled: false, tenant: null },
+      subscription: null,
+    };
+  }
 
-  const t = await Tenant.findById(tenantId).lean().select(
-    'name type plan seats seatsManaged stripeCustomerId stripeSubscriptionId'
-  );
-  if (!t) return null;
+  const meta = {
+    name: tenant.name || null,
+    type: tenant.type || null,
+    professionRbacEnabled: Boolean(tenant.professionRbacEnabled),
+    tenant,
+  };
 
   const base = {
-    tenantName: t.name || null,
-    tenantType: t.type || null,
-    plan: t.plan || 'free',
+    tenantName: tenant.name || null,
+    tenantType: tenant.type || null,
+    plan: tenant.plan || 'free',
     seats: {
-      max: t.seats?.max ?? 0,
-      used: t.seats?.used ?? 0,
+      max: tenant.seats?.max ?? 0,
+      used: tenant.seats?.used ?? 0,
     },
-    seatsManaged: t.seatsManaged || 'stripe',
+    seatsManaged: tenant.seatsManaged || 'stripe',
   };
 
   const sub = await Subscription.findOne({ tenantId }).lean().select('tier status seatsPurchased updatedAt');
   if (!sub) {
     return {
-      ...base,
-      tier: base.plan,
-      status: 'active',
-      seatsPurchased: base.seats?.max || 0,
-      lastUpdate: null,
-      flags: {
-        isFree: base.plan === 'free',
-        isPro: base.plan === 'pro',
-        isTeam: base.plan === 'team',
+      meta,
+      subscription: {
+        ...base,
+        tier: base.plan,
+        status: 'active',
+        seatsPurchased: base.seats?.max || 0,
+        lastUpdate: null,
+        flags: {
+          isFree: base.plan === 'free',
+          isPro: base.plan === 'pro',
+          isTeam: base.plan === 'team',
+        },
       },
     };
   }
 
   return {
-    ...base,
-    tier: sub.tier,
-    status: sub.status,
-    seatsPurchased: sub.seatsPurchased || 0,
-    lastUpdate: sub.updatedAt || null,
-    flags: {
-      isFree: sub.tier === 'free',
-      isPro: sub.tier === 'pro',
-      isTeam: sub.tier === 'team',
+    meta,
+    subscription: {
+      ...base,
+      tier: sub.tier,
+      status: sub.status,
+      seatsPurchased: sub.seatsPurchased || 0,
+      lastUpdate: sub.updatedAt || null,
+      flags: {
+        isFree: sub.tier === 'free',
+        isPro: sub.tier === 'pro',
+        isTeam: sub.tier === 'team',
+      },
     },
   };
 }
 
 async function buildUserContext(user, session = null) {
   const tenantId = String(user.tenantId || session?.tenantId || '');
-  const meta = await getTenantMeta(tenantId);
-  const subscription = await getSubscriptionSnapshot(tenantId);
+  const { meta, subscription } = await getTenantSnapshot(tenantId);
   const tenantFeatures = tenantAccessService.normalizeTenantFeatures(meta.tenant || meta);
   const professionRbacEnabled = Boolean(tenantFeatures.professionRbac);
   const effectiveProfessions = professionRbacEnabled
@@ -218,7 +222,7 @@ async function buildUserContext(user, session = null) {
       professions: effectiveProfessions,
       permissions,
     });
-    permissions = await tenantAccessService.getPermissionStrings({
+    permissions = tenantAccessService.getPermissionStringsFromContext(accessCtx, {
       id: String(user._id),
       userId: String(user._id),
       role: user.role,
@@ -270,8 +274,8 @@ async function buildUserContext(user, session = null) {
   };
 }
 
-async function signAccessToken(user, session) {
-  const ctx = await buildUserContext(user, session);
+async function signAccessToken(user, session, userContext = null) {
+  const ctx = userContext || (await buildUserContext(user, session));
   const payload = {
     sub: ctx.userId,
     userId: ctx.userId,
@@ -333,8 +337,8 @@ async function createSession({ user, clientType, req }) {
     userAgent: String(req?.headers?.['user-agent'] || '').slice(0, 500),
     ip: String(req?.ip || req?.connection?.remoteAddress || ''),
   });
-  const accessToken = await signAccessToken(user, session);
   const userContext = await buildUserContext(user, session);
+  const accessToken = await signAccessToken(user, session, userContext);
   return {
     session,
     accessToken,
@@ -377,8 +381,8 @@ async function rotateRefreshToken({ refreshToken, req }) {
     if (csrfToken && session.isModified?.('csrfToken')) {
       await session.save();
     }
-    const accessToken = await signAccessToken(user, session);
     const userContext = await buildUserContext(user, session);
+    const accessToken = await signAccessToken(user, session, userContext);
     return {
       session,
       accessToken,
@@ -431,8 +435,8 @@ async function rotateRefreshToken({ refreshToken, req }) {
   if (csrfToken && updated.isModified?.('csrfToken')) {
     await updated.save();
   }
-  const accessToken = await signAccessToken(user, updated);
   const userContext = await buildUserContext(user, updated);
+  const accessToken = await signAccessToken(user, updated, userContext);
   return {
     session: updated,
     accessToken,

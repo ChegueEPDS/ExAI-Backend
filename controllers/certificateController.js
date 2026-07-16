@@ -647,17 +647,7 @@ exports.getPublicCertificatesPaged = async (req, res) => {
 
     const project = buildProjectFromFields(req.query.fields);
 
-    // --- NEW: prefetch adopted ids for this tenant (no large lookup in pipeline) ---
-    let adoptedIds = [];
-    if (tenantObjectId) {
-      const links = await CompanyCertificateLink
-        .find({ tenantId: tenantObjectId })
-        .select('certId')
-        .lean();
-      adoptedIds = links.map(l => l.certId);
-    }
-
-    // Aggregate with pagination first; then compute adoptedByMe on the N page items.
+    // Page certificates first. Tenant links are fetched only for the returned ids below.
     const pipeline = [
       { $match: match },
       { $sort: sort },
@@ -666,10 +656,7 @@ exports.getPublicCertificatesPaged = async (req, res) => {
           items: [
             ...(keyset ? [] : [{ $skip: (page - 1) * pageSize }]),
             { $limit: pageSize },
-            // adoptedByMe computed without $lookup
-            ...(tenantObjectId
-              ? [{ $addFields: { adoptedByMe: { $in: ['$_id', adoptedIds] } } }]
-              : [{ $addFields: { adoptedByMe: false } }]),
+            { $addFields: { adoptedByMe: false } },
             { $project: project }
           ],
           total: [{ $count: 'count' }]
@@ -690,6 +677,14 @@ exports.getPublicCertificatesPaged = async (req, res) => {
 
     const [agg] = await aggCursor.exec();
     const items = agg?.items || [];
+    if (tenantObjectId && items.length) {
+      const links = await CompanyCertificateLink.find({
+        tenantId: tenantObjectId,
+        certId: { $in: items.map((item) => item._id) }
+      }).select('certId').lean();
+      const adoptedIds = new Set(links.map((link) => String(link.certId)));
+      for (const item of items) item.adoptedByMe = adoptedIds.has(String(item._id));
+    }
     const total = keyset ? null : (agg?.total?.[0]?.count || 0);
 
     return res.json({ items, total, page, pageSize, nextCursor: encodeNextCursor(items, key), hasNext: items.length === pageSize });
@@ -721,8 +716,6 @@ exports.getMyCertificatesPaged = async (req, res) => {
       equipment:    (req.query.equipment || '').trim(),
     };
 
-    const links  = await CompanyCertificateLink.find({ tenantId: tenantObjectId }).select('certId').lean();
-    const adoptedIds = links.map(l => l.certId);
     const ownMatch = { tenantId: tenantObjectId };
     const adoptedMatch = { visibility: 'public' };
     const certRegex = buildLooseCertNoRegex(f.certNo);
@@ -749,15 +742,26 @@ exports.getMyCertificatesPaged = async (req, res) => {
     });
 
     const pipeline = [
-      { $match: ownMatch },
-      { $addFields: { adoptedByMe: { $and: [ { $eq: ['$visibility', 'public'] }, { $in: ['$_id', adoptedIds] } ] } } },
+      { $match: { tenantId: tenantObjectId } },
+      {
+        $lookup: {
+          from: 'certificates',
+          localField: 'certId',
+          foreignField: '_id',
+          as: 'certificate'
+        }
+      },
+      { $unwind: '$certificate' },
+      { $replaceRoot: { newRoot: '$certificate' } },
+      { $match: adoptedMatch },
+      { $addFields: { adoptedByMe: true } },
       { $project: project },
       {
         $unionWith: {
           coll: 'certificates',
           pipeline: [
-            { $match: { _id: { $in: adoptedIds }, ...adoptedMatch } },
-            { $addFields: { adoptedByMe: true } },
+            { $match: ownMatch },
+            { $addFields: { adoptedByMe: false } },
             { $project: project }
           ]
         }
@@ -784,7 +788,7 @@ exports.getMyCertificatesPaged = async (req, res) => {
       }
     ];
 
-    const [agg] = await Certificate.aggregate(pipeline).option({ maxTimeMS: maxTimeMsFromEnv('CERTIFICATE_QUERY_MAX_TIME_MS', 10_000) });
+    const [agg] = await CompanyCertificateLink.aggregate(pipeline).option({ maxTimeMS: maxTimeMsFromEnv('CERTIFICATE_QUERY_MAX_TIME_MS', 10_000) });
     const items = agg?.items || [];
     const total = keyset ? null : (agg?.total?.[0]?.count || 0);
 

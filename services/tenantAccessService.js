@@ -6,6 +6,7 @@ const TenantAccessGroupMembership = require('../models/tenantAccessGroupMembersh
 const { computePermissions, hasAnyPermission } = require('../helpers/rbac');
 
 const FEATURE_KEYS = Object.freeze(['maintenance', 'professionRbac', 'groupRbac', 'customFields', 'customSchemas', 'documentation']);
+const REQUEST_ACCESS_CONTEXT = Symbol('requestAccessContext');
 
 function toObjectId(value) {
   if (!value) return null;
@@ -126,7 +127,7 @@ async function getUserGroups({ tenantId, userId }) {
   return TenantAccessGroup.find({ tenantId: t, _id: { $in: groupIds }, active: true }).lean();
 }
 
-async function getAccessContext(reqOrUser) {
+async function loadAccessContext(reqOrUser) {
   const user = reqOrUser?.user || reqOrUser || {};
   const scope = reqOrUser?.scope || {};
   const tenantId = scope.tenantId || user.tenantId;
@@ -185,6 +186,25 @@ async function getAccessContext(reqOrUser) {
   };
 }
 
+function isHttpRequest(value) {
+  return Boolean(value && typeof value === 'object' && value.headers && value.method && (value.user || value.scope));
+}
+
+async function getAccessContext(reqOrUser) {
+  if (!isHttpRequest(reqOrUser)) return loadAccessContext(reqOrUser);
+  if (reqOrUser[REQUEST_ACCESS_CONTEXT]) return reqOrUser[REQUEST_ACCESS_CONTEXT];
+
+  const pending = loadAccessContext(reqOrUser).catch((err) => {
+    delete reqOrUser[REQUEST_ACCESS_CONTEXT];
+    throw err;
+  });
+  Object.defineProperty(reqOrUser, REQUEST_ACCESS_CONTEXT, {
+    value: pending,
+    configurable: true,
+  });
+  return pending;
+}
+
 async function can(reqOrUser, resource, action) {
   const ctx = await getAccessContext(reqOrUser);
   if (ctx.isBypass) return true;
@@ -201,6 +221,10 @@ async function can(reqOrUser, resource, action) {
 
 async function getPermissionStrings(reqOrUser) {
   const ctx = await getAccessContext(reqOrUser);
+  return getPermissionStringsFromContext(ctx, reqOrUser);
+}
+
+function getPermissionStringsFromContext(ctx, reqOrUser) {
   if (ctx.isBypass) return ['*:*'];
   if (!ctx.groupRbacEnabled) {
     const user = reqOrUser?.user || reqOrUser || {};
@@ -319,4 +343,5 @@ module.exports = {
   isZoneAllowed,
   legacyPermissionFor,
   getPermissionStrings,
+  getPermissionStringsFromContext,
 };
