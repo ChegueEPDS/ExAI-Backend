@@ -1,9 +1,10 @@
 const mongoose = require('mongoose');
 const QuestionTypeMapping = require('../models/questionTypeMapping');
+const SchemaExtension = require('../models/schemaExtension');
 const { buildCertificateCacheForTenant, resolveCertificateFromCache } = require('../helpers/certificateMatchHelper');
 const { KNOWN_SET_LOWER, normalizeProtectionMethodTypes } = require('../helpers/protectionTypes');
 const { certificateNo, protectionText } = require('./rbSchemaValueService');
-const { loadLegacyRbQuestions } = require('./schemaSeedService');
+const { ensureRbSchema, loadLegacyRbQuestions } = require('./schemaSeedService');
 
 function deriveQuestionReference(input = {}) {
   const explicit = String(input.reference || '').trim();
@@ -76,7 +77,21 @@ async function buildSpecialConditionResult(equipmentDoc, tenantId) {
 
 async function generateInspectionResultsForEquipment({ equipmentDoc, tenantId, inspectionType }) {
   const protections = extractProtectionTokens(equipmentDoc);
-  const questions = (await loadLegacyRbQuestions())
+  const rbSchema = await ensureRbSchema();
+  const [baseQuestions, extension] = await Promise.all([
+    loadLegacyRbQuestions(),
+    SchemaExtension.findOne({ tenantId, schemaId: rbSchema._id }).lean()
+  ]);
+  const tenantQuestions = (extension?.extraQuestions || [])
+    .filter((question) => question?.active !== false)
+    .map((question) => ({
+      ...question,
+      equipmentType: question.equipmentType || question.group || 'General',
+      protectionTypes: Array.isArray(question.protectionTypes) ? question.protectionTypes : [],
+      inspectionTypes: Array.isArray(question.inspectionTypes) ? question.inspectionTypes : [],
+      origin: 'tenant'
+    }));
+  const questions = [...baseQuestions.map((question) => ({ ...question, origin: 'system' })), ...tenantQuestions]
     .map((question) => (question?.toObject ? question.toObject() : question))
     .filter((question) => {
       const questionProtections = Array.isArray(question.protectionTypes)
@@ -100,7 +115,7 @@ async function generateInspectionResultsForEquipment({ equipmentDoc, tenantId, i
       return {
         questionId: undefined,
         schemaQuestionKey: question.key || undefined,
-        questionOrigin: 'system',
+        questionOrigin: question.origin || 'system',
         reference: deriveQuestionReference(question),
         table: question.table || question.Table || '',
         group: question.group || question.Group || '',

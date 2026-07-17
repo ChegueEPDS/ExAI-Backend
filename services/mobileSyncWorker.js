@@ -2,155 +2,24 @@ const ProcessingJob = require('../models/processingJob');
 const Equipment = require('../models/dataplate');
 const Inspection = require('../models/inspection');
 const Tenant = require('../models/tenant');
-const Question = require('../models/questions');
-const QuestionTypeMapping = require('../models/questionTypeMapping');
-const mongoose = require('mongoose');
 const axios = require('axios');
-const { KNOWN_SET_LOWER, normalizeProtectionTypes } = require('../helpers/protectionTypes');
-const { buildCertificateCacheForTenant, resolveCertificateFromCache } = require('../helpers/certificateMatchHelper');
 const { notifyAndStore } = require('../lib/notifications/notifier');
 const { processDataplateForEquipment } = require('./dataplateProcessingService');
-const { certificateNo, complianceStatus, protectionText } = require('./rbSchemaValueService');
+const { complianceStatus } = require('./rbSchemaValueService');
 const { withLock } = require('./distributedLockService');
+const { generateInspectionResultsForEquipment } = require('./inspectionResultGenerator');
 
 let isRunning = false;
 let pollTimer = null;
 let emptyPolls = 0;
 let lastStaleRecoveryAt = 0;
 let stopping = false;
-const certCacheByTenant = new Map(); // tenantId -> { ts, map }
-
 const STALE_RECOVERY_INTERVAL_MS = Math.max(60_000, Number(process.env.MOBILE_SYNC_STALE_RECOVERY_MS || 5 * 60_000));
 
 function addYears(date, years) {
   const d = new Date(date);
   d.setFullYear(d.getFullYear() + years);
   return d;
-}
-
-function escapeRegex(s) {
-  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function extractProtectionTypesFromEquipment(equipmentDoc) {
-  const protection = protectionText(equipmentDoc) || '';
-  if (!protection) return [];
-
-  const tokens = normalizeProtectionTypes(protection).map((v) => String(v).trim().toLowerCase());
-  const hasKnown = tokens.some((t) => KNOWN_SET_LOWER.has(t));
-  if (!hasKnown && tokens.length) {
-    return Array.from(new Set(['d', 'e', ...tokens]));
-  }
-  return tokens;
-}
-
-async function loadAutoInspectionQuestions(equipmentDoc, tenantId, inspectionType = 'Detailed') {
-  try {
-    const protections = extractProtectionTypesFromEquipment(equipmentDoc);
-    const filter = {};
-    const tenantObjectId = tenantId && mongoose.Types.ObjectId.isValid(tenantId) ? new mongoose.Types.ObjectId(tenantId) : null;
-    if (tenantObjectId) filter.tenantId = tenantObjectId;
-
-    if (protections.length) {
-      filter.protectionTypes = {
-        $in: protections.map((token) => new RegExp(`^${escapeRegex(token)}$`, 'i'))
-      };
-    }
-
-    let questions = await Question.find(filter).lean();
-    if ((!questions || !questions.length) && tenantObjectId) {
-      const fallbackFilter = { ...filter };
-      delete fallbackFilter.tenantId;
-      questions = await Question.find(fallbackFilter).lean();
-    }
-    if (!Array.isArray(questions)) return [];
-
-    return questions.filter((q) => {
-      const types = Array.isArray(q.inspectionTypes) ? q.inspectionTypes : [];
-      return !types.length || types.includes(inspectionType);
-    });
-  } catch (err) {
-    return [];
-  }
-}
-
-async function getRelevantEquipmentTypesForDevice(equipmentDoc, tenantId) {
-  const rawType =
-    (equipmentDoc && typeof equipmentDoc === 'object'
-      ? equipmentDoc['Equipment Type'] || equipmentDoc.EquipmentType || ''
-      : '') || '';
-
-  const normalized = String(rawType).toLowerCase().trim();
-  const result = new Set();
-  if (!normalized) return result;
-
-  const tenantObjectId = tenantId && mongoose.Types.ObjectId.isValid(tenantId) ? new mongoose.Types.ObjectId(tenantId) : null;
-  if (!tenantObjectId) return result;
-
-  try {
-    const mappings = await QuestionTypeMapping.find({ tenantId: tenantObjectId, active: true })
-      .select('equipmentPattern equipmentTypes')
-      .lean();
-
-    mappings.forEach((m) => {
-      const pattern = String(m.equipmentPattern || '').toLowerCase().trim();
-      if (!pattern) return;
-      if (!normalized.includes(pattern)) return;
-      (m.equipmentTypes || []).forEach((t) => {
-        if (!t) return;
-        result.add(String(t).toLowerCase());
-      });
-    });
-  } catch {
-    // ignore
-  }
-
-  return result;
-}
-
-async function getCertMapForTenant(tenantId) {
-  const key = String(tenantId || '');
-  if (!key) return new Map();
-  const existing = certCacheByTenant.get(key);
-  const now = Date.now();
-  if (existing && now - existing.ts < 10 * 60 * 1000) return existing.map;
-  const map = await buildCertificateCacheForTenant(tenantId);
-  certCacheByTenant.set(key, { ts: now, map });
-  return map;
-}
-
-async function buildSpecialConditionResult(equipmentDoc, tenantId) {
-  const equipmentSpecific =
-    (equipmentDoc &&
-    typeof equipmentDoc === 'object' &&
-    equipmentDoc['X condition'] &&
-    typeof equipmentDoc['X condition'].Specific === 'string'
-      ? equipmentDoc['X condition'].Specific
-      : '').trim();
-
-  let text = equipmentSpecific;
-  if (!text) {
-    const certNo = certificateNo(equipmentDoc);
-    if (certNo) {
-      const certMap = await getCertMapForTenant(tenantId);
-      const certificate = resolveCertificateFromCache(certMap, String(certNo));
-      text = (certificate?.specCondition || '').trim();
-    }
-  }
-  if (!text) return null;
-
-  return {
-    questionId: undefined,
-    reference: 'SC1',
-    table: 'SC',
-    group: 'SC',
-    number: 1,
-    equipmentType: 'Special Condition',
-    protectionTypes: [],
-    status: 'Passed',
-    note: '',
-    questionText: { eng: text, hun: '' }
-  };
 }
 
 function summarizeAutoInspectionResults(results) {
@@ -258,60 +127,11 @@ async function ensureAutoInspectionFromMobileSync({
   const validUntil = addYears(inspectionDate, 3);
 
   const inspectionType = 'Detailed';
-  const questionDocs = await loadAutoInspectionQuestions(equipmentDoc, tenantId, inspectionType);
-  const basePassedTypes = new Set(['general', 'environment', 'additional checks', 'installation']);
-  const relevantTypes = await getRelevantEquipmentTypesForDevice(equipmentDoc, tenantId);
-  let results = [];
-
-  if (questionDocs.length) {
-    results = questionDocs.map((q) => {
-      const eqType = (q.equipmentType || '').toLowerCase();
-      const isAlwaysPassed = basePassedTypes.has(eqType) || eqType.startsWith('installation');
-      const isRelevantByDevice = relevantTypes.has(eqType);
-      const shouldBePassed = isAlwaysPassed || isRelevantByDevice;
-      return {
-        questionId: q._id ? new mongoose.Types.ObjectId(q._id) : undefined,
-        reference: deriveQuestionReference(q),
-        table: q.table || q.Table || '',
-        group: q.group || q.Group || '',
-        number: q.number ?? q.Number ?? null,
-        equipmentType: q.equipmentType || '',
-        protectionTypes: Array.isArray(q.protectionTypes) ? q.protectionTypes : [],
-        status: shouldBePassed ? 'Passed' : 'NA',
-        note: '',
-        questionText: {
-          eng: q.questionText?.eng || '',
-          hun: q.questionText?.hun || ''
-        }
-      };
-    });
-  }
-
-  if (!results.length) {
-    const failureNote = String(failureNoteFromJob || '').trim();
-    results = [
-      {
-        status: compliance,
-        note:
-          compliance === 'Passed'
-            ? 'Automatically created after mobile sync.'
-            : failureNote || 'Automatically created after mobile sync (Failed).',
-        table: 'AUTO',
-        group: 'AUTO',
-        number: 1,
-        reference: 'AUTO-1',
-        equipmentType: equipmentDoc['Equipment Type'] || '',
-        protectionTypes: [],
-        questionText: {
-          eng: 'Auto-generated inspection after mobile sync.',
-          hun: 'Automatikus ellenőrzés mobil szinkron után.'
-        }
-      }
-    ];
-  }
-
-  const specialResult = await buildSpecialConditionResult(equipmentDoc, tenantId);
-  if (specialResult) results.push(specialResult);
+  let results = await generateInspectionResultsForEquipment({
+    equipmentDoc,
+    tenantId,
+    inspectionType
+  });
   results = results.map((r) => ({ ...r, reference: deriveQuestionReference(r) }));
 
   if (compliance === 'Failed') {
