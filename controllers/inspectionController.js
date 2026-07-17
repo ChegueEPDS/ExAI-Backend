@@ -5,12 +5,10 @@ const Equipment = require('../models/dataplate');
 const mongoose = require('mongoose');
 const { diskUpload } = require('../middlewares/uploadFactory');
 const azureBlob = require('../services/azureBlobService');
-const QuestionTypeMapping = require('../models/questionTypeMapping');
 const SchemaDefinition = require('../models/schemaDefinition');
-const { ensureRbSchema, loadLegacyRbQuestions } = require('../services/schemaSeedService');
-const { buildCertificateCacheForTenant, resolveCertificateFromCache } = require('../helpers/certificateMatchHelper');
-const { KNOWN_SET_LOWER, normalizeProtectionTypes } = require('../helpers/protectionTypes');
-const { certificateNo, getRbValues, ensureRbAssignment, protectionText } = require('../services/rbSchemaValueService');
+const { ensureRbSchema } = require('../services/schemaSeedService');
+const { getRbValues, ensureRbAssignment } = require('../services/rbSchemaValueService');
+const { generateInspectionResultsForEquipment } = require('../services/inspectionResultGenerator');
 const {
   addCycle,
   assignmentCycle,
@@ -97,122 +95,6 @@ function deriveQuestionReference(input = {}) {
     return `${number}`;
   }
   return '';
-}
-
-function extractProtectionTokens(equipmentDoc) {
-  const protection = protectionText(equipmentDoc) || '';
-  if (!protection) return [];
-  const tokens = normalizeProtectionTypes(protection).map((v) => String(v).trim().toLowerCase());
-  const hasKnown = tokens.some((t) => KNOWN_SET_LOWER.has(t));
-  if (!hasKnown && tokens.length) {
-    return Array.from(new Set(['d', 'e', ...tokens]));
-  }
-  return tokens;
-}
-
-async function computeRelevantEquipmentTypes(equipmentDoc, tenantId) {
-  const rawType =
-    (equipmentDoc && typeof equipmentDoc === 'object'
-      ? equipmentDoc['Equipment Type'] || equipmentDoc.EquipmentType || ''
-      : '') || '';
-  const normalized = String(rawType).toLowerCase().trim();
-  const result = new Set();
-  if (!normalized) return result;
-
-  const tenantObjectId = tenantId && mongoose.Types.ObjectId.isValid(tenantId) ? new mongoose.Types.ObjectId(tenantId) : null;
-  if (!tenantObjectId) return result;
-
-  const mappings = await QuestionTypeMapping.find({ tenantId: tenantObjectId, active: true })
-    .select('equipmentPattern equipmentTypes')
-    .lean();
-  (mappings || []).forEach((m) => {
-    const pattern = String(m.equipmentPattern || '').toLowerCase().trim();
-    if (!pattern) return;
-    if (!normalized.includes(pattern)) return;
-    (m.equipmentTypes || []).forEach((t) => {
-      if (!t) return;
-      result.add(String(t).toLowerCase());
-    });
-  });
-  return result;
-}
-
-async function buildSpecialConditionResultFromEquipment(equipmentDoc, tenantId) {
-  const equipmentSpecific =
-    (equipmentDoc &&
-    typeof equipmentDoc === 'object' &&
-    equipmentDoc['X condition'] &&
-    typeof equipmentDoc['X condition'].Specific === 'string'
-      ? equipmentDoc['X condition'].Specific
-      : '').trim();
-
-  let text = equipmentSpecific;
-  if (!text) {
-    const certNo = certificateNo(equipmentDoc);
-    if (certNo) {
-      const certMap = await buildCertificateCacheForTenant(tenantId);
-      const cert = resolveCertificateFromCache(certMap, String(certNo));
-      text = (cert?.specCondition || '').trim();
-    }
-  }
-  if (!text) return null;
-
-  return {
-    questionId: undefined,
-    reference: 'SC1',
-    table: 'SC',
-    group: 'SC',
-    number: 1,
-    equipmentType: 'Special Condition',
-    protectionTypes: [],
-    status: 'Passed',
-    note: '',
-    questionText: { eng: text, hun: '' }
-  };
-}
-
-async function generateInspectionResultsForEquipment({ equipmentDoc, tenantId, inspectionType }) {
-  const protections = extractProtectionTokens(equipmentDoc);
-  const questions = (await loadLegacyRbQuestions())
-    .map((q) => (q?.toObject ? q.toObject() : q))
-    .filter((q) => {
-      const qProtections = Array.isArray(q.protectionTypes)
-        ? q.protectionTypes.map((t) => String(t || '').trim().toLowerCase()).filter(Boolean)
-        : [];
-      if (!protections.length || !qProtections.length) return true;
-      return qProtections.some((t) => protections.includes(t));
-    });
-
-  const relevantTypes = await computeRelevantEquipmentTypes(equipmentDoc, tenantId);
-  const basePassedTypes = new Set(['general', 'environment', 'additional checks', 'installation']);
-
-  let results = (questions || [])
-    .filter((q) => {
-      const types = Array.isArray(q.inspectionTypes) ? q.inspectionTypes : [];
-      return !types.length || types.includes(inspectionType);
-    })
-    .map((q) => {
-      const eqType = (q.equipmentType || '').toLowerCase();
-      const shouldBePassed = basePassedTypes.has(eqType) || eqType.startsWith('installation') || relevantTypes.has(eqType);
-      return {
-        questionId: undefined,
-        schemaQuestionKey: q.key || undefined,
-        questionOrigin: 'system',
-        reference: deriveQuestionReference(q),
-        table: q.table || q.Table || '',
-        group: q.group || q.Group || '',
-        number: q.number ?? q.Number ?? null,
-        equipmentType: q.equipmentType || '',
-        protectionTypes: Array.isArray(q.protectionTypes) ? q.protectionTypes : [],
-        status: shouldBePassed ? 'Passed' : 'NA',
-        note: '',
-        questionText: { eng: q.textI18n?.eng || q.questionText?.eng || q.text || '', hun: q.textI18n?.hun || q.questionText?.hun || '' }
-      };
-    });
-
-  const sc = await buildSpecialConditionResultFromEquipment(equipmentDoc, tenantId);
-  if (sc) results.push(sc);
-  return results;
 }
 
 /**

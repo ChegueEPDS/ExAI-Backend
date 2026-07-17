@@ -48,6 +48,7 @@ const SchemaDefinition = require('../models/schemaDefinition');
 const { applySchemaCycleDefaults } = require('../services/schemaCycleService');
 const { validateSchemaValues } = require('../services/schemaValidationService');
 const { scheduleDashboardStatsDirty } = require('../services/dashboardSummaryService');
+const { generateInspectionResultsForEquipment } = require('../services/inspectionResultGenerator');
 const {
   SEARCHABLE_EQUIPMENT_FIELDS,
   buildSearchTrigrams,
@@ -3583,71 +3584,11 @@ async function createAutoInspectionForImport(
   validUntil.setFullYear(validUntil.getFullYear() + 3);
 
   const normalizedInspectionType = normalizeInspectionType(inspectionType);
-  const questionDocs = await loadAutoInspectionQuestions(
+  let results = await generateInspectionResultsForEquipment({
     equipmentDoc,
     tenantId,
-    normalizedInspectionType,
-    importContext
-  );
-  const basePassedTypes = new Set(['general', 'environment', 'additional checks', 'installation']);
-  const relevantTypes = await getRelevantEquipmentTypesForDevice(
-    equipmentDoc,
-    tenantId,
-    importContext
-  ); // lowercased equipmentType-ok
-  let results = [];
-
-  if (questionDocs.length) {
-    results = questionDocs.map((q) => {
-      const eqType = (q.equipmentType || '').toLowerCase();
-      const isAlwaysPassed = basePassedTypes.has(eqType) || eqType.startsWith('installation');
-      const isRelevantByDevice = relevantTypes.has(eqType);
-
-      return {
-        questionId: q._id ? new mongoose.Types.ObjectId(q._id) : undefined,
-        reference: deriveInspectionQuestionReference(q),
-        table: q.table || q.Table || '',
-        group: q.group || q.Group || '',
-        number: q.number ?? q.Number ?? null,
-        equipmentType: q.equipmentType || '',
-        protectionTypes: Array.isArray(q.protectionTypes)
-          ? q.protectionTypes
-          : [],
-        status: isAlwaysPassed || isRelevantByDevice ? 'Passed' : 'NA',
-        note: '',
-        questionText: {
-          eng: q.questionText?.eng || '',
-          hun: q.questionText?.hun || ''
-        }
-      };
-    });
-  }
-
-  if (!results.length) {
-    results = [{
-      status: 'NA',
-      note: 'Automatically created during XLSX import (all checks passed).',
-      table: 'AUTO',
-      group: 'AUTO',
-      number: 1,
-      reference: 'AUTO-1',
-      equipmentType: equipmentDoc['Equipment Type'] || equipmentDoc.EquipmentType || '',
-      protectionTypes: [],
-      questionText: {
-        eng: 'Auto-generated inspection from XLSX import.',
-        hun: 'Automatikus ellenőrzés XLSX importból.'
-      }
-    }];
-  }
-
-  const specialResult = await buildSpecialConditionResult(
-    equipmentDoc,
-    tenantId,
-    importContext?.certificateCache || null
-  );
-  if (specialResult) {
-    results.push(specialResult);
-  }
+    inspectionType: normalizedInspectionType
+  });
   results = results.map((r) => ({ ...r, reference: deriveInspectionQuestionReference(r) }));
 
   const { summary, status } = summarizeAutoInspectionResults(results);
