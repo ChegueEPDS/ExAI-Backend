@@ -6,7 +6,7 @@ const QuestionsSchema = new mongoose.Schema({
         hun: { type: String }
         },
 
-  tenantId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', required: true, index: true },
+  tenantId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', default: null, index: true },
 
   standard: {
     type: String

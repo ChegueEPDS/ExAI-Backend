@@ -7,6 +7,7 @@ const connectDB = require('./config/db');
 const logger = require('./config/logger');
 const systemSettingsStore = require('./services/systemSettingsStore');
 const { seedInitialSuperAdminIfEmpty } = require('./services/bootstrapSuperAdmin');
+const { seedRbQuestionsIfEmpty } = require('./services/rbQuestionSeedService');
 const { startWorkerRuntime, stopWorkerRuntime, backgroundJobsDisabled } = require('./services/workerRuntime');
 
 let server = null;
@@ -44,6 +45,7 @@ async function main() {
   await connectDB();
   logger.info('[worker] Database connected successfully');
   await seedInitialSuperAdminIfEmpty();
+  await seedRbQuestionsIfEmpty();
 
   await systemSettingsStore.start();
 

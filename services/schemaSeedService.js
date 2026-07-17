@@ -37,23 +37,7 @@ async function loadLegacyRbQuestions() {
   })), 'system');
 }
 
-function rbQuestionsNeedLegacyMetadata(questions = []) {
-  const list = Array.isArray(questions) ? questions : [];
-  if (!list.length) return true;
-  const hasProtectionMetadata = list.some((q) => Array.isArray(q?.protectionTypes) && q.protectionTypes.length);
-  const hasInspectionMetadata = list.some((q) => Array.isArray(q?.inspectionTypes) && q.inspectionTypes.length);
-  if (!hasProtectionMetadata || !hasInspectionMetadata) return true;
-  return list.some((q) => {
-    if (!q) return false;
-    return (
-      !Array.isArray(q.protectionTypes) ||
-      !Array.isArray(q.inspectionTypes) ||
-      typeof q.equipmentType !== 'string'
-    );
-  });
-}
-
-async function ensureRbSchema({ refreshQuestions = false, userId = null } = {}) {
+async function ensureRbSchema({ userId = null } = {}) {
   let rb = await SchemaDefinition.findOne({ scope: 'system', systemKey: 'rb' });
   if (!rb) {
     rb = new SchemaDefinition({
@@ -70,7 +54,7 @@ async function ensureRbSchema({ refreshQuestions = false, userId = null } = {}) 
       defaultCycleValue: 3,
       defaultCycleUnit: 'year',
       dataFields: RB_DATA_FIELDS,
-      questions: await loadLegacyRbQuestions(),
+      questions: [],
       active: true,
       createdBy: userId || null,
       updatedBy: userId || null
@@ -106,13 +90,8 @@ async function ensureRbSchema({ refreshQuestions = false, userId = null } = {}) 
     rb.dataFields = [...rb.dataFields, ...missingFields].sort((a, b) => (a.order || 0) - (b.order || 0));
     changed = true;
   }
-  if (
-    refreshQuestions ||
-    !Array.isArray(rb.questions) ||
-    !rb.questions.length ||
-    rbQuestionsNeedLegacyMetadata(rb.questions)
-  ) {
-    rb.questions = await loadLegacyRbQuestions();
+  if (Array.isArray(rb.questions) && rb.questions.length) {
+    rb.questions = [];
     changed = true;
   }
   if (changed) {

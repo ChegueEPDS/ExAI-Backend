@@ -19,6 +19,7 @@ const limiter = require('./middlewares/rateLimiter');
 const systemSettingsStore = require('./services/systemSettingsStore');
 const { writeSystemAuditLog } = require('./services/auditLogService');
 const { seedInitialSuperAdminIfEmpty } = require('./services/bootstrapSuperAdmin');
+const { seedRbQuestionsIfEmpty } = require('./services/rbQuestionSeedService');
 const { backgroundJobsDisabled, startWorkerRuntime, stopWorkerRuntime } = require('./services/workerRuntime');
 const path = require('path');
 const fs = require('fs');
@@ -583,6 +584,10 @@ async function main() {
   const seedResult = await seedInitialSuperAdminIfEmpty();
   if (seedResult?.reason === 'failed') {
     throw seedResult.error || new Error('Initial SuperAdmin seed failed');
+  }
+  const questionSeedResult = await seedRbQuestionsIfEmpty();
+  if (questionSeedResult?.seeded) {
+    console.log(`Seeded ${questionSeedResult.count} global RB questions`);
   }
 
   await systemSettingsStore.start();
