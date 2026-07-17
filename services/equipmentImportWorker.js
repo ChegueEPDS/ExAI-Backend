@@ -17,13 +17,13 @@ function getPollMs() {
 }
 
 function getStaleMinutes() {
-  const n = Number(process.env.EQUIPMENT_IMPORT_STALE_MINUTES || 15);
+  const n = Number(process.env.EQUIPMENT_IMPORT_STALE_MINUTES || 5);
   return Number.isFinite(n) && n >= 5 ? Math.floor(n) : 15;
 }
 
 async function recoverStaleEquipmentImportJobs() {
   const staleBefore = new Date(Date.now() - getStaleMinutes() * 60 * 1000);
-  await EquipmentImportJob.updateMany(
+  const result = await EquipmentImportJob.updateMany(
     {
       status: 'running',
       $or: [
@@ -38,6 +38,13 @@ async function recoverStaleEquipmentImportJobs() {
       }
     }
   );
+  const recovered = result?.modifiedCount || 0;
+  if (recovered > 0) {
+    logger.warn('[equipment-import-worker] recovered stale running jobs', {
+      recovered,
+      staleMinutes: getStaleMinutes()
+    });
+  }
 }
 
 async function pollEquipmentImportJobs() {

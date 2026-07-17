@@ -2700,6 +2700,12 @@ exports.processEquipmentImportXlsxJob = async (jobIdOrId) => {
   );
   if (!job) return false;
 
+  let heartbeatTimer = null;
+  const stopHeartbeat = () => {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  };
+
   try {
     await notifyEquipmentImportXlsxStatus(String(job.userId), { jobId: job.jobId, status: 'running' });
     console.info('[equipment-import] job started', {
@@ -2707,6 +2713,19 @@ exports.processEquipmentImportXlsxJob = async (jobIdOrId) => {
       attempt: job.attempts,
       resumeAfter: Number(job.progress?.processed) || 0
     });
+    heartbeatTimer = setInterval(() => {
+      EquipmentImportJob.updateOne(
+        { _id: job._id, status: 'running' },
+        { $set: { lastHeartbeatAt: new Date() } }
+      ).catch((heartbeatError) => {
+        console.warn('[equipment-import] heartbeat update failed', {
+          jobId: job.jobId,
+          error: heartbeatError?.message || String(heartbeatError)
+        });
+      });
+    }, Math.max(30_000, Number(process.env.EQUIPMENT_IMPORT_HEARTBEAT_MS || 30_000)));
+    if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+
     const workbookBuffer = await azureBlob.downloadToBuffer(job.sourceBlobPath);
     const result = await runEquipmentImportXlsxCore({
       jobId: job.jobId,
@@ -2814,6 +2833,7 @@ exports.processEquipmentImportXlsxJob = async (jobIdOrId) => {
     });
     return false;
   } finally {
+    stopHeartbeat();
     if (job.sourceBlobPath && job.status === 'succeeded') {
       try {
         await azureBlob.deleteFile(job.sourceBlobPath);
