@@ -52,6 +52,46 @@ test('equipmentMarkings ignores legacy Ex Marking when RB schema exists', () => 
   assert.deepEqual(primaryEquipmentMarking(equipment), { 'Type of Protection': 'db', 'Gas / Dust Group': 'IIC' });
 });
 
+test('protectionText prefers explicit Type of Protection over Marking', () => {
+  const equipment = {
+    schemaAssignments: [{
+      schemaKey: 'rb',
+      values: {
+        exMarking: [{ 'Type of Protection': 'db', Marking: 'Ex eb IIC T4 Gb' }]
+      }
+    }]
+  };
+
+  assert.equal(protectionText(equipment), 'db');
+});
+
+test('protectionText falls back to Marking when Type of Protection is missing', () => {
+  const equipment = {
+    schemaAssignments: [{
+      schemaKey: 'rb',
+      values: {
+        exMarking: [{ Marking: 'Ex db IIIC T120 °C Db' }]
+      }
+    }]
+  };
+
+  assert.equal(protectionText(equipment), 'Ex db IIIC T120 °C Db');
+});
+
+test('protectionText uses structured protectionTypes before Marking', () => {
+  const equipment = {
+    schemaAssignments: [{
+      schemaKey: 'rb',
+      values: {
+        protectionTypes: ['db'],
+        exMarking: [{ Marking: 'Ex eb IIC T4 Gb' }]
+      }
+    }]
+  };
+
+  assert.equal(protectionText(equipment), 'db');
+});
+
 test('valuesFromEquipmentMarkings maps legacy marking shape into RB values', () => {
   const values = valuesFromEquipmentMarkings([{
     Environment: 'G',

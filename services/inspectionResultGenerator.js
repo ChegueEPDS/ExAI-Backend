@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 const QuestionTypeMapping = require('../models/questionTypeMapping');
 const { buildCertificateCacheForTenant, resolveCertificateFromCache } = require('../helpers/certificateMatchHelper');
-const { KNOWN_SET_LOWER, normalizeProtectionTypes } = require('../helpers/protectionTypes');
+const { KNOWN_SET_LOWER, normalizeProtectionMethodTypes } = require('../helpers/protectionTypes');
 const { certificateNo, protectionText } = require('./rbSchemaValueService');
 const { loadLegacyRbQuestions } = require('./schemaSeedService');
 
@@ -19,7 +19,7 @@ function deriveQuestionReference(input = {}) {
 function extractProtectionTokens(equipmentDoc) {
   const protection = protectionText(equipmentDoc) || '';
   if (!protection) return [];
-  const tokens = normalizeProtectionTypes(protection).map((value) => String(value).trim().toLowerCase());
+  const tokens = normalizeProtectionMethodTypes(protection).map((value) => String(value).trim().toLowerCase());
   const hasKnown = tokens.some((token) => KNOWN_SET_LOWER.has(token));
   if (!hasKnown && tokens.length) return Array.from(new Set(['d', 'e', ...tokens]));
   return tokens;

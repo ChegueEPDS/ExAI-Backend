@@ -58,7 +58,15 @@ function primaryEquipmentMarking(entity) {
 }
 
 function protectionText(entity) {
-  return primaryEquipmentMarking(entity)?.['Type of Protection'] || '';
+  const values = getRbValues(entity);
+  const marking = Array.isArray(values.exMarking) ? values.exMarking[0] : null;
+  const explicitType = marking?.['Type of Protection'] || marking?.['Type Of Protection'];
+  if (explicitType) return explicitType;
+
+  const structuredTypes = listValue(values.protectionTypes);
+  if (structuredTypes.length) return structuredTypes.join('; ');
+
+  return marking?.Marking || '';
 }
 
 function certificateNo(entity) {

@@ -113,7 +113,7 @@ function looksLikeProtectionCode(token) {
   return /^[a-z]{1,5}[0-9]{0,2}$/.test(token);
 }
 
-function normalizeProtectionTypes(input) {
+function normalizeProtectionTypes(input, { preserveDustProtectionCodes = false } = {}) {
   const raw = Array.isArray(input) ? input.join(' ') : String(input || '');
   const s = raw
     .replace(/[“”"']/g, ' ')
@@ -135,7 +135,7 @@ function normalizeProtectionTypes(input) {
 
     const w = original.toLowerCase();
     if (NOISE_TOKENS.has(w)) continue;
-    if (NON_PROTECTION_TOKENS.has(w)) continue;
+    if (NON_PROTECTION_TOKENS.has(w) && !(preserveDustProtectionCodes && ['da', 'db', 'dc'].includes(w))) continue;
     if (/^t[1-6]$/.test(w) || /^t\d{2,3}$/.test(w)) continue;
     if (w === 'op' && i + 1 < wordsRaw.length) {
       const next = String(wordsRaw[i + 1] || '').toLowerCase();
@@ -171,4 +171,13 @@ function normalizeProtectionTypes(input) {
   return out;
 }
 
-module.exports = { PROTECTION_TYPE_VALUES, KNOWN_SET_LOWER, normalizeProtectionTypes };
+function normalizeProtectionMethodTypes(input) {
+  return normalizeProtectionTypes(input, { preserveDustProtectionCodes: true });
+}
+
+module.exports = {
+  PROTECTION_TYPE_VALUES,
+  KNOWN_SET_LOWER,
+  normalizeProtectionTypes,
+  normalizeProtectionMethodTypes
+};
