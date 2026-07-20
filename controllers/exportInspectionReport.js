@@ -1282,7 +1282,10 @@ async function appendItrEquipmentImagesSection(ws, workbook, equipment, attachme
 
   const firstPair = preparedImages.slice(0, 2);
   const firstImageRowHeight = Math.max(40, ...firstPair.map(img => (img.heightPx * 72) / 96)) + 10;
-  ensureNextBlockFitsOnPage(ws, 7 + 22 + 18 + firstImageRowHeight);
+  // Reserve some extra space because the XLSX->PDF renderer can paginate
+  // slightly earlier around tall image rows, especially after wrapped remarks.
+  const sectionLeadingBlockHeight = 7 + 22 + 18 + firstImageRowHeight + 18;
+  ensureNextBlockFitsOnPage(ws, sectionLeadingBlockHeight);
 
   const spacerBefore = ws.addRow([]);
   spacerBefore.height = 7;
@@ -1306,7 +1309,8 @@ async function appendItrEquipmentImagesSection(ws, workbook, equipment, attachme
     const pair = preparedImages.slice(i, i + 2);
     const maxHeightPoints = Math.max(40, ...pair.map(img => (img.heightPx * 72) / 96));
     const imageRowHeight = maxHeightPoints + 10;
-    ensureNextBlockFitsOnPage(ws, 18 + imageRowHeight);
+    // Keep the per-image title row on the same page as its image row.
+    ensureNextBlockFitsOnPage(ws, 18 + imageRowHeight + 10);
 
     const titleRow = ws.addRow([]);
     titleRow.height = 18;
