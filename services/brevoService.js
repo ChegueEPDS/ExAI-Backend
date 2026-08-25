@@ -33,6 +33,26 @@ function parseListIds(value) {
     .filter(n => Number.isFinite(n) && n > 0);
 }
 
+function configuredListId(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function getManagedEmailLists() {
+  return {
+    newsletter: {
+      en: configuredListId('BREVO_NEWSLETTER_EN_LIST_ID', 6),
+      hu: configuredListId('BREVO_NEWSLETTER_HU_LIST_ID', 7),
+    },
+    usefulInformation: configuredListId('BREVO_USEFUL_INFORMATION_LIST_ID', 8),
+  };
+}
+
+function newsletterListForLanguage(language) {
+  const lists = getManagedEmailLists().newsletter;
+  return language === 'hu' ? lists.hu : lists.en;
+}
+
 async function brevoRequest(method, path, body) {
   const apiKey = process.env.BREVO_API_KEY;
   if (!apiKey) {
@@ -82,6 +102,72 @@ async function upsertContact({ email, attributes = {}, listIds = [] }) {
   return brevoRequest('post', '/contacts', body);
 }
 
+async function getContact(email) {
+  if (!email) return { skipped: true, reason: 'missing_email' };
+  return brevoRequest('get', `/contacts/${encodeURIComponent(String(email).trim().toLowerCase())}`);
+}
+
+async function updateContact({ email, listIds = [], unlinkListIds = [], attributes = {}, emailBlacklisted }) {
+  if (!email) return { skipped: true, reason: 'missing_email' };
+  const body = {};
+  if (Array.isArray(listIds) && listIds.length) body.listIds = [...new Set(listIds.map(Number).filter(Number.isFinite))];
+  if (Array.isArray(unlinkListIds) && unlinkListIds.length) body.unlinkListIds = [...new Set(unlinkListIds.map(Number).filter(Number.isFinite))];
+  if (attributes && Object.keys(attributes).length) body.attributes = attributes;
+  if (typeof emailBlacklisted === 'boolean') body.emailBlacklisted = emailBlacklisted;
+  if (!Object.keys(body).length) return { ok: true, status: 204 };
+  return brevoRequest('put', `/contacts/${encodeURIComponent(String(email).trim().toLowerCase())}`, body);
+}
+
+async function syncEmailPreferences({
+  email,
+  usefulInformationEnabled = true,
+  newsletterEnabled = true,
+  preferredLanguage = 'en',
+  restoreNewsletterListIds = [],
+}) {
+  if (!email) return { skipped: true, reason: 'missing_email' };
+  const managed = getManagedEmailLists();
+  const contactResult = await getContact(email);
+  const contactMissing = contactResult?.status === 404;
+  if (contactResult?.skipped || (contactResult?.ok === false && !contactMissing)) return contactResult;
+
+  const currentListIds = Array.isArray(contactResult?.data?.listIds) ? contactResult.data.listIds.map(Number) : [];
+  const newsletterIds = Object.values(managed.newsletter);
+  const rememberedNewsletterListIds = currentListIds.filter(id => newsletterIds.includes(id));
+  const restoreIds = (Array.isArray(restoreNewsletterListIds) ? restoreNewsletterListIds : [])
+    .map(Number)
+    .filter(id => newsletterIds.includes(id));
+  const desiredNewsletterIds = newsletterEnabled
+    ? (restoreIds.length ? restoreIds : [newsletterListForLanguage(preferredLanguage)])
+    : [];
+  const desiredAdd = [
+    ...(usefulInformationEnabled ? [managed.usefulInformation] : []),
+    ...desiredNewsletterIds,
+  ];
+  const desiredUnlink = [
+    ...(!usefulInformationEnabled ? [managed.usefulInformation] : []),
+    ...(!newsletterEnabled ? newsletterIds : newsletterIds.filter(id => !desiredNewsletterIds.includes(id))),
+  ];
+
+  const attributes = {};
+  let result;
+  if (contactMissing) {
+    if (!desiredAdd.length) return { ok: true, status: 204, rememberedNewsletterListIds };
+    result = await upsertContact({ email, attributes, listIds: desiredAdd });
+  } else {
+    result = await updateContact({
+      email,
+      listIds: desiredAdd,
+      unlinkListIds: desiredUnlink,
+      attributes,
+      // Explicitly enabling at least one campaign category also reverses a prior
+      // Brevo campaign block; disabled categories stay excluded by list membership.
+      ...(desiredAdd.length ? { emailBlacklisted: false } : {}),
+    });
+  }
+  return { ...result, rememberedNewsletterListIds };
+}
+
 async function sendTransactionalTemplate({ toEmail, templateId, params = {} }) {
   if (!toEmail) return { skipped: true, reason: 'missing_email' };
   const id = Number(templateId);
@@ -100,7 +186,7 @@ async function sendTransactionalTemplate({ toEmail, templateId, params = {} }) {
  * - Adds/updates the contact and (optionally) adds to list(s).
  * - Optionally sends a transactional email template if configured.
  */
-async function onStripeCustomerCreated({ email, firstName, lastName, stripeCustomerId, tenant = null }) {
+async function onStripeCustomerCreated({ email, firstName, lastName, stripeCustomerId, tenant = null, user = null }) {
   try {
     if (shouldTrace()) {
       log('info', '[brevo] onStripeCustomerCreated', {
@@ -112,7 +198,12 @@ async function onStripeCustomerCreated({ email, firstName, lastName, stripeCusto
       });
     }
 
-    const listIds = parseListIds(process.env.BREVO_LIST_IDS || process.env.BREVO_LIST_ID);
+    const managedLists = getManagedEmailLists();
+    const preferredLanguage = user?.preferredLanguage === 'hu' ? 'hu' : 'en';
+    const listIds = [
+      ...(user?.newsletterEmailsEnabled === false ? [] : [newsletterListForLanguage(preferredLanguage)]),
+      ...(user?.marketingEmailsEnabled === false ? [] : [managedLists.usefulInformation]),
+    ];
     const attrs = {
       FIRSTNAME: firstName || '',
       LASTNAME: lastName || '',
@@ -121,6 +212,7 @@ async function onStripeCustomerCreated({ email, firstName, lastName, stripeCusto
       TENANT_NAME: tenant?.name || '',
       TENANT_TYPE: tenant?.type || '',
       PLAN: tenant?.plan || '',
+      LANGUAGE: preferredLanguage,
     };
 
     const upsertResult = await upsertContact({
@@ -161,5 +253,10 @@ async function onStripeCustomerCreated({ email, firstName, lastName, stripeCusto
 module.exports = {
   onStripeCustomerCreated,
   upsertContact,
+  getContact,
+  updateContact,
+  syncEmailPreferences,
+  getManagedEmailLists,
+  newsletterListForLanguage,
   sendTransactionalTemplate,
 };

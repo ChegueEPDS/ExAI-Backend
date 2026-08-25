@@ -5,6 +5,8 @@ class GraphMailService {
   constructor() {
     this.client = getGraphClient();
     this.defaultSender = process.env.MAIL_SENDER_UPN;
+    this.fromAddress = process.env.MAIL_FROM_ADDRESS || 'noreply@atexdb.eu';
+    this.fromName = process.env.MAIL_FROM_NAME || 'ATEXdb';
     this.saveToSent = String(process.env.MAIL_SAVE_TO_SENT || 'true').toLowerCase() === 'true';
     this.inlineLogo = String(process.env.MAIL_INLINE_LOGO || 'false').toLowerCase() === 'true';
     this.inlineLogoTimeoutMs = Number(process.env.MAIL_INLINE_LOGO_TIMEOUT_MS || 5000);
@@ -99,17 +101,52 @@ class GraphMailService {
     const message = {
       subject: subject || '',
       body: { contentType: 'HTML', content: finalHtml || '' },
+      from: {
+        emailAddress: {
+          name: this.fromName,
+          address: this.fromAddress,
+        },
+      },
       toRecipients: this.#recipients(to),
       ...(cc.length ? { ccRecipients: this.#recipients(cc) } : {}),
       ...(bcc.length ? { bccRecipients: this.#recipients(bcc) } : {}),
       ...(finalAttachments.length ? { attachments: finalAttachments.map(a => this.#attachment(a)) } : {}),
     };
 
-    // Application perm: send as specific mailbox
-    await this.client.api(`/users/${encodeURIComponent(sender)}/sendMail`).post({
+    const endpoint = `/users/${encodeURIComponent(sender)}/sendMail`;
+    const payload = {
       message,
       saveToSentItems: this.saveToSent,
-    });
+    };
+
+    // Application permission: submit through the licensed mailbox while exposing
+    // its configured Exchange alias as the visible From address.
+    try {
+      await this.client.api(endpoint).post(payload);
+    } catch (error) {
+      const details = [
+        error?.code,
+        error?.message,
+        error?.body,
+        error?.body?.error?.code,
+        error?.body?.error?.message,
+      ].filter(Boolean).join(' ');
+      const fromPermissionDenied = /ErrorSendAsDenied|does not have the right to send mail|Cannot submit message/i.test(details);
+      if (!fromPermissionDenied) throw error;
+
+      // Do not let an Exchange alias configuration error stop password resets,
+      // invitations and other essential mail. Retry once with the mailbox's
+      // primary identity; the first request was rejected before submission.
+      console.warn(
+        `[mail] Alias sender ${this.fromAddress} was rejected; retrying with primary mailbox ${sender}.`
+      );
+      const fallbackMessage = { ...message };
+      delete fallbackMessage.from;
+      await this.client.api(endpoint).post({
+        message: fallbackMessage,
+        saveToSentItems: this.saveToSent,
+      });
+    }
   }
 }
 

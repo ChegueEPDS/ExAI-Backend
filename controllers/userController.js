@@ -14,12 +14,13 @@ const path = require('path');
 const sharp = require('sharp');
 
 const mailService = require('../services/mailService');
-const { tenantInviteEmailHtml, registrationEmailHtml } = require('../services/mailTemplates');
+const { tenantInviteEmailHtml, registrationEmailHtml, resolveEmailBrand } = require('../services/mailTemplates');
 const { migrateAllUserDataToTenant } = require('../services/tenantMigration');
 const azureBlob = require('../services/azureBlobService');
 const { computePermissions, getEffectiveProfessions, assertValidProfessions } = require('../helpers/rbac');
 const { resolvePublicBaseUrl, persistPublicBaseUrlIfMissing } = require('../helpers/publicBaseUrl');
 const contributionRewardService = require('../services/contributionRewardService');
+const emailPreferenceService = require('../services/emailPreferenceService');
 
 // --- Daily download quota (Free plan) helpers ---
 const FREE_DAILY_LIMIT = 3;
@@ -843,6 +844,9 @@ async function createTenantForRegistration({ plan, companyName, ownerUserId }) {
     });
 
     await user.save();
+    emailPreferenceService.recordInitialPreferences(user).catch(err =>
+      console.warn('[email-preferences] initial consent log failed:', err?.message || err)
+    );
 
     // Create tenant based on plan
     const tenant = await createTenantForRegistration({
@@ -875,9 +879,10 @@ async function createTenantForRegistration({ plan, companyName, ownerUserId }) {
           baseUrl: requestBaseUrl || undefined,
           tenantName: tenant.name
         });
+        const emailBrand = resolveEmailBrand({ tenantName: tenant.name, baseUrl: requestBaseUrl });
         await mailService.sendMail({
           to: user.email,
-          subject: 'Welcome to ATEXdb Certs',
+          subject: `Welcome to ${emailBrand.productName}`,
           html,
           from: process.env.MAIL_SENDER_UPN
         });
@@ -1022,6 +1027,9 @@ exports.createPaidTenantUser = async (req, res) => {
       tenantId: tenant._id,
       nickname: firstName || normalizedEmail.split('@')[0]
     });
+    emailPreferenceService.recordInitialPreferences(user).catch(err =>
+      console.warn('[email-preferences] initial consent log failed:', err?.message || err)
+    );
     await Tenant.findByIdAndUpdate(tenant._id, { ownerUserId: user._id });
 
     // 3) Subscription dokument létrehozása (manuálisan, active)
@@ -1124,8 +1132,8 @@ exports.createPaidTenantUser = async (req, res) => {
 // POST /api/users/:userId/contribution-reward/manual-send
 // Admin: only within same tenant; SuperAdmin: any tenant
 // Behavior:
-// - If user has >=20 certs: sends reward for floor(total/20)*20
-// - If user has <20 certs: sends reward for milestone 20 (early), so they won't get another at 20
+// - Uses the current SuperAdmin-configured contribution step (default 20).
+// - Below the first milestone, sends that reward early and establishes its baseline.
 // Body: { forceResendEmail?: boolean }
 // ---------------------------
 exports.manualSendContributionReward = async (req, res) => {

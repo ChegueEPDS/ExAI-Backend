@@ -3,6 +3,7 @@ const User = require('../models/user');
 const Tenant = require('../models/tenant');
 const mailService = require('./mailService');
 const { tenantInviteEmailHtml } = require('./mailTemplates');
+const emailPreferenceService = require('./emailPreferenceService');
 const { withLock } = require('./distributedLockService');
 const logger = require('../config/logger');
 
@@ -60,6 +61,9 @@ async function createAndNotifySuperAdmin() {
       tenantId: tenant._id,
       emailVerified: true
     });
+    emailPreferenceService.recordInitialPreferences(user).catch(err =>
+      console.warn('[email-preferences] initial consent log failed:', err?.message || err)
+    );
 
     tenant.ownerUserId = user._id;
     await tenant.save();

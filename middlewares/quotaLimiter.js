@@ -6,6 +6,7 @@
 const DownloadQuota = require('../models/downloadQuota');
 const Subscription = require('../models/subscription');
 const Tenant = require('../models/tenant');
+const automatedEmailService = require('../services/automatedEmailService');
 
 function todayYMD(d = new Date()) {
   const y = d.getUTCFullYear();
@@ -110,11 +111,43 @@ async function incrementDailyDownload(req, _res, next) {
     }
 
     const ymd = todayYMD();
-    await DownloadQuota.updateOne(
+    const quota = await DownloadQuota.findOneAndUpdate(
       { userId, ymd },
       { $inc: { count: 1 } },
-      { upsert: true }
+      { upsert: true, new: true, setDefaultsOnInsert: true }
     );
+    const total = await DownloadQuota.aggregate([
+      { $match: { userId: quota.userId } },
+      { $group: { _id: null, count: { $sum: '$count' } } },
+    ]);
+    const totalDownloads = Number(total?.[0]?.count || 0);
+    if (totalDownloads === 1) {
+      automatedEmailService.queueEventEmail({
+        userId,
+        type: 'first_download',
+        dedupeKey: 'first_download',
+        delayMs: 24 * 60 * 60 * 1000,
+      }).catch(() => {});
+    }
+    if (totalDownloads === 5) {
+      automatedEmailService.queueEventEmail({
+        userId,
+        type: 'free_fifth_download',
+        dedupeKey: 'free_fifth_download',
+        meta: { totalDownloads },
+      }).catch(() => {});
+    }
+    if (Number(quota.count || 0) === 3) {
+      await require('../models/automationEmailLog').updateOne(
+        { userId, dedupeKey: 'first_download', status: 'queued' },
+        { $set: { status: 'skipped', lastError: 'superseded_by_daily_limit' } }
+      );
+      automatedEmailService.sendEventEmail({
+        userId,
+        type: 'daily_limit_reached',
+        dedupeKey: `daily_limit_reached:${ymd}`,
+      }).catch(() => {});
+    }
 
     return next();
   } catch (e) {

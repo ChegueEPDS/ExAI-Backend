@@ -86,6 +86,55 @@ const SETTINGS = [
     defaultValue: 20,
     description: 'Issue a reward at every N certificates (e.g. 20 -> 20/40/60...).',
   },
+  {
+    key: 'CONTRIBUTION_REWARD_PROMO_TTL_DAYS',
+    group: 'Contribution rewards',
+    type: 'number',
+    defaultValue: 30,
+    description: 'Days a contribution reward promotion code remains redeemable.',
+  },
+  {
+    key: 'CONTRIBUTION_REWARD_REMINDER_DAYS',
+    group: 'Contribution rewards',
+    type: 'number',
+    defaultValue: 10,
+    description: 'Days after issuing an unredeemed reward before the first reminder.',
+  },
+  {
+    key: 'CONTRIBUTION_REWARD_EXPIRY_REMINDER_DAYS',
+    group: 'Contribution rewards',
+    type: 'number',
+    defaultValue: 3,
+    description: 'Days before reward expiry to send the final reminder.',
+  },
+  {
+    key: 'AUTOMATED_MARKETING_EMAILS_ENABLED',
+    group: 'Automated emails',
+    type: 'boolean',
+    defaultValue: false,
+    description: 'Enable scheduled onboarding, inactivity and marketing emails.',
+  },
+  {
+    key: 'AUTOMATED_EMAIL_WEEKLY_CAP',
+    group: 'Automated emails',
+    type: 'number',
+    defaultValue: 1,
+    description: 'Maximum marketing automation emails per user in a rolling 7-day window.',
+  },
+  {
+    key: 'AUTOMATED_EMAIL_MONTHLY_CAP',
+    group: 'Automated emails',
+    type: 'number',
+    defaultValue: 3,
+    description: 'Maximum marketing automation emails per user in a rolling 30-day window.',
+  },
+  {
+    key: 'AUTOMATED_EMAIL_BATCH_SIZE',
+    group: 'Automated emails',
+    type: 'number',
+    defaultValue: 10,
+    description: 'Maximum queued automated emails sent by the worker per minute.',
+  },
 
   // Dataplate extraction
   {

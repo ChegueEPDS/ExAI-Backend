@@ -14,11 +14,18 @@ const {
 } = require('../controllers/userController');
 const authMiddleware = require('../middlewares/authMiddleware');
 const { memoryUpload } = require('../middlewares/uploadFactory');
+const emailPreferenceController = require('../controllers/emailPreferenceController');
 
 const router = express.Router();
 
 // Signature / tenant logo upload handled in-memory; max ~2 MB per image
 const upload = memoryUpload({ fileSizeMb: 2, files: 2, fields: 40 });
+
+// Public Brevo callback; protected by BREVO_WEBHOOK_SECRET.
+router.post('/webhooks/brevo/marketing', express.json(), emailPreferenceController.handleBrevoMarketingWebhook);
+
+router.get('/user/me/email-preferences', authMiddleware(), emailPreferenceController.getMyEmailPreferences);
+router.put('/user/me/email-preferences', authMiddleware(), express.json(), emailPreferenceController.updateMyEmailPreferences);
 
 // List users (Admin: same tenant, SuperAdmin: all)
 router.get('/users', authMiddleware(['Admin', 'SuperAdmin']), listUsers);
@@ -56,10 +63,10 @@ router.post(
   createPaidTenantUser
 );
 
-// Manual reward email (Admin/SuperAdmin) - also sets baseline for future auto rewards
+// Manual reward email (SuperAdmin only) - also sets baseline for future auto rewards
 router.post(
   '/users/:userId/contribution-reward/manual-send',
-  authMiddleware(['Admin', 'SuperAdmin']),
+  authMiddleware(['SuperAdmin']),
   manualSendContributionReward
 );
 

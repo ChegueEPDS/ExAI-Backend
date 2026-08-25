@@ -3,6 +3,8 @@ const Stripe = require('stripe');
 const Tenant = require('../models/tenant');
 const Subscription = require('../models/subscription');
 const User = require('../models/user');
+const ContributionReward = require('../models/contributionReward');
+const automatedEmailService = require('../services/automatedEmailService');
 const { migrateDeleteCompanyDataButKeepPublic } = require('../services/tenantCleanup');
 
 const PRO_PRICE_ID  = process.env.STRIPE_PRICE_PRO;
@@ -120,6 +122,24 @@ async function upsertSubscriptionSnapshot(
   await Subscription.findOneAndUpdate({ tenantId }, payload, { upsert: true, new: true });
 }
 
+async function markContributionRewardRedeemed({ metadata, checkoutSessionId, subscriptionId, eventCreated }) {
+  const rewardId = metadata?.rewardId;
+  if (!rewardId) return;
+  await ContributionReward.updateOne(
+    { _id: rewardId, status: { $ne: 'redeemed' } },
+    {
+      $set: {
+        status: 'redeemed',
+        redeemedAt: eventCreated ? new Date(eventCreated * 1000) : new Date(),
+        stripeCheckoutSessionId: checkoutSessionId || undefined,
+        stripeSubscriptionId: subscriptionId || undefined,
+        lastStripeSyncAt: new Date(),
+        lastError: '',
+      },
+    }
+  );
+}
+
 // --- controller (single exported handler) ---
 exports.handleStripeWebhook = async (req, res) => {
   const sig = req.headers['stripe-signature'];
@@ -138,6 +158,12 @@ exports.handleStripeWebhook = async (req, res) => {
         const m = s?.metadata || {};
         const subId = s.subscription;
         const customerId = s.customer;
+        await markContributionRewardRedeemed({
+          metadata: m,
+          checkoutSessionId: s.id,
+          subscriptionId: subId,
+          eventCreated: event.created,
+        });
 
         const sub = await stripe.subscriptions.retrieve(subId);
         const item = sub.items.data[0];
@@ -218,6 +244,15 @@ exports.handleStripeWebhook = async (req, res) => {
               tier,
               billingPeriod
             });
+            if ((tier === 'pro' || tier === 'team') && (m.userId || tenant.ownerUserId)) {
+              const welcomeType = tier === 'team' ? 'team_welcome' : 'pro_welcome';
+              automatedEmailService.sendEventEmail({
+                userId: m.userId || tenant.ownerUserId,
+                type: welcomeType,
+                dedupeKey: `${welcomeType}:${subId}`,
+                category: 'service',
+              }).catch(() => {});
+            }
             break;
           }
         }
@@ -280,6 +315,14 @@ exports.handleStripeWebhook = async (req, res) => {
             tier,
             billingPeriod
           });
+          if (buyer?._id || tenant.ownerUserId) {
+            automatedEmailService.sendEventEmail({
+              userId: buyer?._id || tenant.ownerUserId,
+              type: 'team_welcome',
+              dedupeKey: `team_welcome:${subId}`,
+              category: 'service',
+            }).catch(() => {});
+          }
         }
 
         break;
@@ -340,6 +383,11 @@ exports.handleStripeWebhook = async (req, res) => {
 
       case 'customer.subscription.updated': {
         const sub = event.data.object;
+        await markContributionRewardRedeemed({
+          metadata: sub?.metadata,
+          subscriptionId: sub.id,
+          eventCreated: event.created,
+        });
 
         // 1) Find tenant by subscriptionId, or fall back to customer id
         let t = await Tenant.findOne({ stripeSubscriptionId: sub.id });

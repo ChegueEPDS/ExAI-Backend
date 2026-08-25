@@ -30,6 +30,7 @@ async function ensureStripeCustomerForTenant({ stripe, tenantDoc, user }) {
     lastName: user?.lastName || '',
     stripeCustomerId: customer.id,
     tenant: tenantDoc,
+    user,
   });
 
   return customer.id;

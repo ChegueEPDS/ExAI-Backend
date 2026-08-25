@@ -8,6 +8,8 @@ const router = express.Router();
 router.get('/admin/system-settings', authMiddleware(['SuperAdmin']), controller.getSystemSettings);
 router.put('/admin/system-settings', authMiddleware(['SuperAdmin']), controller.updateSystemSettings);
 router.post('/admin/system-settings/reset', authMiddleware(['SuperAdmin']), controller.resetSystemSettingsToDefault);
+router.get('/admin/system-settings/automated-email-tests', authMiddleware(['SuperAdmin']), controller.getAutomatedEmailTestCatalog);
+router.post('/admin/system-settings/automated-email-tests/send', authMiddleware(['SuperAdmin']), controller.sendAutomatedEmailTests);
 router.get('/admin/openai-models', authMiddleware(['SuperAdmin']), controller.listOpenAiModels);
 
 module.exports = router;

@@ -126,10 +126,28 @@ async function hasExactIndex(collectionName, keySpec) {
 const SORT_HINTS = Object.freeze({
   certNo:       { visibility: 1, certNo: 1, _id: 1 },
   manufacturer: { visibility: 1, manufacturer: 1, _id: 1 },
-  equipment:    { visibility: 1, equipment: 1, _id: 1 },
-  issueDate:    { visibility: 1, issueDate: -1, _id: 1 }, // index built descending on date
-  createdAt:    { visibility: 1, createdAt: -1, _id: 1 }  // index built descending on createdAt
+  equipment:    { visibility: 1, equipment: 1, _id: 1 }
 });
+
+function buildFindProjection(project) {
+  const out = {};
+  for (const [field, include] of Object.entries(project || {})) {
+    if (include === 1 && field !== 'adoptedByMe') out[field] = 1;
+  }
+  // uploadedAt is an aggregation alias; regular find projections need the source field.
+  if (project?.uploadedAt) {
+    delete out.uploadedAt;
+    out.createdAt = 1;
+  }
+  return out;
+}
+
+function applyComputedListFields(items, project) {
+  for (const item of items) {
+    item.adoptedByMe = false;
+    if (project?.uploadedAt) item.uploadedAt = item.createdAt;
+  }
+}
 
 function parsePositiveInt(value, fallback, max) {
   const n = parseInt(value, 10);
@@ -166,7 +184,7 @@ function buildKeysetMatch({ sortKey, dir, afterValue, afterId }) {
   return {
     $or: [
       { [sortKey]: { [op]: value } },
-      { [sortKey]: value, _id: { $gt: id } }
+      { [sortKey]: value, _id: { [op]: id } }
     ]
   };
 }
@@ -618,13 +636,15 @@ exports.getPublicCertificatesPaged = async (req, res) => {
     const tenantId = req.scope?.tenantId || null; // for adoptedByMe
     const tenantObjectId = tenantId ? new mongoose.Types.ObjectId(tenantId) : null;
 
-    const page     = Math.max(parseInt(req.query.page || '1', 10), 1);
-    const pageSize = Math.min(Math.max(parseInt(req.query.pageSize || '25', 10), 1), 200);
+    const { page, pageSize } = parsePageParams(req.query, {
+      defaultPageSize: 25,
+      maxPageSize: 200
+    });
 
     const sortKey  = (req.query.sort || 'certNo').toString();
     const dir      = (req.query.dir || 'asc').toString().toLowerCase() === 'desc' ? -1 : 1;
     const key = ALLOWED_SORT_KEYS.has(sortKey) ? sortKey : 'certNo';
-    const sort = { [key]: dir, _id: 1 };
+    const sort = { [key]: dir, _id: dir };
 
     const f = {
       certNo:       (req.query.certNo || '').trim(),
@@ -646,37 +666,29 @@ exports.getPublicCertificatesPaged = async (req, res) => {
     if (keyset) match.$and = [...(match.$and || []), keyset];
 
     const project = buildProjectFromFields(req.query.fields);
+    const findProjection = buildFindProjection(project);
 
-    // Page certificates first. Tenant links are fetched only for the returned ids below.
-    const pipeline = [
-      { $match: match },
-      { $sort: sort },
-      {
-        $facet: {
-          items: [
-            ...(keyset ? [] : [{ $skip: (page - 1) * pageSize }]),
-            { $limit: pageSize },
-            { $addFields: { adoptedByMe: false } },
-            { $project: project }
-          ],
-          total: [{ $count: 'count' }]
-        }
-      }
-    ];
-
-    // Create aggregate cursor with disk spill enabled for big sorts if needed
-    let aggCursor = Certificate.aggregate(pipeline).allowDiskUse(true);
+    // Keep paging and counting separate. A $facet would force the sort/count branches
+    // through one aggregation and can time out even when the page itself is index-backed.
+    let itemsQuery = Certificate.find(match)
+      .sort(sort)
+      .skip(keyset ? 0 : (page - 1) * pageSize)
+      .limit(pageSize)
+      .select(findProjection)
+      .lean();
 
     // Apply an index hint only if the exact compound index exists (prevents runtime "hint not found")
-    const hintSpec = SORT_HINTS[key] || SORT_HINTS.certNo;
-    if (await hasExactIndex('certificates', hintSpec)) {
-      aggCursor = aggCursor.hint(hintSpec);
+    const hintSpec = SORT_HINTS[key];
+    if (hintSpec && await hasExactIndex('certificates', hintSpec)) {
+      itemsQuery = itemsQuery.hint(hintSpec);
     }
-
-    aggCursor = aggCursor.option({ maxTimeMS: maxTimeMsFromEnv('CERTIFICATE_QUERY_MAX_TIME_MS', 10_000) });
-
-    const [agg] = await aggCursor.exec();
-    const items = agg?.items || [];
+    const maxTimeMS = maxTimeMsFromEnv('CERTIFICATE_QUERY_MAX_TIME_MS', 10_000);
+    itemsQuery = itemsQuery.maxTimeMS(maxTimeMS);
+    const [items, total] = await Promise.all([
+      itemsQuery.exec(),
+      keyset ? Promise.resolve(null) : Certificate.countDocuments(match).maxTimeMS(maxTimeMS)
+    ]);
+    applyComputedListFields(items, project);
     if (tenantObjectId && items.length) {
       const links = await CompanyCertificateLink.find({
         tenantId: tenantObjectId,
@@ -685,8 +697,6 @@ exports.getPublicCertificatesPaged = async (req, res) => {
       const adoptedIds = new Set(links.map((link) => String(link.certId)));
       for (const item of items) item.adoptedByMe = adoptedIds.has(String(item._id));
     }
-    const total = keyset ? null : (agg?.total?.[0]?.count || 0);
-
     return res.json({ items, total, page, pageSize, nextCursor: encodeNextCursor(items, key), hasNext: items.length === pageSize });
   } catch (e) {
     console.error('getPublicCertificatesPaged error:', e);
@@ -702,13 +712,15 @@ exports.getMyCertificatesPaged = async (req, res) => {
     if (!tenantId) return res.status(400).json({ message: 'Missing tenantId' });
     const tenantObjectId = new mongoose.Types.ObjectId(tenantId);
 
-    const page     = Math.max(parseInt(req.query.page || '1', 10), 1);
-    const pageSize = Math.min(Math.max(parseInt(req.query.pageSize || '25', 10), 1), 200);
+    const { page, pageSize } = parsePageParams(req.query, {
+      defaultPageSize: 25,
+      maxPageSize: 200
+    });
 
     const sortKey  = (req.query.sort || 'certNo').toString();
     const dir      = (req.query.dir || 'asc').toString().toLowerCase() === 'desc' ? -1 : 1;
     const key = ALLOWED_SORT_KEYS.has(sortKey) ? sortKey : 'certNo';
-    const sort = { [key]: dir, _id: 1 };
+    const sort = { [key]: dir, _id: dir };
 
     const f = {
       certNo:       (req.query.certNo || '').trim(),
@@ -733,6 +745,7 @@ exports.getMyCertificatesPaged = async (req, res) => {
     }
 
     const project = buildProjectFromFields(req.query.fields);
+    const findProjection = buildFindProjection(project);
 
     const keyset = buildKeysetMatch({
       sortKey: key,
@@ -741,56 +754,30 @@ exports.getMyCertificatesPaged = async (req, res) => {
       afterId: req.query.afterId
     });
 
-    const pipeline = [
-      { $match: { tenantId: tenantObjectId } },
-      {
-        $lookup: {
-          from: 'certificates',
-          localField: 'certId',
-          foreignField: '_id',
-          as: 'certificate'
-        }
-      },
-      { $unwind: '$certificate' },
-      { $replaceRoot: { newRoot: '$certificate' } },
-      { $match: adoptedMatch },
-      { $addFields: { adoptedByMe: true } },
-      { $project: project },
-      {
-        $unionWith: {
-          coll: 'certificates',
-          pipeline: [
-            { $match: ownMatch },
-            { $addFields: { adoptedByMe: false } },
-            { $project: project }
-          ]
-        }
-      },
-      {
-        $group: {
-          _id: '$_id',
-          doc: { $first: '$$ROOT' },
-          adoptedFlag: { $max: { $cond: ['$adoptedByMe', 1, 0] } }
-        }
-      },
-      { $set: { 'doc.adoptedByMe': { $toBool: '$adoptedFlag' } } },
-      { $replaceRoot: { newRoot: '$doc' } },
-      ...(keyset ? [{ $match: keyset }] : []),
-      { $sort: sort },
-      {
-        $facet: {
-          items: [
-            ...(keyset ? [] : [{ $skip: (page - 1) * pageSize }]),
-            { $limit: pageSize }
-          ],
-          ...(keyset ? {} : { total: [{ $count: 'count' }] })
-        }
-      }
-    ];
+    const adoptedLinks = await CompanyCertificateLink.find({ tenantId: tenantObjectId })
+      .select('certId')
+      .lean();
+    const adoptedIds = adoptedLinks.map((link) => link.certId);
+    const combinedMatch = adoptedIds.length
+      ? { $or: [ownMatch, { ...adoptedMatch, _id: { $in: adoptedIds } }] }
+      : ownMatch;
+    if (keyset) combinedMatch.$and = [...(combinedMatch.$and || []), keyset];
 
-    const [agg] = await CompanyCertificateLink.aggregate(pipeline).option({ maxTimeMS: maxTimeMsFromEnv('CERTIFICATE_QUERY_MAX_TIME_MS', 10_000) });
-    const items = agg?.items || [];
-    const total = keyset ? null : (agg?.total?.[0]?.count || 0);
+    const maxTimeMS = maxTimeMsFromEnv('CERTIFICATE_QUERY_MAX_TIME_MS', 10_000);
+    const itemsQuery = Certificate.find(combinedMatch)
+      .sort(sort)
+      .skip(keyset ? 0 : (page - 1) * pageSize)
+      .limit(pageSize)
+      .select(findProjection)
+      .lean()
+      .maxTimeMS(maxTimeMS);
+    const [items, total] = await Promise.all([
+      itemsQuery.exec(),
+      keyset ? Promise.resolve(null) : Certificate.countDocuments(combinedMatch).maxTimeMS(maxTimeMS)
+    ]);
+    applyComputedListFields(items, project);
+    const adoptedIdSet = new Set(adoptedIds.map(String));
+    for (const item of items) item.adoptedByMe = adoptedIdSet.has(String(item._id));
 
     return res.json({ items, total, page, pageSize, nextCursor: encodeNextCursor(items, key), hasNext: items.length === pageSize });
   } catch (e) {

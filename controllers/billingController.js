@@ -887,6 +887,7 @@ exports.createCheckoutSession = async (req, res) => {
                     lastName: req.user?.lastName || '',
                     stripeCustomerId: customerId,
                     tenant: { name: (companyName || '').toString(), plan: 'team', type: 'company' },
+                    user: req.user || null,
                   });
                 }
                 const clientRef = `team|${(req.user?.id || req.user?._id || userId || '').toString()}`;
@@ -1303,18 +1304,50 @@ exports.redeemContributionReward = async (req, res) => {
       emailLocal ||
       'company';
     const companyNameGuess = companyNameGuessRaw.replace(/^u-+/i, '').trim() || 'company';
-    const portalBase = (tenant?.name || '').toLowerCase() === 'index' ? 'https://exai.ind-ex.ae' : 'https://certs.atexdb.eu';
+    // Contribution rewards are ATEXdb marketing offers, so every continuation
+    // URL remains on the ATEXdb branded application.
+    const portalBase = 'https://certs.atexdb.eu';
     const successUrl = ensureAbsUrl(process.env.BILLING_SUCCESS_URL || `${portalBase}/billing/success`, `${portalBase}/billing/success`);
-    const cancelUrl = ensureAbsUrl(process.env.BILLING_CANCEL_URL || `${portalBase}/billing`, `${portalBase}/billing`);
+    const cancelUrl = ensureAbsUrl(process.env.BILLING_CANCEL_URL || `${portalBase}/account`, `${portalBase}/account`);
 
-    // If there is an existing subscription, apply coupon to it and redirect to Billing Portal
+    // Existing paid subscription: upgrade/switch to Team monthly and apply the
+    // customer-restricted promotion code in the same Stripe operation.
     const subId = tenant?.stripeSubscriptionId || null;
     if (subId) {
-      try {
-        await stripe.subscriptions.update(subId, { coupon: String(reward.stripeCouponId) });
-      } catch (e) {
-        console.warn('[reward] failed to apply coupon to subscription:', e?.message || e);
-      }
+      const teamPriceId = String(process.env.STRIPE_PRICE_TEAM || '').trim();
+      if (!teamPriceId) return res.status(500).send('Missing STRIPE_PRICE_TEAM');
+      const currentSub = await stripe.subscriptions.retrieve(subId);
+      const currentItem = currentSub?.items?.data?.[0];
+      if (!currentItem?.id) return res.status(409).send('Subscription item is missing');
+      const updatedSub = await stripe.subscriptions.update(subId, {
+        items: [{
+          id: String(currentItem.id),
+          price: teamPriceId,
+          quantity: Math.max(Number(currentItem.quantity || 0), 5),
+        }],
+        discounts: [{ promotion_code: String(reward.stripePromotionCodeId) }],
+        proration_behavior: 'none',
+        metadata: {
+          ...(currentSub.metadata || {}),
+          source: 'certificate-contribution',
+          rewardId: String(reward._id),
+          userId: String(userId),
+          plan: 'team',
+          billingPeriod: 'month',
+        },
+      });
+      await ContributionReward.updateOne(
+        { _id: reward._id },
+        {
+          $set: {
+            status: 'redeemed',
+            redeemedAt: new Date(),
+            stripeSubscriptionId: String(updatedSub.id),
+            lastStripeSyncAt: new Date(),
+            lastError: '',
+          },
+        }
+      );
 
       const portal = await stripe.billingPortal.sessions.create({
         customer: String(reward.stripeCustomerId),

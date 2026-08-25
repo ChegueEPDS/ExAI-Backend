@@ -14,6 +14,7 @@ const { createOneTimeTeamPromoCode, buildPromoCode } = require('./stripeContribu
 const { ensureStripeCustomerForTenant } = require('./stripeCustomerProvisioning');
 const systemSettings = require('./systemSettingsStore');
 const jwt = require('jsonwebtoken');
+const automatedEmailService = require('./automatedEmailService');
 
 function isIndexTenantName(name) {
   return String(name || '').toLowerCase() === 'index';
@@ -31,6 +32,16 @@ function buildRedeemToken({ rewardId, userId }, expiresIn = '30d') {
     secret,
     { expiresIn }
   );
+}
+
+function buildRedeemLinks({ reward, userId, tenantName }) {
+  const base = tenantBaseUrl(tenantName).replace(/\/+$/g, '');
+  const redeemToken = buildRedeemToken({ rewardId: reward._id, userId });
+  return {
+    redeemUrl: `${base}/api/billing/contribution-reward/redeem?token=${encodeURIComponent(redeemToken)}`,
+    copyUrl: `${base}/api/billing/contribution-reward/copy?code=${encodeURIComponent(reward.promoCode || '')}`,
+    accountUrl: `${base}/account`,
+  };
 }
 
 function log(level, message, meta) {
@@ -138,7 +149,7 @@ async function issueMilestoneReward({ userId, milestone, forceResendEmail = fals
         await mailService.sendMail({ to: user.email, subject, html });
         await ContributionReward.updateOne(
           { _id: rewardDoc._id },
-          { $set: { status: 'emailed', emailedAt: new Date(), lastError: '' } }
+          { $set: { status: 'emailed', emailedAt: new Date(), initialEmailSentAt: rewardDoc.initialEmailSentAt || new Date(), lastError: '' } }
         );
         return { ok: true, code: rewardDoc.promoCode, resent: true };
       } catch (mailErr) {
@@ -209,7 +220,7 @@ async function issueMilestoneReward({ userId, milestone, forceResendEmail = fals
       await mailService.sendMail({ to: user.email, subject, html });
       await ContributionReward.updateOne(
         { _id: rewardDoc._id },
-        { $set: { status: 'emailed', emailedAt: new Date() } }
+        { $set: { status: 'emailed', emailedAt: new Date(), initialEmailSentAt: new Date() } }
       );
     } catch (mailErr) {
       const msg = mailErr?.message || String(mailErr);
@@ -257,6 +268,24 @@ async function onCertificatesAdded({ userId, added = 1 }) {
 
     const total = await Certificate.countDocuments({ createdBy: userId });
     const previous = Math.max(0, total - delta);
+    if (previous === 0 && total > 0) {
+      automatedEmailService.sendEventEmail({
+        userId,
+        type: 'first_upload',
+        dedupeKey: 'first_upload',
+      }).catch(() => {});
+    }
+    const halfway = Math.ceil(step / 2);
+    for (let target = step; target <= total + step; target += step) {
+      const halfwayCount = target - step + halfway;
+      if (previous < halfwayCount && total >= halfwayCount) {
+        automatedEmailService.sendContributionHalfway({
+          userId,
+          currentCount: total,
+          milestone: target,
+        }).catch(() => {});
+      }
+    }
 
     const milestones = [];
     for (let m = Math.floor(previous / step) * step + step; m <= total; m += step) {
@@ -284,4 +313,5 @@ async function onCertificatesAdded({ userId, added = 1 }) {
 module.exports = {
   onCertificatesAdded,
   issueManualRewardForUser,
+  buildRedeemLinks,
 };

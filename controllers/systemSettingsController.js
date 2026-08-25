@@ -1,6 +1,9 @@
 const systemSettingsStore = require('../services/systemSettingsStore');
 const { getDefinition } = require('../config/systemSettingsRegistry');
 const axios = require('axios');
+const mailService = require('../services/mailService');
+const mailTemplates = require('../services/mailTemplates');
+const automatedEmailService = require('../services/automatedEmailService');
 
 let modelsCache = {
   chat: { ts: 0, items: [], recommended: [] },
@@ -97,10 +100,110 @@ const resetSystemSettingsToDefault = async (req, res) => {
   }
 };
 
+const EXTRA_TEST_EMAILS = [
+  { key: 'contribution_halfway', label: 'Contribution reward — halfway' },
+  { key: 'contribution_reward_earned', label: 'Contribution reward — earned' },
+  { key: 'contribution_reward_reminder', label: 'Contribution reward — 10-day reminder' },
+  { key: 'contribution_reward_expiry', label: 'Contribution reward — expiry reminder' },
+];
+
+function getAutomatedEmailTestCatalog(_req, res) {
+  return res.json({
+    items: [...automatedEmailService.getLifecycleEmailCatalog(), ...EXTRA_TEST_EMAILS],
+  });
+}
+
+function renderContributionTestEmail(type) {
+  const configuredStep = Number(systemSettingsStore.getNumber('CONTRIBUTION_REWARD_STEP'));
+  const milestone = Number.isInteger(configuredStep) && configuredStep > 0 ? configuredStep : 20;
+  const configuredTtl = Number(systemSettingsStore.getNumber('CONTRIBUTION_REWARD_PROMO_TTL_DAYS'));
+  const ttlDays = Number.isInteger(configuredTtl) && configuredTtl > 0 ? configuredTtl : 30;
+  const common = {
+    firstName: 'Test',
+    milestone,
+    code: `THANKS-TEAM-${milestone}-TESTCODE`,
+    expiresAt: new Date(Date.now() + ttlDays * 86400000),
+    redeemUrl: 'https://certs.atexdb.eu/account?upgrade=team',
+  };
+  if (type === 'contribution_halfway') {
+    return {
+      subject: '[TEST] You’re halfway to your free Team month',
+      html: mailTemplates.contributionHalfwayEmail({
+        firstName: 'Test',
+        currentCount: Math.ceil(milestone / 2),
+        milestone,
+      }, 'ATEXdb'),
+    };
+  }
+  if (type === 'contribution_reward_earned') {
+    return {
+      subject: '[TEST] Thank you — your 100% Team discount code',
+      html: mailTemplates.contributionRewardEmail({
+        ...common,
+        lastName: 'User',
+        copyUrl: 'https://certs.atexdb.eu',
+        accountUrl: 'https://certs.atexdb.eu/account',
+      }, 'ATEXdb'),
+    };
+  }
+  if (type === 'contribution_reward_reminder' || type === 'contribution_reward_expiry') {
+    const finalReminder = type === 'contribution_reward_expiry';
+    return {
+      subject: finalReminder ? '[TEST] Your free Team month expires soon' : '[TEST] Your free Team month is waiting',
+      html: mailTemplates.contributionRewardReminderEmail({ ...common, finalReminder }, 'ATEXdb'),
+    };
+  }
+  return null;
+}
+
+async function sendAutomatedEmailTests(req, res) {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const selected = Array.isArray(req.body?.types)
+      ? [...new Set(req.body.types.map((value) => String(value || '').trim()).filter(Boolean))]
+      : [];
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'A valid email address is required.' });
+    }
+    const allowed = new Set([
+      ...automatedEmailService.getLifecycleEmailCatalog().map((item) => item.key),
+      ...EXTRA_TEST_EMAILS.map((item) => item.key),
+    ]);
+    const unknown = selected.filter((type) => !allowed.has(type));
+    if (!selected.length) return res.status(400).json({ error: 'Select at least one email template.' });
+    if (unknown.length) return res.status(400).json({ error: 'Unknown email template(s).', unknown });
+
+    const results = [];
+    for (const type of selected) {
+      const rendered =
+        automatedEmailService.renderLifecycleTestEmail(type) ||
+        renderContributionTestEmail(type);
+      try {
+        await mailService.sendMail({ to: email, subject: rendered.subject, html: rendered.html });
+        results.push({ type, ok: true });
+      } catch (error) {
+        results.push({ type, ok: false, error: error?.message || String(error) });
+      }
+    }
+    const sent = results.filter((result) => result.ok).length;
+    return res.status(sent === results.length ? 200 : 207).json({
+      ok: sent === results.length,
+      email,
+      sent,
+      failed: results.length - sent,
+      results,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || 'Failed to send test emails.' });
+  }
+}
+
 module.exports = {
   getSystemSettings,
   updateSystemSettings,
   resetSystemSettingsToDefault,
+  getAutomatedEmailTestCatalog,
+  sendAutomatedEmailTests,
   listOpenAiModels: async (req, res) => {
     try {
       if (!process.env.OPENAI_API_KEY) return res.status(400).json({ ok: false, error: 'OPENAI_API_KEY is not set' });

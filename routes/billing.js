@@ -129,7 +129,7 @@ router.get('/invoices', requireAuth, listInvoicesForMe);
 
 
 // Egyszeri jóváírás a következő számlára
-router.post('/free-next-invoice', requireAuth, applyFreeNextInvoice);
+router.post('/free-next-invoice', requireAuth, requireRole('SuperAdmin'), applyFreeNextInvoice);
 
 // Mennyiség frissítése (seat szám) – itt is érdemes auth
 router.post('/update-quantity', requireAuth, updateQuantity);

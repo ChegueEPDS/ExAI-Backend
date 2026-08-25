@@ -52,6 +52,24 @@ const UserSchema = new mongoose.Schema(
     emailVerified: { type: Boolean, default: true },
     emailVerificationToken: { type: String },
     emailVerificationExpires: { type: Date },
+    marketingEmailsEnabled: { type: Boolean, default: true, index: true },
+    newsletterEmailsEnabled: { type: Boolean, default: true, index: true },
+    preferredLanguage: { type: String, enum: ['en', 'hu'], default: 'en' },
+    brevoNewsletterListIds: { type: [Number], default: [] },
+    emailPreferenceSync: {
+      usefulInformation: {
+        status: { type: String, enum: ['synced', 'pending', 'failed'], default: 'pending' },
+        lastAttemptAt: { type: Date, default: null },
+        lastError: { type: String, default: '' },
+      },
+      newsletter: {
+        status: { type: String, enum: ['synced', 'pending', 'failed'], default: 'pending' },
+        lastAttemptAt: { type: Date, default: null },
+        lastError: { type: String, default: '' },
+      },
+    },
+    emailDeliverySuppressed: { type: Boolean, default: false, index: true },
+    emailDeliverySuppressedReason: { type: String, default: '' },
 
     // Opcionális: regisztrációkor kiválasztott fizetős csomag (másik böngésző/tab esetén is)
     pendingCheckoutPlan: { type: String }, // 'pro' | 'team' | 'pro_yearly' | 'team_yearly'

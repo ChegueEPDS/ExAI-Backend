@@ -8,10 +8,11 @@ const Tenant = require('../models/tenant');
 const Subscription = require('../models/subscription');
 const Session = require('../models/session');
 const mailService = require('../services/mailService');
-const { registrationEmailHtml, emailVerificationEmailHtml, forgotPasswordEmailHtml } = require('../services/mailTemplates');
+const { registrationEmailHtml, emailVerificationEmailHtml, forgotPasswordEmailHtml, resolveEmailBrand } = require('../services/mailTemplates');
 const { resolvePublicBaseUrl, persistPublicBaseUrlIfMissing } = require('../helpers/publicBaseUrl');
 const Stripe = require('stripe');
 const { ensureStripeCustomerForTenant } = require('../services/stripeCustomerProvisioning');
+const emailPreferenceService = require('../services/emailPreferenceService');
 const { computePermissions, getEffectiveProfessions } = require('../helpers/rbac');
 const {
   buildSessionMetadata,
@@ -377,6 +378,9 @@ exports.register = async (req, res) => {
           }
         : {}),
     });
+    emailPreferenceService.recordInitialPreferences(user).catch(err =>
+      console.warn('[email-preferences] initial consent log failed:', err?.message || err)
+    );
 
     // 2) personal + free tenant KÖTELEZŐ
     const personalBase = user.email ? `u-${String(user.email).split('@')[0]}` : `u-${user._id}`;
@@ -401,9 +405,10 @@ exports.register = async (req, res) => {
         tenantName: personalTenant.name,
         baseUrl: requestBaseUrl || undefined
       });
+      const emailBrand = resolveEmailBrand({ tenantName: personalTenant.name, baseUrl: requestBaseUrl });
       mailService.sendMail({
         to: user.email,
-        subject: 'Confirm your email for ATEXdb Certs',
+        subject: `Confirm your email for ${emailBrand.productName}`,
         html,
         from: process.env.MAIL_SENDER_UPN
       })
@@ -609,11 +614,12 @@ exports.resendVerificationEmail = async (req, res) => {
       tenantName: tenantName || undefined,
       baseUrl: requestBaseUrl || undefined
     });
+    const emailBrand = resolveEmailBrand({ tenantName: tenantName || undefined, baseUrl: requestBaseUrl });
 
     mailService
       .sendMail({
         to: user.email,
-        subject: 'Confirm your email for ATEXdb Certs',
+        subject: `Confirm your email for ${emailBrand.productName}`,
         html,
         from: process.env.MAIL_SENDER_UPN
       })
@@ -667,6 +673,9 @@ exports.microsoftLogin = async (req, res) => {
         password: 'microsoft-auth', // pre-save hash-eli
         // company: undefined
       });
+      emailPreferenceService.recordInitialPreferences(user).catch(err =>
+        console.warn('[email-preferences] initial consent log failed:', err?.message || err)
+      );
     }
 
     if (!user.tenantId) {
@@ -789,11 +798,12 @@ exports.forgotPassword = async (req, res) => {
       tenantName: tenantName || undefined,
       baseUrl: requestBaseUrl || undefined
     });
+    const emailBrand = resolveEmailBrand({ tenantName: tenantName || undefined, baseUrl: requestBaseUrl });
 
     // fire-and-forget
     mailService.sendMail({
       to: email,
-      subject: 'Your ATEXdb Certs password reset',
+      subject: `Your ${emailBrand.productName} password reset`,
       html,
       from: process.env.MAIL_SENDER_UPN
     })

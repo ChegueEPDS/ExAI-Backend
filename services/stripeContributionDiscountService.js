@@ -1,5 +1,6 @@
 // services/stripeContributionDiscountService.js
 const crypto = require('crypto');
+const systemSettings = require('./systemSettingsStore');
 
 function toInt(v, fallback) {
   const n = Number(v);
@@ -76,7 +77,8 @@ async function createOneTimeTeamPromoCode({ stripe, stripeCustomerId, userId, mi
 
   const { couponId } = await ensureCoupon({ stripe });
   const maxRedemptions = toInt(process.env.STRIPE_CONTRIB_MAX_REDEMPTIONS, 1);
-  const ttlDays = toInt(process.env.STRIPE_CONTRIB_PROMO_TTL_DAYS, 60);
+  const configuredTtl = systemSettings.getNumber('CONTRIBUTION_REWARD_PROMO_TTL_DAYS');
+  const ttlDays = Number.isInteger(configuredTtl) && configuredTtl > 0 ? configuredTtl : 30;
   const expiresAt = ttlDays > 0 ? nowUnix() + ttlDays * 24 * 60 * 60 : null;
 
   for (let attempt = 1; attempt <= 5; attempt++) {

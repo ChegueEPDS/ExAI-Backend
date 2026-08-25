@@ -12,6 +12,7 @@ const { tenantInviteEmailHtml, tenantJoinInviteEmailHtml } = require('../service
 const { resolvePublicBaseUrl, persistPublicBaseUrlIfMissing } = require('../helpers/publicBaseUrl');
 const { assertValidProfessions } = require('../helpers/rbac');
 const { migrateAllUserDataToTenant } = require('../services/tenantMigration');
+const emailPreferenceService = require('../services/emailPreferenceService');
 
 /** Erős ideiglenes jelszó (2-2 kis/nagy/ szám/ spec) */
 function generatePassword() {
@@ -237,6 +238,9 @@ exports.createInvite = async (req, res) => {
       ...(t?.professionRbacEnabled ? { professions } : {}),
       subscriptionTier: t.plan || 'free',
     });
+    emailPreferenceService.recordInitialPreferences(user).catch(err =>
+      console.warn('[email-preferences] initial consent log failed:', err?.message || err)
+    );
     createdNewUser = true;
   } else {
     const currentTenant = user.tenantId ? String(user.tenantId) : null;
