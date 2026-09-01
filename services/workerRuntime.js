@@ -26,7 +26,16 @@ function backgroundJobsDisabled() {
 }
 
 function scheduleInterval(fn, intervalMs) {
-  const timer = setInterval(fn, intervalMs);
+  const timer = setInterval(() => {
+    // Timer callbacks do not observe returned promises. Without an explicit
+    // catch, a transient job/lock failure becomes an unhandled rejection and
+    // the worker's process-level safety handler shuts down the whole runtime.
+    void Promise.resolve()
+      .then(fn)
+      .catch((err) => logger.error('[worker-runtime] scheduled job failed', {
+        error: err?.stack || err?.message || String(err)
+      }));
+  }, intervalMs);
   timers.push(timer);
   return timer;
 }
