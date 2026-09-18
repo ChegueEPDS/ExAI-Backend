@@ -120,7 +120,7 @@ function ensureSessionCsrfToken(session) {
   return session.csrfToken;
 }
 
-async function prepareResponseCsrfToken(req, result = null) {
+async function prepareResponseCsrfToken(req, res, result = null) {
   const session =
     result?.session?.clientType === 'web'
       ? result.session
@@ -130,6 +130,14 @@ async function prepareResponseCsrfToken(req, result = null) {
   const csrfToken = ensureSessionCsrfToken(session);
   if (csrfToken && session?.isModified?.('csrfToken')) {
     await session.save();
+  }
+  if (csrfToken && res) {
+    const refreshMs = session?.expiresAt
+      ? Math.max(0, new Date(session.expiresAt).getTime() - Date.now())
+      : refreshTtlMs('web');
+    // The CSRF token must be readable by JavaScript so a freshly opened tab can
+    // send it back in X-CSRF-Token. The actual auth cookies remain HttpOnly.
+    res.cookie(CSRF_COOKIE, csrfToken, cookieOptions(req, refreshMs, false));
   }
   return csrfToken;
 }

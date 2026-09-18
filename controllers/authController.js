@@ -260,7 +260,7 @@ function getClientType(req) {
 async function sendAuthResult(req, res, result, extra = {}) {
   if (result.session.clientType === 'web') {
     setAuthCookies(res, req, result);
-    const csrfToken = await prepareResponseCsrfToken(req, result);
+    const csrfToken = await prepareResponseCsrfToken(req, res, result);
     return res.status(200).json({
       user: result.user,
       session: result.sessionMeta,
@@ -736,7 +736,7 @@ exports.logout = async (req, res) => {
 exports.me = async (req, res) => {
   const session = buildSessionMetadata(req.session || null);
   if (req.auth?.exp) session.accessExpiresAt = new Date(req.auth.exp * 1000).toISOString();
-  const csrfToken = await prepareResponseCsrfToken(req);
+  const csrfToken = await prepareResponseCsrfToken(req, res);
   return res.json({
     user: req.user,
     session,

@@ -17,6 +17,7 @@ const errorAuditMiddleware = require('./middlewares/errorAuditMiddleware');
 const apiErrorHandler = require('./middlewares/apiErrorHandler');
 const limiter = require('./middlewares/rateLimiter');
 const systemSettingsStore = require('./services/systemSettingsStore');
+const { maintenanceModeMiddleware } = require('./middlewares/maintenanceModeMiddleware');
 const { writeSystemAuditLog } = require('./services/auditLogService');
 const { seedInitialSuperAdminIfEmpty } = require('./services/bootstrapSuperAdmin');
 const { seedRbQuestionsIfEmpty } = require('./services/rbQuestionSeedService');
@@ -259,6 +260,7 @@ app.use((req, res, next) => {
 
 // Request correlation id (used in logs and returned as response header)
 app.use(requestIdMiddleware);
+app.use(maintenanceModeMiddleware);
 
 const NORMAL_REQUEST_TIMEOUT_MS = Math.max(30_000, Number(process.env.HTTP_REQUEST_TIMEOUT_MS || 120_000));
 const LONG_REQUEST_TIMEOUT_MS = Math.max(10 * 60_000, Number(process.env.HTTP_LONG_REQUEST_TIMEOUT_MS || 2 * 60 * 60_000));

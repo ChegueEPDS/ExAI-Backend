@@ -4,10 +4,16 @@ const axios = require('axios');
 const mailService = require('../services/mailService');
 const mailTemplates = require('../services/mailTemplates');
 const automatedEmailService = require('../services/automatedEmailService');
+const { getMaintenanceStatus } = require('../middlewares/maintenanceModeMiddleware');
 
 let modelsCache = {
   chat: { ts: 0, items: [], recommended: [] },
   all: { ts: 0, items: [], recommended: [] },
+};
+
+const getMaintenanceStatusPublic = (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json(getMaintenanceStatus());
 };
 
 function buildRecommendedModels() {
@@ -199,6 +205,7 @@ async function sendAutomatedEmailTests(req, res) {
 }
 
 module.exports = {
+  getMaintenanceStatusPublic,
   getSystemSettings,
   updateSystemSettings,
   resetSystemSettingsToDefault,

@@ -4,6 +4,9 @@ const controller = require('../controllers/systemSettingsController');
 
 const router = express.Router();
 
+// Deliberately public: the frontend must be able to show maintenance before login.
+router.get('/maintenance-status', controller.getMaintenanceStatusPublic);
+
 // SuperAdmin-only global system settings (applies to all tenants)
 router.get('/admin/system-settings', authMiddleware(['SuperAdmin']), controller.getSystemSettings);
 router.put('/admin/system-settings', authMiddleware(['SuperAdmin']), controller.updateSystemSettings);

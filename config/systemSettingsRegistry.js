@@ -6,6 +6,33 @@
  */
 
 const SETTINGS = [
+  // Operational maintenance controls
+  {
+    key: 'MAINTENANCE_MODE',
+    group: 'Maintenance mode',
+    type: 'string',
+    defaultValue: 'off',
+    options: [
+      { value: 'off', label: 'Off' },
+      { value: 'display', label: 'Maintenance page only' },
+      { value: 'read_only', label: 'Maintenance page + block write APIs' },
+    ],
+    description: 'Global maintenance mode. Read-only mode also rejects state-changing API requests with HTTP 503.',
+  },
+  {
+    key: 'MAINTENANCE_MESSAGE',
+    group: 'Maintenance mode',
+    type: 'string',
+    defaultValue: 'We are carrying out scheduled maintenance. Please try again shortly.',
+    description: 'Message shown on the public maintenance screen.',
+  },
+  {
+    key: 'MAINTENANCE_EXPECTED_BACK',
+    group: 'Maintenance mode',
+    type: 'string',
+    defaultValue: '',
+    description: 'Optional expected return time shown verbatim (for example: Today, 18:30 CET).',
+  },
   // Chat models
   {
     key: 'FILE_CHAT_COMPLETIONS_MODEL',
