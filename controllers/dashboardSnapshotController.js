@@ -16,6 +16,10 @@ const SNAPSHOT_MAX_AGE_MS = Math.max(
   60_000,
   Math.min(Number(process.env.DASHBOARD_SNAPSHOT_MAX_AGE_MS || 10 * 60_000), 24 * 60 * 60_000)
 );
+const SNAPSHOT_SOURCE_CONCURRENCY = Math.max(
+  1,
+  Math.min(Number(process.env.DASHBOARD_SNAPSHOT_SOURCE_CONCURRENCY || 2), 4)
+);
 
 function objectIdOrNull(value) {
   return value && mongoose.Types.ObjectId.isValid(String(value))
@@ -72,6 +76,19 @@ async function optional(promise, fallback) {
   }
 }
 
+async function runTasksBounded(tasks, concurrency = SNAPSHOT_SOURCE_CONCURRENCY) {
+  const results = new Array(tasks.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, async () => {
+    while (nextIndex < tasks.length) {
+      const index = nextIndex++;
+      results[index] = await tasks[index]();
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 async function buildSnapshot(req, { tenantId, siteId, zoneId, scope, from, to, mode, severity, features }) {
   const sharedQuery = {
     scope,
@@ -82,24 +99,24 @@ async function buildSnapshot(req, { tenantId, siteId, zoneId, scope, from, to, m
   };
   const metricArgs = { tenantId, siteId, zoneId, from, to, mode, severity };
 
-  const [navigation, status, maintenanceSeverity, healthMetrics, analytics, maintenanceRoot, complianceRoot, plannedInspections, expiredDocumentations, conflicts] = await Promise.all([
-    Promise.all([
+  const [navigation, status, maintenanceSeverity, healthMetrics, analytics, maintenanceRoot, complianceRoot, plannedInspections, expiredDocumentations, conflicts] = await runTasksBounded([
+    () => Promise.all([
       Site.find({ tenantId }).select('_id Name Client updatedAt').sort({ Name: 1, _id: 1 }).lean(),
       Unit.find({ tenantId }).select('_id Name Site parentUnitId ancestors depth updatedAt').sort({ Site: 1, depth: 1, Name: 1, _id: 1 }).lean()
     ]).then(([sites, units]) => ({ sites, units })),
-    computeStatusStackedSummary({ tenantId, siteId, zoneId }),
-    features.maintenance ? computeMaintenanceSeveritySummary({ tenantId, siteId, zoneId }) : null,
-    computeHealthMetrics(metricArgs),
-    computeDashboardAnalytics({ tenantId, siteId, zoneId, from, to }),
-    features.maintenance
+    () => computeStatusStackedSummary({ tenantId, siteId, zoneId }),
+    () => features.maintenance ? computeMaintenanceSeveritySummary({ tenantId, siteId, zoneId }) : null,
+    () => computeHealthMetrics(metricArgs),
+    () => computeDashboardAnalytics({ tenantId, siteId, zoneId, from, to }),
+    () => features.maintenance
       ? optional(capture(rootCauseController.getMaintenanceRootCauses, childRequest(req, { ...sharedQuery, severity: severity || '', limit: '10' })), { total: 0, top: [] })
       : null,
-    optional(capture(rootCauseController.getComplianceRootCauses, childRequest(req, { ...sharedQuery, limit: '10' })), { total: 0, top: [] }),
-    optional(capture(plannedInspectionController.getPlannedInspections, childRequest(req, { ...sharedQuery, limit: '200' })), { summary: null, items: [] }),
-    features.documentation
+    () => optional(capture(rootCauseController.getComplianceRootCauses, childRequest(req, { ...sharedQuery, limit: '10' })), { total: 0, top: [] }),
+    () => optional(capture(plannedInspectionController.getPlannedInspections, childRequest(req, { ...sharedQuery, limit: '200' })), { summary: null, items: [] }),
+    () => features.documentation
       ? optional(capture(documentationController.listExpiredDocumentationsForDashboard, childRequest(req, { ...sharedQuery, limit: '50' })), { summary: null, items: [] })
       : { summary: null, items: [] },
-    optional(capture(equipmentConflictController.listConflicts, childRequest(req, { status: 'open', limit: '5' })), { items: [] })
+    () => optional(capture(equipmentConflictController.listConflicts, childRequest(req, { status: 'open', limit: '5' })), { items: [] })
   ]);
 
   return {
@@ -167,4 +184,4 @@ exports.getDashboardSnapshot = async (req, res) => {
   }
 };
 
-exports._private = { bucketDate, capture };
+exports._private = { bucketDate, capture, runTasksBounded };
