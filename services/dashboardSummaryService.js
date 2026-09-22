@@ -241,14 +241,16 @@ async function getMaterializedSummary({
   zoneId = null,
   params = {},
   loader,
-  maxAgeMs = DEFAULT_MAX_AGE_MS
+  maxAgeMs = DEFAULT_MAX_AGE_MS,
+  withMeta = false
 }) {
   const key = buildKey({ tenantId, kind, siteId, zoneId, params });
   if (!key.kind) throw new Error('Missing summary kind');
   if (typeof loader !== 'function') throw new Error('Missing summary loader');
 
+  const wrap = (summary, cacheStatus) => withMeta ? { summary, cacheStatus } : summary;
   const cached = getCachedSummary(key);
-  if (cached) return cached;
+  if (cached) return wrap(cached, 'memory-hit');
 
   const sourceVersion = await getCurrentVersion(key.tenantId);
   const doc = await DashboardSummary.findOne({ _id: key.summaryId }).lean();
@@ -258,23 +260,26 @@ async function getMaterializedSummary({
     Number(doc.sourceVersion || 0) === sourceVersion &&
     isFreshEnough(doc, maxAgeMs)
   ) {
-    return cacheSummary(key, doc.summary || {});
+    return wrap(cacheSummary(key, doc.summary || {}), 'hit');
   }
 
   if (doc?.summary && Object.keys(doc.summary).length) {
     enqueueRebuild({ key, loader, sourceVersion });
-    return cacheSummary(key, doc.summary);
+    return wrap(cacheSummary(key, doc.summary), 'stale');
   }
 
   const existingLoad = inFlightLoads.get(key.queueKey);
-  if (existingLoad) return existingLoad;
+  if (existingLoad) {
+    const summary = await existingLoad;
+    return wrap(summary, 'coalesced');
+  }
 
   const loadPromise = (async () => {
     const summary = await loader();
     return saveFreshSummary(key, sourceVersion, summary);
   })().finally(() => inFlightLoads.delete(key.queueKey));
   inFlightLoads.set(key.queueKey, loadPromise);
-  return loadPromise;
+  return wrap(await loadPromise, 'miss');
 }
 
 async function markDashboardStatsDirty({ tenantId, reason = 'data_changed' }) {

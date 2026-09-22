@@ -13,6 +13,23 @@ function parseSeverityQuery(v) {
   return raw;
 }
 
+function bucketDateQuery(v, bucketMs = 5 * 60 * 1000) {
+  const raw = normalizeQueryValue(v);
+  if (!raw) return null;
+  const time = new Date(raw).getTime();
+  if (!Number.isFinite(time)) return raw;
+  return new Date(Math.floor(time / bucketMs) * bucketMs).toISOString();
+}
+
+function metricParams(query) {
+  return {
+    from: bucketDateQuery(query.from),
+    to: bucketDateQuery(query.to),
+    mode: normalizeQueryValue(query.mode),
+    severity: parseSeverityQuery(query.severity)
+  };
+}
+
 exports.getSiteHealthMetrics = async (req, res) => {
   try {
     const tenantId = req.scope?.tenantId;
@@ -22,12 +39,7 @@ exports.getSiteHealthMetrics = async (req, res) => {
       return res.status(400).json({ message: 'Invalid site id.' });
     }
 
-    const params = {
-      from: normalizeQueryValue(req.query.from),
-      to: normalizeQueryValue(req.query.to),
-      mode: normalizeQueryValue(req.query.mode),
-      severity: parseSeverityQuery(req.query.severity)
-    };
+    const params = metricParams(req.query);
     const metrics = await getMaterializedSummary({
       kind: 'health-metrics',
       tenantId,
@@ -55,12 +67,7 @@ exports.getZoneHealthMetrics = async (req, res) => {
       return res.status(400).json({ message: 'Invalid zone id.' });
     }
 
-    const params = {
-      from: normalizeQueryValue(req.query.from),
-      to: normalizeQueryValue(req.query.to),
-      mode: normalizeQueryValue(req.query.mode),
-      severity: parseSeverityQuery(req.query.severity)
-    };
+    const params = metricParams(req.query);
     const metrics = await getMaterializedSummary({
       kind: 'health-metrics',
       tenantId,
@@ -84,12 +91,7 @@ exports.getTenantHealthMetrics = async (req, res) => {
     const tenantId = req.scope?.tenantId;
     if (!tenantId) return res.status(401).json({ message: 'Missing tenantId from auth.' });
 
-    const params = {
-      from: normalizeQueryValue(req.query.from),
-      to: normalizeQueryValue(req.query.to),
-      mode: normalizeQueryValue(req.query.mode),
-      severity: parseSeverityQuery(req.query.severity)
-    };
+    const params = metricParams(req.query);
     const metrics = await getMaterializedSummary({
       kind: 'health-metrics',
       tenantId,
