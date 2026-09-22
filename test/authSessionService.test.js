@@ -30,3 +30,30 @@ test('prepareResponseCsrfToken persists a readable CSRF cookie for web sessions'
   assert.equal(cookies[0].options.path, '/');
   assert.ok(cookies[0].options.maxAge > 0);
 });
+
+test('development HTTP does not emit browser-rejected Secure CSRF cookies', async () => {
+  const previousNodeEnv = process.env.NODE_ENV;
+  const previousSecure = process.env.AUTH_COOKIE_SECURE;
+  process.env.NODE_ENV = 'development';
+  process.env.AUTH_COOKIE_SECURE = 'true';
+  try {
+    const cookies = [];
+    const session = {
+      clientType: 'web',
+      csrfToken: 'local-csrf',
+      expiresAt: new Date(Date.now() + 60_000),
+      isModified: () => false,
+    };
+    await prepareResponseCsrfToken(
+      { headers: { host: 'localhost:3000' }, hostname: 'localhost', secure: false },
+      { cookie: (name, value, options) => cookies.push({ name, value, options }) },
+      { session }
+    );
+    assert.equal(cookies[0].options.secure, false);
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    if (previousSecure === undefined) delete process.env.AUTH_COOKIE_SECURE;
+    else process.env.AUTH_COOKIE_SECURE = previousSecure;
+  }
+});

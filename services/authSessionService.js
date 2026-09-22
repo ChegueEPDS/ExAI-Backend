@@ -69,10 +69,13 @@ function minDate(a, b) {
 }
 
 function cookieSecure(req) {
-  if (String(process.env.AUTH_COOKIE_SECURE || '').trim()) {
-    return String(process.env.AUTH_COOKIE_SECURE).toLowerCase() === 'true';
+  const requestIsHttps = Boolean(req.secure || String(req.headers?.['x-forwarded-proto'] || '').split(',')[0].trim() === 'https');
+  const configured = String(process.env.AUTH_COOKIE_SECURE || '').trim().toLowerCase();
+  if (configured === 'false') return false;
+  if (configured === 'true') {
+    return process.env.NODE_ENV === 'production' ? true : requestIsHttps;
   }
-  return process.env.NODE_ENV === 'production' || req.secure || req.headers['x-forwarded-proto'] === 'https';
+  return process.env.NODE_ENV === 'production' || requestIsHttps;
 }
 
 function cookieSameSite() {
@@ -88,8 +91,9 @@ function cookieOptions(req, maxAge, httpOnly = true) {
     path: '/',
     maxAge,
   };
-  const domain = String(process.env.AUTH_COOKIE_DOMAIN || '').trim();
-  if (domain) opts.domain = domain;
+  const domain = String(process.env.AUTH_COOKIE_DOMAIN || '').trim().replace(/^\./, '').toLowerCase();
+  const requestHost = String(req.hostname || req.headers?.host || '').split(':')[0].toLowerCase();
+  if (domain && (requestHost === domain || requestHost.endsWith(`.${domain}`))) opts.domain = domain;
   return opts;
 }
 
@@ -107,6 +111,13 @@ function parseCookies(req) {
 
 function hashToken(token) {
   return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
+
+function clearCachedSession(sessionId) {
+  if (!sessionId) return;
+  for (const key of authContextCache.keys()) {
+    if (key.startsWith(`${sessionId}:`)) authContextCache.delete(key);
+  }
 }
 
 function randomToken(bytes = 48) {
@@ -140,6 +151,25 @@ async function prepareResponseCsrfToken(req, res, result = null) {
     res.cookie(CSRF_COOKIE, csrfToken, cookieOptions(req, refreshMs, false));
   }
   return csrfToken;
+}
+
+async function prepareRefreshCsrfToken(req, res) {
+  const refreshToken = getRefreshTokenFromRequest(req);
+  if (!refreshToken || getRefreshTokenSourceFromRequest(req) !== 'cookie') return null;
+  const refreshHash = hashToken(refreshToken);
+  const nowDate = new Date();
+  const session = await Session.findOne({
+    clientType: 'web',
+    revokedAt: null,
+    expiresAt: { $gt: nowDate },
+    $or: [
+      { refreshTokenHash: refreshHash },
+      { previousRefreshTokenHash: refreshHash, previousRefreshTokenGraceUntil: { $gt: nowDate } },
+    ],
+  });
+  if (!session) return null;
+  if (session.absoluteExpiresAt && new Date(session.absoluteExpiresAt) <= nowDate) return null;
+  return prepareResponseCsrfToken(req, res, { session });
 }
 
 async function getTenantSnapshot(tenantId) {
@@ -502,18 +532,19 @@ async function authenticateAccessToken(token) {
 
 async function revokeSession(sessionId) {
   if (!sessionId) return;
-  for (const key of authContextCache.keys()) {
-    if (key.startsWith(`${sessionId}:`)) authContextCache.delete(key);
-  }
+  clearCachedSession(sessionId);
   await Session.findByIdAndUpdate(sessionId, { revokedAt: new Date() });
 }
 
 async function revokeRefreshToken(refreshToken) {
   if (!refreshToken) return;
-  await Session.findOneAndUpdate(
-    { refreshTokenHash: hashToken(refreshToken), revokedAt: null },
-    { revokedAt: new Date() }
+  const refreshHash = hashToken(refreshToken);
+  const session = await Session.findOneAndUpdate(
+    { revokedAt: null, $or: [{ refreshTokenHash: refreshHash }, { previousRefreshTokenHash: refreshHash }] },
+    { revokedAt: new Date() },
+    { new: true }
   );
+  clearCachedSession(session?._id);
 }
 
 function setAuthCookies(res, req, result) {
@@ -593,7 +624,10 @@ async function validateCsrf(req, tokenSource) {
     await session.save();
   }
   const headerToken = req.headers['x-csrf-token'];
-  return Boolean(csrfToken && headerToken && String(csrfToken) === String(headerToken));
+  if (!csrfToken || !headerToken) return false;
+  const expected = Buffer.from(String(csrfToken));
+  const received = Buffer.from(String(headerToken));
+  return expected.length === received.length && crypto.timingSafeEqual(expected, received);
 }
 
 module.exports = {
@@ -605,6 +639,7 @@ module.exports = {
   buildSessionMetadata,
   clearAuthCookies,
   createSession,
+  prepareRefreshCsrfToken,
   prepareResponseCsrfToken,
   getAccessTokenFromRequest,
   getRefreshTokenFromRequest,

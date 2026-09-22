@@ -19,6 +19,7 @@ const {
   buildUserContext,
   clearAuthCookies,
   createSession,
+  prepareRefreshCsrfToken,
   prepareResponseCsrfToken,
   getRefreshTokenFromRequest,
   getRefreshTokenSourceFromRequest,
@@ -706,6 +707,16 @@ exports.renewToken = async (req, res) => {
     const authResult = await rotateRefreshToken({ refreshToken, req });
     return sendAuthResult(req, res, authResult);
   } catch (error) {
+    return res.status(401).json({ error: 'Invalid or expired session' });
+  }
+};
+
+exports.csrf = async (req, res) => {
+  try {
+    const csrfToken = await prepareRefreshCsrfToken(req, res);
+    if (!csrfToken) return res.status(401).json({ error: 'Invalid or expired session' });
+    return res.json({ csrfToken });
+  } catch {
     return res.status(401).json({ error: 'Invalid or expired session' });
   }
 };

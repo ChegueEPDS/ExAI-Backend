@@ -6,6 +6,7 @@ const {
   login,
   logout,
   me,
+  csrf,
   renewToken,
   microsoftLogin,
   forgotPassword,
@@ -31,6 +32,7 @@ router.post('/login', captchaVerify,login);
 router.post('/microsoft-login', microsoftLogin);
 router.post('/renew-token', renewToken);
 router.post('/auth/refresh', renewToken);
+router.get('/auth/csrf', csrf);
 router.post('/logout', logout);
 router.get('/auth/me', requireAuth, me);
 router.get('/auth/session', requireAuth, me);
