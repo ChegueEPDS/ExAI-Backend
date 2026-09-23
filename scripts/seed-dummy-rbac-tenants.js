@@ -83,7 +83,6 @@ async function upsertTenant({ name, dryRun }) {
     existing.type = 'company';
     existing.plan = 'team';
     existing.seats = { max: Math.max(existing.seats?.max || 0, 10), used: existing.seats?.used || 0 };
-    existing.seatsManaged = 'manual';
     existing.features = featureDefaults();
     existing.professionRbacEnabled = false;
     await existing.save();
@@ -95,7 +94,6 @@ async function upsertTenant({ name, dryRun }) {
     type: 'company',
     plan: 'team',
     seats: { max: 10, used: 0 },
-    seatsManaged: 'manual',
     features: featureDefaults(),
     professionRbacEnabled: false,
   });

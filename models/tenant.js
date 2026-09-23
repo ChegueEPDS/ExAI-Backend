@@ -37,17 +37,10 @@ const TenantSchema = new mongoose.Schema(
     plan: { type: String, enum: ['free', 'pro', 'team'], required: true },
     ownerUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
 
-    // Stripe billing
-    stripeCustomerId: { type: String, index: true },
-    stripeSubscriptionId: { type: String, index: true },
-
     seats: {
       type: SeatsSchema,
       default: () => ({ max: 0, used: 0 }),
     },
-
-    // Legacy 'stripe' values remain readable; all new tenants are manual.
-    seatsManaged: { type: String, enum: ['stripe', 'manual'], default: 'manual' },
 
     // Dashboard settings (used by Insp-Ex analytics)
     dashboardSettings: {

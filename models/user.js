@@ -80,13 +80,6 @@ const UserSchema = new mongoose.Schema(
     emailDeliverySuppressed: { type: Boolean, default: false, index: true },
     emailDeliverySuppressedReason: { type: String, default: '' },
 
-    // Opcionális: regisztrációkor kiválasztott fizetős csomag (másik böngésző/tab esetén is)
-    pendingCheckoutPlan: { type: String }, // 'pro' | 'team' | 'pro_yearly' | 'team_yearly'
-    pendingCheckoutSeats: { type: Number },
-    pendingCheckoutCompanyName: { type: String },
-    pendingCheckoutPromoCode: { type: String },
-    pendingCheckoutCampaign: { type: String },
-
     // Last successful interactive sign-in. Token refreshes do not update this.
     lastLoginAt: { type: Date, index: true },
   },

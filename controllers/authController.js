@@ -95,8 +95,7 @@ async function createCompanyTenantForTeam({ companyName, seats = 5, ownerUserId 
     type: 'company',
     plan: 'team',
     ownerUserId: ownerUserId ? ownerUserId : undefined,
-    seats: { max: maxSeats, used: 1 },
-    seatsManaged: 'manual'
+    seats: { max: maxSeats, used: 1 }
   });
   return tenant;
 }
@@ -123,7 +122,7 @@ async function getOrCreateTenantByName(tenantNameRaw, type = 'company', ownerUse
       ownerUserId: ownerUserId || undefined,
       // PERSONAL: enforce valid defaults required by the model
       ...(isPersonal ? { plan: opts.plan || 'free', seats: { max: 1, used: 1 } } : {}),
-      // COMPANY: plan must be 'team' by schema rule; do NOT set here (it will be set in billing/manual flows)
+      // COMPANY: the plan is assigned by the administrative provisioning flow.
     });
   }
   return t;
@@ -133,7 +132,7 @@ async function getSubscriptionSnapshot(tenantId) {
   if (!tenantId) return null;
 
   const t = await Tenant.findById(tenantId).lean().select(
-    'name type plan seats seatsManaged stripeCustomerId stripeSubscriptionId'
+    'name type plan seats'
   );
   if (!t) return null;
 
@@ -141,8 +140,7 @@ async function getSubscriptionSnapshot(tenantId) {
     tenantName: t.name || null,
     tenantType: t.type || null,          // 'personal' | 'company'
     plan: t.plan || 'free',              // 'free' | 'pro' | 'team'
-    seats: pick(t.seats || {}, ['max', 'used']),
-    seatsManaged: t.seatsManaged || 'manual'
+    seats: pick(t.seats || {}, ['max', 'used'])
   };
 
   const sub = await Subscription.findOne({ tenantId }).lean().select(
@@ -312,11 +310,6 @@ exports.register = async (req, res) => {
     password,
     nickname,
     role,
-    desiredPlan,
-    desiredSeats,
-    desiredCompanyName,
-    desiredPromoCode,
-    desiredCampaign,
   } = req.body || {};
 
   try {
@@ -329,28 +322,7 @@ exports.register = async (req, res) => {
     const emailToken = crypto.randomBytes(32).toString('hex');
     const emailTokenExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
-    // Opcionális: fizetős csomag kiválasztás regisztrációnál (verifikáció után Stripe-ra irányítás)
-    const normalizedDesiredPlan = String(desiredPlan || '').trim().toLowerCase();
-    const allowedPlans = new Set(['pro', 'team', 'pro_yearly', 'team_yearly', '']);
-    if (!allowedPlans.has(normalizedDesiredPlan)) {
-      return res.status(400).json({ error: 'Invalid desiredPlan' });
-    }
-    const pendingSeatsRaw = Number(desiredSeats);
-    const pendingSeats =
-      normalizedDesiredPlan.startsWith('team')
-        ? (Number.isInteger(pendingSeatsRaw) ? Math.max(5, pendingSeatsRaw) : 5)
-        : 1;
-    const pendingCompanyName =
-      normalizedDesiredPlan.startsWith('team')
-        ? String(desiredCompanyName || '').trim()
-        : '';
-    const pendingPromoCode = String(desiredPromoCode || '').trim();
-    const pendingCampaign = String(desiredCampaign || '').trim();
-    if (normalizedDesiredPlan.startsWith('team') && !pendingCompanyName) {
-      return res.status(400).json({ error: 'desiredCompanyName is required for team plans' });
-    }
-
-    // 1) user létrehozása – NINCS subscriptionTier kézzel írva
+    // A nyilvános regisztráció mindig ingyenes személyes tenantot hoz létre.
     let user = await User.create({
       firstName,
       lastName,
@@ -361,15 +333,6 @@ exports.register = async (req, res) => {
       emailVerified: false,
       emailVerificationToken: emailToken,
       emailVerificationExpires: emailTokenExpires,
-      ...(normalizedDesiredPlan
-        ? {
-            pendingCheckoutPlan: normalizedDesiredPlan,
-            pendingCheckoutSeats: pendingSeats,
-            pendingCheckoutCompanyName: pendingCompanyName || undefined,
-            pendingCheckoutPromoCode: pendingPromoCode || undefined,
-            pendingCheckoutCampaign: pendingCampaign || undefined,
-          }
-        : {}),
     });
     emailPreferenceService.recordInitialPreferences(user).catch(err =>
       console.warn('[email-preferences] initial consent log failed:', err?.message || err)
@@ -504,26 +467,6 @@ exports.verifyEmail = async (req, res) => {
     user.emailVerificationToken = undefined;
     user.emailVerificationExpires = undefined;
 
-    const pendingCheckout =
-      user.pendingCheckoutPlan && ['pro', 'team', 'pro_yearly', 'team_yearly'].includes(String(user.pendingCheckoutPlan))
-        ? {
-            plan: String(user.pendingCheckoutPlan),
-            seats:
-              String(user.pendingCheckoutPlan).startsWith('team')
-                ? Math.max(5, Number(user.pendingCheckoutSeats || 5))
-                : 1,
-            companyName: String(user.pendingCheckoutCompanyName || ''),
-            promoCode: String(user.pendingCheckoutPromoCode || ''),
-            campaign: String(user.pendingCheckoutCampaign || ''),
-          }
-        : null;
-
-    // Pending checkout adatot egyszer használjuk (verifikáció után töröljük)
-    user.pendingCheckoutPlan = undefined;
-    user.pendingCheckoutSeats = undefined;
-    user.pendingCheckoutCompanyName = undefined;
-    user.pendingCheckoutPromoCode = undefined;
-    user.pendingCheckoutCampaign = undefined;
     await user.save();
 
     if (!user.tenantId) {
@@ -534,10 +477,7 @@ exports.verifyEmail = async (req, res) => {
     const authResult = await createSession({ user, clientType: getClientType(req), req });
     attachAuthResultToRequest(req, authResult);
 
-    return sendAuthResult(req, res, authResult, {
-      message: 'Email verified successfully',
-      pendingCheckout,
-    });
+    return sendAuthResult(req, res, authResult, { message: 'Email verified successfully' });
   } catch (error) {
     console.error('❌ Email verification error:', error);
     return res.status(500).json({ error: 'Internal server error' });

@@ -71,7 +71,7 @@ exports.listTenants = async (req, res) => {
     }
 
     const tenants = await Tenant.find(query)
-      .select('_id name type plan seats seatsManaged ownerUserId professionRbacEnabled features createdAt updatedAt')
+      .select('_id name type plan seats ownerUserId professionRbacEnabled features createdAt updatedAt')
       .lean();
 
     return res.json({
@@ -158,7 +158,6 @@ exports.createTenant = async (req, res) => {
       type: 'company',
       plan: 'team',
       seats: { max: Number.MAX_SAFE_INTEGER, used: 0 },
-      seatsManaged: 'manual',
       features: {
         maintenance: false,
         professionRbac: false,
@@ -192,7 +191,7 @@ exports.getTenantById = async (req, res) => {
     }
 
     const tenant = await Tenant.findById(id)
-      .select('_id name type plan seats seatsManaged ownerUserId professionRbacEnabled features createdAt updatedAt')
+      .select('_id name type plan seats ownerUserId professionRbacEnabled features createdAt updatedAt')
       .lean();
 
     if (!tenant) {
@@ -210,7 +209,7 @@ exports.getTenantById = async (req, res) => {
  * PATCH /api/tenants/:id
  * - Admin → csak a saját tenantját módosíthatja
  * - SuperAdmin → bármelyiket
- * Body: { name?, seatsMax?, seatsManaged?, plan? }
+ * Body: { name?, seatsMax?, plan? }
  * Megjegyzés: type NEM módosítható ezen az endpointon.
  */
 exports.updateTenant = async (req, res) => {
@@ -228,7 +227,7 @@ exports.updateTenant = async (req, res) => {
       return res.status(404).json({ message: 'Tenant not found' });
     }
 
-    const { name, seatsMax, seatsManaged, plan, professionRbacEnabled, features } = req.body || {};
+    const { name, seatsMax, plan, professionRbacEnabled, features } = req.body || {};
     const updates = {};
     const currentFeatures = normalizeFeatures(
       tenant.features?.toObject ? tenant.features.toObject() : tenant.features || {},
@@ -262,9 +261,6 @@ exports.updateTenant = async (req, res) => {
       }
       updates.name = nextName;
     }
-
-    // seatsManaged (legacy Stripe-managed tenants can only be migrated to manual)
-    updates.seatsManaged = 'manual';
 
     // plan – csak a schema szerinti kombináció engedélyezett, type nem változik itt
     if (typeof plan === 'string' && plan.trim()) {

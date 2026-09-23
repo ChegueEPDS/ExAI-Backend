@@ -30,8 +30,7 @@ async function sweepExpiredSubscriptions() {
             $set: {
               plan: 'free',
               'seats.max': 1,
-              'seats.used': 1,
-              seatsManaged: 'manual'
+              'seats.used': 1
             }
           }
         }

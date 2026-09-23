@@ -30,7 +30,6 @@ Key groups (see `.env.example` for the full, commented list):
 - OpenAI (tenant AI profile): configured in **Admin → AI settings** (no Assistants API dependency)
 - Azure: Blob, Document Intelligence, OCR, Custom Vision, Search, Entra ID
 - Mail / Brevo: `MAIL_*`, `BREVO_*`
-- Billing / Stripe: `STRIPE_*`, `BILLING_*`
 - Captcha: `RECAPTCHA_*`, `CAPTCHA_*`
 
 If you are unsure, start with:
@@ -270,20 +269,6 @@ Professions:
 - POST `/api/notifications/:id/read`
 - POST `/api/notifications/read-all`
 - DELETE `/api/notifications/:id`
-
-### Billing
-- POST `/api/billing/checkout`
-- POST `/api/billing/portal`
-- GET `/api/billing/portal/return`
-- GET `/api/billing/invoices`
-- POST `/api/billing/free-next-invoice`
-- POST `/api/billing/update-quantity`
-- POST `/api/billing/grant-credit`
-- POST `/api/billing/pause`
-- POST `/api/billing/resume`
-- POST `/api/billing/grant-manual-license`
-- POST `/api/billing/revoke-manual-license`
-- POST `/api/stripe/webhook` (raw body)
 
 ### Metrics / Analytics / Summaries
 - GET `/api/combined-statistics`

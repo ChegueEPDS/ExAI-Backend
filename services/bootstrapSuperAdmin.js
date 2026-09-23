@@ -47,7 +47,6 @@ async function createAndNotifySuperAdmin() {
       type: 'company',
       plan: 'team',
       seats: { max: 5, used: 1 },
-      seatsManaged: 'manual',
       professionRbacEnabled: true
     });
 

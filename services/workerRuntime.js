@@ -7,7 +7,6 @@ const certificateDraftWorker = require('./certificateDraftWorker');
 const equipmentImportWorker = require('./equipmentImportWorker');
 const equipmentBulkDeleteWorker = require('./equipmentBulkDeleteWorker');
 const documentationExpiryNotifier = require('./documentationExpiryNotifier');
-const automatedEmailService = require('./automatedEmailService');
 const emailPreferenceService = require('./emailPreferenceService');
 const reportExportController = require('../controllers/exportInspectionReport');
 const { withLock } = require('./distributedLockService');
@@ -82,19 +81,9 @@ function startWorkerRuntime() {
   withLock('documentations:expiry-notifications', 30 * 60 * 1000, documentationExpiryNotifier.sweepDocumentationExpiryNotifications)
     .catch((err) => logger.warn('[worker-runtime] documentation expiry sweep failed', err?.message || err));
   scheduleInterval(
-    () => withLock('automated-emails:lifecycle', 30 * 60 * 1000, automatedEmailService.sweepLifecycleEmails),
-    24 * 60 * 60 * 1000
-  );
-  scheduleInterval(
-    () => withLock('automated-emails:queued', 55 * 1000, automatedEmailService.sweepQueuedEmails),
-    60 * 1000
-  );
-  scheduleInterval(
     () => withLock('email-preferences:brevo-sync', 5 * 60 * 1000, emailPreferenceService.sweepPendingEmailPreferenceSync),
     10 * 60 * 1000
   );
-  withLock('automated-emails:lifecycle', 30 * 60 * 1000, automatedEmailService.sweepLifecycleEmails)
-    .catch((err) => logger.warn('[worker-runtime] automated email sweep failed', err?.message || err));
 
   mobileSyncWorker.start({ intervalMs: 5000 });
 
@@ -107,8 +96,7 @@ function startWorkerRuntime() {
     equipmentImportWorker: true,
     equipmentBulkDeleteWorker: true,
     mobileSyncWorker: true,
-    documentationExpiryNotifier: true,
-    automatedEmailService: true
+    documentationExpiryNotifier: true
   });
 
   return { started: true };

@@ -181,77 +181,7 @@ async function sendTransactionalTemplate({ toEmail, templateId, params = {} }) {
   });
 }
 
-/**
- * Trigger Brevo sync when a Stripe customer is created.
- * - Adds/updates the contact and (optionally) adds to list(s).
- * - Optionally sends a transactional email template if configured.
- */
-async function onStripeCustomerCreated({ email, firstName, lastName, stripeCustomerId, tenant = null, user = null }) {
-  try {
-    if (shouldTrace()) {
-      log('info', '[brevo] onStripeCustomerCreated', {
-        email,
-        stripeCustomerId,
-        tenantId: tenant?._id ? String(tenant._id) : null,
-        tenantName: tenant?.name || null,
-        plan: tenant?.plan || null,
-      });
-    }
-
-    const managedLists = getManagedEmailLists();
-    const preferredLanguage = user?.preferredLanguage === 'hu' ? 'hu' : 'en';
-    const listIds = [
-      ...(user?.newsletterEmailsEnabled === false ? [] : [newsletterListForLanguage(preferredLanguage)]),
-      ...(user?.marketingEmailsEnabled === false ? [] : [managedLists.usefulInformation]),
-    ];
-    const attrs = {
-      FIRSTNAME: firstName || '',
-      LASTNAME: lastName || '',
-      STRIPE_CUSTOMER_ID: stripeCustomerId || '',
-      TENANT_ID: tenant?._id ? String(tenant._id) : '',
-      TENANT_NAME: tenant?.name || '',
-      TENANT_TYPE: tenant?.type || '',
-      PLAN: tenant?.plan || '',
-      LANGUAGE: preferredLanguage,
-    };
-
-    const upsertResult = await upsertContact({
-      email,
-      attributes: attrs,
-      listIds,
-    });
-
-    if (upsertResult?.ok === false) {
-      log('warn', '[brevo] upsert contact failed', { email, status: upsertResult.status, error: upsertResult.error });
-    }
-
-    const templateId = process.env.BREVO_WELCOME_TEMPLATE_ID;
-    const shouldSend =
-      String(process.env.BREVO_SEND_WELCOME || '').trim() === '1' &&
-      templateId;
-
-    if (shouldSend) {
-      const sendResult = await sendTransactionalTemplate({
-        toEmail: email,
-        templateId,
-        params: {
-          firstName: firstName || '',
-          lastName: lastName || '',
-          tenantName: tenant?.name || '',
-          plan: tenant?.plan || '',
-        },
-      });
-      if (sendResult?.ok === false) {
-        log('warn', '[brevo] send transactional email failed', { email, status: sendResult.status, error: sendResult.error });
-      }
-    }
-  } catch (err) {
-    log('warn', '[brevo] onStripeCustomerCreated failed', { error: err?.message || String(err) });
-  }
-}
-
 module.exports = {
-  onStripeCustomerCreated,
   upsertContact,
   getContact,
   updateContact,

@@ -19,7 +19,6 @@ const { migrateAllUserDataToTenant } = require('../services/tenantMigration');
 const azureBlob = require('../services/azureBlobService');
 const { computePermissions, getEffectiveProfessions, assertValidProfessions } = require('../helpers/rbac');
 const { resolvePublicBaseUrl, persistPublicBaseUrlIfMissing } = require('../helpers/publicBaseUrl');
-const contributionRewardService = require('../services/contributionRewardService');
 const emailPreferenceService = require('../services/emailPreferenceService');
 const { requestedPreferredLanguage } = require('../config/supportedLocales');
 
@@ -488,8 +487,6 @@ exports.updateUserProfile = async (req, res) => {
     firstName,
     lastName,
     nickname,
-    billingName,
-    billingAddress,
     position,
     positionInfo,
     email,
@@ -616,8 +613,6 @@ exports.updateUserProfile = async (req, res) => {
       ...(firstName !== undefined ? { firstName } : {}),
       ...(lastName !== undefined ? { lastName } : {}),
       ...(nickname !== undefined ? { nickname } : {}),
-      ...(billingName !== undefined ? { billingName } : {}),
-      ...(billingAddress !== undefined ? { billingAddress } : {}),
       ...(position !== undefined ? { position } : {}),
       ...(positionInfo !== undefined ? { positionInfo } : {}),
       ...(signatureUpdate.$unset ? {} : signatureUpdate)
@@ -770,183 +765,6 @@ async function ensureUniqueTenantName(base) {
  * - free/pro -> type='personal'
  * - team     -> type='company', seats.max=5 by default, user becomes Admin
  */
-async function createTenantForRegistration({ plan, companyName, ownerUserId }) {
-  const isTeam = String(plan).toLowerCase() === 'team';
-  const type = isTeam ? 'company' : 'personal';
-  const nameSource = isTeam ? (companyName || 'company') : `u-${ownerUserId || Math.random().toString(36).slice(2,6)}`;
-  const uniqueName = await ensureUniqueTenantName(nameSource);
-
-  const tenant = new Tenant({
-    name: uniqueName,
-    type,
-    plan: String(plan).toLowerCase(), // 'free' | 'pro' | 'team'
-    ownerUserId: ownerUserId ? new mongoose.Types.ObjectId(ownerUserId) : undefined,
-    seats: isTeam ? { max: 5, used: 1 } : { max: 1, used: 1 },
-  });
-
-  await tenant.save();
-  return tenant;
-}
-
-// ---------------------------
-// POST /api/register
-// Body: { email, password, firstName?, lastName?, nickname?, plan:'free'|'pro'|'team', companyName? }
-// Behavior:
-//  - Validates and ensures unique email
-//  - Creates user
-//  - Creates tenant depending on plan
-//  - Links user to tenant (team -> user.role='Admin')
-//  - Does NOT start Stripe automatically (frontend can call a billing endpoint after)
-//  - Returns minimal safe payload
-// ---------------------------
-/*exports.register = async (req, res) => {
-  try {
-    const {
-      email,
-      password,
-      firstName,
-      lastName,
-      nickname,
-      plan = 'free',
-      companyName,
-    } = req.body || {};
-
-    // Basic validation
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required.' });
-    }
-
-    const normalizedEmail = String(email).trim().toLowerCase();
-    const existing = await User.findOne({ email: normalizedEmail });
-    if (existing) {
-      return res.status(409).json({ error: 'Email already in use.' });
-    }
-
-    const hash = await bcrypt.hash(String(password), 10);
-
-    // Create bare user first (tenant will be attached after createTenantForRegistration)
-    const user = new User({
-      email: normalizedEmail,
-      password: hash,
-      firstName: firstName || '',
-      lastName: lastName || '',
-      nickname: nickname || firstName || '',
-      role: 'User',                 // default; may be upgraded to Admin for TEAM
-      subscriptionTier: String(plan).toLowerCase(), // 'free' | 'pro' | 'team'
-    });
-
-    await user.save();
-    emailPreferenceService.recordInitialPreferences(user).catch(err =>
-      console.warn('[email-preferences] initial consent log failed:', err?.message || err)
-    );
-
-    // Create tenant based on plan
-    const tenant = await createTenantForRegistration({
-      plan,
-      companyName,
-      ownerUserId: user._id,
-    });
-
-    // Link user to tenant; for TEAM owner is Admin
-    user.tenantId = tenant._id;
-    if (String(plan).toLowerCase() === 'team') {
-      user.role = 'Admin';
-    }
-    await user.save();
-
-    // Fire-and-forget welcome e-mail (do not block registration flow)
-    (async () => {
-      try {
-        const requestBaseUrl = await resolvePublicBaseUrl({ req, tenantId: tenant._id });
-        await persistPublicBaseUrlIfMissing({
-          tenantId: tenant._id,
-          baseUrl: requestBaseUrl,
-          updatedBy: user._id
-        });
-        const loginUrl = requestBaseUrl || process.env.APP_BASE_URL_CERTS || 'https://certs.atexdb.eu';
-        const html = registrationEmailHtml({
-          firstName: user.firstName || '',
-          lastName:  user.lastName  || '',
-          loginUrl,
-          baseUrl: requestBaseUrl || undefined,
-          tenantName: tenant.name
-        });
-        const emailBrand = resolveEmailBrand({ tenantName: tenant.name, baseUrl: requestBaseUrl });
-        await mailService.sendMail({
-          to: user.email,
-          subject: `Welcome to ${emailBrand.productName}`,
-          html,
-          from: process.env.MAIL_SENDER_UPN
-        });
-        console.log('[mail] Registration welcome email sent to', user.email);
-      } catch (err) {
-        console.warn('[mail] Registration e-mail failed:', err?.message || err);
-      }
-    })();
-
-    // NOTE: Stripe: frontend should now open a checkout session for pro/team.
-    // We intentionally do not start Stripe here to keep controller cohesive.
-    // Return minimal info so frontend can proceed to billing if needed.
-    return res.status(201).json({
-      message: 'Registration successful.',
-      user: {
-        id: user._id,
-        email: user.email,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        nickname: user.nickname,
-        role: user.role,
-        subscriptionTier: user.subscriptionTier,
-        tenantId: tenant._id,
-      },
-      tenant: {
-        id: tenant._id,
-        name: tenant.name,
-        type: tenant.type,
-        plan: tenant.plan,
-        seats: tenant.seats,
-      }
-    });
-  } catch (error) {
-    console.error('register error:', error);
-    return res.status(500).json({ error: 'Internal server error' });
-  }
-};
-
-// ---------------------------
-// POST /api/register/tenant-only
-// Body: { plan:'free'|'pro'|'team', companyName? }
-// Requires auth (uses req.scope?.userId) to create an extra tenant and attach caller as owner.
-// Useful for later flows; optional for your current needs.
-// ---------------------------
-exports.createTenant = async (req, res) => {
-  try {
-    const userId = req.scope?.userId || req.user?.id;
-    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-
-    const { plan = 'free', companyName } = req.body || {};
-    const tenant = await createTenantForRegistration({
-      plan,
-      companyName,
-      ownerUserId: userId,
-    });
-
-    return res.status(201).json({
-      message: 'Tenant created.',
-      tenant: {
-        id: tenant._id,
-        name: tenant.name,
-        type: tenant.type,
-        plan: tenant.plan,
-        seats: tenant.seats,
-      }
-    });
-  } catch (error) {
-    console.error('createTenant error:', error);
-    return res.status(500).json({ error: 'Internal server error' });
-  }
-}; */
-
 const jwt = require('jsonwebtoken');
 
 // Helper: egyszerű slugify + ensure unique tenant name (local)
@@ -1006,7 +824,6 @@ exports.createPaidTenantUser = async (req, res) => {
       plan: plan,
       ownerUserId: undefined,
       seats: { max: seats, used: 1 },
-      seatsManaged: 'manual', // fontos: stripe nélkül manuális kezelés
     });
 
     // 2) User létrehozása
@@ -1037,11 +854,10 @@ exports.createPaidTenantUser = async (req, res) => {
       status: 'active',
       seatsPurchased: seats,
       expiresAt: expires,
-      // egyéb mezők: customerId / stripeSubscriptionId --> üresen hagyjuk
     });
 
     // 4) (Biztonsági) tenant cache/frissítés: állítsuk be a tenant.plan is ha szükséges
-    await Tenant.findByIdAndUpdate(tenant._id, { plan, 'seats.used': 1, seatsManaged: 'manual' });
+    await Tenant.findByIdAndUpdate(tenant._id, { plan, 'seats.used': 1 });
 
     // 5) Token generálás (rövid életű access token)
     // A payload tükrözi a signAccessTokenWithSubscription logikáját:
@@ -1066,7 +882,6 @@ exports.createPaidTenantUser = async (req, res) => {
         tenantType: tenant.type,
         plan: tenant.plan,
         seats: { max: tenant.seats.max, used: tenant.seats.used },
-        seatsManaged: tenant.seatsManaged,
         tier: sub.tier,
         status: sub.status,
         seatsPurchased: sub.seatsPurchased,
@@ -1121,52 +936,6 @@ exports.createPaidTenantUser = async (req, res) => {
   } catch (e) {
     console.error('createPaidTenantUser error', e);
     return res.status(500).json({ error: e.message || 'Internal server error' });
-  }
-};
-
-// ---------------------------
-// POST /api/users/:userId/contribution-reward/manual-send
-// Admin: only within same tenant; SuperAdmin: any tenant
-// Behavior:
-// - Uses the current SuperAdmin-configured contribution step (default 20).
-// - Below the first milestone, sends that reward early and establishes its baseline.
-// Body: { forceResendEmail?: boolean }
-// ---------------------------
-exports.manualSendContributionReward = async (req, res) => {
-  try {
-    const role = (req.role || '').toString();
-    const callerTenantId = req.scope?.tenantId || null;
-    const { userId } = req.params || {};
-    const forceResendEmail =
-      req.body?.forceResendEmail === true ||
-      String(req.body?.forceResendEmail || '').toLowerCase() === 'true' ||
-      String(req.query?.forceResendEmail || '') === '1';
-
-    if (!userId) return res.status(400).json({ error: 'userId is required' });
-
-    const target = await User.findById(userId).select('_id tenantId email firstName lastName').lean();
-    if (!target) return res.status(404).json({ error: 'User not found' });
-
-    if (role !== 'SuperAdmin') {
-      if (!callerTenantId) return res.status(403).json({ error: 'Missing tenantId' });
-      if (String(target.tenantId || '') !== String(callerTenantId || '')) {
-        return res.status(403).json({ error: 'Forbidden: cannot reward user from another tenant' });
-      }
-    }
-
-    const out = await contributionRewardService.issueManualRewardForUser({
-      userId: String(target._id),
-      forceResendEmail,
-    });
-
-    return res.json({
-      ok: true,
-      user: { id: String(target._id), email: target.email || null },
-      ...out,
-    });
-  } catch (e) {
-    console.error('manualSendContributionReward error', e);
-    return res.status(500).json({ error: e?.message || 'Failed to send reward' });
   }
 };
 

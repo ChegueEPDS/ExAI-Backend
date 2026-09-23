@@ -3,11 +3,6 @@ const mongoose = require('mongoose');
 
 const SubscriptionSchema = new mongoose.Schema({
   tenantId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', required: true },
-  stripeCustomerId: { type: String, index: true },
-  stripeSubscriptionId: { type: String, index: true },
-  productId: { type: String },
-  priceId: { type: String },
-
   tier: { type: String, enum: ['free', 'pro', 'team'], required: true },
   seatsPurchased: { type: Number, default: 0 },
 
@@ -19,7 +14,6 @@ const SubscriptionSchema = new mongoose.Schema({
 
   // 🔹 Manuális licencekhez / ideiglenes hosszabbításhoz
   expiresAt: { type: Date },
-  billingPeriod: { type: String, enum: ['month', 'year'], default: 'month' },
 }, { timestamps: true });
 
 // Hasznos indexek

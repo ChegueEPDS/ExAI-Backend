@@ -177,7 +177,7 @@ async function getTenantSnapshot(tenantId) {
 
   const tenant = await Tenant.findById(tenantId)
     .lean()
-    .select('name type features professionRbacEnabled plan seats seatsManaged stripeCustomerId stripeSubscriptionId');
+    .select('name type features professionRbacEnabled plan seats');
   if (!tenant) {
     return {
       meta: { name: null, type: null, professionRbacEnabled: false, tenant: null },
@@ -200,7 +200,6 @@ async function getTenantSnapshot(tenantId) {
       max: tenant.seats?.max ?? 0,
       used: tenant.seats?.used ?? 0,
     },
-    seatsManaged: tenant.seatsManaged || 'manual',
   };
 
   const sub = await Subscription.findOne({ tenantId }).lean().select('tier status seatsPurchased updatedAt');
