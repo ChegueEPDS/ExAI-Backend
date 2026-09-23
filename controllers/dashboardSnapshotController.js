@@ -18,7 +18,7 @@ const SNAPSHOT_MAX_AGE_MS = Math.max(
 );
 const SNAPSHOT_SOURCE_CONCURRENCY = Math.max(
   1,
-  Math.min(Number(process.env.DASHBOARD_SNAPSHOT_SOURCE_CONCURRENCY || 2), 4)
+  Math.min(Number(process.env.DASHBOARD_SNAPSHOT_SOURCE_CONCURRENCY || 4), 4)
 );
 
 function objectIdOrNull(value) {
@@ -36,6 +36,25 @@ function parseDate(value) {
 function bucketDate(date, bucketMs = 5 * 60_000) {
   if (!date) return null;
   return new Date(Math.floor(date.getTime() / bucketMs) * bucketMs);
+}
+
+function resolveRange(range, rawFrom, rawTo, now = new Date()) {
+  const normalizedRange = ['30d', '90d', '365d', 'all'].includes(String(range))
+    ? String(range)
+    : null;
+  if (!normalizedRange) {
+    return {
+      range: null,
+      from: bucketDate(parseDate(rawFrom)),
+      to: bucketDate(parseDate(rawTo))
+    };
+  }
+  if (normalizedRange === 'all') return { range: normalizedRange, from: null, to: null };
+  const days = Number.parseInt(normalizedRange, 10);
+  const to = new Date(now);
+  const from = new Date(to);
+  from.setUTCDate(from.getUTCDate() - days);
+  return { range: normalizedRange, from, to };
 }
 
 function capture(controller, req, fallback = null) {
@@ -89,7 +108,7 @@ async function runTasksBounded(tasks, concurrency = SNAPSHOT_SOURCE_CONCURRENCY)
   return results;
 }
 
-async function buildSnapshot(req, { tenantId, siteId, zoneId, scope, from, to, mode, severity, features }) {
+async function buildSnapshot(req, { tenantId, siteId, zoneId, scope, from, to, mode, severity, features, section }) {
   const sharedQuery = {
     scope,
     ...(siteId ? { siteId: String(siteId) } : {}),
@@ -99,19 +118,33 @@ async function buildSnapshot(req, { tenantId, siteId, zoneId, scope, from, to, m
   };
   const metricArgs = { tenantId, siteId, zoneId, from, to, mode, severity };
 
-  const [navigation, status, maintenanceSeverity, healthMetrics, analytics, maintenanceRoot, complianceRoot, plannedInspections, expiredDocumentations, conflicts] = await runTasksBounded([
+  if (section === 'analysis') {
+    const [maintenanceSeverity, healthMetrics, maintenanceRoot, complianceRoot] = await runTasksBounded([
+      () => features.maintenance ? computeMaintenanceSeveritySummary({ tenantId, siteId, zoneId }) : null,
+      () => computeHealthMetrics(metricArgs),
+      () => features.maintenance
+        ? optional(capture(rootCauseController.getMaintenanceRootCauses, childRequest(req, { ...sharedQuery, severity: severity || '', limit: '10' })), { total: 0, top: [] })
+        : null,
+      () => optional(capture(rootCauseController.getComplianceRootCauses, childRequest(req, { ...sharedQuery, limit: '10' })), { total: 0, top: [] })
+    ]);
+
+    return {
+      generatedAt: new Date().toISOString(),
+      section,
+      scope: { scope, siteId: siteId ? String(siteId) : null, zoneId: zoneId ? String(zoneId) : null },
+      maintenanceSeverity,
+      healthMetrics,
+      rootCauses: { maintenance: maintenanceRoot, compliance: complianceRoot }
+    };
+  }
+
+  const [navigation, status, analytics, plannedInspections, expiredDocumentations, conflicts] = await runTasksBounded([
     () => Promise.all([
       Site.find({ tenantId }).select('_id Name Client updatedAt').sort({ Name: 1, _id: 1 }).lean(),
       Unit.find({ tenantId }).select('_id Name Site parentUnitId ancestors depth updatedAt').sort({ Site: 1, depth: 1, Name: 1, _id: 1 }).lean()
     ]).then(([sites, units]) => ({ sites, units })),
     () => computeStatusStackedSummary({ tenantId, siteId, zoneId }),
-    () => features.maintenance ? computeMaintenanceSeveritySummary({ tenantId, siteId, zoneId }) : null,
-    () => computeHealthMetrics(metricArgs),
     () => computeDashboardAnalytics({ tenantId, siteId, zoneId, from, to }),
-    () => features.maintenance
-      ? optional(capture(rootCauseController.getMaintenanceRootCauses, childRequest(req, { ...sharedQuery, severity: severity || '', limit: '10' })), { total: 0, top: [] })
-      : null,
-    () => optional(capture(rootCauseController.getComplianceRootCauses, childRequest(req, { ...sharedQuery, limit: '10' })), { total: 0, top: [] }),
     () => optional(capture(plannedInspectionController.getPlannedInspections, childRequest(req, { ...sharedQuery, limit: '200' })), { summary: null, items: [] }),
     () => features.documentation
       ? optional(capture(documentationController.listExpiredDocumentationsForDashboard, childRequest(req, { ...sharedQuery, limit: '50' })), { summary: null, items: [] })
@@ -121,13 +154,11 @@ async function buildSnapshot(req, { tenantId, siteId, zoneId, scope, from, to, m
 
   return {
     generatedAt: new Date().toISOString(),
+    section: 'overview',
     navigation,
     scope: { scope, siteId: siteId ? String(siteId) : null, zoneId: zoneId ? String(zoneId) : null },
     status,
-    maintenanceSeverity,
-    healthMetrics,
     analytics,
-    rootCauses: { maintenance: maintenanceRoot, compliance: complianceRoot },
     plannedInspections,
     expiredDocumentations,
     conflicts
@@ -146,26 +177,34 @@ exports.getDashboardSnapshot = async (req, res) => {
     if (scope !== 'global' && !siteId) return res.status(400).json({ message: 'Invalid siteId.' });
     if (scope === 'zone' && !zoneId) return res.status(400).json({ message: 'Invalid zoneId.' });
 
-    const from = bucketDate(parseDate(req.query.from));
-    const to = bucketDate(parseDate(req.query.to));
+    const resolvedRange = resolveRange(req.query.range, req.query.from, req.query.to);
+    const { from, to } = resolvedRange;
     const mode = String(req.query.mode || 'start');
     const severity = req.query.severity ? String(req.query.severity) : null;
+    const section = String(req.query.section || 'overview') === 'analysis' ? 'analysis' : 'overview';
     const accessContext = await tenantAccess.getAccessContext(req);
     const features = accessContext.features || { maintenance: false, documentation: false };
     const params = {
       scope,
-      from: from?.toISOString() || null,
-      to: to?.toISOString() || null,
+      // Named windows keep the materialized cache key stable. The concrete
+      // timestamps are refreshed by maxAge/SWR instead of creating a cold key
+      // every few minutes.
+      range: resolvedRange.range,
+      ...(resolvedRange.range ? {} : {
+        from: from?.toISOString() || null,
+        to: to?.toISOString() || null
+      }),
       mode,
       severity,
+      section,
       maintenance: Boolean(features.maintenance),
       documentation: Boolean(features.documentation)
     };
     const result = await getMaterializedSummary({
-      kind: 'dashboard-snapshot-v1', tenantId, siteId, zoneId, params,
+      kind: 'dashboard-snapshot-v3', tenantId, siteId, zoneId, params,
       maxAgeMs: SNAPSHOT_MAX_AGE_MS,
       withMeta: true,
-      loader: () => buildSnapshot(req, { tenantId, siteId, zoneId, scope, from, to, mode, severity, features })
+      loader: () => buildSnapshot(req, { tenantId, siteId, zoneId, scope, from, to, mode, severity, features, section })
     });
 
     const body = JSON.stringify(result.summary);
@@ -184,4 +223,4 @@ exports.getDashboardSnapshot = async (req, res) => {
   }
 };
 
-exports._private = { bucketDate, capture, runTasksBounded };
+exports._private = { bucketDate, resolveRange, capture, runTasksBounded };

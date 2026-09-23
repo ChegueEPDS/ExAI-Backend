@@ -305,6 +305,28 @@ function computeOpenAging(incidents, nowMs) {
   return { openCount: open.length, ...stats };
 }
 
+function buildOpenBacklogItems(groups, equipmentsById, nowMs) {
+  return groups.flatMap(({ kind, incidents }) => (incidents || [])
+    .filter((inc) => inc.endMs == null && inc.startMs != null)
+    .map((inc) => {
+      const equipmentId = inc.equipmentId ? String(inc.equipmentId) : '';
+      const equipment = equipmentsById.get(equipmentId) || null;
+      return {
+        equipmentId,
+        eqId: equipment?.EqID || null,
+        tagNo: equipment?.TagNo || null,
+        kind,
+        schemaId: inc.schemaId || null,
+        schemaName: inc.schemaName || null,
+        severity: inc.severity || null,
+        startedAt: new Date(inc.startMs).toISOString(),
+        ageHours: Math.max(0, nowMs - inc.startMs) / 3600000
+      };
+    }))
+    .filter((item) => item.equipmentId)
+    .sort((a, b) => b.ageHours - a.ageHours);
+}
+
 function computeThroughput(incidents, fromMs, toMs) {
   const started = filterByWindowStart(incidents, fromMs, toMs).length;
   const resolved = filterByWindowResolved(incidents, fromMs, toMs).length;
@@ -593,6 +615,12 @@ async function computeDashboardAnalytics({ tenantId, siteId = null, zoneId = nul
   const openAgingCompliance = computeOpenAging(complianceIncidents, nowMs);
   const openAgingComplianceSchemas = computeOpenAging(complianceSchemaIncidents, nowMs);
   const openAgingOverall = computeOpenAging([...maintenanceIncidents, ...maintenanceSchemaIncidents, ...complianceIncidents, ...complianceSchemaIncidents], nowMs);
+  const openBacklogItems = buildOpenBacklogItems([
+    { kind: 'maintenance', incidents: maintenanceIncidents },
+    { kind: 'maintenance-schema', incidents: maintenanceSchemaIncidents },
+    { kind: 'compliance', incidents: complianceIncidents },
+    { kind: 'compliance-schema', incidents: complianceSchemaIncidents }
+  ], equipmentsById, nowMs);
 
   const throughputMaintenance = computeThroughput(maintenanceIncidents, fromMs, toMs);
   const throughputMaintenanceSchemas = computeThroughput(maintenanceSchemaIncidents, fromMs, toMs);
@@ -640,7 +668,8 @@ async function computeDashboardAnalytics({ tenantId, siteId = null, zoneId = nul
     },
     slaTargets,
     overall: {
-      openAging: openAgingOverall
+      openAging: openAgingOverall,
+      openItems: openBacklogItems
     },
     maintenance: {
       mttr: mttrMaintenance,
