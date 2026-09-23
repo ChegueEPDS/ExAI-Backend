@@ -43,9 +43,6 @@ const graphRoutes = require('./routes/graphRoutes');
 const injectionRoutes = require('./routes/injectionRoutes');
 const certificateDraftRoutes = require('./routes/certificateDraftRoutes');
 const notificationsRoutes = require('./routes/notificationsRoutes');
-const billingRoutes = require('./routes/billing');
-const billingWebhook = require('./routes/billingWebhook');
-const upgradeRoutes = require('./routes/upgrade');
 const tenantRoutes = require('./routes/tenantRoutes');
 const healthMetricsRoutes = require('./routes/healthMetricsRoutes');
 const inviteRoutes = require('./routes/inviteRoutes');
@@ -319,8 +316,6 @@ app.use((req, res, next) => {
 });
 
 // Fontos: webhook raw body-val, a JSON parser ELŐTT:
-app.use('/api', billingWebhook);
-
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(limiter);
@@ -451,8 +446,6 @@ app.use('/api/sites', siteRoutes);
 app.use('/api/graph', graphRoutes);
 app.use('/api', injectionRoutes);
 app.use('/api', notificationsRoutes);
-app.use('/api/billing', billingRoutes);
-app.use('/api', upgradeRoutes);
 app.use('/api', tenantRoutes);
 app.use('/api', tenantAccessRoutes);
 app.use('/api', auditRoutes);

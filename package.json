@@ -47,7 +47,6 @@
     "qrcode": "^1.5.4",
     "sanitize-html": "^2.14.0",
     "sharp": "^0.33.5",
-    "stripe": "^18.5.0",
     "tiktoken": "^1.0.17",
     "undici": "^7.15.0",
     "unzipper": "^0.10.14",

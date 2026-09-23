@@ -6,6 +6,7 @@ const {
   configuredLocales,
   isSupportedLocale,
   normalizeLocale,
+  requestedPreferredLanguage,
 } = require('../config/supportedLocales');
 const User = require('../models/user');
 const { responseFor } = require('../controllers/userPreferenceController');
@@ -33,4 +34,12 @@ test('user preferredLanguage keeps a safe default and validates configured local
   assert.equal(User.schema.path('preferredLanguage').defaultValue, DEFAULT_LOCALE);
   assert.equal(responseFor({ preferredLanguage: 'hu' }).preferredLanguage, 'hu');
   assert.equal(responseFor({ preferredLanguage: '' }).preferredLanguage, 'en');
+});
+
+test('new-user language selection defaults to English and rejects unsupported locales', () => {
+  assert.equal(requestedPreferredLanguage(undefined), 'en');
+  assert.equal(requestedPreferredLanguage(''), 'en');
+  assert.equal(requestedPreferredLanguage('HU'), 'hu');
+  assert.equal(requestedPreferredLanguage('fr'), null);
+  assert.equal(new User({ preferredLanguage: requestedPreferredLanguage('HU') }).preferredLanguage, 'hu');
 });

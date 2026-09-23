@@ -10,8 +10,6 @@ const Session = require('../models/session');
 const mailService = require('../services/mailService');
 const { registrationEmailHtml, emailVerificationEmailHtml, forgotPasswordEmailHtml, resolveEmailBrand } = require('../services/mailTemplates');
 const { resolvePublicBaseUrl, persistPublicBaseUrlIfMissing } = require('../helpers/publicBaseUrl');
-const Stripe = require('stripe');
-const { ensureStripeCustomerForTenant } = require('../services/stripeCustomerProvisioning');
 const emailPreferenceService = require('../services/emailPreferenceService');
 const { computePermissions, getEffectiveProfessions } = require('../helpers/rbac');
 const {
@@ -30,12 +28,6 @@ const {
   validateCsrf,
 } = require('../services/authSessionService');
 const { verifyMicrosoftAccessToken } = require('../services/microsoftTokenVerifier');
-
-let stripe = null;
-const stripeKey = process.env.STRIPE_SECRET_KEY;
-if (stripeKey) {
-  stripe = new Stripe(stripeKey, { apiVersion: '2024-06-20' });
-}
 
 /**
  * ------------------------------------------------------------
@@ -104,7 +96,7 @@ async function createCompanyTenantForTeam({ companyName, seats = 5, ownerUserId 
     plan: 'team',
     ownerUserId: ownerUserId ? ownerUserId : undefined,
     seats: { max: maxSeats, used: 1 },
-    seatsManaged: 'stripe'
+    seatsManaged: 'manual'
   });
   return tenant;
 }
@@ -150,7 +142,7 @@ async function getSubscriptionSnapshot(tenantId) {
     tenantType: t.type || null,          // 'personal' | 'company'
     plan: t.plan || 'free',              // 'free' | 'pro' | 'team'
     seats: pick(t.seats || {}, ['max', 'used']),
-    seatsManaged: t.seatsManaged || 'stripe'
+    seatsManaged: t.seatsManaged || 'manual'
   };
 
   const sub = await Subscription.findOne({ tenantId }).lean().select(
@@ -539,18 +531,6 @@ exports.verifyEmail = async (req, res) => {
       user = ensured.user;
     }
 
-    // Stripe Customer csak visszaigazolás után (free user esetén is)
-    if (stripe && user?.tenantId) {
-      try {
-        const tenant = await Tenant.findById(user.tenantId);
-        if (tenant) {
-          await ensureStripeCustomerForTenant({ stripe, tenantDoc: tenant, user });
-        }
-      } catch (err) {
-        console.warn('[stripe] Failed to create customer after email verification:', err?.message || err);
-      }
-    }
-
     const authResult = await createSession({ user, clientType: getClientType(req), req });
     attachAuthResultToRequest(req, authResult);
 
@@ -663,25 +643,27 @@ exports.microsoftLogin = async (req, res) => {
       return res.status(400).json({ error: 'Azure ID is missing in the token' });
     }
 
-    let user = await User.findOne({ azureId });
+    let user = await User.findOne({
+      $or: [
+        { azureId },
+        ...(email ? [{ email: String(email).trim().toLowerCase() }] : []),
+      ],
+    });
     if (!user) {
-      user = await User.create({
-        azureId,
-        firstName,
-        lastName,
-        email: email || `no-email-${azureId}@microsoft.com`,
-        role: 'User',
-        password: 'microsoft-auth', // pre-save hash-eli
-        // company: undefined
+      return res.status(403).json({
+        error: 'No account has been provisioned for this Microsoft identity. Ask a tenant administrator to add you.',
       });
-      emailPreferenceService.recordInitialPreferences(user).catch(err =>
-        console.warn('[email-preferences] initial consent log failed:', err?.message || err)
-      );
+    }
+
+    if (!user.azureId) {
+      user.azureId = azureId;
+      await user.save();
     }
 
     if (!user.tenantId) {
-      const ensured = await ensureTenantForUserFromName(user, tenantName);
-      user = ensured.user;
+      return res.status(403).json({
+        error: 'This account is not assigned to a tenant. Ask an administrator to add it.',
+      });
     }
 
     const authResult = await createSession({ user, clientType: getClientType(req), req });

@@ -19,10 +19,15 @@ function isSupportedLocale(value) {
   return Boolean(normalized) && configuredLocales().includes(normalized);
 }
 
+function requestedPreferredLanguage(value) {
+  if (value === undefined || value === null || value === '') return DEFAULT_LOCALE;
+  return isSupportedLocale(value) ? normalizeLocale(value) : null;
+}
+
 module.exports = {
   DEFAULT_LOCALE,
   configuredLocales,
   isSupportedLocale,
   normalizeLocale,
+  requestedPreferredLanguage,
 };
-

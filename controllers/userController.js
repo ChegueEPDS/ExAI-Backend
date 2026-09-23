@@ -21,6 +21,7 @@ const { computePermissions, getEffectiveProfessions, assertValidProfessions } = 
 const { resolvePublicBaseUrl, persistPublicBaseUrlIfMissing } = require('../helpers/publicBaseUrl');
 const contributionRewardService = require('../services/contributionRewardService');
 const emailPreferenceService = require('../services/emailPreferenceService');
+const { requestedPreferredLanguage } = require('../config/supportedLocales');
 
 // --- Daily download quota (Free plan) helpers ---
 const FREE_DAILY_LIMIT = 3;
@@ -426,15 +427,6 @@ exports.moveUserToTenant = async (req, res) => {
 
     const toTenant = await Tenant.findById(toTenantId).select('seats name').lean();
     if (!toTenant) return res.status(404).json({ error: 'Cél tenant nem található.' });
-
-    // Seat ellenőrzés + atomikus foglalás feltétellel
-    const seatInc = await Tenant.updateOne(
-      { _id: toTenantId, 'seats.used': { $lt: toTenant.seats.max } },
-      { $inc: { 'seats.used': 1 } }
-    );
-    if (!seatInc?.acknowledged || seatInc.modifiedCount !== 1) {
-      return res.status(400).json({ error: 'Nincs szabad seat a cél tenantban.' });
-    }
 
     // Migráció a user korábbi tenantjáról az újra (best-effort)
     if (fromTenantId) {
@@ -972,7 +964,7 @@ async function makeUniqueTenantName(base) {
 
 /**
  * POST /api/admin/create-paid-tenant-user
- * Body: { email, firstName?, lastName?, password?, tenantName?, plan?: 'pro'|'team', seats?: number, role?: 'User'|'Admin' }
+ * Body: { email, firstName?, lastName?, password?, tenantName?, plan?: 'pro'|'team', seats?: number, role?: 'User'|'Admin', preferredLanguage? }
  * Guard: authMiddleware(['Admin','SuperAdmin']) — csak Admin / SuperAdmin hívja
  */
 exports.createPaidTenantUser = async (req, res) => {
@@ -990,10 +982,13 @@ exports.createPaidTenantUser = async (req, res) => {
       tenantName = null,
       plan = 'pro',   // 'pro' vagy 'team'
       seats = (plan === 'team' ? 5 : 1),
-      role = 'User'
+      role = 'User',
+      preferredLanguage: bodyPreferredLanguage,
     } = req.body || {};
 
     if (!email) return res.status(400).json({ error: 'Email required' });
+    const preferredLanguage = requestedPreferredLanguage(bodyPreferredLanguage);
+    if (!preferredLanguage) return res.status(400).json({ error: 'Unsupported preferred language' });
     if (!['pro','team'].includes(plan)) return res.status(400).json({ error: 'Invalid plan' });
     if (plan === 'team' && (!Number.isInteger(seats) || seats < 5)) {
       return res.status(400).json({ error: 'Team plan needs at least 5 seats' });
@@ -1025,7 +1020,8 @@ exports.createPaidTenantUser = async (req, res) => {
       password: hashed,
       role: plan === 'team' ? 'Admin' : role,
       tenantId: tenant._id,
-      nickname: firstName || normalizedEmail.split('@')[0]
+      nickname: firstName || normalizedEmail.split('@')[0],
+      preferredLanguage,
     });
     emailPreferenceService.recordInitialPreferences(user).catch(err =>
       console.warn('[email-preferences] initial consent log failed:', err?.message || err)

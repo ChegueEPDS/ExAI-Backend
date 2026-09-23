@@ -200,7 +200,7 @@ async function getTenantSnapshot(tenantId) {
       max: tenant.seats?.max ?? 0,
       used: tenant.seats?.used ?? 0,
     },
-    seatsManaged: tenant.seatsManaged || 'stripe',
+    seatsManaged: tenant.seatsManaged || 'manual',
   };
 
   const sub = await Subscription.findOne({ tenantId }).lean().select('tier status seatsPurchased updatedAt');

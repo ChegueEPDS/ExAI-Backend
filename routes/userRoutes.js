@@ -8,9 +8,7 @@ const {
   listUsers,
   getMyDownloadQuota,
   moveUserToTenant,
-  deleteUser,
-  createPaidTenantUser,
-  manualSendContributionReward
+  deleteUser
 } = require('../controllers/userController');
 const authMiddleware = require('../middlewares/authMiddleware');
 const { memoryUpload } = require('../middlewares/uploadFactory');
@@ -60,17 +58,4 @@ router.get('/user/me/quota', authMiddleware(), getMyDownloadQuota);
 router.post('/users/move-to-tenant/:toTenantId', authMiddleware(['Admin', 'SuperAdmin']), moveUserToTenant );
 
 // routes/userRoutes.js  -- ADD
-router.post(
-  '/admin/create-paid-tenant-user',
-  authMiddleware(['Admin','SuperAdmin']),
-  createPaidTenantUser
-);
-
-// Manual reward email (SuperAdmin only) - also sets baseline for future auto rewards
-router.post(
-  '/users/:userId/contribution-reward/manual-send',
-  authMiddleware(['SuperAdmin']),
-  manualSendContributionReward
-);
-
 module.exports = router;

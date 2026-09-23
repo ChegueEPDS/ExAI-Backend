@@ -1,8 +1,6 @@
 // routes/authRoutes.js
 const express = require('express');
-const { body } = require('express-validator');
 const {
-  register,
   login,
   logout,
   me,
@@ -21,12 +19,11 @@ const { requireAuth } = require('../middlewares/authMiddleware');
 
 const router = express.Router();
 
-router.post('/register', [
-  body('firstName').notEmpty(),
-  body('lastName').notEmpty(),
-  body('email').isEmail(),
-  body('password').isLength({ min: 6 }),
-], register);
+// Self-service registration is intentionally disabled. Users are provisioned
+// by a tenant Admin or SuperAdmin through POST /api/invitations.
+router.post('/register', (req, res) => res.status(403).json({
+  error: 'Self-service registration is disabled. Ask a tenant administrator to add you.',
+}));
 
 router.post('/login', captchaVerify,login);
 router.post('/microsoft-login', microsoftLogin);

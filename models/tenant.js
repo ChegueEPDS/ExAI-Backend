@@ -33,7 +33,7 @@ const TenantSchema = new mongoose.Schema(
       match: /^[a-z0-9\-_.]+$/, // egyszerű slug szabály, ha szeretnéd
     },
     type: { type: String, enum: ['personal', 'company'], required: true },
-    // regisztrációnál mindig free, csak a Stripe webhook módosíthatja
+    // A licencet a rendszer adminisztratív úton kezeli.
     plan: { type: String, enum: ['free', 'pro', 'team'], required: true },
     ownerUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
 
@@ -46,8 +46,8 @@ const TenantSchema = new mongoose.Schema(
       default: () => ({ max: 0, used: 0 }),
     },
 
-    // hogyan kezeli az üléseket
-    seatsManaged: { type: String, enum: ['stripe', 'manual'], default: 'stripe' },
+    // Legacy 'stripe' values remain readable; all new tenants are manual.
+    seatsManaged: { type: String, enum: ['stripe', 'manual'], default: 'manual' },
 
     // Dashboard settings (used by Insp-Ex analytics)
     dashboardSettings: {
@@ -114,7 +114,6 @@ const TenantSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// regisztrációnál plan mindig free, később a Stripe webhook állítja át pro/team-re
 // Üzleti szabályok:
 // - company → csak team
 // - personal → free vagy pro

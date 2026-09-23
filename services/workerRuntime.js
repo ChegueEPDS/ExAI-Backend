@@ -7,7 +7,6 @@ const certificateDraftWorker = require('./certificateDraftWorker');
 const equipmentImportWorker = require('./equipmentImportWorker');
 const equipmentBulkDeleteWorker = require('./equipmentBulkDeleteWorker');
 const documentationExpiryNotifier = require('./documentationExpiryNotifier');
-const contributionRewardWorker = require('./contributionRewardWorker');
 const automatedEmailService = require('./automatedEmailService');
 const emailPreferenceService = require('./emailPreferenceService');
 const reportExportController = require('../controllers/exportInspectionReport');
@@ -83,16 +82,6 @@ function startWorkerRuntime() {
   withLock('documentations:expiry-notifications', 30 * 60 * 1000, documentationExpiryNotifier.sweepDocumentationExpiryNotifications)
     .catch((err) => logger.warn('[worker-runtime] documentation expiry sweep failed', err?.message || err));
   scheduleInterval(
-    () => withLock('contribution-rewards:sweep', 30 * 60 * 1000, contributionRewardWorker.sweepContributionRewards),
-    6 * 60 * 60 * 1000
-  );
-  scheduleInterval(
-    () => withLock('contribution-rewards:halfway', 30 * 60 * 1000, contributionRewardWorker.sweepHalfwayMilestones),
-    24 * 60 * 60 * 1000
-  );
-  withLock('contribution-rewards:sweep', 30 * 60 * 1000, contributionRewardWorker.sweepContributionRewards)
-    .catch((err) => logger.warn('[worker-runtime] contribution reward sweep failed', err?.message || err));
-  scheduleInterval(
     () => withLock('automated-emails:lifecycle', 30 * 60 * 1000, automatedEmailService.sweepLifecycleEmails),
     24 * 60 * 60 * 1000
   );
@@ -119,7 +108,6 @@ function startWorkerRuntime() {
     equipmentBulkDeleteWorker: true,
     mobileSyncWorker: true,
     documentationExpiryNotifier: true,
-    contributionRewardWorker: true,
     automatedEmailService: true
   });
 

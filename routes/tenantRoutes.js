@@ -44,11 +44,11 @@ router.get(
 
 /**
  * POST /api/tenants
- * Admin / SuperAdmin
+ * SuperAdmin only
  */
 router.post(
   '/tenants',
-  authMiddleware(['Admin', 'SuperAdmin']),
+  authMiddleware(['SuperAdmin']),
   createTenant
 );
 

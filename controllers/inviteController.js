@@ -13,6 +13,7 @@ const { resolvePublicBaseUrl, persistPublicBaseUrlIfMissing } = require('../help
 const { assertValidProfessions } = require('../helpers/rbac');
 const { migrateAllUserDataToTenant } = require('../services/tenantMigration');
 const emailPreferenceService = require('../services/emailPreferenceService');
+const { requestedPreferredLanguage } = require('../config/supportedLocales');
 
 /** Erős ideiglenes jelszó (2-2 kis/nagy/ szám/ spec) */
 function generatePassword() {
@@ -129,15 +130,15 @@ async function createOrRefreshJoinInvite({ req, user, fromTenantId, toTenant, in
 
 /**
  * POST /api/invitations  (LEGYEGYSZERŰSÍTETT FLOW)
- * Body: { tenantId?, email (required), role?('User'|'Admin'), firstName?, lastName?, nickname? }
+ * Body: { tenantId?, email (required), role?('User'|'Admin'), firstName?, lastName?, nickname?, preferredLanguage? }
  *
  * - Admin: csak a saját tenantjába hívhat; SuperAdmin: bármelyikbe.
  * - Ha az e-mail nem létezik:
- *    - seat +1 (atomikus check)
+ *    - user létrehozása korlát nélkül
  *    - user létrehozása generált jelszóval és tenantId-vel
  *    - e-mail küldés jelszóval
  * - Ha létező user tenant nélkül:
- *    - seat +1 (atomikus check)
+ *    - hozzárendelés korlát nélkül
  *    - hozzárendelés a tenantodhoz (role beállítás), név kitöltése ha hiányzott
  *    - e-mail küldés (jelszó nélkül)
  * - Ha már a cél tenant tagja:
@@ -160,6 +161,7 @@ exports.createInvite = async (req, res) => {
     firstName: bodyFirstName,
     lastName: bodyLastName,
     nickname: bodyNickname,
+    preferredLanguage: bodyPreferredLanguage,
     professions: bodyProfessions,
     accessGroupIds,
   } = req.body || {};
@@ -174,6 +176,8 @@ exports.createInvite = async (req, res) => {
   if (!email) {
     return res.status(400).json({ error: 'email kötelező.' });
   }
+  const preferredLanguage = requestedPreferredLanguage(bodyPreferredLanguage);
+  if (!preferredLanguage) return res.status(400).json({ error: 'Unsupported preferred language.' });
   const normalizedEmail = String(email).trim().toLowerCase();
 
   // Név fallback e-mailből, ha nem kaptunk
@@ -193,7 +197,7 @@ exports.createInvite = async (req, res) => {
   const lastName  = bodyLastName?.trim()  || fallbackLast  || 'User';
   const nickname  = bodyNickname?.trim()  || null;
 
-  // Tenant és seat meta
+  // Tenant meta
   const t = await Tenant.findById(tenantId).select('seats plan name type professionRbacEnabled').lean();
   if (!t) return res.status(404).json({ error: 'Tenant nem található.' });
 
@@ -215,15 +219,6 @@ exports.createInvite = async (req, res) => {
   let tempPassword = null;
 
   if (!user) {
-    // seat +1 atomikusan
-    const seatInc = await Tenant.updateOne(
-      { _id: tenantId, 'seats.used': { $lt: t.seats.max } },
-      { $inc: { 'seats.used': 1 } }
-    );
-    if (!seatInc?.acknowledged || seatInc.modifiedCount !== 1) {
-      return res.status(400).json({ error: 'Nincs szabad seat a tenantban.' });
-    }
-
     // Új user generált jelszóval
     tempPassword = generatePassword();
     const hash = await bcrypt.hash(String(tempPassword), 10);
@@ -233,6 +228,7 @@ exports.createInvite = async (req, res) => {
       firstName,
       lastName,
       nickname,
+      preferredLanguage,
       role: targetRole === 'Admin' ? 'Admin' : 'User',
       tenantId,
       ...(t?.professionRbacEnabled ? { professions } : {}),
@@ -246,14 +242,6 @@ exports.createInvite = async (req, res) => {
     const currentTenant = user.tenantId ? String(user.tenantId) : null;
 
     if (!currentTenant) {
-      // seat +1 és hozzárendelés
-      const seatInc = await Tenant.updateOne(
-        { _id: tenantId, 'seats.used': { $lt: t.seats.max } },
-        { $inc: { 'seats.used': 1 } }
-      );
-      if (!seatInc?.acknowledged || seatInc.modifiedCount !== 1) {
-        return res.status(400).json({ error: 'Nincs szabad seat a tenantban.' });
-      }
       user.tenantId = tenantId;
       if (user.role !== 'SuperAdmin') {
         user.role = targetRole === 'Admin' ? 'Admin' : 'User';
@@ -468,15 +456,6 @@ exports.acceptJoinInvite = async (req, res) => {
     if (!toTenant || toTenant.type !== 'company' || toTenant.plan !== 'team') {
       await TenantJoinInvite.updateOne({ _id: invite._id }, { $set: { status: 'pending' } });
       return res.status(400).json({ error: 'Target team tenant is no longer available.' });
-    }
-
-    const seatInc = await Tenant.updateOne(
-      { _id: invite.toTenantId, 'seats.used': { $lt: toTenant.seats.max } },
-      { $inc: { 'seats.used': 1 } }
-    );
-    if (!seatInc?.acknowledged || seatInc.modifiedCount !== 1) {
-      await TenantJoinInvite.updateOne({ _id: invite._id }, { $set: { status: 'pending' } });
-      return res.status(400).json({ error: 'No available seat in the target tenant.' });
     }
 
     if (fromTenantId) {

@@ -1,15 +1,6 @@
 // controllers/tenantController.js
 const Tenant = require('../models/tenant');
-const Stripe = require('stripe');
 const { ensureDefaultTenantAccessGroups } = require('../services/defaultTenantAccessGroups');
-
-let stripe = null;
-try {
-  const key = process.env.STRIPE_SECRET_KEY;
-  if (key) stripe = new Stripe(key, { apiVersion: '2024-06-20' });
-} catch (_) {
-  stripe = null;
-}
 
 function slugify(name) {
   return String(name || '')
@@ -149,57 +140,25 @@ exports.searchTenants = async (req, res) => {
 
 /**
  * POST /api/tenants
- * Admin / SuperAdmin tud új tenantot létrehozni
- * Body:
- *  - name?: string (ha nincs, slug/unique generálás)
- *  - type: 'company' | 'personal'  (schema: company -> csak 'team')
- *  - plan: 'free' | 'pro' | 'team'
- *  - seatsMax?: number (team: MIN 5; personal: 1)
- *  - seatsManaged?: 'stripe' | 'manual' (default: 'stripe')
- *  - ownerUserId?: ObjectId (opcionális; csak tároljuk, used itt 0 marad)
+ * Csak SuperAdmin hozhat létre tenantot.
+ * A plan/type/seat mezők belső kompatibilitási értékek; a termékben nincs
+ * csomagválasztás és nincs felhasználói korlát.
+ * Body: { name: string }
  */
 exports.createTenant = async (req, res) => {
   try {
-    let { name, type, plan, seatsMax, seatsManaged = 'stripe', ownerUserId } = req.body || {};
-
-    type = String(type || '').trim();
-    plan = String(plan || '').trim();
-
-    if (!['company','personal'].includes(type)) {
-      return res.status(400).json({ message: 'Invalid tenant type.' });
-    }
-    if (!['free','pro','team'].includes(plan)) {
-      return res.status(400).json({ message: 'Invalid plan.' });
-    }
-    // Üzleti szabályok a schema-val összhangban
-    if (type === 'company' && plan !== 'team') {
-      return res.status(400).json({ message: 'Company tenant must use team plan.' });
-    }
-    if (type === 'personal' && !['free','pro'].includes(plan)) {
-      return res.status(400).json({ message: 'Personal tenant must be free or pro.' });
-    }
-
-    // seats: team >=5, különben 1
-    if (plan === 'team') {
-      const n = Number(seatsMax || 0);
-      if (!Number.isInteger(n) || n < 5) {
-        return res.status(400).json({ message: 'Team plan requires at least 5 seats.' });
-      }
-      seatsMax = n;
-    } else {
-      seatsMax = 1;
-    }
+    const name = String(req.body?.name || '').trim();
+    if (!name) return res.status(400).json({ message: 'Tenant name is required.' });
 
     // név: ha nincs megadva, generálunk egyedi slugot
-    const finalName = await ensureUniqueTenantName(name || (type === 'personal' ? 'u-personal' : 'company'));
+    const finalName = await ensureUniqueTenantName(name);
 
     const t = await Tenant.create({
       name: finalName,
-      type,
-      plan,
-      ownerUserId: ownerUserId || undefined,
-      seats: { max: seatsMax, used: 0 },
-      seatsManaged,
+      type: 'company',
+      plan: 'team',
+      seats: { max: Number.MAX_SAFE_INTEGER, used: 0 },
+      seatsManaged: 'manual',
       features: {
         maintenance: false,
         professionRbac: false,
@@ -304,13 +263,8 @@ exports.updateTenant = async (req, res) => {
       updates.name = nextName;
     }
 
-    // seatsManaged
-    if (typeof seatsManaged === 'string') {
-      if (!['stripe', 'manual'].includes(seatsManaged)) {
-        return res.status(400).json({ message: 'Invalid seatsManaged (stripe|manual).' });
-      }
-      updates.seatsManaged = seatsManaged;
-    }
+    // seatsManaged (legacy Stripe-managed tenants can only be migrated to manual)
+    updates.seatsManaged = 'manual';
 
     // plan – csak a schema szerinti kombináció engedélyezett, type nem változik itt
     if (typeof plan === 'string' && plan.trim()) {
@@ -412,18 +366,6 @@ exports.updateTenant = async (req, res) => {
     // Végrehajtás
     const updated = await Tenant.findByIdAndUpdate(id, updates, { new: true });
     const updatedJson = updated ? normalizeTenantFeaturesForResponse(updated.toObject ? updated.toObject() : updated) : updated;
-
-    // Best-effort: keep Stripe Customer name in sync (if configured)
-    if (updates.name && stripe && updated?.stripeCustomerId) {
-      try {
-        await stripe.customers.update(String(updated.stripeCustomerId), {
-          name: String(updated.name),
-          metadata: { tenantName: String(updated.name) },
-        });
-      } catch (e) {
-        try { console.warn('[tenants/update] stripe customer update failed:', e?.message || e); } catch {}
-      }
-    }
 
     return res.json(updatedJson);
   } catch (e) {
