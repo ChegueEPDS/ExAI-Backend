@@ -1,6 +1,7 @@
 // models/user.js
 const mongoose = require('mongoose');
 const bcrypt = require('bcrypt');
+const { DEFAULT_LOCALE, isSupportedLocale, normalizeLocale } = require('../config/supportedLocales');
 
 const PROFESSIONS = Object.freeze([
   'manager',
@@ -54,7 +55,15 @@ const UserSchema = new mongoose.Schema(
     emailVerificationExpires: { type: Date },
     marketingEmailsEnabled: { type: Boolean, default: true, index: true },
     newsletterEmailsEnabled: { type: Boolean, default: true, index: true },
-    preferredLanguage: { type: String, enum: ['en', 'hu'], default: 'en' },
+    preferredLanguage: {
+      type: String,
+      default: DEFAULT_LOCALE,
+      set: value => normalizeLocale(value) || DEFAULT_LOCALE,
+      validate: {
+        validator: isSupportedLocale,
+        message: 'Unsupported preferred language',
+      },
+    },
     brevoNewsletterListIds: { type: [Number], default: [] },
     emailPreferenceSync: {
       usefulInformation: {

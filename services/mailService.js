@@ -8,7 +8,9 @@ class GraphMailService {
     this.fromAddress = process.env.MAIL_FROM_ADDRESS || 'noreply@atexdb.eu';
     this.fromName = process.env.MAIL_FROM_NAME || 'ATEXdb';
     this.saveToSent = String(process.env.MAIL_SAVE_TO_SENT || 'true').toLowerCase() === 'true';
-    this.inlineLogo = String(process.env.MAIL_INLINE_LOGO || 'false').toLowerCase() === 'true';
+    // Inline by default so the brand logo is not dependent on the recipient
+    // allowing remote images. Set MAIL_INLINE_LOGO=false to opt out.
+    this.inlineLogo = String(process.env.MAIL_INLINE_LOGO || 'true').toLowerCase() === 'true';
     this.inlineLogoTimeoutMs = Number(process.env.MAIL_INLINE_LOGO_TIMEOUT_MS || 5000);
   }
 
@@ -65,6 +67,7 @@ class GraphMailService {
     const logoUrls = [
       'https://certs.atexdb.eu/public/index_logo.png',
       'https://certs.atexdb.eu/public/ATEXdb.png',
+      'https://demo.epds.eu/public/epds_logo_mono.png',
     ];
 
     const matchedUrl = logoUrls.find(u => inputHtml.includes(u));

@@ -103,7 +103,7 @@ test('halfway email renders configured milestone values dynamically', () => {
   assert.match(html, /Ada/);
 });
 
-test('marketing emails always use ATEXdb branding and links', () => {
+test('marketing emails use the tenant brand and matching links', () => {
   const html = mailTemplates.automatedLifecycleEmail({
     firstName: 'Ada',
     heading: 'Welcome',
@@ -111,10 +111,12 @@ test('marketing emails always use ATEXdb branding and links', () => {
     ctaLabel: 'Open',
     ctaUrl: 'https://exai.ind-ex.ae/account',
   }, 'index');
-  assert.match(html, /public\/ATEXdb\.png/);
-  assert.match(html, /https:\/\/certs\.atexdb\.eu\/account/);
-  assert.doesNotMatch(html, /index_logo\.png/);
-  assert.doesNotMatch(html, /https:\/\/exai\.ind-ex\.ae\/account/);
+  assert.match(html, /index_logo\.png/);
+  assert.match(html, /https:\/\/exai\.ind-ex\.ae\/account/);
+  assert.match(html, /#fff100/i);
+  assert.match(html, /The ExAI IndEx Team/);
+  assert.doesNotMatch(html, /public\/ATEXdb\.png/);
+  assert.doesNotMatch(html, /https:\/\/certs\.atexdb\.eu\/account/);
 });
 
 test('system emails resolve IndEx branding from the public domain', () => {
@@ -157,6 +159,24 @@ test('system emails resolve ATEXdb branding from the certs domain', () => {
   assert.doesNotMatch(html, /index_logo\.png/);
 });
 
+test('system emails resolve EPDS branding and links from the demo domain', () => {
+  const html = mailTemplates.emailVerificationEmailHtml({
+    firstName: 'Ada',
+    lastName: 'Lovelace',
+    verifyUrl: 'https://demo.epds.eu/verify-email?token=test',
+    tenantName: 'some-tenant',
+    baseUrl: 'https://demo.epds.eu',
+  });
+  assert.match(html, /demo\.epds\.eu\/public\/epds_logo_mono\.png/);
+  assert.match(html, /ExAI by EPDS/);
+  assert.match(html, /href="https:\/\/demo\.epds\.eu\/verify-email\?token=test"/);
+  assert.match(html, /#e98f17/i);
+  assert.match(html, /background:#0f2a43/i);
+  assert.match(html, /The EPDS Team/);
+  assert.doesNotMatch(html, /public\/ATEXdb\.png/);
+  assert.doesNotMatch(html, /index_logo\.png/);
+});
+
 test('system login buttons use the real login route when given only an origin', () => {
   const html = mailTemplates.forgotPasswordEmailHtml({
     firstName: 'Ada',
@@ -167,7 +187,7 @@ test('system login buttons use the real login route when given only an origin', 
   assert.match(html, /href="https:\/\/certs\.atexdb\.eu\/login"/);
 });
 
-test('marketing CTAs use existing certificate and account routes', () => {
+test('marketing CTAs use existing certificate and account routes for the tenant brand', () => {
   const uploadHtml = mailTemplates.contributionHalfwayEmail({
     firstName: 'Ada',
     currentCount: 10,
@@ -179,8 +199,8 @@ test('marketing CTAs use existing certificate and account routes', () => {
     ctaLabel: 'Upgrade',
     ctaPath: 'account?upgrade=pro',
   }, 'index');
-  assert.match(uploadHtml, /href="https:\/\/certs\.atexdb\.eu\/cert\?tab=upload"/);
-  assert.match(upgradeHtml, /href="https:\/\/certs\.atexdb\.eu\/account\?upgrade=pro"/);
+  assert.match(uploadHtml, /href="https:\/\/exai\.ind-ex\.ae\/cert\?tab=upload"/);
+  assert.match(upgradeHtml, /href="https:\/\/exai\.ind-ex\.ae\/account\?upgrade=pro"/);
 });
 
 test('join invitation buttons preserve the real token route and reject action', () => {

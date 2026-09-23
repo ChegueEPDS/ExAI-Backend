@@ -41,6 +41,26 @@ const EMAIL_BRANDS = Object.freeze({
     surface: '#f4f7ff',
     soft: '#e8f1fb',
   },
+  epds: {
+    key: 'epds',
+    name: 'EPDS',
+    productName: 'ExAI by EPDS',
+    footerName: 'EPDS',
+    legalEntityName: 'EPDS Kft.',
+    legalAddress: '1154 Budapest, Kozák tér 13-16.',
+    legalEmail: 'info@epds.hu',
+    companyRegistrationNumber: '01 09 291697',
+    taxNumber: '25834138-2-42',
+    teamName: 'EPDS Team',
+    baseUrl: 'https://demo.epds.eu',
+    logoUrl: 'https://demo.epds.eu/public/epds_logo_mono.png',
+    logoAlt: 'EPDS logo',
+    primary: '#e98f17',
+    ink: '#17252f',
+    header: '#0f2a43',
+    surface: '#f5f7f9',
+    soft: '#fdf3e4',
+  },
 });
 
 function isIndexTenant(tenantName) {
@@ -56,16 +76,29 @@ function isIndexUrl(baseUrl) {
   }
 }
 
+function isEpdsUrl(baseUrl) {
+  try {
+    const host = new URL(String(baseUrl || '')).hostname.toLowerCase();
+    return host === 'demo.epds.eu' || host.endsWith('.demo.epds.eu');
+  } catch (_) {
+    return false;
+  }
+}
+
 function resolveEmailBrand({ tenantName, baseUrl, forceBrand } = {}) {
   if (forceBrand === 'atexdb') return EMAIL_BRANDS.atexdb;
   if (forceBrand === 'index') return EMAIL_BRANDS.index;
+  if (forceBrand === 'epds') return EMAIL_BRANDS.epds;
   if (String(baseUrl || '').trim()) {
+    if (isEpdsUrl(baseUrl)) return EMAIL_BRANDS.epds;
     return isIndexUrl(baseUrl) ? EMAIL_BRANDS.index : EMAIL_BRANDS.atexdb;
   }
+  if ((tenantName || '').toLowerCase() === 'epds') return EMAIL_BRANDS.epds;
   return isIndexTenant(tenantName) ? EMAIL_BRANDS.index : EMAIL_BRANDS.atexdb;
 }
 
 function getTenantBaseUrl(tenantName) {
+  if ((tenantName || '').toLowerCase() === 'epds') return EMAIL_BRANDS.epds.baseUrl;
   return isIndexTenant(tenantName) ? 'https://exai.ind-ex.ae' : 'https://certs.atexdb.eu';
 }
 
@@ -587,6 +620,7 @@ function reportExportReadyEmail({ firstName, lastName, fileName, downloadUrl, jo
 }
 
 function contributionRewardEmail({ firstName, lastName, milestone, code, expiresAt, redeemUrl, copyUrl, accountUrl }, tenantName) {
+  const brand = resolveEmailBrand({ tenantName });
   const name = firstName || 'there';
   const safeCode = escapeHtml(code || '');
   const safeMilestone = Number(milestone) || 0;
@@ -594,7 +628,7 @@ function contributionRewardEmail({ firstName, lastName, milestone, code, expires
     ? expiresAt.toISOString().slice(0, 10)
     : null;
 
-  const marketingBase = EMAIL_BRANDS.atexdb.baseUrl;
+  const marketingBase = brand.baseUrl;
   const safeRedeemUrl = withBaseOrigin(marketingBase, redeemUrl, 'billing?product=team&billingPeriod=month');
   const redeemLabel = displayHost(safeRedeemUrl);
   const safeCopyUrl = copyUrl ? withBaseOrigin(marketingBase, copyUrl) : null;
@@ -603,7 +637,7 @@ function contributionRewardEmail({ firstName, lastName, milestone, code, expires
 
   return baseTemplate({
     title: 'Your Team discount code',
-    forceBrand: 'atexdb',
+    tenantName,
     bodyHtml: `
       <h2 style="color:#131313;">Hi ${escapeHtml(name)},</h2>
       <p>Thank you for contributing to our certificate database - you have now uploaded <strong>${safeMilestone}</strong> certificates.</p>
@@ -644,20 +678,21 @@ function contributionRewardEmail({ firstName, lastName, milestone, code, expires
 
       <p style="margin:0;">Account: <a href="${safeAccountUrl}" target="_blank" rel="noopener noreferrer">${accountLabel}</a></p>
       <p style="margin:6px 0 0 0;">Upgrade link: <a href="${safeRedeemUrl}" target="_blank" rel="noopener noreferrer">${redeemLabel}</a></p>
-      <p>Best regards,<br/>The ATEXdb Team</p>
+      <p>Best regards,<br/>The ${brand.teamName}</p>
     `
   });
 }
 
 function contributionRewardReminderEmail({ firstName, milestone, code, expiresAt, redeemUrl, finalReminder = false }, tenantName) {
+  const brand = resolveEmailBrand({ tenantName });
   const name = escapeHtml(firstName || 'there');
   const expiry = expiresAt instanceof Date && !isNaN(expiresAt.getTime())
     ? expiresAt.toISOString().slice(0, 10)
     : '';
-  const url = withBaseOrigin(EMAIL_BRANDS.atexdb.baseUrl, redeemUrl, 'billing?product=team&billingPeriod=month');
+  const url = withBaseOrigin(brand.baseUrl, redeemUrl, 'billing?product=team&billingPeriod=month');
   return baseTemplate({
     title: finalReminder ? 'Your Team reward expires soon' : 'Your free Team month is waiting',
-    forceBrand: 'atexdb',
+    tenantName,
     bodyHtml: `
       <h2>Hi ${name},</h2>
       <p>You earned a free month of Team after uploading <strong>${Number(milestone) || 0}</strong> certificates, but the reward has not been redeemed yet.</p>
@@ -666,16 +701,17 @@ function contributionRewardReminderEmail({ firstName, milestone, code, expiresAt
       <p style="margin-top:18px;"><strong>What Team gives you:</strong></p>
       ${renderFeatureCards(TEAM_EMAIL_FEATURES)}
       <p style="margin:22px 0;text-align:center;"><a href="${url}" style="background:#f8d201;color:#131313;text-decoration:none;padding:12px 24px;border-radius:6px;display:inline-block;">Redeem your free month</a></p>
-      <p>Best regards,<br/>The ATEXdb Team</p>
+      <p>Best regards,<br/>The ${brand.teamName}</p>
     `
   });
 }
 
 function contributionHalfwayEmail({ firstName, currentCount, milestone, uploadUrl }, tenantName) {
-  const url = withBaseOrigin(EMAIL_BRANDS.atexdb.baseUrl, uploadUrl, 'cert?tab=upload');
+  const brand = resolveEmailBrand({ tenantName });
+  const url = withBaseOrigin(brand.baseUrl, uploadUrl, 'cert?tab=upload');
   return baseTemplate({
     title: 'You’re halfway to your free Team month',
-    forceBrand: 'atexdb',
+    tenantName,
     bodyHtml: `
       <h2>Hi ${escapeHtml(firstName || 'there')},</h2>
       <p>You’ve uploaded <strong>${Number(currentCount) || 0}</strong> certificates, so you’re halfway to your next free Team month at <strong>${Number(milestone) || 0}</strong> uploads.</p>
@@ -683,23 +719,24 @@ function contributionHalfwayEmail({ firstName, currentCount, milestone, uploadUr
       <p style="margin-top:18px;"><strong>What you can unlock with Team:</strong></p>
       ${renderFeatureCards(TEAM_EMAIL_FEATURES)}
       <p style="margin:22px 0;text-align:center;"><a href="${url}" style="background:#f8d201;color:#131313;text-decoration:none;padding:12px 24px;border-radius:6px;display:inline-block;">Upload more certificates</a></p>
-      <p>Best regards,<br/>The ATEXdb Team</p>
+      <p>Best regards,<br/>The ${brand.teamName}</p>
     `
   });
 }
 
 function automatedLifecycleEmail({ firstName, heading, paragraphs = [], bullets = [], features = [], ctaLabel, ctaUrl, ctaPath = 'account' }, tenantName) {
-  const url = withBaseOrigin(EMAIL_BRANDS.atexdb.baseUrl, ctaUrl, ctaPath);
+  const brand = resolveEmailBrand({ tenantName });
+  const url = withBaseOrigin(brand.baseUrl, ctaUrl, ctaPath);
   return baseTemplate({
     title: heading,
-    forceBrand: 'atexdb',
+    tenantName,
     bodyHtml: `
       <h2>Hi ${escapeHtml(firstName || 'there')},</h2>
       ${paragraphs.map((p) => `<p>${escapeHtml(p)}</p>`).join('')}
       ${bullets.length ? `<ul>${bullets.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : ''}
       ${renderFeatureCards(features)}
       ${ctaLabel ? `<p style="margin:22px 0;text-align:center;"><a href="${url}" style="background:#f8d201;color:#131313;text-decoration:none;padding:12px 24px;border-radius:6px;display:inline-block;">${escapeHtml(ctaLabel)}</a></p>` : ''}
-      <p>Best regards,<br/>The ATEXdb Team</p>
+      <p>Best regards,<br/>The ${brand.teamName}</p>
     `
   });
 }

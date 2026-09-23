@@ -15,6 +15,7 @@ const {
 const authMiddleware = require('../middlewares/authMiddleware');
 const { memoryUpload } = require('../middlewares/uploadFactory');
 const emailPreferenceController = require('../controllers/emailPreferenceController');
+const userPreferenceController = require('../controllers/userPreferenceController');
 
 const router = express.Router();
 
@@ -26,6 +27,8 @@ router.post('/webhooks/brevo/marketing', express.json(), emailPreferenceControll
 
 router.get('/user/me/email-preferences', authMiddleware(), emailPreferenceController.getMyEmailPreferences);
 router.put('/user/me/email-preferences', authMiddleware(), express.json(), emailPreferenceController.updateMyEmailPreferences);
+router.get('/user/me/preferences', authMiddleware(), userPreferenceController.getMyPreferences);
+router.put('/user/me/preferences', authMiddleware(), express.json(), userPreferenceController.updateMyPreferences);
 
 // List users (Admin: same tenant, SuperAdmin: all)
 router.get('/users', authMiddleware(['Admin', 'SuperAdmin']), listUsers);
