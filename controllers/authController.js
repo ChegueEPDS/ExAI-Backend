@@ -13,7 +13,7 @@ const { resolvePublicBaseUrl, persistPublicBaseUrlIfMissing } = require('../help
 const Stripe = require('stripe');
 const { ensureStripeCustomerForTenant } = require('../services/stripeCustomerProvisioning');
 const emailPreferenceService = require('../services/emailPreferenceService');
-const { computePermissions, getEffectiveProfessions } = require('../helpers/rbac');
+const { computePermissions, getEffectiveProfessions, assertValidProfessions } = require('../helpers/rbac');
 const {
   buildSessionMetadata,
   buildUserContext,
@@ -324,6 +324,8 @@ exports.register = async (req, res) => {
     desiredCompanyName,
     desiredPromoCode,
     desiredCampaign,
+    profession,
+    professions,
   } = req.body || {};
 
   try {
@@ -357,6 +359,18 @@ exports.register = async (req, res) => {
       return res.status(400).json({ error: 'desiredCompanyName is required for team plans' });
     }
 
+    const professionInput = profession !== undefined ? profession : professions;
+    let selectedProfession;
+    try {
+      const normalizedProfessions = assertValidProfessions(professionInput);
+      if (normalizedProfessions.length !== 1) {
+        return res.status(400).json({ error: 'Exactly one profession is required' });
+      }
+      [selectedProfession] = normalizedProfessions;
+    } catch (error) {
+      return res.status(400).json({ error: error.message || 'Invalid profession' });
+    }
+
     // 1) user létrehozása – NINCS subscriptionTier kézzel írva
     let user = await User.create({
       firstName,
@@ -368,6 +382,7 @@ exports.register = async (req, res) => {
       emailVerified: false,
       emailVerificationToken: emailToken,
       emailVerificationExpires: emailTokenExpires,
+      professions: [selectedProfession],
       ...(normalizedDesiredPlan
         ? {
             pendingCheckoutPlan: normalizedDesiredPlan,
@@ -388,6 +403,17 @@ exports.register = async (req, res) => {
     const personalTenant = await getOrCreateTenantByName(personalBase, 'personal', user._id, {
       plan: 'free'
     });
+
+    // A selected profession enables profession-based RBAC for the user's tenant.
+    await Tenant.updateOne(
+      { _id: personalTenant._id },
+      {
+        $set: {
+          professionRbacEnabled: true,
+          'features.professionRbac': true,
+        }
+      }
+    );
 
     user.tenantId = personalTenant._id;
     await user.save();
@@ -420,7 +446,8 @@ exports.register = async (req, res) => {
 
     return res.status(201).json({
       message: 'User registered successfully. Please confirm your email before signing in.',
-      requiresEmailVerification: true
+      requiresEmailVerification: true,
+      profession: user.professions[0]
     });
   } catch (error) {
     console.error('❌ Registration error:', error);
